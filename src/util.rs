@@ -1,49 +1,70 @@
 #![allow(non_snake_case)]
 
+use std::ffi::CStr;
 use std::fs::File;
 use std::io::Read;
+use std::mem::{offset_of, size_of};
 use std::os::raw::{c_char, c_int};
 use std::str::from_utf8;
-use std::ffi::CStr;
 
-const MAXDNAME: usize = 256;
-const MAXLABEL: usize = 63;
-const EC_MISC: i32 = 1;
-const RANDFILE: &str = "/path/to/random/file"; // Placeholder path
+use crate::all_addr::{AllAddr, RrData};
+use crate::config::DhcpConfig;
+use crate::daemon::Daemon;
 
-static mut SEED: [u32; 32] = [0; 32];
-static mut IN: [u32; 12] = [0; 12];
-static mut OUT: [u32; 8] = [0; 8];
-static mut OUTLEFT: i32 = 0;
+pub(crate) const MAXDNAME: usize = 256;
+pub(crate) const MAXLABEL: usize = 63;
+pub(crate) const EC_MISC: i32 = 1;
+pub(crate) const RANDFILE: &str = "/path/to/random/file"; // Placeholder path
+
+pub(crate) static mut SEED: [u32; 32] = [0; 32];
+pub(crate) static mut IN: [u32; 12] = [0; 12];
+pub(crate) static mut OUT: [u32; 8] = [0; 8];
+pub(crate) static mut OUTLEFT: i32 = 0;
 
 extern "C" {
-    fn die(msg: *const c_char, arg: *const c_char, code: c_int) -> !;
-    fn my_syslog(priority: c_int, fmt: *const c_char, ...);
+    pub(crate) fn die(msg: *const c_char, arg: *const c_char, code: c_int) -> !;
+    pub(crate) fn my_syslog(priority: c_int, fmt: *const c_char, ...);
 }
 
-fn rand_init() {
-    let mut fd = File::open(RANDFILE).unwrap_or_else(|_| {
-        unsafe {
-            die(CStr::from_bytes_with_nul(b"failed to seed the random number generator\0").unwrap().as_ptr(), std::ptr::null(), EC_MISC);
-        }
+pub(crate) fn rand_init() {
+    let mut fd = File::open(RANDFILE).unwrap_or_else(|_| unsafe {
+        die(
+            CStr::from_bytes_with_nul(b"failed to seed the random number generator\0")
+                .unwrap()
+                .as_ptr(),
+            std::ptr::null(),
+            EC_MISC,
+        );
     });
-    
+
     let mut seed_buffer = [0u8; 32 * 4]; // 32 u32s
     let mut in_buffer = [0u8; 12 * 4]; // 12 u32s
-    
+
     if fd.read_exact(&mut seed_buffer).is_err() || fd.read_exact(&mut in_buffer).is_err() {
         unsafe {
-            die(CStr::from_bytes_with_nul(b"failed to seed the random number generator\0").unwrap().as_ptr(), std::ptr::null(), EC_MISC);
+            die(
+                CStr::from_bytes_with_nul(b"failed to seed the random number generator\0")
+                    .unwrap()
+                    .as_ptr(),
+                std::ptr::null(),
+                EC_MISC,
+            );
         }
     }
-    
+
     unsafe {
-        SEED.copy_from_slice(std::slice::from_raw_parts(seed_buffer.as_ptr() as *const u32, 32));
-        IN.copy_from_slice(std::slice::from_raw_parts(in_buffer.as_ptr() as *const u32, 12));
+        SEED.copy_from_slice(std::slice::from_raw_parts(
+            seed_buffer.as_ptr() as *const u32,
+            32,
+        ));
+        IN.copy_from_slice(std::slice::from_raw_parts(
+            in_buffer.as_ptr() as *const u32,
+            12,
+        ));
     }
 }
 
-const fn rotate(x: u32, b: u32) -> u32 {
+pub(crate) const fn rotate(x: u32, b: u32) -> u32 {
     (x << b) | (x >> (32 - b))
 }
 
@@ -53,7 +74,7 @@ macro_rules! MUSH {
     };
 }
 
-fn surf() {
+pub(crate) fn surf() {
     let mut t = [0u32; 12];
     let mut x;
     let mut sum = 0u32;
@@ -90,7 +111,7 @@ fn surf() {
     }
 }
 
-fn rand16() -> u16 {
+pub(crate) fn rand16() -> u16 {
     unsafe {
         if OUTLEFT == 0 {
             if IN[0] == u32::MAX {
@@ -117,7 +138,7 @@ fn rand16() -> u16 {
     }
 }
 
-fn rand32() -> u32 {
+pub(crate) fn rand32() -> u32 {
     unsafe {
         if OUTLEFT == 0 {
             if IN[0] == u32::MAX {
@@ -144,7 +165,7 @@ fn rand32() -> u32 {
     }
 }
 
-fn rand64() -> u64 {
+pub(crate) fn rand64() -> u64 {
     static mut OUTLEFT: i32 = 0;
     unsafe {
         if OUTLEFT < 2 {
@@ -172,12 +193,12 @@ fn rand64() -> u64 {
     }
 }
 
-struct RRList {
+pub(crate) struct RRList {
     rr: u16,
     next: Option<Box<RRList>>,
 }
 
-fn rr_on_list(list: &Option<Box<RRList>>, rr: u16) -> bool {
+pub(crate) fn rr_on_list(list: &Option<Box<RRList>>, rr: u16) -> bool {
     let mut current = list;
     while let Some(ref node) = current {
         if node.rr == rr {
@@ -188,8 +209,8 @@ fn rr_on_list(list: &Option<Box<RRList>>, rr: u16) -> bool {
     false
 }
 
-fn check_name(in_name: &mut String) -> i32 {
-    // remove trailing . 
+pub(crate) fn check_name(in_name: &mut String) -> i32 {
+    // remove trailing .
     // also fail empty string and label > 63 chars
     let mut dotgap = 0usize;
     let mut l = in_name.len();
@@ -197,17 +218,17 @@ fn check_name(in_name: &mut String) -> i32 {
     let mut idn_encode = 0;
     let mut hasuscore = 0;
     let mut hasucase = 0;
-  
+
     if l == 0 || l > MAXDNAME {
         return 0;
     }
-    
+
     if in_name.ends_with('.') {
         in_name.pop();
         l -= 1;
         nowhite = 1;
     }
-    
+
     for c in in_name.bytes() {
         if c == b'.' {
             dotgap = 0;
@@ -239,6 +260,44 @@ fn check_name(in_name: &mut String) -> i32 {
     1
 }
 
-fn main() {
-    // Placeholders for codes that initialize or call the converted functions
+pub(crate) fn countof<T>(array: &[T]) -> usize {
+    array.len()
+}
+
+pub(crate) fn min<T: Ord>(a: T, b: T) -> T {
+    if a < b {
+        a
+    } else {
+        b
+    }
+}
+
+pub(crate) const OPTION_BITS: usize = std::mem::size_of::<u32>() * 8;
+pub(crate) const OPTION_SIZE: usize =
+    (OPT_LAST as usize / OPTION_BITS) + ((OPT_LAST as usize % OPTION_BITS != 0) as usize);
+
+pub(crate) fn option_var(daemon: &Daemon, x: usize) -> u32 {
+    daemon.options[x / OPTION_BITS]
+}
+
+pub(crate) fn option_val(x: usize) -> u32 {
+    1u32 << (x % OPTION_BITS)
+}
+
+pub(crate) fn option_bool(daemon: &Daemon, x: usize) -> bool {
+    (option_var(daemon, x) & option_val(x)) != 0
+}
+
+pub(crate) fn stat_is_equal(a: u32, b: u32) -> bool {
+    (a & 0xffff0000) == b
+}
+
+pub(crate) const RR_IMDATALEN: usize = size_of::<AllAddr>() - offset_of!(RrData, data);
+
+fn have_config(config: &Option<Box<DhcpConfig>>, mask: u32) -> bool {
+    if let Some(cfg) = config {
+        (cfg.flags & mask) != 0
+    } else {
+        false
+    }
 }

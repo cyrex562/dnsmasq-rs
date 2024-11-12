@@ -70,6 +70,16 @@ fn find_addrlist(list: &AddrList, flag: u32, addr: &Addr) -> Option<&AddrList> {
     None
 }
 
+fn is_same_net6(p0: &Ipv6Addr, p1: &Ipv6Addr, p2: u32) -> bool {
+    todo!()
+}
+
+fn is_same_net(p0: &Ipv4Addr, p1: &Ipv4Addr, p2: u32) -> bool {
+    todo!()
+}
+
+
+
 fn find_subnet(zone: &AuthZone, flag: u32, addr: &Addr) -> Option<&AddrList> {
     zone.subnet.as_ref().and_then(|subnet| find_addrlist(subnet, flag, addr))
 }
@@ -88,12 +98,30 @@ fn filter_zone(zone: &AuthZone, flag: u32, addr: &Addr) -> bool {
     find_subnet(zone, flag, addr).is_some()
 }
 
-fn in_zone(zone: &AuthZone, name: &str, cut: Option<&mut &str>) -> bool {
+/// 
+/// 
+/// # Arguments 
+/// 
+/// * `zone`: 
+/// * `name`: 
+/// * `cut`: 
+/// 
+/// returns: bool 
+/// 
+/// # Examples 
+/// 
+/// ```
+/// 
+/// ```
+fn in_zone(zone: &AuthZone, name: &str, cut: &mut String) -> bool {
     let namelen = name.len();
     let domainlen = zone.domain.len();
 
-    if let Some(cut) = cut {
-        *cut = "";
+    // if let Some(ref cut) = cut {
+    //     *cut = "";
+    // }
+    if cut.is_empty() == false {
+        *cut = "".into();
     }
 
     if namelen >= domainlen && name.ends_with(&zone.domain) {
@@ -101,9 +129,10 @@ fn in_zone(zone: &AuthZone, name: &str, cut: Option<&mut &str>) -> bool {
             return true;
         }
         if name.chars().nth(namelen - domainlen - 1) == Some('.') {
-            if let Some(cut) = cut {
-                *cut = &name[namelen - domainlen - 1..];
-            }
+            // if let Some(cut) = cut {
+            //     *cut = &name[namelen - domainlen - 1..];
+            // }
+            *cut = name[namelen - domainlen - 1..].into();
             return true;
         }
     }
@@ -138,8 +167,3 @@ fn answer_auth(header: &mut DnsHeader, limit: usize, qlen: usize, now: SystemTim
 }
 
 // ... existing code ...
-
-fn main() {
-    let daemon = Daemon::new();
-    // ... existing code ...
-}

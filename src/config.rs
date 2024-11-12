@@ -1,3 +1,7 @@
+use std::net::Ipv4Addr;
+use std::time::SystemTime;
+
+use crate::dhcp_netid::{DhcpNetId, DhcpNetIdList};
 
 // Constants
 pub const FTABSIZ: usize = 150;
@@ -184,3 +188,35 @@ pub const NO_DUMPFILE: bool = true;
 
 #[cfg(all(target_os = "linux", not(feature = "inotify")))]
 pub const NO_INOTIFY: bool = true;
+
+
+pub struct DelayConfig {
+    pub delay: i32,
+    pub netid: Option<Box<DhcpNetId>>,
+    pub next: Option<Box<DelayConfig>>,
+}
+
+pub struct HwAddrConfig {
+    pub hwaddr_len: i32,
+    pub hwaddr_type: i32,
+    pub hwaddr: [u8; DHCP_CHADDR_MAX],
+    pub wildcard_mask: u32,
+    pub next: Option<Box<HwAddrConfig>>,
+}
+
+pub struct DhcpConfig {
+    pub flags: u32,
+    pub clid_len: i32, // length of client identifier
+    pub clid: Vec<u8>, // clientid
+    pub hostname: String,
+    pub domain: String,
+    pub netid: Option<Box<DhcpNetIdList>>,
+    pub filter: Option<Box<DhcpNetId>>,
+    #[cfg(feature = "have_dhcp6")]
+    pub addr6: Option<Box<AddrList>>,
+    pub addr: Ipv4Addr,
+    pub decline_time: SystemTime,
+    pub lease_time: u32,
+    pub hwaddr: Option<Box<HwAddrConfig>>,
+    pub next: Option<Box<DhcpConfig>>,
+}

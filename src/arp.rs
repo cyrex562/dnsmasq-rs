@@ -4,39 +4,27 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ptr::null_mut;
 use std::mem::size_of;
 use std::ffi::c_void;
-use libc::{self, AF_INET, AF_INET6};
+use libc::{self};
+use crate::arp_record::ArpRecord;
+use crate::context::Context;
 
 
-const INTERVAL: u64 = 90;
-const DHCP_CHADDR_MAX: usize = 16;
-const ARP_MARK: u16 = 0;
-const ARP_FOUND: u16 = 1;
-const ARP_NEW: u16 = 2;
-const ARP_EMPTY: u16 = 3;
 
-#[derive(Clone, Copy)]
-union AllAddr {
-    addr4: Ipv4Addr,
-    addr6: Ipv6Addr,
-}
 
-struct ArpRecord {
-    hwlen: u16,
-    status: u16,
-    family: i32,
-    hwaddr: [u8; DHCP_CHADDR_MAX],
-    addr: AllAddr,
-    next: *mut ArpRecord,
-}
+// #[derive(Clone, Copy)]
+// pub(crate) union AllAddr {
+//     addr4: Ipv4Addr,
+//     addr6: Ipv6Addr,
+// }
 
-static mut ARPS: *mut ArpRecord = null_mut();
-static mut OLD: *mut ArpRecord = null_mut();
-static mut FREELIST: *mut ArpRecord = null_mut();
-static mut LAST: SystemTime = SystemTime::UNIX_EPOCH;
+// static mut ARPS: *mut ArpRecord = null_mut();
+// static mut OLD: *mut ArpRecord = null_mut();
+// static mut FREELIST: *mut ArpRecord = null_mut();
+// static mut LAST: SystemTime = SystemTime::UNIX_EPOCH;
 
-fn filter_mac(family: i32, addrp: *const c_void, mac: &[u8], parmv: *mut c_void) -> i32 {
+fn filter_mac(ctx: &mut Context, family: i32, addrp: *const c_void, mac: &[u8], parmv: *mut c_void) -> i32 {
     unsafe {
-        let mut arp = ARPS;
+        let mut arp = ctx.ARPS;
 
         if mac.len() > DHCP_CHADDR_MAX {
             return 1;
@@ -76,9 +64,9 @@ fn filter_mac(family: i32, addrp: *const c_void, mac: &[u8], parmv: *mut c_void)
         }
 
         if arp.is_null() {
-            let new_arp = if !FREELIST.is_null() {
-                let arp = FREELIST;
-                FREELIST = (*FREELIST).next;
+            let new_arp = if !ctx.FREELIST.is_null() {
+                let arp = ctx.FREELIST;
+                ctx.FREELIST = (*ctx.FREELIST).next;
                 arp
             } else {
                 libc::malloc(size_of::<ArpRecord>()) as *mut ArpRecord
@@ -88,8 +76,8 @@ fn filter_mac(family: i32, addrp: *const c_void, mac: &[u8], parmv: *mut c_void)
                 return 1;
             }
 
-            (*new_arp).next = ARPS;
-            ARPS = new_arp;
+            (*new_arp).next = ctx.ARPS;
+            ctx.ARPS = new_arp;
             (*new_arp).status = ARP_NEW;
             (*new_arp).hwlen = mac.len() as u16;
             (*new_arp).family = family;
@@ -105,13 +93,13 @@ fn filter_mac(family: i32, addrp: *const c_void, mac: &[u8], parmv: *mut c_void)
     }
 }
 
-fn find_mac(addr: Option<&libc::sockaddr>, mac: &mut [u8], lazy: bool, now: SystemTime) -> i32 {
+fn find_mac(ctx: &mut Context, addr: Option<&libc::sockaddr>, mac: &mut [u8], lazy: bool, now: SystemTime) -> i32 {
     unsafe {
-        let mut arp = ARPS;
+        let mut arp = ctx.ARPS;
         let mut updated = false;
 
         loop {
-            if now.duration_since(LAST).unwrap_or(Duration::new(0, 0)).as_secs() < INTERVAL {
+            if now.duration_since(ctx.LAST).unwrap_or(Duration::new(0, 0)).as_secs() < INTERVAL {
                 if addr.is_none() {
                     return 0;
                 }
@@ -146,9 +134,9 @@ fn find_mac(addr: Option<&libc::sockaddr>, mac: &mut [u8], lazy: bool, now: Syst
 
             if !updated {
                 updated = true;
-                LAST = now;
+                ctx.LAST = now;
 
-                arp = ARPS;
+                arp = ctx.ARPS;
                 while !arp.is_null() {
                     if (*arp).status != ARP_EMPTY {
                         (*arp).status = ARP_MARK;
@@ -158,13 +146,13 @@ fn find_mac(addr: Option<&libc::sockaddr>, mac: &mut [u8], lazy: bool, now: Syst
 
                 iface_enumerate(libc::AF_UNSPEC, null_mut(), filter_mac);
 
-                let mut up = &mut ARPS;
+                let mut up = &mut ctx.ARPS;
                 while !(*up).is_null() {
                     let tmp = (*up).next;
                     if (*up).status == ARP_MARK {
                         *up = tmp;
-                        (*up).next = OLD;
-                        OLD = *up;
+                        (*up).next = ctx.OLD;
+                        ctx.OLD = *up;
                     } else {
                         up = &mut (*up).next;
                     }
@@ -173,17 +161,17 @@ fn find_mac(addr: Option<&libc::sockaddr>, mac: &mut [u8], lazy: bool, now: Syst
                 continue;
             }
 
-            let new_arp = if !FREELIST.is_null() {
-                let arp = FREELIST;
-                FREELIST = (*FREELIST).next;
+            let new_arp = if !ctx.FREELIST.is_null() {
+                let arp = ctx.FREELIST;
+                ctx.FREELIST = (*ctx.FREELIST).next;
                 arp
             } else {
                 libc::malloc(size_of::<ArpRecord>()) as *mut ArpRecord
             };
 
             if !new_arp.is_null() {
-                (*new_arp).next = ARPS;
-                ARPS = new_arp;
+                (*new_arp).next = ctx.ARPS;
+                ctx.ARPS = new_arp;
                 (*new_arp).status = ARP_EMPTY;
                 (*new_arp).family = addr.unwrap().sa_family as i32;
                 (*new_arp).hwlen = 0;
@@ -200,21 +188,21 @@ fn find_mac(addr: Option<&libc::sockaddr>, mac: &mut [u8], lazy: bool, now: Syst
     }
 }
 
-fn do_arp_script_run() -> i32 {
+fn do_arp_script_run(ctx: &mut Context) -> i32 {
     unsafe {
-        if !OLD.is_null() {
+        if !ctx.OLD.is_null() {
             #[cfg(feature = "script")]
             if option_bool(OPT_SCRIPT_ARP) {
                 queue_arp(ACTION_ARP_DEL, &(*OLD).hwaddr, (*OLD).hwlen, (*OLD).family, &(*OLD).addr);
             }
-            let arp = OLD;
-            OLD = (*OLD).next;
-            (*arp).next = FREELIST;
-            FREELIST = arp;
+            let arp = ctx.OLD;
+            ctx.OLD = (*ctx.OLD).next;
+            (*arp).next = ctx.FREELIST;
+            ctx.FREELIST = arp;
             return 1;
         }
 
-        let mut arp = ARPS;
+        let mut arp = ctx.ARPS;
         while !arp.is_null() {
             if (*arp).status == ARP_NEW {
                 #[cfg(feature = "script")]
