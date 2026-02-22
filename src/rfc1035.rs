@@ -5,9 +5,14 @@
 
 use bytes::{BufMut, BytesMut};
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::time::{Duration, Instant};
 
+use crate::cache::{CacheRecord, DnsCache};
 use crate::dns_protocol::{DnsHeader, RrType};
-use crate::types::addr::AllAddr;
+use crate::types::addr::{AllAddr, CnameAddr, RrDataAddr};
+use crate::types::constants::{
+    F_CNAME, F_DNSSECOK, F_FORWARD, F_IPV4, F_IPV6, F_NEG, F_NXDOMAIN, F_REVERSE, F_RR,
+};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Error type
@@ -250,8 +255,62 @@ pub fn parse_rr(pkt: &[u8], offset: &mut usize) -> Result<DnsRr, DnsError> {
     if *offset + rdlen > pkt.len() {
         return Err(DnsError::UnexpectedEof);
     }
-    let rdata = pkt[*offset..*offset + rdlen].to_vec();
+    let rdata_start = *offset;
+    let raw_rdata = pkt[*offset..*offset + rdlen].to_vec();
     *offset += rdlen;
+
+    // For record types whose rdata contains domain names that may use DNS
+    // pointer compression, decompress them here so stored rdata is always
+    // self-contained (no references back into the original packet).
+    let rdata = match rtype {
+        2 | 5 | 12 => {
+            // NS, CNAME, PTR: rdata is a single domain name.
+            let mut pos = rdata_start;
+            match extract_name(pkt, &mut pos) {
+                Ok(n) => {
+                    let mut buf = BytesMut::new();
+                    write_name(&mut buf, &n);
+                    buf.to_vec()
+                }
+                Err(_) => raw_rdata,
+            }
+        }
+        15 => {
+            // MX: 2-byte preference then a domain name.
+            if raw_rdata.len() >= 2 {
+                let mut pos = rdata_start + 2;
+                match extract_name(pkt, &mut pos) {
+                    Ok(n) => {
+                        let mut buf = BytesMut::new();
+                        buf.put_u16(u16::from_be_bytes([raw_rdata[0], raw_rdata[1]]));
+                        write_name(&mut buf, &n);
+                        buf.to_vec()
+                    }
+                    Err(_) => raw_rdata,
+                }
+            } else {
+                raw_rdata
+            }
+        }
+        6 => {
+            // SOA: MNAME (name) + RNAME (name) + 5 × u32 fixed fields.
+            let mut pos = rdata_start;
+            let ok = extract_name(pkt, &mut pos)
+                .and_then(|mname| extract_name(pkt, &mut pos).map(|rname| (mname, rname)));
+            match ok {
+                Ok((mname, rname)) if pos + 20 <= pkt.len() => {
+                    let mut buf = BytesMut::new();
+                    write_name(&mut buf, &mname);
+                    write_name(&mut buf, &rname);
+                    buf.put_slice(&pkt[pos..pos + 20]);
+                    buf.to_vec()
+                }
+                _ => raw_rdata,
+            }
+        }
+        _ => raw_rdata,
+    };
+
     Ok(DnsRr { name, rtype, class, ttl, rdata })
 }
 
@@ -481,8 +540,255 @@ pub fn extract_request(pkt: &[u8]) -> Option<(String, RrType)> {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Tests
+// Cache population: extract_addresses
 // ──────────────────────────────────────────────────────────────────────────────
+
+/// Configuration for [`extract_addresses`].
+#[derive(Debug, Clone)]
+pub struct ExtractConfig {
+    /// Maximum TTL to cache, in seconds.  `0` means no limit.
+    pub max_ttl: u32,
+    /// Default negative-caching TTL when no SOA record is present.
+    /// `0` means do not cache negative responses without a SOA.
+    pub neg_ttl: u32,
+    /// Reject DNS replies containing RFC 1918 / private IPv4 or
+    /// ULA / link-local IPv6 addresses (DNS rebind protection).
+    pub check_rebind: bool,
+    /// Suppress negative caching entirely.
+    pub no_neg_cache: bool,
+    /// The reply was DNSSEC-validated; set `F_DNSSECOK` on cached records.
+    pub secure: bool,
+}
+
+impl Default for ExtractConfig {
+    fn default() -> Self {
+        Self {
+            max_ttl: 0,
+            neg_ttl: 0,
+            check_rebind: false,
+            no_neg_cache: false,
+            secure: false,
+        }
+    }
+}
+
+/// Return value of [`extract_addresses`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtractResult {
+    /// Records were cached (or there was nothing to cache).
+    Cached,
+    /// DNS-rebind protection blocked a private/ULA address in the reply.
+    RebindBlocked,
+    /// The packet is structurally malformed.
+    BadPacket,
+}
+
+/// Maximum CNAME chain depth we will follow in a single reply.
+const CNAME_CHAIN_LIMIT: usize = 10;
+
+/// Clamp `ttl` to `max_ttl` when `max_ttl > 0`.
+fn clamp_ttl(ttl: u32, max_ttl: u32) -> u32 {
+    if max_ttl != 0 && ttl > max_ttl { max_ttl } else { ttl }
+}
+
+/// Scan `authority` for a SOA record and return the effective negative TTL.
+///
+/// The negative TTL is `min(soa_ttl, soa_minimum)` as defined by RFC 2308.
+fn find_soa_minimum_ttl(authority: &[DnsRr]) -> Option<u32> {
+    for rr in authority {
+        if rr.rtype != 6 /* SOA */ { continue; }
+        // rdata layout after parse_rr decompression:
+        //   MNAME (wire-format labels) | RNAME (wire-format labels) |
+        //   serial(4) | refresh(4) | retry(4) | expire(4) | minimum(4)
+        let mut pos = 0usize;
+        extract_name(&rr.rdata, &mut pos).ok()?; // mname
+        extract_name(&rr.rdata, &mut pos).ok()?; // rname
+        if pos + 20 <= rr.rdata.len() {
+            let minimum = u32::from_be_bytes([
+                rr.rdata[pos + 16],
+                rr.rdata[pos + 17],
+                rr.rdata[pos + 18],
+                rr.rdata[pos + 19],
+            ]);
+            return Some(rr.ttl.min(minimum));
+        }
+    }
+    None
+}
+
+/// Extract DNS records from a parsed reply and insert them into `cache`.
+///
+/// This is the Rust port of `extract_addresses()` from `rfc1035.c`.
+///
+/// Handles A, AAAA, CNAME, PTR, and arbitrary RR types.
+/// Performs negative caching for `NXDOMAIN` and `NODATA` replies.
+pub fn extract_addresses(
+    packet: &DnsPacket,
+    cache: &mut DnsCache,
+    now: Instant,
+    config: &ExtractConfig,
+) -> ExtractResult {
+    // Only process replies with exactly one question.
+    if packet.questions.len() != 1 {
+        return ExtractResult::BadPacket;
+    }
+    let q = &packet.questions[0];
+    // Only cache IN (class 1) answers.
+    if q.qclass != 1 {
+        return ExtractResult::Cached;
+    }
+
+    let qname_lower = q.name.to_lowercase();
+    let qtype       = q.qtype;
+    let is_nxdomain = packet.header.rcode() == 3;
+    let secflag     = if config.secure { F_DNSSECOK } else { 0 };
+
+    // ── PTR reverse lookup ────────────────────────────────────────────────────
+    if qtype == 12 /* PTR */ {
+        // Only cache when the question name is a valid .arpa reverse zone name.
+        if let Some(ip_addr) = in_arpa_name_2_addr(&qname_lower) {
+            let addr_flag = match &ip_addr {
+                AllAddr::Addr4(_) => F_IPV4,
+                AllAddr::Addr6(_) => F_IPV6,
+                _ => 0,
+            };
+            let mut found = false;
+            for rr in &packet.answers {
+                if rr.rtype != 12 || rr.class != 1 { continue; }
+                if !rr.name.eq_ignore_ascii_case(&q.name) { continue; }
+                let mut off = 0usize;
+                let target = match extract_name(&rr.rdata, &mut off) {
+                    Ok(t)  => t,
+                    Err(_) => return ExtractResult::BadPacket,
+                };
+                let ttl = clamp_ttl(rr.ttl, config.max_ttl);
+                cache.insert(CacheRecord {
+                    name:    target,
+                    flags:   addr_flag | F_REVERSE | secflag,
+                    ttl,
+                    expires: now + Duration::from_secs(u64::from(ttl)),
+                    addr:    Some(ip_addr.clone()),
+                    rdata:   None,
+                });
+                found = true;
+            }
+            if found {
+                return ExtractResult::Cached;
+            }
+        }
+        // For PTR queries with no PTR answer we do not cache a negative entry.
+        return ExtractResult::Cached;
+    }
+
+    // ── Forward lookup (A, AAAA, or arbitrary RR) ─────────────────────────────
+    let addr_flag = match qtype {
+        1  /* A    */ => F_IPV4,
+        28 /* AAAA */ => F_IPV6,
+        _             => F_RR,
+    };
+
+    // Follow the CNAME chain beginning at the question name.
+    let mut current_name = qname_lower.clone();
+    let mut cname_hops   = 0usize;
+    let mut found        = false;
+
+    'cname_loop: loop {
+        for rr in &packet.answers {
+            if rr.class != 1 { continue; }
+            if !rr.name.eq_ignore_ascii_case(&current_name) { continue; }
+            let ttl = clamp_ttl(rr.ttl, config.max_ttl);
+
+            if rr.rtype == 5 /* CNAME */ {
+                if cname_hops >= CNAME_CHAIN_LIMIT { break 'cname_loop; }
+                let mut off = 0usize;
+                let target = match extract_name(&rr.rdata, &mut off) {
+                    Ok(t)  => t.to_lowercase(),
+                    Err(_) => return ExtractResult::BadPacket,
+                };
+                cache.insert(CacheRecord {
+                    name:    current_name.clone(),
+                    flags:   F_CNAME | F_FORWARD | secflag,
+                    ttl,
+                    expires: now + Duration::from_secs(u64::from(ttl)),
+                    addr:    Some(AllAddr::Cname(CnameAddr {
+                        is_name_ptr:  true,
+                        target_name:  Some(target.clone()),
+                        uid:          0,
+                    })),
+                    rdata: None,
+                });
+                cname_hops += 1;
+                current_name = target;
+                continue 'cname_loop; // restart loop for the CNAME target
+            }
+
+            if rr.rtype != qtype || is_nxdomain { continue; }
+
+            let addr = match qtype {
+                1 /* A */ => {
+                    if rr.rdata.len() < 4 { return ExtractResult::BadPacket; }
+                    let ip = Ipv4Addr::new(
+                        rr.rdata[0], rr.rdata[1], rr.rdata[2], rr.rdata[3],
+                    );
+                    if config.check_rebind && private_net(ip, true) {
+                        return ExtractResult::RebindBlocked;
+                    }
+                    AllAddr::Addr4(ip)
+                }
+                28 /* AAAA */ => {
+                    if rr.rdata.len() < 16 { return ExtractResult::BadPacket; }
+                    let mut b = [0u8; 16];
+                    b.copy_from_slice(&rr.rdata[..16]);
+                    let ip = Ipv6Addr::from(b);
+                    if config.check_rebind && private_net6(&ip, true) {
+                        return ExtractResult::RebindBlocked;
+                    }
+                    AllAddr::Addr6(ip)
+                }
+                _ => AllAddr::RrData(RrDataAddr {
+                    rrtype: rr.rtype,
+                    data:   rr.rdata.clone(),
+                }),
+            };
+            cache.insert(CacheRecord {
+                name:    current_name.clone(),
+                flags:   addr_flag | F_FORWARD | secflag,
+                ttl,
+                expires: now + Duration::from_secs(u64::from(ttl)),
+                addr:    Some(addr),
+                rdata:   None,
+            });
+            found = true;
+        }
+        break 'cname_loop;
+    }
+
+    // ── Negative caching ──────────────────────────────────────────────────────
+    if !found && !config.no_neg_cache {
+        let neg_ttl = find_soa_minimum_ttl(&packet.authority)
+            .map(|t| clamp_ttl(t, config.max_ttl))
+            .or_else(|| if config.neg_ttl > 0 { Some(config.neg_ttl) } else { None });
+        if let Some(ttl) = neg_ttl {
+            let neg_flags = if is_nxdomain {
+                F_NXDOMAIN | F_NEG | F_FORWARD | secflag
+            } else {
+                addr_flag | F_NEG | F_FORWARD | secflag
+            };
+            cache.insert(CacheRecord {
+                name:    qname_lower,
+                flags:   neg_flags,
+                ttl,
+                expires: now + Duration::from_secs(u64::from(ttl)),
+                addr:    None,
+                rdata:   None,
+            });
+        }
+    }
+
+    ExtractResult::Cached
+}
+
+
 
 #[cfg(test)]
 mod tests {
@@ -774,4 +1080,208 @@ mod tests {
         skip_name(&buf, &mut off).unwrap();
         assert_eq!(buf[off], 0xFF);
     }
+
+    // ── extract_addresses ─────────────────────────────────────────────────────
+
+    use crate::cache::DnsCache;
+    use crate::types::constants::{F_FORWARD, F_IPV4, F_IPV6, F_CNAME, F_NEG, F_NXDOMAIN, F_REVERSE};
+
+    /// Build a minimal DNS reply header (12 bytes) with the given rcode.
+    fn reply_header(id: u16, qd: u16, an: u16, ns: u16, rcode: u8) -> Vec<u8> {
+        let mut v = vec![
+            (id >> 8) as u8, id as u8,
+            0x84, rcode, // QR=1, AA=1, rcode
+            (qd >> 8) as u8, qd as u8,
+            (an >> 8) as u8, an as u8,
+            (ns >> 8) as u8, ns as u8,
+            0x00, 0x00,
+        ];
+        v
+    }
+
+    /// Append a DNS question section for `name` IN `qtype`.
+    fn push_question(buf: &mut Vec<u8>, name: &str, qtype: u16) {
+        let mut bm = BytesMut::new();
+        write_name(&mut bm, name);
+        buf.extend_from_slice(&bm);
+        buf.extend_from_slice(&qtype.to_be_bytes());
+        buf.extend_from_slice(&[0x00, 0x01]); // class IN
+    }
+
+    /// Append a DNS resource record for `name` IN `rtype` with the given rdata.
+    fn push_rr(buf: &mut Vec<u8>, name: &str, rtype: u16, ttl: u32, rdata: &[u8]) {
+        let mut bm = BytesMut::new();
+        write_name(&mut bm, name);
+        buf.extend_from_slice(&bm);
+        buf.extend_from_slice(&rtype.to_be_bytes());
+        buf.extend_from_slice(&[0x00, 0x01]); // class IN
+        buf.extend_from_slice(&ttl.to_be_bytes());
+        buf.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        buf.extend_from_slice(rdata);
+    }
+
+    #[test]
+    fn extract_a_record() {
+        // Build: example.com IN A → 93.184.216.34, TTL 300
+        let mut pkt = reply_header(1, 1, 1, 0, 0);
+        push_question(&mut pkt, "example.com", 1);
+        push_rr(&mut pkt, "example.com", 1, 300, &[93, 184, 216, 34]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        let result = extract_addresses(&dp, &mut cache, now, &ExtractConfig::default());
+        assert_eq!(result, ExtractResult::Cached);
+
+        let rec = cache.lookup_by_name("example.com", F_IPV4, now).expect("A record not cached");
+        assert_eq!(rec.addr.as_ref().unwrap().as_ipv4(), Some(Ipv4Addr::new(93, 184, 216, 34)));
+        assert_eq!(rec.ttl, 300);
+        assert!(rec.flags & F_FORWARD != 0);
+    }
+
+    #[test]
+    fn extract_aaaa_record() {
+        let ip6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let mut pkt = reply_header(2, 1, 1, 0, 0);
+        push_question(&mut pkt, "example.com", 28);
+        push_rr(&mut pkt, "example.com", 28, 600, &ip6.octets());
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        assert_eq!(
+            extract_addresses(&dp, &mut cache, now, &ExtractConfig::default()),
+            ExtractResult::Cached
+        );
+        let rec = cache.lookup_by_name("example.com", F_IPV6, now).unwrap();
+        assert_eq!(rec.addr.as_ref().unwrap().as_ipv6(), Some(ip6));
+    }
+
+    #[test]
+    fn extract_cname_chain() {
+        // www.example.com CNAME → example.com, then example.com A → 1.2.3.4
+        let mut bm = BytesMut::new();
+        write_name(&mut bm, "example.com");
+        let cname_rdata = bm.to_vec();
+
+        let mut pkt = reply_header(3, 1, 2, 0, 0);
+        push_question(&mut pkt, "www.example.com", 1);
+        push_rr(&mut pkt, "www.example.com", 5, 60, &cname_rdata);  // CNAME
+        push_rr(&mut pkt, "example.com", 1, 300, &[1, 2, 3, 4]);    // A
+
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        assert_eq!(
+            extract_addresses(&dp, &mut cache, now, &ExtractConfig::default()),
+            ExtractResult::Cached
+        );
+
+        // CNAME record must be in cache
+        assert!(cache.lookup_by_name("www.example.com", F_CNAME, now).is_some(), "CNAME not cached");
+
+        // Terminal A record for the CNAME target must be in cache
+        let rec = cache.lookup_by_name("example.com", F_IPV4, now).unwrap();
+        assert_eq!(rec.addr.as_ref().unwrap().as_ipv4(), Some(Ipv4Addr::new(1, 2, 3, 4)));
+    }
+
+    #[test]
+    fn extract_ptr_record() {
+        // 34.216.184.93.in-addr.arpa PTR → example.com
+        let ptr_name = "34.216.184.93.in-addr.arpa";
+        let mut bm = BytesMut::new();
+        write_name(&mut bm, "example.com");
+
+        let mut pkt = reply_header(4, 1, 1, 0, 0);
+        push_question(&mut pkt, ptr_name, 12);
+        push_rr(&mut pkt, ptr_name, 12, 120, &bm);
+
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        assert_eq!(
+            extract_addresses(&dp, &mut cache, now, &ExtractConfig::default()),
+            ExtractResult::Cached
+        );
+
+        // PTR stores the hostname with F_REVERSE and the IP as the address.
+        let rec = cache.lookup_by_name("example.com", F_IPV4 | F_REVERSE, now).expect("PTR record not cached");
+        assert_eq!(
+            rec.addr.as_ref().unwrap().as_ipv4(),
+            Some(Ipv4Addr::new(93, 184, 216, 34))
+        );
+    }
+
+    #[test]
+    fn extract_nxdomain_cached() {
+        // Build an NXDOMAIN reply with a SOA in authority (minimum TTL = 300).
+        // SOA rdata: mname=ns.example.com, rname=admin.example.com, then 5 u32s.
+        let mut soa_rdata = BytesMut::new();
+        write_name(&mut soa_rdata, "ns.example.com");
+        write_name(&mut soa_rdata, "admin.example.com");
+        soa_rdata.put_u32(1);   // serial
+        soa_rdata.put_u32(3600); // refresh
+        soa_rdata.put_u32(900);  // retry
+        soa_rdata.put_u32(86400); // expire
+        soa_rdata.put_u32(300);  // minimum TTL
+
+        // Header: QR=1, AA=1, RCODE=3 (NXDOMAIN), QDCOUNT=1, NSCOUNT=1
+        let mut pkt = vec![
+            0x00, 0x05,       // ID
+            0x84, 0x03,       // QR=1, AA=1, RCODE=NXDOMAIN
+            0x00, 0x01,       // QDCOUNT=1
+            0x00, 0x00,       // ANCOUNT=0
+            0x00, 0x01,       // NSCOUNT=1
+            0x00, 0x00,       // ARCOUNT=0
+        ];
+        push_question(&mut pkt, "noexist.example.com", 1);
+        push_rr(&mut pkt, "example.com", 6, 600, &soa_rdata); // SOA in authority
+
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        assert_eq!(
+            extract_addresses(&dp, &mut cache, now, &ExtractConfig::default()),
+            ExtractResult::Cached
+        );
+
+        let rec = cache.lookup_by_name("noexist.example.com", F_NXDOMAIN | F_NEG, now).expect("NXDOMAIN not cached");
+        assert_eq!(rec.ttl, 300); // clamp to SOA minimum
+    }
+
+    #[test]
+    fn extract_rebind_blocked() {
+        // Reply with a private address should be rejected when check_rebind = true.
+        let mut pkt = reply_header(6, 1, 1, 0, 0);
+        push_question(&mut pkt, "evil.example.com", 1);
+        push_rr(&mut pkt, "evil.example.com", 1, 300, &[192, 168, 1, 1]);
+
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        let cfg = ExtractConfig { check_rebind: true, ..Default::default() };
+        assert_eq!(
+            extract_addresses(&dp, &mut cache, now, &cfg),
+            ExtractResult::RebindBlocked
+        );
+        // Nothing should be cached.
+        assert_eq!(cache.inserts, 0);
+    }
+
+    #[test]
+    fn extract_max_ttl_clamped() {
+        let mut pkt = reply_header(7, 1, 1, 0, 0);
+        push_question(&mut pkt, "example.com", 1);
+        push_rr(&mut pkt, "example.com", 1, 86400, &[1, 2, 3, 4]);
+
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        let cfg = ExtractConfig { max_ttl: 3600, ..Default::default() };
+        extract_addresses(&dp, &mut cache, now, &cfg);
+
+        let rec = cache.lookup_by_name("example.com", F_IPV4, now).unwrap();
+        assert_eq!(rec.ttl, 3600); // clamped from 86400
+    }
 }
+
