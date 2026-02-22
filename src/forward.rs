@@ -197,6 +197,110 @@ pub fn reply_matches_query(query_pkt: &[u8], reply_pkt: &[u8]) -> bool {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Random FD pool (allocate_rfd / free_rfd)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Maximum number of cached random UDP sockets.
+pub const RANDOM_SOCKS: usize = 64;
+
+/// A cached random-port UDP socket with reference counting.
+///
+/// Mirrors dnsmasq's `struct randfd`.  In the async Rust version we store
+/// `tokio::net::UdpSocket` instead of a raw file descriptor so the socket is
+/// owned by the pool and dropped when refcount reaches zero.
+#[derive(Debug)]
+pub struct RandomSocket {
+    pub socket:     Arc<tokio::net::UdpSocket>,
+    /// How many pending queries currently share this socket.
+    pub refcount:   usize,
+    /// Upstream server index this socket is "pinned" to, or `None` if free.
+    pub server_idx: Option<usize>,
+}
+
+/// Pool of cached random-port UDP sockets.
+///
+/// Mirrors dnsmasq's `daemon->randomsocks[]` array plus the logic in
+/// `allocate_rfd()` / `free_rfd()`.
+///
+/// The pool keeps up to `RANDOM_SOCKS` sockets open.  When a query needs an
+/// ephemeral source socket the pool tries to reuse an existing socket bound to
+/// the same upstream server.  If none exists and the pool is full, the entry
+/// with `refcount == 0` and the oldest last-used index is evicted.
+pub struct RandFdPool {
+    slots: Vec<Option<RandomSocket>>,
+}
+
+impl RandFdPool {
+    /// Create an empty pool.
+    pub fn new() -> Self {
+        let mut slots = Vec::with_capacity(RANDOM_SOCKS);
+        for _ in 0..RANDOM_SOCKS {
+            slots.push(None);
+        }
+        Self { slots }
+    }
+
+    /// Allocate or reuse a random UDP socket for the given upstream server.
+    ///
+    /// Returns an `Arc` clone of the socket on success.  The socket is bound
+    /// to `0.0.0.0:0` (OS picks an ephemeral port).
+    ///
+    /// Binding is performed asynchronously; the method is `async`.
+    pub async fn allocate(&mut self, server_idx: usize) -> Option<Arc<tokio::net::UdpSocket>> {
+        // 1. Look for an existing slot pinned to this server with room.
+        for slot in self.slots.iter_mut().flatten() {
+            if slot.server_idx == Some(server_idx) {
+                slot.refcount += 1;
+                return Some(Arc::clone(&slot.socket));
+            }
+        }
+
+        // 2. Find a free slot (empty or refcount == 0).
+        let free_idx = self
+            .slots
+            .iter()
+            .position(|s| s.is_none() || s.as_ref().is_some_and(|r| r.refcount == 0));
+
+        let idx = free_idx?;
+
+        // Bind a new UDP socket on an OS-assigned ephemeral port.
+        let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok()?;
+        let sock = Arc::new(sock);
+        self.slots[idx] = Some(RandomSocket {
+            socket: Arc::clone(&sock),
+            refcount: 1,
+            server_idx: Some(server_idx),
+        });
+        Some(sock)
+    }
+
+    /// Release one reference to the socket used by the query with `server_idx`.
+    ///
+    /// Decrements `refcount`.  When `refcount` reaches zero the slot is left
+    /// in place (the socket stays open for reuse) but flagged as available.
+    pub fn free(&mut self, server_idx: usize) {
+        for slot in self.slots.iter_mut().flatten() {
+            if slot.server_idx == Some(server_idx) && slot.refcount > 0 {
+                slot.refcount -= 1;
+                return;
+            }
+        }
+    }
+
+    /// Return the number of occupied slots (refcount > 0).
+    pub fn active_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|s| s.as_ref().is_some_and(|r| r.refcount > 0))
+            .count()
+    }
+}
+
+impl Default for RandFdPool {
+    fn default() -> Self { Self::new() }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Async forwarding engine
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -235,6 +339,8 @@ pub struct ForwardEngine {
     pub config:          ForwardConfig,
     pub table:           ForwardTable,
     upstream_order:      Vec<usize>,
+    /// Pool of cached random-port UDP sockets for query dispatch.
+    pub rfd_pool:        RandFdPool,
 }
 
 impl ForwardEngine {
@@ -245,6 +351,7 @@ impl ForwardEngine {
             upstream_order: (0..n).collect(),
             table: ForwardTable::new(),
             config,
+            rfd_pool: RandFdPool::new(),
         }
     }
 
@@ -832,6 +939,50 @@ mod tests {
         let r = resp.unwrap();
         let restored = u16::from_be_bytes([r[0], r[1]]);
         assert_eq!(restored, client_id);
+    }
+
+    // ── RandFdPool ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn rfd_pool_allocate_returns_socket() {
+        let mut pool = RandFdPool::new();
+        let sock = pool.allocate(0).await;
+        assert!(sock.is_some());
+        assert_eq!(pool.active_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn rfd_pool_reuses_same_server_socket() {
+        let mut pool = RandFdPool::new();
+        let s1 = pool.allocate(0).await.unwrap();
+        let s2 = pool.allocate(0).await.unwrap();
+        // Both arcs should point to the same socket (same local addr).
+        assert_eq!(
+            s1.local_addr().unwrap(),
+            s2.local_addr().unwrap()
+        );
+        assert_eq!(pool.active_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn rfd_pool_free_decrements_refcount() {
+        let mut pool = RandFdPool::new();
+        pool.allocate(7).await.unwrap();
+        assert_eq!(pool.active_count(), 1);
+        pool.free(7);
+        assert_eq!(pool.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn rfd_pool_different_servers_get_different_sockets() {
+        let mut pool = RandFdPool::new();
+        let s0 = pool.allocate(0).await.unwrap();
+        let s1 = pool.allocate(1).await.unwrap();
+        assert_ne!(
+            s0.local_addr().unwrap(),
+            s1.local_addr().unwrap()
+        );
+        assert_eq!(pool.active_count(), 2);
     }
 }
 
