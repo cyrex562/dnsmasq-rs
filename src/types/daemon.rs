@@ -110,6 +110,8 @@ pub struct Daemon {
     pub pipe_to_parent:  i32,
     pub max_procs:       i32,
     pub randport_limit:  i32,
+    /// Incremented each time a config reload (SIGHUP) is processed.
+    pub reload_count:    u32,
 
     // ── DHCP state (feature-gated) ────────────────────────────────────────────
     #[cfg(feature = "dhcp")]
@@ -286,6 +288,7 @@ impl Default for Daemon {
             pipe_to_parent: -1,
             max_procs: 0,
             randport_limit: 0,
+            reload_count: 0,
 
             #[cfg(feature = "dhcp")]
             dhcp: vec![],
