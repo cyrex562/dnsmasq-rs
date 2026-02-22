@@ -13,6 +13,8 @@ pub enum DnsmasqError {
     PrivilegeDrop(String),
     #[error("pid file error: {0}")]
     PidFile(String),
+    #[error("daemonize failed: {0}")]
+    Daemonize(String),
     #[error("bind error on {0}: {1}")]
     Bind(String, String),
     #[error("signal error: {0}")]

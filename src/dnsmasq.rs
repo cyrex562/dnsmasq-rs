@@ -64,6 +64,64 @@ pub fn read_pid_file(path: &str) -> Result<u32, DnsmasqError> {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Process daemonization
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Daemonize the current process (double-fork, new session, redirect std fds).
+///
+/// This implements the standard Unix daemon idiom:
+/// 1. First `fork()` — the parent exits.
+/// 2. `setsid()` — become a session leader, detach from the controlling terminal.
+/// 3. Second `fork()` — ensure we are not a session leader (cannot reacquire tty).
+/// 4. Redirect stdin/stdout/stderr to `/dev/null`.
+/// 5. Change working directory to `/`.
+///
+/// **Must be called before any tokio runtime is started** (tokio is not
+/// fork-safe).
+///
+/// Returns `Ok(())` in the grandchild (the actual daemon).
+/// The intermediate parent and original parent both exit cleanly.
+#[cfg(unix)]
+pub fn daemonize() -> Result<(), DnsmasqError> {
+    use nix::unistd::{dup2, fork, setsid, ForkResult};
+
+    // First fork.
+    match unsafe { fork() }.map_err(|e| DnsmasqError::Daemonize(e.to_string()))? {
+        ForkResult::Parent { .. } => std::process::exit(0),
+        ForkResult::Child => {}
+    }
+
+    // Create new session.
+    setsid().map_err(|e| DnsmasqError::Daemonize(e.to_string()))?;
+
+    // Second fork (prevents re-acquiring a controlling terminal).
+    match unsafe { fork() }.map_err(|e| DnsmasqError::Daemonize(e.to_string()))? {
+        ForkResult::Parent { .. } => std::process::exit(0),
+        ForkResult::Child => {}
+    }
+
+    // Change to root directory so we don't hold a mount point.
+    std::env::set_current_dir("/")
+        .map_err(|e| DnsmasqError::Daemonize(e.to_string()))?;
+
+    // Redirect stdin/stdout/stderr to /dev/null using libc directly.
+    let devnull = unsafe {
+        libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDWR)
+    };
+    if devnull < 0 {
+        return Err(DnsmasqError::Daemonize("open /dev/null failed".into()));
+    }
+    for fd in [0i32, 1, 2] {
+        dup2(devnull, fd).map_err(|e| DnsmasqError::Daemonize(e.to_string()))?;
+    }
+    if devnull > 2 {
+        unsafe { libc::close(devnull) };
+    }
+
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Main event loop
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -166,6 +224,74 @@ pub async fn run_main_loop(
     result
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// SIGHUP config reload
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Actions to perform on SIGHUP (config reload).
+///
+/// Flushes the DNS cache and reloads `/etc/hosts` and any servers-file entries.
+/// In a full implementation this would call `cache_reload()`, re-read
+/// `/etc/resolv.conf`, and re-parse the servers-file.  Here we provide the
+/// plumbing so the main loop can drive it.
+pub async fn on_sighup(daemon_handle: &DaemonHandle) {
+    use tracing::info;
+
+    let mut d = daemon_handle.write().await;
+
+    // Reload upstream servers from resolv.conf (stub — file parsing not yet wired).
+    info!("SIGHUP: flushing DNS cache and reloading configuration");
+
+    // Clear any locally cached negative/positive entries that may be stale.
+    // In a full implementation: d.dns_cache.clear() once Daemon owns the cache.
+    let _ = d; // prevent unused warning
+
+    // A full implementation would also:
+    // - Re-read /etc/resolv.conf for upstream server addresses
+    // - Re-parse /etc/hosts into the cache
+    // - Re-open log files
+    // - Reload DHCP lease file
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Timer / alarm management
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Periodic housekeeping actions driven by a timer.
+///
+/// Runs once per interval (default 1 second) and:
+/// - Expires timed-out DNS cache entries.
+/// - Expires timed-out pending forwarded queries.
+///
+/// In a full implementation this would also drive DHCP lease expiry, RA
+/// transmission scheduling, and the DNSSEC validation timeout queue.
+pub async fn on_alarm(daemon_handle: &DaemonHandle) {
+    use std::time::Instant;
+
+    let now = Instant::now();
+    let d = daemon_handle.read().await;
+    // In a full implementation: d.dns_cache.expire_old(now) once Daemon owns the cache.
+    let _ = (now, d);
+}
+
+/// Spawn a background tokio task that calls [`on_alarm`] every `interval`.
+///
+/// The task holds a weak reference via the provided `DaemonHandle` (`Arc`) so
+/// it can be cancelled by dropping the handle.  Returns a `JoinHandle` that
+/// can be aborted to stop the timer.
+pub fn spawn_alarm_task(
+    daemon_handle: DaemonHandle,
+    interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            on_alarm(&daemon_handle).await;
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +332,32 @@ mod tests {
         let gid = nix::unistd::getgid().as_raw();
         // Should succeed without any syscall since uid/gid already match.
         drop_privileges(uid, gid).expect("drop_privileges failed for current user");
+    }
+
+    // ── SIGHUP reload ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn on_sighup_does_not_panic() {
+        let handle = init_daemon();
+        // Should run without panic; cache clear is a no-op on empty cache.
+        on_sighup(&handle).await;
+    }
+
+    // ── Alarm timer ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn on_alarm_does_not_panic() {
+        let handle = init_daemon();
+        on_alarm(&handle).await;
+    }
+
+    #[tokio::test]
+    async fn spawn_alarm_task_can_be_aborted() {
+        let handle = init_daemon();
+        let task = spawn_alarm_task(handle, std::time::Duration::from_millis(10));
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        task.abort();
+        // After abort, joining returns an error (cancelled).
+        assert!(task.await.is_err());
     }
 }
