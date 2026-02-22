@@ -39,12 +39,16 @@ pub mod crypto;
 pub mod auth;
 
 #[cfg(feature = "dhcp")]
+pub mod dhcp;
+#[cfg(feature = "dhcp")]
 pub mod dhcp_common;
 #[cfg(feature = "dhcp")]
 pub mod rfc2131;
 #[cfg(feature = "dhcp")]
 pub mod lease;
 
+#[cfg(feature = "dhcp6")]
+pub mod dhcp6;
 #[cfg(feature = "dhcp6")]
 pub mod rfc3315;
 #[cfg(feature = "dhcp6")]
