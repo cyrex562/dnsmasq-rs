@@ -141,6 +141,52 @@ fn find_requested_ip(options: &[u8]) -> Option<Ipv4Addr> {
     Some(Ipv4Addr::new(data[0], data[1], data[2], data[3]))
 }
 
+/// Handle a DHCP INFORM message.
+///
+/// INFORM clients already have an IP address and just want options.
+/// We respond with ACK containing options but without assigning an address
+/// (yiaddr remains UNSPECIFIED).
+#[cfg(feature = "dhcp")]
+pub fn handle_inform(pkt: &DhcpPacket, server_id: Ipv4Addr) -> Option<DhcpReply> {
+    // Must have a ciaddr to reply to.
+    if pkt.ciaddr == Ipv4Addr::UNSPECIFIED {
+        return None;
+    }
+    Some(DhcpReply {
+        msg_type: DhcpMsgType::Ack,
+        yiaddr:   Ipv4Addr::UNSPECIFIED, // not assigning an address
+        options:  build_reply_options(DhcpMsgType::Ack, server_id),
+        siaddr:   server_id,
+        giaddr:   pkt.giaddr,
+    })
+}
+
+/// Handle a DHCP RELEASE message.
+///
+/// The client is releasing its leased address.  In a full implementation this
+/// would delete the lease from the database.  Here we record the event and
+/// return `None` (no reply is sent for RELEASE per RFC 2131 §4.3.4).
+#[cfg(feature = "dhcp")]
+pub fn handle_release(pkt: &DhcpPacket, pool_start: Ipv4Addr, pool_end: Ipv4Addr) -> bool {
+    // Return true if the ciaddr was in our pool (we would free it).
+    in_pool(pkt.ciaddr, pool_start, pool_end)
+}
+
+/// Handle a DHCP DECLINE message.
+///
+/// The client is refusing the offered address (e.g. duplicate detected).
+/// Per RFC 2131 §4.3.3 we should remove the address from the pool; here we
+/// return whether the declined address was ours.
+#[cfg(feature = "dhcp")]
+pub fn handle_decline(pkt: &DhcpPacket, pool_start: Ipv4Addr, pool_end: Ipv4Addr) -> bool {
+    // Check the requested IP option (option 50) — this is what the client is declining.
+    if let Some(declined_ip) = find_requested_ip(&pkt.options) {
+        in_pool(declined_ip, pool_start, pool_end)
+    } else {
+        false
+    }
+}
+
 #[cfg(all(test, feature = "dhcp"))]
 mod tests {
     use super::*;
@@ -252,5 +298,60 @@ mod tests {
         pkt.options = opts_with_requested_ip(out_of_pool);
         let reply = handle_request(&pkt, start, end, server).unwrap();
         assert_eq!(reply.msg_type, DhcpMsgType::Nak);
+    }
+
+    #[test]
+    fn handle_inform_with_ciaddr_returns_ack() {
+        let server = Ipv4Addr::new(192, 168, 1, 1);
+        let mut pkt = base_packet();
+        pkt.ciaddr = Ipv4Addr::new(192, 168, 1, 50);
+        let reply = handle_inform(&pkt, server).unwrap();
+        assert_eq!(reply.msg_type, DhcpMsgType::Ack);
+        assert_eq!(reply.yiaddr, Ipv4Addr::UNSPECIFIED);
+    }
+
+    #[test]
+    fn handle_inform_without_ciaddr_returns_none() {
+        let server = Ipv4Addr::new(192, 168, 1, 1);
+        let pkt = base_packet(); // ciaddr is UNSPECIFIED
+        assert!(handle_inform(&pkt, server).is_none());
+    }
+
+    #[test]
+    fn handle_release_returns_true_for_pool_address() {
+        let start = Ipv4Addr::new(10, 0, 0, 100);
+        let end   = Ipv4Addr::new(10, 0, 0, 200);
+        let mut pkt = base_packet();
+        pkt.ciaddr = Ipv4Addr::new(10, 0, 0, 150);
+        assert!(handle_release(&pkt, start, end));
+    }
+
+    #[test]
+    fn handle_release_returns_false_for_foreign_address() {
+        let start = Ipv4Addr::new(10, 0, 0, 100);
+        let end   = Ipv4Addr::new(10, 0, 0, 200);
+        let mut pkt = base_packet();
+        pkt.ciaddr = Ipv4Addr::new(192, 168, 1, 50); // not in pool
+        assert!(!handle_release(&pkt, start, end));
+    }
+
+    #[test]
+    fn handle_decline_pool_address_returns_true() {
+        let start = Ipv4Addr::new(10, 0, 0, 100);
+        let end   = Ipv4Addr::new(10, 0, 0, 200);
+        let declined = Ipv4Addr::new(10, 0, 0, 120);
+        let mut pkt = base_packet();
+        pkt.options = opts_with_requested_ip(declined);
+        assert!(handle_decline(&pkt, start, end));
+    }
+
+    #[test]
+    fn handle_decline_foreign_address_returns_false() {
+        let start = Ipv4Addr::new(10, 0, 0, 100);
+        let end   = Ipv4Addr::new(10, 0, 0, 200);
+        let declined = Ipv4Addr::new(192, 168, 1, 50); // not in pool
+        let mut pkt = base_packet();
+        pkt.options = opts_with_requested_ip(declined);
+        assert!(!handle_decline(&pkt, start, end));
     }
 }
