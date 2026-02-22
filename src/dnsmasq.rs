@@ -2,6 +2,7 @@
 //!
 //! Mirrors the startup logic in `dnsmasq.c` (the original 2478-line C file).
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -60,6 +61,109 @@ pub fn read_pid_file(path: &str) -> Result<u32, DnsmasqError> {
     text.trim()
         .parse::<u32>()
         .map_err(|e| DnsmasqError::PidFile(format!("parse pid in {path}: {e}")))
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Main event loop
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Outcome of the main event loop.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RunResult {
+    /// Exited cleanly (SIGTERM or SIGINT received).
+    Clean,
+    /// Exited due to an I/O error.
+    IoError,
+}
+
+/// Run the main daemon event loop.
+///
+/// This function:
+/// 1. Binds a UDP DNS socket on `0.0.0.0:{port}`.
+/// 2. Spawns a tokio task running the forwarding engine.
+/// 3. Waits for SIGTERM, SIGINT, or SIGHUP.  On SIGHUP it notifies
+///    the provided `sighup_tx` channel (so the caller can reload config).
+///    On SIGTERM/SIGINT it shuts down.
+///
+/// The forwarding task is cancelled when the main loop exits.
+///
+/// Returns [`RunResult::Clean`] on orderly shutdown.
+pub async fn run_main_loop(
+    daemon_handle: DaemonHandle,
+    sighup_tx: Option<tokio::sync::mpsc::Sender<()>>,
+) -> RunResult {
+    use std::sync::Arc;
+    use tokio::net::UdpSocket;
+    use tokio::signal::unix::{signal, SignalKind};
+    use tracing::{error, info, warn};
+
+    use crate::forward::{ForwardConfig, ForwardEngine, run_forward_loop};
+
+    // ── Resolve configuration ────────────────────────────────────────────────
+    let (port, upstreams) = {
+        let d = daemon_handle.read().await;
+        let ups: Vec<_> = d
+            .servers
+            .iter()
+            .map(|s| SocketAddr::from(s.addr.clone()))
+            .collect();
+        (d.port, ups)
+    };
+
+    // ── Bind the DNS listening socket ────────────────────────────────────────
+    let bind_addr = format!("0.0.0.0:{port}");
+    let client_sock = match UdpSocket::bind(&bind_addr).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            error!("failed to bind UDP socket on {bind_addr}: {e}");
+            return RunResult::IoError;
+        }
+    };
+    info!("listening for DNS queries on {bind_addr}");
+
+    // ── Spawn the forwarding engine ──────────────────────────────────────────
+    let fwd_config = ForwardConfig {
+        upstreams,
+        ..Default::default()
+    };
+    let fwd_sock = Arc::clone(&client_sock);
+    let fwd_task = tokio::spawn(async move {
+        if let Err(e) = run_forward_loop(fwd_sock, fwd_config).await {
+            error!("forward loop exited: {e}");
+        }
+    });
+
+    // ── Signal handling ──────────────────────────────────────────────────────
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(_) => { fwd_task.abort(); return RunResult::IoError; }
+    };
+    let mut sighup = match signal(SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(_) => { fwd_task.abort(); return RunResult::IoError; }
+    };
+
+    let result = loop {
+        tokio::select! {
+            _ = sigterm.recv() => {
+                info!("received SIGTERM — shutting down");
+                break RunResult::Clean;
+            }
+            _ = sighup.recv() => {
+                info!("received SIGHUP — reloading configuration");
+                if let Some(ref tx) = sighup_tx {
+                    let _ = tx.send(()).await;
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("received SIGINT — shutting down");
+                break RunResult::Clean;
+            }
+        }
+    };
+
+    fwd_task.abort();
+    result
 }
 
 #[cfg(test)]

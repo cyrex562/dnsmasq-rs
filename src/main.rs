@@ -137,23 +137,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sighup = signal(SignalKind::hangup())?;
 
-    loop {
-        tokio::select! {
-            _ = sigterm.recv() => {
-                info!("received SIGTERM — shutting down");
-                break;
-            }
-            _ = sighup.recv() => {
-                warn!("received SIGHUP — reloading logs");
-                // Placeholder: a full implementation would re-open log files here.
-            }
-            _ = tokio::signal::ctrl_c() => {
-                info!("received SIGINT — shutting down");
-                break;
-            }
-        }
-    }
+    let (sighup_tx, mut sighup_rx) = tokio::sync::mpsc::channel::<()>(4);
 
-    info!("dnsmasq-rs stopped");
+    let daemon_clone = daemon_handle.clone();
+    tokio::spawn(async move {
+        while sighup_rx.recv().await.is_some() {
+            warn!("SIGHUP: reloading configuration (stub — implement cache_reload here)");
+            let _d = daemon_clone.read().await;
+        }
+    });
+
+    let result = dnsmasq::run_main_loop(daemon_handle, Some(sighup_tx)).await;
+
+    info!("dnsmasq-rs stopped ({result:?})");
     Ok(())
 }
