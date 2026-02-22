@@ -9,7 +9,7 @@ use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use crate::types::addr::MySockAddr;
 use crate::types::constants::*;
 use crate::types::daemon::Daemon;
-use crate::types::network::Iname;
+use crate::types::network::{HostsFile, Iname};
 use crate::types::server::{Server, SERV_4ADDR, SERV_6ADDR, SERV_LITERAL_ADDRESS};
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -353,6 +353,247 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
         "server" | "local" | "address" => {
             let v = require_value(key)?;
             parse_server_or_address(daemon, key, v, cl)?;
+        }
+
+        // ── DHCP options (stubs) ────────────────────────────────────────────
+        "dhcp-range" => {
+            let _ = require_value("dhcp-range")?;
+            // TODO: parse into DhcpRange and push to daemon.dhcp
+        }
+
+        "dhcp-host" => {
+            let _ = require_value("dhcp-host")?;
+            // TODO: parse into DhcpConfig and push to daemon.dhcp_conf
+        }
+
+        "dhcp-option" => {
+            let _ = require_value("dhcp-option")?;
+            // TODO: parse into DhcpOpt and push to daemon.dhcp_opts
+        }
+
+        "dhcp-boot" => {
+            let _ = require_value("dhcp-boot")?;
+            // TODO: parse into DhcpBoot and push to daemon.boot_config
+        }
+
+        "dhcp-leasefile" => {
+            let v = require_value("dhcp-leasefile")?;
+            daemon.lease_file = Some(v.to_string());
+        }
+
+        "dhcp-lease-max" => {
+            let v = require_value("dhcp-lease-max")?;
+            let n: i32 = v.parse().map_err(|_| invalid(v, "expected an integer"))?;
+            daemon.dhcp_max = n;
+        }
+
+        "dhcp-ignore" => {
+            let _ = require_value("dhcp-ignore")?;
+            // TODO: implement dhcp-ignore tag matching
+        }
+
+        "dhcp-vendor" => {
+            let _ = require_value("dhcp-vendor")?;
+            // TODO: implement dhcp-vendor class matching
+        }
+
+        "dhcp-userclass" => {
+            let _ = require_value("dhcp-userclass")?;
+            // TODO: implement dhcp-userclass matching
+        }
+
+        "dhcp-circuitid" => {
+            let _ = require_value("dhcp-circuitid")?;
+            // TODO: implement dhcp-circuitid matching
+        }
+
+        "dhcp-subscrid" => {
+            let _ = require_value("dhcp-subscrid")?;
+            // TODO: implement dhcp-subscrid matching
+        }
+
+        "dhcp-remoteid" => {
+            let _ = require_value("dhcp-remoteid")?;
+            // TODO: implement dhcp-remoteid matching
+        }
+
+        "dhcp-mac" => {
+            let _ = require_value("dhcp-mac")?;
+            // TODO: implement dhcp-mac matching
+        }
+
+        "dhcp-reply-delay" => {
+            let _ = require_value("dhcp-reply-delay")?;
+            // TODO: store in daemon.delay_conf when field is added
+        }
+
+        "no-dhcp-interface" => {
+            let v = require_value("no-dhcp-interface")?;
+            daemon.dhcp_except.push(Iname { name: Some(v.to_string()), addr: None, flags: 0 });
+        }
+
+        // ── DNS record stubs ────────────────────────────────────────────────
+        "mx-host" => {
+            let _ = require_value("mx-host")?;
+            // TODO: parse and push to daemon.mxnames
+        }
+
+        "srv-host" => {
+            let _ = require_value("srv-host")?;
+            // TODO: parse and push to daemon.mxnames (SRV)
+        }
+
+        "txt-record" => {
+            let _ = require_value("txt-record")?;
+            // TODO: parse and push to daemon.txt
+        }
+
+        "ptr-record" => {
+            let _ = require_value("ptr-record")?;
+            // TODO: parse and push to daemon.ptr
+        }
+
+        "host-record" => {
+            let _ = require_value("host-record")?;
+            // TODO: parse and push to daemon.host_records
+        }
+
+        "cname" => {
+            let _ = require_value("cname")?;
+            // TODO: parse and push to daemon.cnames
+        }
+
+        "naptr-record" => {
+            let _ = require_value("naptr-record")?;
+            // TODO: parse and push to daemon.naptr
+        }
+
+        "trust-anchor" => {
+            let _ = require_value("trust-anchor")?;
+            // TODO: parse and push to daemon.ds
+        }
+
+        // ── Additional hosts files ──────────────────────────────────────────
+        "addn-hosts" | "addn-hosts-dir" | "hosts-dir" => {
+            let v = require_value(key)?;
+            daemon.addn_hosts.push(HostsFile { flags: 0, fname: v.to_string(), index: 0 });
+        }
+
+        // ── conf-dir (recursive config loading) ────────────────────────────
+        "conf-dir" => {
+            let _ = require_value("conf-dir")?;
+            // TODO: recursively load config files from directory
+        }
+
+        // ── DNS forwarding limit ────────────────────────────────────────────
+        "dns-forward-max" => {
+            let _ = require_value("dns-forward-max")?;
+            // TODO: store in daemon.dns_forward_max when field is added
+        }
+
+        // ── Auth zone ──────────────────────────────────────────────────────
+        "auth-zone" => {
+            let _ = require_value("auth-zone")?;
+            // TODO: parse and push to daemon.auth_zones
+        }
+
+        // ── TFTP options ───────────────────────────────────────────────────
+        "tftp-root" => {
+            let v = require_value("tftp-root")?;
+            #[cfg(feature = "tftp")]
+            { daemon.tftp_prefix = Some(v.to_string()); }
+            #[cfg(not(feature = "tftp"))]
+            { let _ = v; }
+        }
+
+        "tftp-max" => {
+            let v = require_value("tftp-max")?;
+            let n: i32 = v.parse().map_err(|_| invalid(v, "expected an integer"))?;
+            #[cfg(feature = "tftp")]
+            { daemon.tftp_max = n; }
+            #[cfg(not(feature = "tftp"))]
+            { let _ = n; }
+        }
+
+        "tftp-unique-root" => {
+            daemon.set_option(OPT_TFTP_APREF_IP);
+        }
+
+        // ── ipset / nftset ─────────────────────────────────────────────────
+        "ipset" => {
+            let _ = require_value("ipset")?;
+            // TODO: parse and push to daemon.ipsets
+        }
+
+        "nftset" => {
+            let _ = require_value("nftset")?;
+            // TODO: parse nftset rules
+        }
+
+        // ── alias ─────────────────────────────────────────────────────────
+        "alias" => {
+            let _ = require_value("alias")?;
+            // TODO: parse and push to daemon.doctors
+        }
+
+        // ── bogus-nxdomain ────────────────────────────────────────────────
+        "bogus-nxdomain" => {
+            let _ = require_value("bogus-nxdomain")?;
+            // TODO: parse address and push to daemon.bogus_addr
+        }
+
+        // ── log-rotate ────────────────────────────────────────────────────
+        "log-rotate" => {
+            let _ = require_value("log-rotate")?;
+            // TODO: store in daemon.log_maxlines when field is added
+        }
+
+        // ── DNS rebind protection ─────────────────────────────────────────
+        "stop-dns-rebind" => {
+            daemon.set_option(OPT_NO_REBIND);
+        }
+
+        "rebind-localhost-ok" => {
+            daemon.set_option(OPT_LOCAL_REBIND);
+        }
+
+        "rebind-domain-ok" => {
+            let _ = require_value("rebind-domain-ok")?;
+            // TODO: parse domain and push to daemon.no_rebind
+        }
+
+        "no-rebind-localhost" => {
+            // noop: clears rebind-localhost-ok; no action needed as default
+        }
+
+        // ── DNSSEC ────────────────────────────────────────────────────────
+        "dnssec-check-unsigned" => {
+            daemon.set_option(OPT_DNSSEC_IGN_NS);
+        }
+
+        // ── Boolean flags not yet in the bool section ─────────────────────
+        "no-round-robin" => {
+            daemon.set_option(OPT_NORR);
+        }
+
+        "bind-dynamic" => {
+            daemon.set_option(OPT_CLEVERBIND);
+        }
+
+        "no-hosts6" => {
+            // TODO: implement no-hosts6 (skip IPv6 /etc/hosts entries)
+        }
+
+        "filter-A" => {
+            // TODO: implement filter-A when OPT_FILTER_A constant is added
+        }
+
+        "filter-AAAA" => {
+            // TODO: implement filter-AAAA when OPT_FILTER_AAAA constant is added
+        }
+
+        "port-limit" => {
+            // TODO: implement port-limit when OPT_PORTLIMIT constant is added
         }
 
         // ── no-resolv (with value is alias for resolv-file) ────────────────
