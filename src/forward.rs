@@ -282,6 +282,75 @@ impl ForwardEngine {
 
     /// Process an upstream reply.
     ///
+    /// Matches the reply's transaction ID against the pending table.  Returns:
+    /// - `Ok(Some((client_addr, reply)))` — valid reply, restore client ID
+    /// - `Ok(None)` — no matching pending query (ignore)
+    /// - `Err(pending)` — SERVFAIL reply; caller should retry with `retry_query`
+    pub fn handle_reply_with_failover(
+        &mut self,
+        reply: &mut Vec<u8>,
+    ) -> Result<Option<(SocketAddr, Vec<u8>)>, PendingQuery> {
+        if reply.len() < 12 { return Ok(None); }
+        let reply_id = u16::from_be_bytes([reply[0], reply[1]]);
+        // Peek at rcode (lower 4 bits of byte 3).
+        let rcode = reply[3] & 0x0F;
+        if rcode == 2 /* SERVFAIL */ {
+            // Remove from table and return Err so caller can try next server.
+            if let Some(pending) = self.table.remove(reply_id) {
+                if pending.retries < self.config.max_retries {
+                    return Err(pending);
+                }
+                // Max retries exhausted — return SERVFAIL to client.
+                patch_id(reply, pending.orig_id);
+                return Ok(Some((pending.client, reply.clone())));
+            }
+            return Ok(None);
+        }
+        // Normal reply (including NXDOMAIN etc.).
+        let pending = match self.table.remove(reply_id) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        patch_id(reply, pending.orig_id);
+        Ok(Some((pending.client, reply.clone())))
+    }
+
+    /// Retry a query that received SERVFAIL, using the next available upstream.
+    ///
+    /// Increments `pending.retries`, picks the next server that has not yet
+    /// been tried (stored in `pending.upstream_idx`), and re-sends the
+    /// original query.  Returns `Some(new_id)` on success.
+    pub async fn retry_query(
+        &mut self,
+        mut pending: PendingQuery,
+        orig_pkt: &[u8],
+        upstream_sock: &tokio::net::UdpSocket,
+    ) -> Option<u16> {
+        let mut tried = HashSet::new();
+        tried.insert(pending.upstream_idx);
+        let next_idx = next_server(&self.upstream_order, &tried, pending.upstream_idx)?;
+        let upstream_addr = self.config.upstreams[next_idx];
+
+        pending.retries += 1;
+        pending.upstream_idx = next_idx;
+        pending.sent_at = Instant::now();
+        let new_id = self.table.alloc_query(
+            pending.orig_id, pending.client, next_idx, pending.question_hash,
+        );
+
+        let mut out = orig_pkt.to_vec();
+        patch_id(&mut out, new_id);
+        match upstream_sock.send_to(&out, upstream_addr).await {
+            Ok(_) => Some(new_id),
+            Err(_) => {
+                self.table.remove(new_id);
+                None
+            }
+        }
+    }
+
+    /// Process an upstream reply.
+    ///
     /// Matches the reply's transaction ID against the pending table.  If a
     /// match is found, restores the original client ID and returns
     /// `(client_addr, reply_bytes)`.
@@ -660,6 +729,62 @@ mod tests {
     }
 
     // ── TCP fallback helpers ──────────────────────────────────────────────────
+
+    #[test]
+    fn servfail_triggers_retry_path() {
+        let config = ForwardConfig {
+            upstreams: vec![
+                "127.0.0.1:5353".parse().unwrap(),
+                "127.0.0.2:5353".parse().unwrap(),
+            ],
+            max_retries: 1,
+            ..Default::default()
+        };
+        let client: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let mut engine = ForwardEngine::new(config);
+        let new_id = engine.table.alloc_query(42, client, 0, [0u8; 16]);
+
+        // Build a SERVFAIL reply (rcode=2 in byte 3).
+        let mut reply = vec![
+            (new_id >> 8) as u8, (new_id & 0xFF) as u8,
+            0x84, 0x02, // QR=1, rcode=SERVFAIL
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let result = engine.handle_reply_with_failover(&mut reply);
+        // Should return Err(pending) because retries < max_retries.
+        assert!(result.is_err(), "SERVFAIL with retries left should return Err");
+        let pending = result.unwrap_err();
+        assert_eq!(pending.orig_id, 42);
+        assert_eq!(pending.retries, 0); // not yet incremented — retry_query does that
+    }
+
+    #[test]
+    fn servfail_exhausted_retries_returns_reply() {
+        let config = ForwardConfig {
+            upstreams: vec!["127.0.0.1:5353".parse().unwrap()],
+            max_retries: 0,
+            ..Default::default()
+        };
+        let client: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let mut engine = ForwardEngine::new(config);
+        let new_id = engine.table.alloc_query(99, client, 0, [0u8; 16]);
+
+        let mut reply = vec![
+            (new_id >> 8) as u8, (new_id & 0xFF) as u8,
+            0x84, 0x02, // SERVFAIL
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let result = engine.handle_reply_with_failover(&mut reply);
+        // max_retries=0 → return SERVFAIL to client.
+        assert!(result.is_ok());
+        let inner = result.unwrap();
+        assert!(inner.is_some());
+        let (addr, resp) = inner.unwrap();
+        assert_eq!(addr, client);
+        let restored = u16::from_be_bytes([resp[0], resp[1]]);
+        assert_eq!(restored, 99);
+    }
+
 
     #[test]
     fn is_truncated_detects_tc_bit() {
