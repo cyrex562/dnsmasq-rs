@@ -1,0 +1,499 @@
+//! DNS cache — idiomatic Rust port of `cache.c` from dnsmasq.
+//!
+//! The cache is a bounded LRU map keyed by `(name, type-flags)`.  Expired
+//! entries are evicted lazily on lookup and proactively via `expire_old`.
+
+use std::num::NonZeroUsize;
+use std::time::Instant;
+
+use lru::LruCache;
+
+use crate::types::addr::AllAddr;
+use crate::types::constants::{
+    F_CNAME, F_DNSSEC, F_DNSKEY, F_DS, F_FORWARD, F_IMMORTAL, F_IPV4, F_IPV6, F_NEG,
+    F_NXDOMAIN, F_REVERSE, F_RR,
+};
+
+// ---------------------------------------------------------------------------
+// Type-flag mask
+// ---------------------------------------------------------------------------
+
+/// Mask of all "type" bits that identify what kind of record a cache entry is.
+pub const TYPE_MASK: u32 =
+    F_IPV4 | F_IPV6 | F_CNAME | F_NEG | F_NXDOMAIN | F_REVERSE
+    | F_DNSKEY | F_DS | F_RR
+    | F_DNSSEC; // extra type bits for DNSSEC records
+
+/// Return only the type bits from a flags word.
+pub fn type_flags(flags: u32) -> u32 {
+    flags & TYPE_MASK
+}
+
+// ---------------------------------------------------------------------------
+// Public data structures
+// ---------------------------------------------------------------------------
+
+/// Cache lookup key: lower-cased name + type-flag bits.
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+pub struct CacheKey {
+    pub name:  String,
+    /// Only the type bits (see `type_flags`).
+    pub flags: u32,
+}
+
+/// A single DNS cache record — equivalent to `struct crec` in C.
+#[derive(Debug, Clone)]
+pub struct CacheRecord {
+    /// The domain name this record belongs to.
+    pub name:    String,
+    /// Full set of F_* flag bits for this record.
+    pub flags:   u32,
+    /// Original TTL in seconds.
+    pub ttl:     u32,
+    /// Wall-clock instant at which this record expires.
+    pub expires: Instant,
+    /// Address / CNAME / DS / DNSKEY payload.
+    pub addr:    Option<AllAddr>,
+    /// Raw RR wire-format bytes (DNSSEC / arbitrary RR data).
+    pub rdata:   Option<Vec<u8>>,
+}
+
+/// The DNS cache — bounded LRU map with per-query statistics.
+pub struct DnsCache {
+    max_size: usize,
+    records:  LruCache<CacheKey, CacheRecord>,
+    // statistics
+    pub inserts:   u64,
+    pub evictions: u64,
+    pub hits:      u64,
+    pub misses:    u64,
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if `rec` is expired at `now`.
+/// Immortal records (F_IMMORTAL set) never expire.
+pub fn record_is_expired(rec: &CacheRecord, now: Instant) -> bool {
+    if rec.flags & F_IMMORTAL != 0 {
+        return false;
+    }
+    rec.expires <= now
+}
+
+// ---------------------------------------------------------------------------
+// DnsCache implementation
+// ---------------------------------------------------------------------------
+
+impl DnsCache {
+    /// Create a new cache with the given maximum number of entries.
+    ///
+    /// # Panics
+    /// Panics if `max_size` is zero.
+    pub fn new(max_size: usize) -> Self {
+        let capacity = NonZeroUsize::new(max_size)
+            .expect("DnsCache max_size must be non-zero");
+        Self {
+            max_size,
+            records: LruCache::new(capacity),
+            inserts:   0,
+            evictions: 0,
+            hits:      0,
+            misses:    0,
+        }
+    }
+
+    /// Insert (or replace) a record in the cache.
+    ///
+    /// The LRU crate evicts the least-recently-used entry automatically when
+    /// the cache is full; we track that as an eviction.
+    pub fn insert(&mut self, rec: CacheRecord) {
+        let key = CacheKey {
+            name:  rec.name.to_lowercase(),
+            flags: type_flags(rec.flags),
+        };
+        let was_full = self.records.len() == self.max_size;
+        self.records.put(key, rec);
+        self.inserts += 1;
+        if was_full {
+            self.evictions += 1;
+        }
+    }
+
+    /// Look up a record by name and type flags.
+    ///
+    /// Returns `None` if no matching record exists or if the record has
+    /// expired.  Expired records are removed from the cache on access.
+    pub fn lookup_by_name(
+        &mut self,
+        name:  &str,
+        flags: u32,
+        now:   Instant,
+    ) -> Option<&CacheRecord> {
+        let key = CacheKey {
+            name:  name.to_lowercase(),
+            flags: type_flags(flags),
+        };
+
+        // Peek first so we can evict without fighting the borrow checker.
+        let expired = self
+            .records
+            .peek(&key)
+            .map_or(false, |r| record_is_expired(r, now));
+
+        if expired {
+            self.records.pop(&key);
+            self.misses += 1;
+            return None;
+        }
+
+        if self.records.get(&key).is_some() {
+            self.hits += 1;
+            // Re-borrow immutably for the return value.
+            self.records.get(&key)
+        } else {
+            self.misses += 1;
+            None
+        }
+    }
+
+    /// Reverse lookup: return a record whose `addr` matches `addr`.
+    ///
+    /// Performs a linear scan; intended for PTR / hostname lookups where the
+    /// caller knows only the IP address.  Expired records are skipped.
+    pub fn lookup_by_addr(
+        &mut self,
+        addr: &AllAddr,
+        now:  Instant,
+    ) -> Option<&CacheRecord> {
+        // Collect keys of expired records to evict them first.
+        let expired_keys: Vec<CacheKey> = self
+            .records
+            .iter()
+            .filter(|(_, r)| record_is_expired(r, now))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in expired_keys {
+            self.records.pop(&k);
+        }
+
+        // Now search for a matching address in live records.
+        // We find the key first, then re-borrow.
+        let found_key: Option<CacheKey> = self
+            .records
+            .iter()
+            .find(|(_, r)| addr_matches(&r.addr, addr))
+            .map(|(k, _)| k.clone());
+
+        if let Some(k) = found_key {
+            self.hits += 1;
+            self.records.get(&k)
+        } else {
+            self.misses += 1;
+            None
+        }
+    }
+
+    /// Sweep the cache and remove all expired records.
+    ///
+    /// This is best-effort; the LRU naturally evicts entries when the cache is
+    /// full, so this sweep is mainly useful to reclaim memory between fills.
+    pub fn expire_old(&mut self, now: Instant) {
+        let expired_keys: Vec<CacheKey> = self
+            .records
+            .iter()
+            .filter(|(_, r)| record_is_expired(r, now))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in expired_keys {
+            self.records.pop(&k);
+        }
+    }
+
+    /// Remove every record from the cache.
+    pub fn clear(&mut self) {
+        self.records.clear();
+    }
+
+    /// Number of entries currently in the cache.
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Returns `true` if the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if `haystack` matches `needle` by IP address.
+fn addr_matches(haystack: &Option<AllAddr>, needle: &AllAddr) -> bool {
+    match (haystack, needle) {
+        (Some(AllAddr::Addr4(a)), AllAddr::Addr4(b)) => a == b,
+        (Some(AllAddr::Addr6(a)), AllAddr::Addr6(b)) => a == b,
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+    use std::time::{Duration, Instant};
+
+    fn make_a_record(name: &str, ip: Ipv4Addr, ttl: u32, expires: Instant) -> CacheRecord {
+        CacheRecord {
+            name: name.to_string(),
+            flags: F_IPV4 | F_FORWARD,
+            ttl,
+            expires,
+            addr: Some(AllAddr::Addr4(ip)),
+            rdata: None,
+        }
+    }
+
+    fn make_ptr_record(name: &str, ip: Ipv4Addr, ttl: u32, expires: Instant) -> CacheRecord {
+        CacheRecord {
+            name: name.to_string(),
+            flags: F_IPV4 | F_REVERSE,
+            ttl,
+            expires,
+            addr: Some(AllAddr::Addr4(ip)),
+            rdata: None,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // type_flags
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn type_flags_masks_correctly() {
+        use crate::types::constants::{F_DHCP, F_HOSTS};
+        let all = F_IPV4 | F_IPV6 | F_CNAME | F_NEG | F_NXDOMAIN | F_REVERSE | F_DHCP | F_HOSTS;
+        let result = type_flags(all);
+        // DHCP and HOSTS are not type flags
+        assert_eq!(result & F_IPV4,     F_IPV4);
+        assert_eq!(result & F_IPV6,     F_IPV6);
+        assert_eq!(result & F_CNAME,    F_CNAME);
+        assert_eq!(result & F_NEG,      F_NEG);
+        assert_eq!(result & F_NXDOMAIN, F_NXDOMAIN);
+        assert_eq!(result & F_REVERSE,  F_REVERSE);
+        assert_eq!(result & F_DHCP,     0);
+        assert_eq!(result & F_HOSTS,    0);
+    }
+
+    // ------------------------------------------------------------------
+    // record_is_expired
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn immortal_record_never_expires() {
+        let rec = CacheRecord {
+            name: "example.com".into(),
+            flags: F_IMMORTAL | F_IPV4,
+            ttl: 0,
+            expires: Instant::now() - Duration::from_secs(9999),
+            addr: None,
+            rdata: None,
+        };
+        assert!(!record_is_expired(&rec, Instant::now()));
+    }
+
+    #[test]
+    fn mortal_record_expires() {
+        let past = Instant::now() - Duration::from_secs(1);
+        let rec = CacheRecord {
+            name: "example.com".into(),
+            flags: F_IPV4,
+            ttl: 60,
+            expires: past,
+            addr: None,
+            rdata: None,
+        };
+        assert!(record_is_expired(&rec, Instant::now()));
+    }
+
+    // ------------------------------------------------------------------
+    // insert / lookup_by_name hit and miss
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn insert_and_lookup_hit() {
+        let mut cache = DnsCache::new(16);
+        let future = Instant::now() + Duration::from_secs(300);
+        cache.insert(make_a_record("example.com", Ipv4Addr::new(1, 2, 3, 4), 300, future));
+
+        let result = cache.lookup_by_name("example.com", F_IPV4, Instant::now());
+        assert!(result.is_some());
+        assert_eq!(cache.hits,   1);
+        assert_eq!(cache.misses, 0);
+    }
+
+    #[test]
+    fn lookup_miss_returns_none() {
+        let mut cache = DnsCache::new(16);
+        let result = cache.lookup_by_name("missing.example.com", F_IPV4, Instant::now());
+        assert!(result.is_none());
+        assert_eq!(cache.misses, 1);
+    }
+
+    #[test]
+    fn lookup_is_case_insensitive() {
+        let mut cache = DnsCache::new(16);
+        let future = Instant::now() + Duration::from_secs(300);
+        cache.insert(make_a_record("Example.COM", Ipv4Addr::new(1, 2, 3, 4), 300, future));
+
+        assert!(cache.lookup_by_name("example.com", F_IPV4, Instant::now()).is_some());
+        assert!(cache.lookup_by_name("EXAMPLE.COM", F_IPV4, Instant::now()).is_some());
+    }
+
+    // ------------------------------------------------------------------
+    // TTL expiry
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn expired_record_returns_none() {
+        let mut cache = DnsCache::new(16);
+        // Already expired
+        let past = Instant::now() - Duration::from_millis(1);
+        cache.insert(make_a_record("example.com", Ipv4Addr::new(1, 2, 3, 4), 0, past));
+
+        let result = cache.lookup_by_name("example.com", F_IPV4, Instant::now());
+        assert!(result.is_none());
+        assert_eq!(cache.misses, 1);
+        // Record should have been evicted
+        assert!(cache.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // LRU eviction
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn lru_eviction_when_full() {
+        let mut cache = DnsCache::new(3);
+        let future = Instant::now() + Duration::from_secs(300);
+
+        cache.insert(make_a_record("a.example.com", Ipv4Addr::new(1, 0, 0, 1), 300, future));
+        cache.insert(make_a_record("b.example.com", Ipv4Addr::new(1, 0, 0, 2), 300, future));
+        cache.insert(make_a_record("c.example.com", Ipv4Addr::new(1, 0, 0, 3), 300, future));
+
+        // Access 'a' so it becomes recently used
+        cache.lookup_by_name("a.example.com", F_IPV4, Instant::now());
+
+        // Insert a 4th entry — 'b' (LRU) should be evicted
+        cache.insert(make_a_record("d.example.com", Ipv4Addr::new(1, 0, 0, 4), 300, future));
+
+        assert_eq!(cache.len(), 3);
+        assert!(cache.lookup_by_name("b.example.com", F_IPV4, Instant::now()).is_none());
+        assert!(cache.lookup_by_name("a.example.com", F_IPV4, Instant::now()).is_some());
+        assert!(cache.lookup_by_name("c.example.com", F_IPV4, Instant::now()).is_some());
+        assert!(cache.lookup_by_name("d.example.com", F_IPV4, Instant::now()).is_some());
+        assert!(cache.evictions > 0);
+    }
+
+    // ------------------------------------------------------------------
+    // lookup_by_addr
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn lookup_by_addr_finds_ptr_record() {
+        let mut cache = DnsCache::new(16);
+        let future = Instant::now() + Duration::from_secs(300);
+        let ip = Ipv4Addr::new(192, 168, 1, 1);
+        cache.insert(make_ptr_record("1.1.168.192.in-addr.arpa", ip, 300, future));
+
+        let result = cache.lookup_by_addr(&AllAddr::Addr4(ip), Instant::now());
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "1.1.168.192.in-addr.arpa");
+    }
+
+    #[test]
+    fn lookup_by_addr_miss() {
+        let mut cache = DnsCache::new(16);
+        let result = cache.lookup_by_addr(&AllAddr::Addr4(Ipv4Addr::new(10, 0, 0, 1)), Instant::now());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn lookup_by_addr_skips_expired() {
+        let mut cache = DnsCache::new(16);
+        let past = Instant::now() - Duration::from_millis(1);
+        let ip = Ipv4Addr::new(10, 0, 0, 1);
+        cache.insert(make_ptr_record("1.0.0.10.in-addr.arpa", ip, 0, past));
+
+        let result = cache.lookup_by_addr(&AllAddr::Addr4(ip), Instant::now());
+        assert!(result.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // expire_old
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn expire_old_removes_stale_records() {
+        let mut cache = DnsCache::new(16);
+        let past   = Instant::now() - Duration::from_millis(1);
+        let future = Instant::now() + Duration::from_secs(300);
+
+        cache.insert(make_a_record("old.example.com",  Ipv4Addr::new(1,1,1,1), 0,   past));
+        cache.insert(make_a_record("new.example.com",  Ipv4Addr::new(2,2,2,2), 300, future));
+
+        cache.expire_old(Instant::now());
+
+        assert_eq!(cache.len(), 1);
+        assert!(cache.lookup_by_name("new.example.com", F_IPV4, Instant::now()).is_some());
+    }
+
+    // ------------------------------------------------------------------
+    // clear
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn clear_empties_cache() {
+        let mut cache = DnsCache::new(16);
+        let future = Instant::now() + Duration::from_secs(300);
+        cache.insert(make_a_record("a.example.com", Ipv4Addr::new(1,0,0,1), 300, future));
+        cache.insert(make_a_record("b.example.com", Ipv4Addr::new(1,0,0,2), 300, future));
+
+        assert_eq!(cache.len(), 2);
+        cache.clear();
+        assert!(cache.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // DNSSEC feature
+    // ------------------------------------------------------------------
+
+    #[cfg(feature = "dnssec")]
+    #[test]
+    fn dnssec_record_stored_and_retrieved() {
+        let mut cache = DnsCache::new(16);
+        let future = Instant::now() + Duration::from_secs(300);
+        let rdata = vec![0xDE, 0xAD, 0xBE, 0xEF];
+
+        let rec = CacheRecord {
+            name:    "example.com".into(),
+            flags:   F_DNSKEY | F_DNSSEC,
+            ttl:     300,
+            expires: future,
+            addr:    None,
+            rdata:   Some(rdata.clone()),
+        };
+        cache.insert(rec);
+
+        let result = cache.lookup_by_name("example.com", F_DNSKEY | F_DNSSEC, Instant::now());
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().rdata.as_deref(), Some(rdata.as_slice()));
+    }
+}

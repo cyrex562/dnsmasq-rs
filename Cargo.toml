@@ -51,10 +51,11 @@ libc = "0.2"
 
 # Crypto (DNSSEC)
 ring = { version = "0.17", optional = false }
-rsa = { version = "0.9", optional = false }
+rsa = { version = "0.9", features = ["sha2"], optional = false }
+sha2 = "0.10"
 p256 = { version = "0.13", optional = false }
 p384 = { version = "0.13", optional = false }
-ed25519-dalek = { version = "2", optional = false }
+ed25519-dalek = { version = "2", features = ["rand_core"], optional = false }
 
 # D-Bus (optional)
 zbus = { version = "4", optional = true }
