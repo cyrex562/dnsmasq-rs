@@ -17,7 +17,7 @@ use crate::hash_questions::hash_questions;
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// A pending (in-flight) forwarded DNS query.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PendingQuery {
     /// DNS transaction ID sent upstream.
     pub id: u16,
@@ -299,6 +299,83 @@ impl ForwardEngine {
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// TCP fallback
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Check whether the TC (truncated) bit is set in a DNS reply.
+///
+/// Returns `true` only when the packet is at least 12 bytes (header-complete)
+/// and byte 2, bit 1 is set.
+pub fn is_truncated(pkt: &[u8]) -> bool {
+    pkt.len() >= 12 && pkt[2] & 0x02 != 0
+}
+
+/// Send a DNS query over TCP to `upstream` and return the full response.
+///
+/// DNS-over-TCP prefixes the message with a 2-byte big-endian length field
+/// (RFC 1035 §4.2.2).  This function:
+/// 1. Writes the 2-byte length prefix + query payload.
+/// 2. Reads the 2-byte length prefix of the response.
+/// 3. Reads exactly that many bytes and returns them.
+///
+/// Returns `None` on any I/O error or if the server closes the connection
+/// before a complete response is received.
+pub async fn tcp_query(
+    upstream: SocketAddr,
+    query: &[u8],
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let connect = tokio::time::timeout(timeout, TcpStream::connect(upstream));
+    let mut stream = connect.await.ok()?.ok()?;
+
+    // Write length-prefixed query.
+    let len = query.len() as u16;
+    let frame: Vec<u8> = {
+        let mut v = Vec::with_capacity(2 + query.len());
+        v.extend_from_slice(&len.to_be_bytes());
+        v.extend_from_slice(query);
+        v
+    };
+    tokio::time::timeout(timeout, stream.write_all(&frame))
+        .await.ok()?.ok()?;
+
+    // Read 2-byte response length.
+    let mut len_buf = [0u8; 2];
+    tokio::time::timeout(timeout, stream.read_exact(&mut len_buf))
+        .await.ok()?.ok()?;
+    let resp_len = u16::from_be_bytes(len_buf) as usize;
+
+    // Read the response body.
+    let mut resp = vec![0u8; resp_len];
+    tokio::time::timeout(timeout, stream.read_exact(&mut resp))
+        .await.ok()?.ok()?;
+
+    Some(resp)
+}
+
+/// Handle a UDP reply that has the TC bit set.
+///
+/// Retries the original query (`orig_query`) over TCP to the same upstream
+/// server.  On success the full (untruncated) response is returned with the
+/// client's original query ID restored.
+pub async fn tcp_fallback(
+    upstream: SocketAddr,
+    orig_query: &[u8],
+    client_id: u16,
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    let mut resp = tcp_query(upstream, orig_query, timeout).await?;
+    if resp.len() >= 2 {
+        resp[0] = (client_id >> 8) as u8;
+        resp[1] = (client_id & 0xFF) as u8;
+    }
+    Some(resp)
+}
+
 /// Run the DNS UDP forwarding event loop.
 ///
 /// * `client_sock` — bound UDP socket facing DNS clients.
@@ -331,9 +408,24 @@ pub async fn run_forward_loop(
             }
             // ── Upstream reply ────────────────────────────────────────────────
             result = upstream_sock.recv_from(&mut upstream_buf) => {
-                let (len, _) = result?;
+                let (len, upstream_addr) = result?;
                 let mut pkt = upstream_buf[..len].to_vec();
                 if let Some((client_addr, reply)) = engine.handle_reply(&mut pkt) {
+                    if is_truncated(&reply) {
+                        // TC bit set — retry over TCP.
+                        let pending = engine.table.lookup(
+                            u16::from_be_bytes([reply[0], reply[1]])
+                        ).cloned();
+                        if let Some(q) = pending {
+                            let timeout = engine.config.timeout;
+                            if let Some(full) = tcp_fallback(
+                                upstream_addr, &pkt, q.orig_id, timeout
+                            ).await {
+                                let _ = client_sock.send_to(&full, client_addr).await;
+                                continue;
+                            }
+                        }
+                    }
                     let _ = client_sock.send_to(&reply, client_addr).await;
                 }
             }
@@ -565,6 +657,56 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         let expired = engine.expire_queries();
         assert_eq!(expired.len(), 1);
+    }
+
+    // ── TCP fallback helpers ──────────────────────────────────────────────────
+
+    #[test]
+    fn is_truncated_detects_tc_bit() {
+        let mut pkt = vec![0u8; 12];
+        assert!(!is_truncated(&pkt));
+        pkt[2] |= 0x02; // set TC bit
+        assert!(is_truncated(&pkt));
+    }
+
+    #[test]
+    fn is_truncated_short_packet_safe() {
+        assert!(!is_truncated(&[]));
+        assert!(!is_truncated(&[0u8; 11]));
+    }
+
+    #[tokio::test]
+    async fn tcp_fallback_restores_client_id() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Start a mock TCP DNS server that echoes back the query.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut len_buf = [0u8; 2];
+                let _ = stream.read_exact(&mut len_buf).await;
+                let len = u16::from_be_bytes(len_buf) as usize;
+                let mut body = vec![0u8; len];
+                let _ = stream.read_exact(&mut body).await;
+                // Echo: prepend length prefix.
+                let resp_len = (body.len() as u16).to_be_bytes();
+                let _ = stream.write_all(&resp_len).await;
+                let _ = stream.write_all(&body).await;
+            }
+        });
+
+        // Build a minimal query (12-byte header).
+        let query = vec![0x00, 0x42, 0x01, 0x00,
+                         0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let client_id: u16 = 0x1234;
+        let resp = tcp_fallback(addr, &query, client_id, Duration::from_secs(2)).await;
+        assert!(resp.is_some());
+        let r = resp.unwrap();
+        let restored = u16::from_be_bytes([r[0], r[1]]);
+        assert_eq!(restored, client_id);
     }
 }
 
