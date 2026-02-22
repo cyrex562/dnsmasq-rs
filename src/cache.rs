@@ -211,6 +211,39 @@ impl DnsCache {
         }
     }
 
+    /// Check whether a negative cache record (NXDOMAIN or NODATA) exists for
+    /// the given name.
+    ///
+    /// A negative record is one with both `F_NEG` and either `F_NXDOMAIN`
+    /// (the name doesn't exist) or no `F_NXDOMAIN` (NODATA — the name exists
+    /// but has no records of the queried type).
+    ///
+    /// Returns `Some(record)` if an unexpired negative entry exists.
+    pub fn lookup_negative(
+        &mut self,
+        name: &str,
+        nxdomain: bool,
+        now: Instant,
+    ) -> Option<&CacheRecord> {
+        let flags = if nxdomain {
+            crate::types::constants::F_NEG | crate::types::constants::F_NXDOMAIN
+        } else {
+            crate::types::constants::F_NEG
+        };
+        self.lookup_by_name(name, flags, now)
+    }
+
+    /// Returns `true` when `name` is known to be NXDOMAIN (not expired).
+    pub fn is_nxdomain(&mut self, name: &str, now: Instant) -> bool {
+        self.lookup_negative(name, true, now).is_some()
+    }
+
+    /// Returns `true` when `name` is known to have no data for the queried type
+    /// (NODATA / negative caching without NXDOMAIN, not expired).
+    pub fn is_nodata(&mut self, name: &str, now: Instant) -> bool {
+        self.lookup_negative(name, false, now).is_some()
+    }
+
     /// Remove every record from the cache.
     pub fn clear(&mut self) {
         self.records.clear();
@@ -224,6 +257,39 @@ impl DnsCache {
     /// Returns `true` if the cache is empty.
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// extract_addresses integration
+// ---------------------------------------------------------------------------
+
+/// Process a raw DNS reply packet by:
+/// 1. Parsing the wire-format packet.
+/// 2. Calling [`crate::rfc1035::extract_addresses`] to populate `cache`.
+///
+/// Returns `true` if the packet was successfully processed (even if nothing
+/// was cached), `false` if the packet is malformed.
+///
+/// This is the primary integration point between the forwarding engine and
+/// the DNS cache.  Call this every time an upstream reply is received.
+pub fn cache_reply(
+    wire: &[u8],
+    cache: &mut DnsCache,
+    config: &crate::rfc1035::ExtractConfig,
+) -> bool {
+    use std::time::Instant;
+    use crate::rfc1035::{extract_addresses, ExtractResult, DnsPacket};
+
+    let packet = match DnsPacket::parse(wire) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    let now = Instant::now();
+    match extract_addresses(&packet, cache, now, config) {
+        ExtractResult::BadPacket => false,
+        _ => true,
     }
 }
 
@@ -667,5 +733,94 @@ mod tests {
         // reload_hosts with empty list → cache cleared.
         reload_hosts(&[], 60, &mut cache);
         assert!(cache.lookup_by_name("stale.example", F_IPV4, Instant::now()).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // cache_reply / extract_addresses integration
+    // ------------------------------------------------------------------
+
+    fn make_a_reply(name: &str, ip: std::net::Ipv4Addr) -> Vec<u8> {
+        use crate::rfc1035::{DnsPacket, DnsQuestion, DnsRr};
+        use crate::dns_protocol::DnsHeader;
+        let pkt = DnsPacket {
+            header: DnsHeader {
+                id: 1, hb3: 0x84, hb4: 0x00,
+                qdcount: 1, ancount: 1, nscount: 0, arcount: 0,
+            },
+            questions: vec![DnsQuestion {
+                name: name.to_string(), qtype: 1, qclass: 1,
+            }],
+            answers: vec![DnsRr {
+                name: name.to_string(),
+                rtype: 1, class: 1, ttl: 60,
+                rdata: ip.octets().to_vec(),
+            }],
+            authority: vec![],
+            additional: vec![],
+        };
+        pkt.write().to_vec()
+    }
+
+    #[test]
+    fn cache_reply_populates_cache() {
+        let mut cache = DnsCache::new(100);
+        let wire = make_a_reply("example.com", "1.2.3.4".parse().unwrap());
+        let cfg = crate::rfc1035::ExtractConfig::default();
+        let ok = cache_reply(&wire, &mut cache, &cfg);
+        assert!(ok);
+        let now = Instant::now();
+        assert!(cache.lookup_by_name("example.com", F_IPV4, now).is_some());
+    }
+
+    #[test]
+    fn cache_reply_bad_packet_returns_false() {
+        let mut cache = DnsCache::new(100);
+        let cfg = crate::rfc1035::ExtractConfig::default();
+        assert!(!cache_reply(&[0u8; 3], &mut cache, &cfg));
+    }
+
+    // ------------------------------------------------------------------
+    // Negative caching helpers
+    // ------------------------------------------------------------------
+
+    fn insert_nxdomain(cache: &mut DnsCache, name: &str, now: Instant) {
+        cache.insert(CacheRecord {
+            name: name.to_string(),
+            flags: F_NEG | F_NXDOMAIN,
+            ttl: 60,
+            expires: now + Duration::from_secs(120),
+            addr: None,
+            rdata: None,
+        });
+    }
+
+    #[test]
+    fn is_nxdomain_true_when_cached() {
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        insert_nxdomain(&mut cache, "gone.example", now);
+        assert!(cache.is_nxdomain("gone.example", now));
+    }
+
+    #[test]
+    fn is_nxdomain_false_when_not_cached() {
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        assert!(!cache.is_nxdomain("unknown.example", now));
+    }
+
+    #[test]
+    fn is_nxdomain_false_after_expiry() {
+        let mut cache = DnsCache::new(100);
+        let past = Instant::now() - Duration::from_secs(200);
+        cache.insert(CacheRecord {
+            name: "expired.example".to_string(),
+            flags: F_NEG | F_NXDOMAIN,
+            ttl: 60,
+            expires: past,
+            addr: None,
+            rdata: None,
+        });
+        assert!(!cache.is_nxdomain("expired.example", Instant::now()));
     }
 }
