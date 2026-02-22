@@ -8,11 +8,12 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
 use crate::cache::{CacheRecord, DnsCache};
-use crate::dns_protocol::{DnsHeader, RrType};
+use crate::dns_protocol::{DnsHeader, RrType, HB3_AA, HB3_QR, HB3_TC, HB4_AD, HB4_RA};
 use crate::types::addr::{AllAddr, CnameAddr, RrDataAddr};
 use crate::types::constants::{
-    F_CNAME, F_DNSSECOK, F_FORWARD, F_IPV4, F_IPV6, F_NEG, F_NXDOMAIN, F_REVERSE, F_RR,
+    F_CNAME, F_DNSSECOK, F_FORWARD, F_IPV4, F_IPV6, F_NEG, F_NXDOMAIN, F_RCODE, F_REVERSE, F_RR,
 };
+use crate::types::dns_records::{Cname, HostRecord, MxSrvRecord, Naptr, PtrRecord, TxtRecord};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Error type
@@ -788,7 +789,383 @@ pub fn extract_addresses(
     ExtractResult::Cached
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Answer local queries
+// ──────────────────────────────────────────────────────────────────────────────
 
+/// Configuration for answering DNS queries from local data and cache.
+pub struct LocalConfig<'a> {
+    pub local_ttl:     u32,
+    pub txt_records:   &'a [TxtRecord],
+    pub rr_records:    &'a [TxtRecord],   // arbitrary cached-RR types (class field = rrtype)
+    pub mx_records:    &'a [MxSrvRecord],
+    pub ptr_records:   &'a [PtrRecord],
+    pub host_records:  &'a [HostRecord],
+    pub cnames:        &'a [Cname],
+    pub naptr_records: &'a [Naptr],
+}
+
+/// Port of C's `setup_reply()`.  Sets standard response flags on a DnsHeader.
+pub fn setup_reply(header: &mut DnsHeader, flags: u32) {
+    header.hb3 = (header.hb3 & !(HB3_AA | HB3_TC)) | HB3_QR;
+    header.hb4 = (header.hb4 & !HB4_AD) | HB4_RA;
+    header.nscount = 0;
+    header.arcount = 0;
+    header.ancount = 0;
+    if flags == F_NXDOMAIN {
+        header.set_rcode(3);
+    } else if flags == F_RCODE {
+        header.set_rcode(4); // NOTIMP
+    } else if flags & (F_IPV4 | F_IPV6) != 0 {
+        header.set_rcode(0);
+        header.hb3 |= HB3_AA;
+    } else {
+        header.set_rcode(0);
+    }
+}
+
+/// Port of C's `answer_request()`.  Answers DNS queries from local config and cache.
+///
+/// Returns `None` when the query should be forwarded to an upstream resolver.
+pub fn answer_request(
+    query:  &DnsPacket,
+    cache:  &mut DnsCache,
+    now:    Instant,
+    config: &LocalConfig<'_>,
+) -> Option<DnsPacket> {
+    // 1. Validate: exactly 1 question, no answers/authority, opcode=QUERY(0).
+    if query.questions.len() != 1
+        || !query.answers.is_empty()
+        || !query.authority.is_empty()
+        || query.header.opcode() != 0
+    {
+        return None;
+    }
+
+    let q      = &query.questions[0];
+    let qtype  = q.qtype;
+    let qclass = q.qclass;
+
+    // 2. Only handle IN (1) or CH (3).
+    if qclass != 1 && qclass != 3 {
+        return None;
+    }
+
+    // 3. Build response with header copy: QR=1, RA=1, clear AA & AD.
+    let mut resp_hdr = query.header;
+    resp_hdr.hb3 = (resp_hdr.hb3 & !(HB3_AA | HB3_TC)) | HB3_QR;
+    resp_hdr.hb4 = (resp_hdr.hb4 & !HB4_AD) | HB4_RA;
+    resp_hdr.ancount = 0;
+    resp_hdr.nscount = 0;
+    resp_hdr.arcount = 0;
+
+    let mut response = DnsPacket {
+        header:     resp_hdr,
+        questions:  query.questions.clone(),
+        answers:    Vec::new(),
+        authority:  Vec::new(),
+        additional: Vec::new(),
+    };
+
+    // 4. CH class: reply NOTIMP for well-known chaos names, otherwise forward.
+    if qclass == 3 {
+        let lower = q.name.to_lowercase();
+        if lower == "bind"
+            || lower == "server"
+            || lower.ends_with(".bind")
+            || lower.ends_with(".server")
+        {
+            response.header.set_rcode(4); // NOTIMP
+            return Some(response);
+        }
+        return None;
+    }
+
+    // 5. IN class processing.
+    let mut name     = q.name.to_lowercase();
+    let mut answers: Vec<DnsRr> = Vec::new();
+    let mut ans      = false;
+    let mut nxdomain = false;
+    let mut auth     = false;
+    let ttl          = config.local_ttl;
+
+    // 5a. CNAME chain (max 16 hops).
+    for _ in 0..16 {
+        // Config CNAMEs first.
+        if let Some(c) = config.cnames.iter().find(|c| c.alias.to_lowercase() == name) {
+            let target = c.target.clone();
+            let mut rd = BytesMut::new();
+            write_name(&mut rd, &target);
+            answers.push(DnsRr { name: name.clone(), rtype: 5, class: 1, ttl, rdata: rd.to_vec() });
+            name = target.to_lowercase();
+            ans  = true;
+            continue;
+        }
+
+        // Cached CNAME.
+        let cname_target: Option<String> = cache
+            .lookup_by_name(&name, F_CNAME, now)
+            .and_then(|r| {
+                if let Some(AllAddr::Cname(ref c)) = r.addr {
+                    c.target_name.clone()
+                } else {
+                    None
+                }
+            });
+        if let Some(target) = cname_target {
+            let mut rd = BytesMut::new();
+            write_name(&mut rd, &target);
+            answers.push(DnsRr { name: name.clone(), rtype: 5, class: 1, ttl, rdata: rd.to_vec() });
+            name = target.to_lowercase();
+            ans  = true;
+            continue;
+        }
+
+        // Cached NXDOMAIN.
+        if cache.lookup_by_name(&name, F_NXDOMAIN | F_NEG, now).is_some() {
+            nxdomain = true;
+            ans      = true;
+        }
+        break;
+    }
+
+    // 5b. TXT (qtype 16 or ANY=255).
+    if qtype == 16 || qtype == 255 {
+        for t in config.txt_records.iter()
+            .filter(|t| t.class == qclass && t.name.to_lowercase() == name)
+        {
+            answers.push(DnsRr {
+                name: name.clone(), rtype: 16, class: 1, ttl, rdata: t.txt.clone(),
+            });
+            ans  = true;
+            auth = true;
+        }
+    }
+
+    // 5c. Arbitrary cached-RR (qclass IN only).
+    if qclass == 1 {
+        for t in config.rr_records.iter()
+            .filter(|t| t.name.to_lowercase() == name && (t.class == qtype || qtype == 255))
+        {
+            answers.push(DnsRr {
+                name: name.clone(), rtype: t.class, class: 1, ttl, rdata: t.txt.clone(),
+            });
+            ans  = true;
+            auth = true;
+        }
+    }
+
+    // 5d. PTR (qtype 12 or ANY).
+    if qtype == 12 || qtype == 255 {
+        let mut found_ptr = false;
+        for p in config.ptr_records.iter().filter(|p| p.name.to_lowercase() == name) {
+            let mut rd = BytesMut::new();
+            write_name(&mut rd, &p.ptr);
+            answers.push(DnsRr { name: name.clone(), rtype: 12, class: 1, ttl, rdata: rd.to_vec() });
+            ans       = true;
+            auth      = true;
+            found_ptr = true;
+        }
+        if !found_ptr {
+            if let Some(addr) = in_arpa_name_2_addr(&name) {
+                // Try host_records reverse lookup.
+                if let Some(hostname) = host_records_find_by_addr(&addr, config.host_records) {
+                    let mut rd = BytesMut::new();
+                    write_name(&mut rd, &hostname);
+                    answers.push(DnsRr {
+                        name: name.clone(), rtype: 12, class: 1, ttl, rdata: rd.to_vec(),
+                    });
+                    ans       = true;
+                    auth      = true;
+                    found_ptr = true;
+                }
+                if !found_ptr {
+                    // Try cache reverse lookup.
+                    let cached = cache
+                        .lookup_by_addr(&addr, now)
+                        .map(|r| (r.name.clone(), r.flags));
+                    if let Some((hostname, flags)) = cached {
+                        if flags & F_NXDOMAIN != 0 {
+                            nxdomain = true;
+                            ans      = true;
+                        } else {
+                            let mut rd = BytesMut::new();
+                            write_name(&mut rd, &hostname);
+                            answers.push(DnsRr {
+                                name: name.clone(), rtype: 12, class: 1, ttl, rdata: rd.to_vec(),
+                            });
+                            ans = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 5e. A / AAAA (qtype 1, 28, or ANY).
+    if qtype == 1 || qtype == 28 || qtype == 255 {
+        let want_a    = qtype == 1  || qtype == 255;
+        let want_aaaa = qtype == 28 || qtype == 255;
+        let mut found_in_host = false;
+
+        for hr in config.host_records.iter() {
+            if !hr.names.iter().any(|n| n.to_lowercase() == name) {
+                continue;
+            }
+            if want_a {
+                if let Some(ip4) = hr.addr4 {
+                    answers.push(DnsRr {
+                        name: name.clone(), rtype: 1, class: 1, ttl, rdata: ip4.octets().to_vec(),
+                    });
+                    ans           = true;
+                    auth          = true;
+                    found_in_host = true;
+                }
+            }
+            if want_aaaa {
+                if let Some(ip6) = hr.addr6 {
+                    answers.push(DnsRr {
+                        name: name.clone(), rtype: 28, class: 1, ttl, rdata: ip6.octets().to_vec(),
+                    });
+                    ans           = true;
+                    auth          = true;
+                    found_in_host = true;
+                }
+            }
+        }
+
+        if !found_in_host {
+            if want_a {
+                let cached = cache
+                    .lookup_by_name(&name, F_IPV4, now)
+                    .map(|r| (r.addr.clone(), r.flags, r.ttl));
+                if let Some((addr, flags, cached_ttl)) = cached {
+                    if flags & F_NEG != 0 {
+                        if flags & F_NXDOMAIN != 0 {
+                            nxdomain = true;
+                        }
+                        ans = true;
+                    } else if let Some(AllAddr::Addr4(ip)) = addr {
+                        answers.push(DnsRr {
+                            name: name.clone(), rtype: 1, class: 1,
+                            ttl: cached_ttl, rdata: ip.octets().to_vec(),
+                        });
+                        ans = true;
+                    }
+                }
+            }
+            if want_aaaa {
+                let cached = cache
+                    .lookup_by_name(&name, F_IPV6, now)
+                    .map(|r| (r.addr.clone(), r.flags, r.ttl));
+                if let Some((addr, flags, cached_ttl)) = cached {
+                    if flags & F_NEG != 0 {
+                        if flags & F_NXDOMAIN != 0 {
+                            nxdomain = true;
+                        }
+                        ans = true;
+                    } else if let Some(AllAddr::Addr6(ip)) = addr {
+                        answers.push(DnsRr {
+                            name: name.clone(), rtype: 28, class: 1,
+                            ttl: cached_ttl, rdata: ip.octets().to_vec(),
+                        });
+                        ans = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // 5f. MX (qtype 15 or ANY).
+    if qtype == 15 || qtype == 255 {
+        for m in config.mx_records.iter()
+            .filter(|m| !m.is_srv && m.name.to_lowercase() == name)
+        {
+            let mut rd = BytesMut::new();
+            rd.put_u16(m.priority as u16);
+            write_name(&mut rd, &m.target);
+            answers.push(DnsRr { name: name.clone(), rtype: 15, class: 1, ttl, rdata: rd.to_vec() });
+            ans  = true;
+            auth = true;
+        }
+    }
+
+    // 5g. SRV (qtype 33 or ANY).
+    if qtype == 33 || qtype == 255 {
+        for s in config.mx_records.iter()
+            .filter(|m| m.is_srv && m.name.to_lowercase() == name)
+        {
+            let mut rd = BytesMut::new();
+            rd.put_u16(s.priority as u16);
+            rd.put_u16(s.weight as u16);
+            rd.put_u16(s.srv_port);
+            write_name(&mut rd, &s.target);
+            answers.push(DnsRr { name: name.clone(), rtype: 33, class: 1, ttl, rdata: rd.to_vec() });
+            ans  = true;
+            auth = true;
+        }
+    }
+
+    // 5h. NAPTR (qtype 35 or ANY).
+    if qtype == 35 || qtype == 255 {
+        for n in config.naptr_records.iter()
+            .filter(|n| n.name.to_lowercase() == name)
+        {
+            let mut rd = BytesMut::new();
+            rd.put_u16(n.order as u16);
+            rd.put_u16(n.pref as u16);
+            rd.put_u8(n.flags.len() as u8);
+            rd.put_slice(n.flags.as_bytes());
+            rd.put_u8(n.services.len() as u8);
+            rd.put_slice(n.services.as_bytes());
+            rd.put_u8(n.regexp.len() as u8);
+            rd.put_slice(n.regexp.as_bytes());
+            write_name(&mut rd, &n.replace);
+            answers.push(DnsRr { name: name.clone(), rtype: 35, class: 1, ttl, rdata: rd.to_vec() });
+            ans  = true;
+            auth = true;
+        }
+    }
+
+    // 6. No answer found → forward upstream.
+    if !ans {
+        return None;
+    }
+
+    // 7. Finalise response header.
+    response.answers        = answers;
+    response.header.ancount = response.answers.len() as u16;
+    if nxdomain {
+        response.header.set_rcode(3);
+        response.header.hb3 &= !HB3_AA;
+    } else if auth {
+        response.header.hb3 |= HB3_AA;
+        response.header.set_rcode(0);
+    } else {
+        response.header.hb3 &= !HB3_AA;
+        response.header.set_rcode(0);
+    }
+    response.header.hb3 |= HB3_QR;
+    response.header.hb4 |= HB4_RA;
+
+    Some(response)
+}
+
+/// Search `host_records` for the first record whose `addr4` or `addr6` matches
+/// `addr`.  Returns the first name from the matching record's `names` vec.
+fn host_records_find_by_addr(addr: &AllAddr, host_records: &[HostRecord]) -> Option<String> {
+    for hr in host_records {
+        let matched = match addr {
+            AllAddr::Addr4(ip4) => hr.addr4.as_ref() == Some(ip4),
+            AllAddr::Addr6(ip6) => hr.addr6.as_ref() == Some(ip6),
+            _                   => false,
+        };
+        if matched {
+            return hr.names.first().cloned();
+        }
+    }
+    None
+}
 
 #[cfg(test)]
 mod tests {
@@ -1282,6 +1659,146 @@ mod tests {
 
         let rec = cache.lookup_by_name("example.com", F_IPV4, now).unwrap();
         assert_eq!(rec.ttl, 3600); // clamped from 86400
+    }
+
+    // ── setup_reply ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_setup_reply_nxdomain() {
+        use crate::dns_protocol::HB3_QR;
+        let mut h = DnsHeader::default();
+        setup_reply(&mut h, F_NXDOMAIN);
+        assert_eq!(h.rcode(), 3);
+        assert!(h.hb3 & HB3_QR != 0, "QR must be set");
+    }
+
+    #[test]
+    fn test_setup_reply_noerror_auth() {
+        use crate::dns_protocol::{HB3_AA, HB3_QR};
+        let mut h = DnsHeader::default();
+        setup_reply(&mut h, F_IPV4);
+        assert_eq!(h.rcode(), 0);
+        assert!(h.hb3 & HB3_QR != 0, "QR must be set");
+        assert!(h.hb3 & HB3_AA != 0, "AA must be set for F_IPV4");
+    }
+
+    // ── answer_request ────────────────────────────────────────────────────────
+
+    fn make_query(name: &str, qtype: u16) -> DnsPacket {
+        let mut buf = BytesMut::new();
+        let mut h = DnsHeader::default();
+        h.qdcount = 1;
+        buf.put_slice(&h.to_bytes());
+        write_name(&mut buf, name);
+        buf.put_u16(qtype);
+        buf.put_u16(1); // IN
+        DnsPacket::parse(&buf).unwrap()
+    }
+
+    fn empty_config<'a>() -> LocalConfig<'a> {
+        LocalConfig {
+            local_ttl:    60,
+            txt_records:  &[],
+            rr_records:   &[],
+            mx_records:   &[],
+            ptr_records:  &[],
+            host_records: &[],
+            cnames:       &[],
+            naptr_records: &[],
+        }
+    }
+
+    #[test]
+    fn test_answer_request_a_from_host_records() {
+        use crate::types::dns_records::HostRecord;
+        let hr = HostRecord {
+            ttl:   60,
+            flags: 0,
+            names: vec!["myhost.local".into()],
+            addr4: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            addr6: None,
+        };
+        let cfg = LocalConfig { host_records: std::slice::from_ref(&hr), ..empty_config() };
+        let query = make_query("myhost.local", 1);
+        let mut cache = DnsCache::new(100);
+        let resp = answer_request(&query, &mut cache, Instant::now(), &cfg)
+            .expect("should answer from host_records");
+        assert_eq!(resp.answers.len(), 1);
+        let rr = &resp.answers[0];
+        assert_eq!(rr.rtype, 1);
+        assert_eq!(rr.rdata, vec![10, 0, 0, 1]);
+        assert!(resp.header.is_aa(), "AA should be set for host_records answer");
+    }
+
+    #[test]
+    fn test_answer_request_mx() {
+        use crate::types::dns_records::MxSrvRecord;
+        let mx = MxSrvRecord {
+            name:     "example.com".into(),
+            target:   "mail.example.com".into(),
+            is_srv:   false,
+            srv_port: 0,
+            priority: 10,
+            weight:   0,
+            offset:   0,
+        };
+        let cfg = LocalConfig { mx_records: std::slice::from_ref(&mx), ..empty_config() };
+        let query = make_query("example.com", 15);
+        let mut cache = DnsCache::new(100);
+        let resp = answer_request(&query, &mut cache, Instant::now(), &cfg)
+            .expect("should answer MX");
+        assert_eq!(resp.answers.len(), 1);
+        assert_eq!(resp.answers[0].rtype, 15);
+        let pref = u16::from_be_bytes([resp.answers[0].rdata[0], resp.answers[0].rdata[1]]);
+        assert_eq!(pref, 10);
+    }
+
+    #[test]
+    fn test_answer_request_nxdomain_from_cache() {
+        use crate::cache::CacheRecord;
+        let now = Instant::now();
+        let mut cache = DnsCache::new(100);
+        cache.insert(CacheRecord {
+            name:    "noexist.local".into(),
+            flags:   F_NXDOMAIN | F_NEG,
+            ttl:     300,
+            expires: now + std::time::Duration::from_secs(300),
+            addr:    None,
+            rdata:   None,
+        });
+        let cfg   = empty_config();
+        let query = make_query("noexist.local", 1);
+        let resp  = answer_request(&query, &mut cache, now, &cfg)
+            .expect("should return NXDOMAIN response");
+        assert_eq!(resp.header.rcode(), 3);
+    }
+
+    #[test]
+    fn test_answer_request_no_match_returns_none() {
+        let cfg   = empty_config();
+        let query = make_query("unknown.example.com", 1);
+        let mut cache = DnsCache::new(100);
+        let resp = answer_request(&query, &mut cache, Instant::now(), &cfg);
+        assert!(resp.is_none(), "unknown name should return None");
+    }
+
+    #[test]
+    fn test_answer_request_txt() {
+        use crate::types::dns_records::TxtRecord;
+        let txt = TxtRecord {
+            name:  "example.com".into(),
+            txt:   b"v=spf1 ~all".to_vec(),
+            class: 1,
+            stat:  0,
+        };
+        let cfg   = LocalConfig { txt_records: std::slice::from_ref(&txt), ..empty_config() };
+        let query = make_query("example.com", 16);
+        let mut cache = DnsCache::new(100);
+        let resp = answer_request(&query, &mut cache, Instant::now(), &cfg)
+            .expect("should answer TXT");
+        assert_eq!(resp.answers.len(), 1);
+        assert_eq!(resp.answers[0].rtype, 16);
+        assert_eq!(resp.answers[0].rdata, b"v=spf1 ~all".to_vec());
     }
 }
 
