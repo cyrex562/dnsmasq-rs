@@ -13,7 +13,7 @@ use crate::types::addr::{AllAddr, CnameAddr, RrDataAddr};
 use crate::types::constants::{
     F_CNAME, F_DNSSECOK, F_FORWARD, F_IPV4, F_IPV6, F_NEG, F_NXDOMAIN, F_RCODE, F_REVERSE, F_RR,
 };
-use crate::types::dns_records::{Cname, HostRecord, MxSrvRecord, Naptr, PtrRecord, TxtRecord};
+use crate::types::dns_records::{BogusAddr, Cname, Doctor, HostRecord, MxSrvRecord, Naptr, PtrRecord, TxtRecord};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Error type
@@ -1167,6 +1167,180 @@ fn host_records_find_by_addr(addr: &AllAddr, host_records: &[HostRecord]) -> Opt
     None
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Check helpers: bogus addresses, ignored addresses, local domain, do_doctor
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Returns `true` if `sub` is equal to `domain` or is a subdomain of it
+/// (case-insensitive).
+pub fn hostname_issubdomain(sub: &str, domain: &str) -> bool {
+    let s = sub.to_lowercase();
+    let d = domain.to_lowercase();
+    s == d || s.ends_with(&format!(".{d}"))
+}
+
+/// Returns `true` if `addr` falls within the range / prefix described by `ba`.
+fn addr_in_bogus_range(addr: &AllAddr, ba: &BogusAddr) -> bool {
+    match addr {
+        AllAddr::Addr4(ip) if !ba.is6 => match &ba.addr {
+            AllAddr::Addr4(ba_ip) => {
+                let prefix = ba.prefix.clamp(0, 32) as u32;
+                let mask = if prefix == 0 {
+                    0u32
+                } else if prefix >= 32 {
+                    u32::MAX
+                } else {
+                    !((1u32 << (32 - prefix)) - 1)
+                };
+                (u32::from_be_bytes(ip.octets()) & mask)
+                    == (u32::from_be_bytes(ba_ip.octets()) & mask)
+            }
+            _ => false,
+        },
+        AllAddr::Addr6(ip) if ba.is6 => match &ba.addr {
+            AllAddr::Addr6(ba_ip) => {
+                let prefix = ba.prefix.clamp(0, 128) as u32;
+                let full  = (prefix / 8) as usize;
+                let rem   = prefix % 8;
+                let ib = ip.octets();
+                let bb = ba_ip.octets();
+                if ib[..full] != bb[..full] {
+                    return false;
+                }
+                if rem > 0 && full < 16 {
+                    let mask = !((1u8 << (8 - rem)) - 1);
+                    (ib[full] & mask) == (bb[full] & mask)
+                } else {
+                    true
+                }
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Check whether any A record in `packet` matches a bogus-address list.
+///
+/// If a match is found, inserts an NXDOMAIN negative cache entry for the
+/// question name (TTL = `local_ttl`) and returns `true`.
+pub fn check_for_bogus_wildcard(
+    packet:     &DnsPacket,
+    cache:      &mut DnsCache,
+    now:        Instant,
+    bogus_addrs: &[BogusAddr],
+    local_ttl:  u32,
+) -> bool {
+    if bogus_addrs.is_empty() { return false; }
+
+    let qname = packet.questions.first().map(|q| q.name.to_lowercase());
+
+    for rr in &packet.answers {
+        if rr.class != 1 || rr.rdata.len() < 4 { continue; }
+        let addr_opt: Option<AllAddr> = match rr.rtype {
+            1 if rr.rdata.len() >= 4 => Some(AllAddr::Addr4(Ipv4Addr::new(
+                rr.rdata[0], rr.rdata[1], rr.rdata[2], rr.rdata[3],
+            ))),
+            _ => None,
+        };
+        if let Some(addr) = addr_opt {
+            for ba in bogus_addrs {
+                if addr_in_bogus_range(&addr, ba) {
+                    if let Some(ref name) = qname {
+                        cache.insert(CacheRecord {
+                            name:    name.clone(),
+                            flags:   F_FORWARD | F_NEG | F_NXDOMAIN,
+                            ttl:     local_ttl,
+                            expires: now + Duration::from_secs(u64::from(local_ttl)),
+                            addr:    None,
+                            rdata:   None,
+                        });
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Check whether any A or AAAA record in `packet` matches an address in the
+/// ignore list.  If so, the reply should be silently dropped.
+pub fn check_for_ignored_address(packet: &DnsPacket, ignore_addrs: &[BogusAddr]) -> bool {
+    if ignore_addrs.is_empty() { return false; }
+
+    for rr in &packet.answers {
+        if rr.class != 1 { continue; }
+        let addr_opt: Option<AllAddr> = match rr.rtype {
+            1 if rr.rdata.len() >= 4 => Some(AllAddr::Addr4(Ipv4Addr::new(
+                rr.rdata[0], rr.rdata[1], rr.rdata[2], rr.rdata[3],
+            ))),
+            28 if rr.rdata.len() >= 16 => {
+                let mut b = [0u8; 16];
+                b.copy_from_slice(&rr.rdata[..16]);
+                Some(AllAddr::Addr6(Ipv6Addr::from(b)))
+            }
+            _ => None,
+        };
+        if let Some(addr) = addr_opt {
+            for ia in ignore_addrs {
+                if addr_in_bogus_range(&addr, ia) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Returns `true` if `name` matches any locally-configured record type.
+///
+/// Checks NAPTR, MX/SRV, TXT, and PTR records for an exact match or subdomain
+/// relationship (mirrors C's `check_for_local_domain()`).
+pub fn check_for_local_domain(name: &str, config: &LocalConfig<'_>) -> bool {
+    config.naptr_records.iter().any(|n| hostname_issubdomain(name, &n.name))
+        || config.mx_records.iter().any(|m| hostname_issubdomain(name, &m.name))
+        || config.txt_records.iter().any(|t| hostname_issubdomain(name, &t.name))
+        || config.ptr_records.iter().any(|p| hostname_issubdomain(name, &p.name))
+        || config.host_records.iter().any(|h| {
+            h.names.iter().any(|n| hostname_issubdomain(name, n))
+        })
+}
+
+/// Rewrite A-record addresses in `packet.answers` according to `doctors`.
+///
+/// Returns `true` if any rewrite was performed.  Clears the AA flag on the
+/// header when a rewrite happens (data is no longer authoritative).
+pub fn do_doctor(packet: &mut DnsPacket, doctors: &[Doctor]) -> bool {
+    if doctors.is_empty() { return false; }
+    let mut done = false;
+    for rr in &mut packet.answers {
+        if rr.class != 1 || rr.rtype != 1 || rr.rdata.len() < 4 { continue; }
+        let ip = u32::from_be_bytes([rr.rdata[0], rr.rdata[1], rr.rdata[2], rr.rdata[3]]);
+        for doctor in doctors {
+            let in_u32  = u32::from_be_bytes(doctor.in_addr.octets());
+            let end_u32 = u32::from_be_bytes(doctor.end_addr.octets());
+            let out_u32 = u32::from_be_bytes(doctor.out_addr.octets());
+            let mask    = u32::from_be_bytes(doctor.mask.octets());
+            let matches = if end_u32 == 0 {
+                (ip & mask) == (in_u32 & mask)
+            } else {
+                ip >= in_u32 && ip <= end_u32
+            };
+            if matches {
+                let new_ip = (ip & !mask) | (out_u32 & mask);
+                let bytes = new_ip.to_be_bytes();
+                rr.rdata[..4].copy_from_slice(&bytes);
+                packet.header.hb3 &= !HB3_AA;
+                done = true;
+                break;
+            }
+        }
+    }
+    done
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1800,5 +1974,115 @@ mod tests {
         assert_eq!(resp.answers[0].rtype, 16);
         assert_eq!(resp.answers[0].rdata, b"v=spf1 ~all".to_vec());
     }
+
+    // ── check helpers ─────────────────────────────────────────────────────────
+
+    use crate::types::dns_records::{BogusAddr, Doctor};
+
+    #[test]
+    fn hostname_issubdomain_eq_and_sub() {
+        assert!(hostname_issubdomain("example.com", "example.com"));
+        assert!(hostname_issubdomain("www.example.com", "example.com"));
+        assert!(!hostname_issubdomain("notexample.com", "example.com"));
+        assert!(!hostname_issubdomain("other.com", "example.com"));
+    }
+
+    #[test]
+    fn check_for_local_domain_matches() {
+        let hr = HostRecord {
+            ttl: -1, flags: 0,
+            names: vec!["myhost.local".into()],
+            addr4: Some(Ipv4Addr::new(1, 2, 3, 4)),
+            addr6: None,
+        };
+        let cfg = LocalConfig { host_records: std::slice::from_ref(&hr), ..empty_config() };
+        assert!(check_for_local_domain("myhost.local", &cfg));
+        assert!(check_for_local_domain("sub.myhost.local", &cfg));
+        assert!(!check_for_local_domain("other.example.com", &cfg));
+    }
+
+    #[test]
+    fn do_doctor_rewrites_a_record() {
+        // Doctor rule: rewrite 192.168.1.0/24 → 10.0.0.0/24 (mask /24)
+        let doctor = Doctor {
+            in_addr:  Ipv4Addr::new(192, 168, 1, 0),
+            end_addr: Ipv4Addr::new(0, 0, 0, 0), // 0 = use subnet
+            out_addr: Ipv4Addr::new(10, 0, 0, 0),
+            mask:     Ipv4Addr::new(255, 255, 255, 0),
+        };
+        let mut pkt = reply_header(10, 1, 1, 0, 0);
+        push_question(&mut pkt, "h.test", 1);
+        push_rr(&mut pkt, "h.test", 1, 60, &[192, 168, 1, 5]);
+        let mut dp = DnsPacket::parse(&pkt).unwrap();
+        assert!(do_doctor(&mut dp, std::slice::from_ref(&doctor)));
+        // host octet preserved (5), network bits rewritten → 10.0.0.5
+        assert_eq!(dp.answers[0].rdata, vec![10, 0, 0, 5]);
+        assert_eq!(dp.header.hb3 & 0x04, 0); // AA cleared
+    }
+
+    #[test]
+    fn do_doctor_no_match() {
+        let doctor = Doctor {
+            in_addr:  Ipv4Addr::new(10, 0, 0, 0),
+            end_addr: Ipv4Addr::new(0, 0, 0, 0),
+            out_addr: Ipv4Addr::new(172, 16, 0, 0),
+            mask:     Ipv4Addr::new(255, 0, 0, 0),
+        };
+        let mut pkt = reply_header(11, 1, 1, 0, 0);
+        push_question(&mut pkt, "h.test", 1);
+        push_rr(&mut pkt, "h.test", 1, 60, &[8, 8, 8, 8]);
+        let mut dp = DnsPacket::parse(&pkt).unwrap();
+        assert!(!do_doctor(&mut dp, std::slice::from_ref(&doctor)));
+        assert_eq!(dp.answers[0].rdata, vec![8, 8, 8, 8]); // unchanged
+    }
+
+    #[test]
+    fn check_bogus_wildcard_caches_nxdomain() {
+        let ba = BogusAddr {
+            is6: false,
+            prefix: 32,
+            addr: AllAddr::Addr4(Ipv4Addr::new(1, 2, 3, 4)),
+        };
+        let mut pkt = reply_header(12, 1, 1, 0, 0);
+        push_question(&mut pkt, "evil.example.com", 1);
+        push_rr(&mut pkt, "evil.example.com", 1, 60, &[1, 2, 3, 4]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        assert!(check_for_bogus_wildcard(&dp, &mut cache, now, std::slice::from_ref(&ba), 300));
+        // NXDOMAIN entry should now be in cache
+        let rec = cache.lookup_by_name("evil.example.com", F_NXDOMAIN | F_NEG, now);
+        assert!(rec.is_some());
+    }
+
+    #[test]
+    fn check_ignored_address_matches() {
+        let ia = BogusAddr {
+            is6: false,
+            prefix: 24,
+            addr: AllAddr::Addr4(Ipv4Addr::new(192, 0, 2, 0)),
+        };
+        let mut pkt = reply_header(13, 1, 1, 0, 0);
+        push_question(&mut pkt, "h.test", 1);
+        push_rr(&mut pkt, "h.test", 1, 60, &[192, 0, 2, 99]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        assert!(check_for_ignored_address(&dp, std::slice::from_ref(&ia)));
+    }
+
+    #[test]
+    fn check_ignored_address_no_match() {
+        let ia = BogusAddr {
+            is6: false,
+            prefix: 32,
+            addr: AllAddr::Addr4(Ipv4Addr::new(1, 2, 3, 4)),
+        };
+        let mut pkt = reply_header(14, 1, 1, 0, 0);
+        push_question(&mut pkt, "h.test", 1);
+        push_rr(&mut pkt, "h.test", 1, 60, &[8, 8, 8, 8]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        assert!(!check_for_ignored_address(&dp, std::slice::from_ref(&ia)));
+    }
 }
+
 
