@@ -871,3 +871,118 @@ Each module must have:
    - `fuzz_dns_packet_parser`
    - `fuzz_dhcp_option_parser`
    - `fuzz_config_file_parser`
+
+---
+
+## Completion Tasks (Stubs & Incomplete Implementations)
+
+The following tasks represent code that was scaffolded or only partially ported. Each item below must be completed for a production-quality implementation.
+
+### DNS Core (`src/rfc1035.rs`)
+
+| ID | Task | Description |
+|---|---|---|
+| `rfc1035-extract-addresses` | Implement `extract_addresses()` | ~400 C lines. Populates DNS cache from reply packet — processes A/AAAA/CNAME/PTR/SOA/MX/SRV/TXT/DNSKEY/DS/RRSIG RRs |
+| `rfc1035-answer-request` | Implement `answer_request()` | ~500 C lines. Builds DNS reply from local config (hosts, address=, mx-host, txt-record, ptr-record etc.) |
+| `rfc1035-add-resource-record` | Implement `add_resource_record()` | Writes RRs into DNS reply buffer with name compression. Current `write_rr()` has no compression. |
+| `rfc1035-check-functions` | Implement check/setup helpers | `check_for_bogus_wildcard()`, `check_for_ignored_address()`, `do_doctor()`, `check_for_local_domain()`, `setup_reply()`, `report_addresses()` — all missing |
+| `rfc1035-resize-packet` | Implement `resize_packet()` | Removes/truncates EDNS0 OPT to fit within smaller UDP MTU |
+
+### DNS Forwarding (`src/forward.rs`)
+
+| ID | Task | Description |
+|---|---|---|
+| `forward-async-loop` | Implement async query dispatch loop | Port `receive_query()`, `reply_query()`, `tcp_request()`, `send_from()`. Heart of dnsmasq. Currently only `ForwardTable` data structure (370 lines vs 3319 C lines) |
+| `forward-tcp-fallback` | Implement TCP fallback | Port `tcp_from_udp()`. When UDP reply has TC bit set, retry over TCP |
+| `forward-retry-failover` | Implement retry/failover | Port `fast_retry()`, `pop_and_retry_query()`, `server_gone()`, `resend_query()` |
+| `forward-rfd-management` | Implement random FD management | Port `allocate_rfd()` / `free_rfds()` — random source-port FD pool for upstream queries |
+
+### Daemon Init & Event Loop (`src/dnsmasq.rs`)
+
+| ID | Task | Description |
+|---|---|---|
+| `dnsmasq-main-loop` | Implement main event loop | Port poll/select event loop from `dnsmasq.c main()`. Integrates DNS, DHCP, RA, timers, signals |
+| `dnsmasq-daemonize` | Implement `daemonize()` | UNIX fork, setsid, close stdio, write PID, drop privileges in child |
+| `dnsmasq-sighup-reload` | Implement SIGHUP reload | Port `clear_cache_and_reload()` — re-reads config, hosts, resolv.conf, DHCP config on SIGHUP |
+| `dnsmasq-alarm-timer` | Implement timer management | Port `send_alarm()`, `queue_event()`, `send_event()` and periodic timer logic |
+
+### Configuration Parser (`src/option.rs`)
+
+| ID | Task | Description |
+|---|---|---|
+| `option-missing-opts` | Implement ~170 missing config options | Only ~35 of 200+ options handled. Missing: `dhcp-range`, `dhcp-host`, `dhcp-option`, `dhcp-boot`, `mx-host`, `srv-host`, `txt-record`, `ptr-record`, `address/AAAA`, `host-record`, `cname`, `resolv-file`, `servers-file`, `hosts-dir`, `addn-hosts`, `conf-dir`, `local-ttl`, `max-ttl`, `neg-ttl`, `dns-forward-max`, `interface`, `except-interface`, `bind-interfaces`, `bogus-nxdomain`, `alias`, `ipset`, `nftset`, `auth-zone`, `tftp-root` and many more |
+| `option-read-opts-cli` | Implement `read_opts()` CLI | Port 300+ command-line arguments via getopt. Currently only `--conf-file`, `--port`, `--version` |
+| `option-dynfile` | Implement conf-dir / servers-file | Port `option_read_dynfile()` for `/etc/dnsmasq.d/` and `read_servers_file()` for dynamic upstream server files |
+| `option-reread-dhcp` | Implement `reread_dhcp()` | Re-reads DHCP host/option/range config on SIGHUP |
+
+### DNS Cache (`src/cache.rs`)
+
+| ID | Task | Description |
+|---|---|---|
+| `cache-hosts-reload` | Implement /etc/hosts loading | Load `/etc/hosts` and addn-hosts files into cache as immortal records |
+| `cache-extract-integration` | Integrate with extract_addresses() | Wire `extract_addresses()` into `DnsCache::insert()` — CNAME chains, negative caching, TTL clamping |
+| `cache-negative-caching` | Implement negative caching | NXDOMAIN and NODATA entries with `F_NEG` flag, SOA-derived negative TTL, proper expiry |
+
+### Network Interfaces (`src/network.rs`)
+
+| ID | Task | Description |
+|---|---|---|
+| `network-enumerate-ifaces` | Implement `enumerate_interfaces()` | Uses getifaddrs()/netlink to populate `daemon.interfaces`. Critical for binding. Currently only stub helpers |
+| `network-socket-creation` | Implement listener socket creation | Port `create_wildcard_listeners()`, `create_bound_listeners()`, `join_multicast()`, `set_ipv6pktinfo()`, `local_bind()` |
+| `network-iface-check` | Implement `iface_check()` | Validates whether a packet on an interface should be accepted (checking allowed/excluded lists) |
+
+### Missing Modules (no Rust equivalent yet)
+
+| ID | Task | Description |
+|---|---|---|
+| `dhcp-module` | Create `src/dhcp.rs` | Port `dhcp.c` (1124 lines): `dhcp_init()`, `dhcp_packet()` main loop, `address_allocate()` with ICMP ping conflict detection, `dhcp_read_ethers()`, `host_from_dns()`. Feature-gated `dhcp`. |
+| `dhcp6-module` | Create `src/dhcp6.rs` | Port `dhcp6.c` (881 lines): `dhcp6_init()`, `dhcp6_packet()` main loop, `get_client_mac()`, `make_duid()` DUID-LLT, `dhcp_construct_contexts()`. Feature-gated `dhcp6`. |
+| `metrics-wiring` | Wire metrics counters into code | `src/metrics/mod.rs` has atomic counters but no code path calls `metrics::inc()`. Instrument `forward.rs`, `cache.rs`, `rfc2131.rs` etc. |
+
+### DHCPv4 State Machine (`src/rfc2131.rs`)
+
+| ID | Task | Description |
+|---|---|---|
+| `rfc2131-inform-release` | Implement INFORM/RELEASE/DECLINE | Port `handle_inform()`, `handle_release()`, `handle_decline()`. Only DISCOVER and REQUEST currently handled |
+| `rfc2131-relay` | Implement DHCP relay agent | Relay forwarding with giaddr, Option 82, unicast to client |
+| `rfc2131-pxe` | Implement PXE boot | `dhcp-boot` option, next-server, filename fields, PXE vendor class matching |
+| `rfc2131-option-injection` | Implement full option injection | All configured `dhcp-option` values, domain-search, router, DNS servers, lease time, subnet mask etc. Currently only msg_type and server_id added |
+
+### DNSSEC Validation (`src/dnssec.rs`)
+
+| ID | Task | Description |
+|---|---|---|
+| `dnssec-validate-chain` | Implement full validation chain | `verify_packet()`, check RRSIG against DNSKEY, walk chain of trust from root |
+| `dnssec-nsec` | Implement NSEC/NSEC3 proof-of-nonexistence | NSEC/NSEC3 parsing and proof-of-non-existence for secure negative responses |
+
+### DHCPv6 State Machine (`src/rfc3315.rs`)
+
+| ID | Task | Description |
+|---|---|---|
+| `rfc3315-missing-types` | Implement Renew/Rebind/Release/Decline/Confirm/Info-Request | Only Solicit→Advertise and Request→Reply implemented. Missing all other DHCPv6 message types and Prefix Delegation (IA_PD) |
+
+### Other Modules
+
+| ID | Task | Description |
+|---|---|---|
+| `domain-ipv6-synth` | domain: IPv6 synthetic names | Port IPv6 address synthesis and reverse PTR synthesis. Currently only IPv4 handled |
+| `domain-match-wildcard` | domain_match: SERV_WILDCARD / NODOTS | Port SERV_WILDCARD matching, NODOTS server exclusion, SERV_IS_LOCAL distinction |
+| `log-syslog` | log: full syslog facility mapping | Port full `log.c` (494 lines): facility selection, async log queue, `die()` with cleanup |
+| `bpf-socket` | bpf: raw socket + BPF attachment | Port AF_PACKET socket, `SO_ATTACH_FILTER`, raw DHCP packet sending. Currently only instruction arrays |
+| `dbus-real-impl` | dbus: real zbus D-Bus interface | Port `dbus.c` (1106 lines) using zbus: GetVersion, ClearCache, SetServers methods, lease-change signals |
+| `tables-bsd-impl` | tables: BSD PF table ioctl | Implement actual pfctl ioctl on BSD targets. Currently always returns `NotSupported` |
+
+### End-to-End Wiring
+
+| ID | Task | Description |
+|---|---|---|
+| `wiring-dns-pipeline` | Wire DNS pipeline | `receive_query()` → cache lookup → `forward.rs` → `reply_query()` → `cache insert`. All modules currently standalone |
+| `wiring-dhcp-pipeline` | Wire DHCPv4 pipeline | `dhcp.rs` socket loop → `rfc2131.rs` → `lease.rs` → `helper.rs` script notification |
+
+### Property-Based Tests
+
+| ID | Task | Description |
+|---|---|---|
+| `proptest-rfc1035` | proptest: DNS parser | Arbitrary valid packets round-trip; `extract_name` handles all inputs; `write_name`→`extract_name` identity |
+| `proptest-cache` | proptest: DNS cache | Insert N records with arbitrary TTLs; LRU eviction invariants |
+| `proptest-dhcp` | proptest: DHCP parser | Arbitrary option buffers don't panic in `find_option()`; valid packets round-trip |
