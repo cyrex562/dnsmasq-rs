@@ -2,11 +2,12 @@
 //!
 //! Ported from dnsmasq's `forward.c`.  This module contains the pure
 //! data structures (`ForwardTable`, `PendingQuery`) and stateless helper
-//! functions (`patch_id`, `next_server`, `reply_matches_query`).
-//! The async I/O loop is deferred to Phase 11.
+//! functions (`patch_id`, `next_server`, `reply_matches_query`), plus
+//! the async UDP forwarding engine (`ForwardEngine`, `run_forward_loop`).
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::hash_questions::hash_questions;
@@ -196,8 +197,155 @@ pub fn reply_matches_query(query_pkt: &[u8], reply_pkt: &[u8]) -> bool {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Tests
+// Async forwarding engine
 // ──────────────────────────────────────────────────────────────────────────────
+
+/// Maximum DNS packet size (UDP).
+pub const MAX_PACKET_SIZE: usize = 65535;
+
+/// Default query timeout before a forwarded query is abandoned.
+pub const QUERY_TIMEOUT_SECS: u64 = 10;
+
+/// Configuration for the forwarding engine.
+#[derive(Debug, Clone)]
+pub struct ForwardConfig {
+    /// Ordered list of upstream resolver addresses.
+    pub upstreams: Vec<SocketAddr>,
+    /// Per-query timeout.
+    pub timeout: Duration,
+    /// Maximum number of retries per query.
+    pub max_retries: u8,
+}
+
+impl Default for ForwardConfig {
+    fn default() -> Self {
+        Self {
+            upstreams:   Vec::new(),
+            timeout:     Duration::from_secs(QUERY_TIMEOUT_SECS),
+            max_retries: 2,
+        }
+    }
+}
+
+/// Stateful DNS forwarding engine.
+///
+/// Owns a [`ForwardTable`] and the forwarding configuration.  Used by
+/// `run_forward_loop` but can also be driven manually for testing.
+pub struct ForwardEngine {
+    pub config:          ForwardConfig,
+    pub table:           ForwardTable,
+    upstream_order:      Vec<usize>,
+}
+
+impl ForwardEngine {
+    /// Create a new engine with the given configuration.
+    pub fn new(config: ForwardConfig) -> Self {
+        let n = config.upstreams.len();
+        Self {
+            upstream_order: (0..n).collect(),
+            table: ForwardTable::new(),
+            config,
+        }
+    }
+
+    /// Forward `pkt` to an upstream server and record the pending query.
+    ///
+    /// Returns `Some(upstream_id)` on success, `None` if no upstream is
+    /// available or the send fails.
+    pub async fn forward_query(
+        &mut self,
+        pkt: &[u8],
+        client: SocketAddr,
+        upstream_sock: &tokio::net::UdpSocket,
+    ) -> Option<u16> {
+        if pkt.len() < 12 || self.config.upstreams.is_empty() {
+            return None;
+        }
+        let tried = HashSet::new();
+        let server_idx = next_server(&self.upstream_order, &tried, usize::MAX)?;
+        let upstream_addr = self.config.upstreams[server_idx];
+
+        let qhash = hash_questions(pkt).unwrap_or([0u8; 16]);
+        let orig_id = u16::from_be_bytes([pkt[0], pkt[1]]);
+        let new_id = self.table.alloc_query(orig_id, client, server_idx, qhash);
+
+        let mut out = pkt.to_vec();
+        patch_id(&mut out, new_id);
+        match upstream_sock.send_to(&out, upstream_addr).await {
+            Ok(_) => Some(new_id),
+            Err(_) => {
+                self.table.remove(new_id);
+                None
+            }
+        }
+    }
+
+    /// Process an upstream reply.
+    ///
+    /// Matches the reply's transaction ID against the pending table.  If a
+    /// match is found, restores the original client ID and returns
+    /// `(client_addr, reply_bytes)`.
+    pub fn handle_reply(&mut self, reply: &mut Vec<u8>) -> Option<(SocketAddr, Vec<u8>)> {
+        if reply.len() < 2 { return None; }
+        let reply_id = u16::from_be_bytes([reply[0], reply[1]]);
+        let pending = self.table.remove(reply_id)?;
+        patch_id(reply, pending.orig_id);
+        Some((pending.client, reply.clone()))
+    }
+
+    /// Expire timed-out pending queries.
+    pub fn expire_queries(&mut self) -> Vec<PendingQuery> {
+        self.table.expire_old(self.config.timeout)
+    }
+}
+
+/// Run the DNS UDP forwarding event loop.
+///
+/// * `client_sock` — bound UDP socket facing DNS clients.
+/// * `config`      — forwarding configuration (upstreams, timeout).
+///
+/// Runs until an unrecoverable I/O error occurs.  Logs are omitted for
+/// simplicity; callers should wrap this in a task and handle the error.
+pub async fn run_forward_loop(
+    client_sock: Arc<tokio::net::UdpSocket>,
+    config: ForwardConfig,
+) -> std::io::Result<()> {
+    // Ephemeral socket for upstream communication.
+    let upstream_sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+
+    let mut engine       = ForwardEngine::new(config);
+    let mut client_buf   = vec![0u8; MAX_PACKET_SIZE];
+    let mut upstream_buf = vec![0u8; MAX_PACKET_SIZE];
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+
+    loop {
+        tokio::select! {
+            // ── Incoming client query ─────────────────────────────────────────
+            result = client_sock.recv_from(&mut client_buf) => {
+                let (len, src) = result?;
+                let pkt = &client_buf[..len];
+                // Only forward DNS queries (QR bit == 0).
+                if pkt.len() >= 12 && pkt[2] & 0x80 == 0 {
+                    engine.forward_query(pkt, src, &upstream_sock).await;
+                }
+            }
+            // ── Upstream reply ────────────────────────────────────────────────
+            result = upstream_sock.recv_from(&mut upstream_buf) => {
+                let (len, _) = result?;
+                let mut pkt = upstream_buf[..len].to_vec();
+                if let Some((client_addr, reply)) = engine.handle_reply(&mut pkt) {
+                    let _ = client_sock.send_to(&reply, client_addr).await;
+                }
+            }
+            // ── Periodic expiry cleanup ───────────────────────────────────────
+            _ = ticker.tick() => {
+                let _expired = engine.expire_queries();
+            }
+        }
+    }
+}
+
+
 
 #[cfg(test)]
 mod tests {
@@ -367,4 +515,56 @@ mod tests {
         let query = make_dns_query("example.com", 1);
         assert!(!reply_matches_query(&query, &[0u8; 3]));
     }
+
+    // ── ForwardEngine ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn forward_engine_handle_reply_restores_id() {
+        let config = ForwardConfig {
+            upstreams: vec!["127.0.0.1:5353".parse().unwrap()],
+            ..Default::default()
+        };
+        let mut engine = ForwardEngine::new(config);
+        let client: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        // Simulate inserting a pending query with orig_id=42.
+        let new_id = engine.table.alloc_query(42, client, 0, [0u8; 16]);
+
+        // Build a fake reply with the upstream ID.
+        let mut reply = vec![
+            (new_id >> 8) as u8, (new_id & 0xFF) as u8, // upstream ID
+            0x84, 0x00, // QR=1, AA=1
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, // counts
+        ];
+        let (addr, patched) = engine.handle_reply(&mut reply).expect("should match");
+        assert_eq!(addr, client);
+        // Restored to original client ID 42.
+        let restored_id = u16::from_be_bytes([patched[0], patched[1]]);
+        assert_eq!(restored_id, 42);
+    }
+
+    #[test]
+    fn forward_engine_handle_reply_unknown_id_returns_none() {
+        let config = ForwardConfig::default();
+        let mut engine = ForwardEngine::new(config);
+        let mut reply = vec![0xAB, 0xCD, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
+                             0x00, 0x00, 0x00, 0x00];
+        assert!(engine.handle_reply(&mut reply).is_none());
+    }
+
+    #[test]
+    fn forward_engine_expire_queries() {
+        let config = ForwardConfig {
+            timeout: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let mut engine = ForwardEngine::new(config);
+        let client: SocketAddr = "127.0.0.1:999".parse().unwrap();
+        engine.table.alloc_query(1, client, 0, [0u8; 16]);
+        // Wait for timeout.
+        std::thread::sleep(Duration::from_millis(5));
+        let expired = engine.expire_queries();
+        assert_eq!(expired.len(), 1);
+    }
 }
+
