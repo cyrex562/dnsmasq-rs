@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use lru::LruCache;
 
+use crate::metrics::{inc_metric, Metric};
 use crate::types::addr::AllAddr;
 use crate::types::constants::{
     F_CNAME, F_DNSSEC, F_DNSKEY, F_DS, F_FORWARD, F_IMMORTAL, F_IPV4, F_IPV6, F_NEG,
@@ -116,8 +117,10 @@ impl DnsCache {
         let was_full = self.records.len() == self.max_size;
         self.records.put(key, rec);
         self.inserts += 1;
+        inc_metric(Metric::DnsCacheInserted);
         if was_full {
             self.evictions += 1;
+            inc_metric(Metric::DnsCacheLiveFreed);
         }
     }
 

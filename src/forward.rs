@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::hash_questions::hash_questions;
+use crate::metrics::{inc_metric, Metric};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Types
@@ -379,7 +380,10 @@ impl ForwardEngine {
         let mut out = pkt.to_vec();
         patch_id(&mut out, new_id);
         match upstream_sock.send_to(&out, upstream_addr).await {
-            Ok(_) => Some(new_id),
+            Ok(_) => {
+                inc_metric(Metric::DnsQueriesForwarded);
+                Some(new_id)
+            }
             Err(_) => {
                 self.table.remove(new_id);
                 None
@@ -544,6 +548,7 @@ pub async fn tcp_fallback(
     client_id: u16,
     timeout: Duration,
 ) -> Option<Vec<u8>> {
+    inc_metric(Metric::TcpConnections);
     let mut resp = tcp_query(upstream, orig_query, timeout).await?;
     if resp.len() >= 2 {
         resp[0] = (client_id >> 8) as u8;
