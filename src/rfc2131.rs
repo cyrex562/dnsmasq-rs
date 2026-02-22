@@ -6,7 +6,9 @@ use std::net::Ipv4Addr;
 #[cfg(feature = "dhcp")]
 use crate::dhcp_protocol::{
     DhcpMsgType, DhcpPacket,
+    BOOTREQUEST, BOOTREPLY,
     OPTION_END, OPTION_MESSAGE_TYPE, OPTION_REQUESTED_IP, OPTION_SERVER_IDENTIFIER,
+    DHCP_SERVER_PORT,
 };
 #[cfg(feature = "dhcp")]
 use crate::types::dhcp::DhcpLease;
@@ -187,6 +189,57 @@ pub fn handle_decline(pkt: &DhcpPacket, pool_start: Ipv4Addr, pool_end: Ipv4Addr
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Relay agent support (RFC 2131 §4.1.1 / RFC 1542)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Direction of relay forwarding.
+#[cfg(feature = "dhcp")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayDirection {
+    /// Client → server (giaddr is set to relay's address).
+    ClientToServer,
+    /// Server → client (relay forwards reply to client).
+    ServerToClient,
+}
+
+/// Add relay-agent information to a DHCP packet being forwarded from client
+/// to server.
+///
+/// - Sets `hops += 1` (relay hop count).
+/// - Sets `giaddr` to `relay_addr` if it is currently UNSPECIFIED.
+///
+/// Returns `false` if `hops` has reached 16 (discard per RFC 1542 §3.2).
+#[cfg(feature = "dhcp")]
+pub fn relay_client_to_server(pkt: &mut DhcpPacket, relay_addr: Ipv4Addr) -> bool {
+    if pkt.hops >= 16 {
+        return false;
+    }
+    pkt.hops += 1;
+    if pkt.giaddr == Ipv4Addr::UNSPECIFIED {
+        pkt.giaddr = relay_addr;
+    }
+    pkt.op = BOOTREQUEST;
+    true
+}
+
+/// Strip relay-agent modifications and forward a server reply to the client.
+///
+/// The relay:
+/// 1. Extracts the destination from `giaddr` (if set) or uses broadcast.
+/// 2. Sets `op = BOOTREPLY`.
+/// 3. Returns the destination address where the packet should be sent.
+///
+/// Returns `None` if `giaddr` is UNSPECIFIED (packet was not relayed).
+#[cfg(feature = "dhcp")]
+pub fn relay_server_to_client(pkt: &mut DhcpPacket) -> Option<Ipv4Addr> {
+    if pkt.giaddr == Ipv4Addr::UNSPECIFIED {
+        return None;
+    }
+    pkt.op = BOOTREPLY;
+    Some(pkt.giaddr)
+}
+
 #[cfg(all(test, feature = "dhcp"))]
 mod tests {
     use super::*;
@@ -353,5 +406,48 @@ mod tests {
         let mut pkt = base_packet();
         pkt.options = opts_with_requested_ip(declined);
         assert!(!handle_decline(&pkt, start, end));
+    }
+
+    // ── relay tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn relay_client_to_server_sets_giaddr_and_increments_hops() {
+        let mut pkt = base_packet();
+        let relay = Ipv4Addr::new(10, 0, 0, 1);
+        assert!(relay_client_to_server(&mut pkt, relay));
+        assert_eq!(pkt.giaddr, relay);
+        assert_eq!(pkt.hops, 1);
+    }
+
+    #[test]
+    fn relay_client_to_server_preserves_existing_giaddr() {
+        let mut pkt = base_packet();
+        pkt.giaddr = Ipv4Addr::new(172, 16, 0, 1);
+        let relay = Ipv4Addr::new(10, 0, 0, 1);
+        assert!(relay_client_to_server(&mut pkt, relay));
+        assert_eq!(pkt.giaddr, Ipv4Addr::new(172, 16, 0, 1));
+    }
+
+    #[test]
+    fn relay_client_to_server_rejects_at_hop_limit() {
+        let mut pkt = base_packet();
+        pkt.hops = 16;
+        let relay = Ipv4Addr::new(10, 0, 0, 1);
+        assert!(!relay_client_to_server(&mut pkt, relay));
+    }
+
+    #[test]
+    fn relay_server_to_client_returns_giaddr() {
+        let mut pkt = base_packet();
+        pkt.giaddr = Ipv4Addr::new(10, 0, 0, 254);
+        let dest = relay_server_to_client(&mut pkt).unwrap();
+        assert_eq!(dest, Ipv4Addr::new(10, 0, 0, 254));
+        assert_eq!(pkt.op, BOOTREPLY);
+    }
+
+    #[test]
+    fn relay_server_to_client_returns_none_without_giaddr() {
+        let mut pkt = base_packet();
+        assert!(relay_server_to_client(&mut pkt).is_none());
     }
 }
