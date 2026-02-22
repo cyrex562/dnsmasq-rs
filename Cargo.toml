@@ -20,6 +20,14 @@ ubus     = []
 ipset    = []
 nftset   = []
 
+[lib]
+name = "dnsmasq_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dnsmasq-rs"
+path = "src/main.rs"
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
