@@ -228,6 +228,101 @@ impl DnsCache {
 }
 
 // ---------------------------------------------------------------------------
+// /etc/hosts file loading
+// ---------------------------------------------------------------------------
+
+/// Parse a single `/etc/hosts`-format line into cache records and append them
+/// to `cache`.
+///
+/// Format: `ip_addr  hostname [alias ...]`  (with optional comment after `#`)
+///
+/// Returns the number of records inserted.
+pub fn parse_hosts_line(line: &str, ttl: u32, now: Instant, cache: &mut DnsCache) -> usize {
+    // Strip comments.
+    let line = if let Some(idx) = line.find('#') { &line[..idx] } else { line };
+    let line = line.trim();
+    if line.is_empty() { return 0; }
+
+    let mut parts = line.split_whitespace();
+    let ip_str = match parts.next() { Some(s) => s, None => return 0 };
+    let expires = now + std::time::Duration::from_secs(u64::from(ttl) + 3600);
+    let mut count = 0;
+
+    if let Ok(ip4) = ip_str.parse::<std::net::Ipv4Addr>() {
+        let addr = AllAddr::Addr4(ip4);
+        for name in parts {
+            let name = name.to_ascii_lowercase();
+            cache.insert(CacheRecord {
+                name,
+                flags: F_IPV4 | F_FORWARD | F_IMMORTAL,
+                ttl,
+                expires,
+                addr: Some(addr.clone()),
+                rdata: None,
+            });
+            count += 1;
+        }
+    } else if let Ok(ip6) = ip_str.parse::<std::net::Ipv6Addr>() {
+        let addr = AllAddr::Addr6(ip6);
+        for name in parts {
+            let name = name.to_ascii_lowercase();
+            cache.insert(CacheRecord {
+                name,
+                flags: F_IPV6 | F_FORWARD | F_IMMORTAL,
+                ttl,
+                expires,
+                addr: Some(addr.clone()),
+                rdata: None,
+            });
+            count += 1;
+        }
+    }
+
+    count
+}
+
+/// Load `/etc/hosts` (or any hosts-format file at `path`) into `cache`.
+///
+/// All inserted entries use `F_IMMORTAL` so they are never expired by TTL.
+/// Returns the number of records inserted, or an `io::Error` on read failure.
+pub fn load_hosts_file(
+    path: &str,
+    ttl: u32,
+    now: Instant,
+    cache: &mut DnsCache,
+) -> std::io::Result<usize> {
+    let text = std::fs::read_to_string(path)?;
+    let total = text.lines()
+        .map(|l| parse_hosts_line(l, ttl, now, cache))
+        .sum();
+    Ok(total)
+}
+
+/// Reload all hosts files listed in `paths` into a (pre-cleared) cache.
+///
+/// Clears the cache first so stale entries from previous loads are removed,
+/// then re-loads each file in order.  Returns the total records inserted.
+pub fn reload_hosts(
+    paths: &[String],
+    ttl: u32,
+    cache: &mut DnsCache,
+) -> usize {
+    let now = Instant::now();
+    cache.clear();
+    let mut total = 0;
+    for path in paths {
+        match load_hosts_file(path, ttl, now, cache) {
+            Ok(n) => total += n,
+            Err(e) => {
+                // Non-fatal: log and continue with remaining files.
+                eprintln!("dnsmasq-rs: warning: could not read {path}: {e}");
+            }
+        }
+    }
+    total
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
@@ -495,5 +590,82 @@ mod tests {
         let result = cache.lookup_by_name("example.com", F_DNSKEY | F_DNSSEC, Instant::now());
         assert!(result.is_some());
         assert_eq!(result.unwrap().rdata.as_deref(), Some(rdata.as_slice()));
+    }
+
+    // ------------------------------------------------------------------
+    // hosts file loading
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_hosts_line_ipv4() {
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        let count = parse_hosts_line("192.168.1.1  myhost myhost.local", 60, now, &mut cache);
+        assert_eq!(count, 2);
+        let found = cache.lookup_by_name("myhost", F_IPV4, now);
+        assert!(found.is_some());
+        assert_eq!(
+            found.unwrap().addr.as_ref().unwrap().as_ipv4(),
+            Some("192.168.1.1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn parse_hosts_line_ipv6() {
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        let count = parse_hosts_line("::1  localhost6", 60, now, &mut cache);
+        assert_eq!(count, 1);
+        let found = cache.lookup_by_name("localhost6", F_IPV6, now);
+        assert!(found.is_some());
+    }
+
+    #[test]
+    fn parse_hosts_line_comment_stripped() {
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        // The hostname after '#' should not be inserted.
+        let count = parse_hosts_line("10.0.0.1  real # ignored", 60, now, &mut cache);
+        assert_eq!(count, 1);
+        let found = cache.lookup_by_name("ignored", F_IPV4, now);
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn parse_hosts_line_blank_returns_zero() {
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        assert_eq!(parse_hosts_line("", 60, now, &mut cache), 0);
+        assert_eq!(parse_hosts_line("  # comment only", 60, now, &mut cache), 0);
+    }
+
+    #[test]
+    fn load_hosts_file_real_etc_hosts() {
+        let mut cache = DnsCache::new(1024);
+        let now = Instant::now();
+        // /etc/hosts always exists on Linux; at minimum 'localhost' should appear.
+        let result = load_hosts_file("/etc/hosts", 60, now, &mut cache);
+        assert!(result.is_ok(), "should read /etc/hosts");
+        assert!(result.unwrap() > 0, "should load at least one record from /etc/hosts");
+    }
+
+    #[test]
+    fn load_hosts_file_missing_returns_error() {
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        let result = load_hosts_file("/tmp/dnsmasq_rs_nonexistent_hosts_99999", 60, now, &mut cache);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn reload_hosts_clears_old_entries() {
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        // Pre-populate the cache.
+        parse_hosts_line("1.2.3.4  stale.example", 60, now, &mut cache);
+        assert!(cache.lookup_by_name("stale.example", F_IPV4, now).is_some());
+        // reload_hosts with empty list → cache cleared.
+        reload_hosts(&[], 60, &mut cache);
+        assert!(cache.lookup_by_name("stale.example", F_IPV4, Instant::now()).is_none());
     }
 }
