@@ -1340,8 +1340,60 @@ pub fn do_doctor(packet: &mut DnsPacket, doctors: &[Doctor]) -> bool {
     done
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// resize_packet: trim raw wire bytes and optionally re-attach EDNS0 OPT
+// ──────────────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+/// Trim a raw DNS packet to the actual end of its content and optionally
+/// re-attach an EDNS0 OPT pseudo-header.
+///
+/// Port of C's `resize_packet()` from `rfc1035.c`.
+///
+/// * If the packet is malformed at any point, returns the original bytes
+///   unchanged.
+/// * If `edns_opt` is `Some(bytes)` **and** the current `arcount` is zero,
+///   appends the bytes and sets `arcount = 1` in the returned packet.
+pub fn resize_packet(pkt: &[u8], edns_opt: Option<&[u8]>) -> Vec<u8> {
+    if pkt.len() < 12 {
+        return pkt.to_vec();
+    }
+    let qdcount = u16::from_be_bytes([pkt[4],  pkt[5]])  as usize;
+    let ancount = u16::from_be_bytes([pkt[6],  pkt[7]])  as usize;
+    let nscount = u16::from_be_bytes([pkt[8],  pkt[9]])  as usize;
+    let arcount = u16::from_be_bytes([pkt[10], pkt[11]]) as usize;
+
+    let mut off = 12usize;
+
+    // Skip questions: name + QTYPE(2) + QCLASS(2).
+    for _ in 0..qdcount {
+        if skip_name(pkt, &mut off).is_err() { return pkt.to_vec(); }
+        if off + 4 > pkt.len()               { return pkt.to_vec(); }
+        off += 4;
+    }
+    // Skip all resource records (answers + authority + additional).
+    for _ in 0..(ancount + nscount + arcount) {
+        if skip_name(pkt, &mut off).is_err()  { return pkt.to_vec(); }
+        if off + 10 > pkt.len()               { return pkt.to_vec(); }
+        let rdlen = u16::from_be_bytes([pkt[off + 8], pkt[off + 9]]) as usize;
+        off += 10 + rdlen;
+        if off > pkt.len()                    { return pkt.to_vec(); }
+    }
+
+    let mut result = pkt[..off].to_vec();
+
+    // Re-attach the EDNS0 pseudo-header if provided and packet has no AR records.
+    if let Some(opt) = edns_opt {
+        if arcount == 0 {
+            result.extend_from_slice(opt);
+            // Update arcount field in the header.
+            result[10] = 0x00;
+            result[11] = 0x01;
+        }
+    }
+    result
+}
+
+
 mod tests {
     use super::*;
     use crate::dns_protocol::{HB3_QR, HB3_RD, HB4_RA};
@@ -2082,6 +2134,59 @@ mod tests {
         push_rr(&mut pkt, "h.test", 1, 60, &[8, 8, 8, 8]);
         let dp = DnsPacket::parse(&pkt).unwrap();
         assert!(!check_for_ignored_address(&dp, std::slice::from_ref(&ia)));
+    }
+
+    // ── resize_packet ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn resize_packet_trims_to_end() {
+        // Build a minimal A-record response and add trailing garbage bytes.
+        let mut pkt = reply_header(15, 1, 1, 0, 0);
+        push_question(&mut pkt, "example.com", 1);
+        push_rr(&mut pkt, "example.com", 1, 300, &[1, 2, 3, 4]);
+        let valid_len = pkt.len();
+        pkt.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // trailing garbage
+
+        let result = resize_packet(&pkt, None);
+        assert_eq!(result.len(), valid_len);
+    }
+
+    #[test]
+    fn resize_packet_attaches_edns_when_no_ar() {
+        // Simple query packet (arcount == 0).
+        let pkt = query_bytes();
+        // Fake EDNS0 OPT record: root name (0x00) + type OPT (41) + class 4096 + ttl 0 + rdlen 0
+        let edns_opt: Vec<u8> = vec![
+            0x00,                   // root name
+            0x00, 0x29,             // TYPE OPT (41)
+            0x10, 0x00,             // CLASS 4096 (UDP payload size)
+            0x00, 0x00, 0x00, 0x00, // TTL (extended rcode + flags)
+            0x00, 0x00,             // RDLENGTH 0
+        ];
+        let result = resize_packet(&pkt, Some(&edns_opt));
+        // arcount should now be 1.
+        let arcount = u16::from_be_bytes([result[10], result[11]]);
+        assert_eq!(arcount, 1);
+        // The EDNS OPT bytes should be at the end.
+        assert!(result.ends_with(&edns_opt));
+    }
+
+    #[test]
+    fn resize_packet_does_not_attach_when_ar_nonzero() {
+        // Build a packet that already has 1 additional record.
+        let mut pkt = reply_header(16, 1, 1, 0, 0);
+        // Manually set arcount = 1 in header.
+        pkt[10] = 0x00;
+        pkt[11] = 0x01;
+        push_question(&mut pkt, "example.com", 1);
+        push_rr(&mut pkt, "example.com", 1, 60, &[1, 2, 3, 4]);
+        push_rr(&mut pkt, "example.com", 1, 60, &[5, 6, 7, 8]); // the "additional"
+        let original_len = pkt.len();
+
+        let edns_opt = vec![0x00u8, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let result = resize_packet(&pkt, Some(&edns_opt));
+        // No EDNS appended because arcount was already 1.
+        assert_eq!(result.len(), original_len);
     }
 }
 
