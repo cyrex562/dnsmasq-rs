@@ -204,6 +204,225 @@ pub fn handle_request6(
     }
 }
 
+// ─── Wire-level option helpers ────────────────────────────────────────────────
+//
+// These operate on raw DHCPv6 options wire bytes where each option is:
+//   code (2 BE) | length (2 BE) | data (length bytes)
+//
+// All `opt` slices passed to these helpers include the 4-byte header.
+// Mirrors the C opt6_find / opt6_next / opt6_uint helpers in rfc3315.c.
+
+/// Scan a raw options buffer and return the first option whose code equals
+/// `search` and whose data length is at least `minsize`.
+///
+/// Returns a sub-slice covering the full option (header + data), or `None`.
+///
+/// Mirrors `opt6_find()` in `rfc3315.c`.
+#[cfg(feature = "dhcp6")]
+pub fn opt6_find(mut opts: &[u8], search: u16, minsize: usize) -> Option<&[u8]> {
+    loop {
+        if opts.len() < 4 { return None; }
+        let code = u16::from_be_bytes([opts[0], opts[1]]);
+        let len  = u16::from_be_bytes([opts[2], opts[3]]) as usize;
+        if 4 + len > opts.len() { return None; }
+        if code == search && len >= minsize {
+            return Some(&opts[..4 + len]);
+        }
+        opts = &opts[4 + len..];
+    }
+}
+
+/// Advance past the current option and return a slice starting at the next
+/// option header, or `None` if there is no next option.
+///
+/// `opts` must start at an option header (code field).
+///
+/// Mirrors `opt6_next()` in `rfc3315.c`.
+#[cfg(feature = "dhcp6")]
+pub fn opt6_next(opts: &[u8]) -> Option<&[u8]> {
+    if opts.len() < 4 { return None; }
+    let len = u16::from_be_bytes([opts[2], opts[3]]) as usize;
+    let next = 4 + len;
+    if next >= opts.len() { return None; }
+    Some(&opts[next..])
+}
+
+/// Read a big-endian unsigned integer of `size` bytes from an option slice.
+///
+/// `offset` is relative to byte 0 of the slice (the code field).
+/// - `offset=0, size=2` → option type code
+/// - `offset=2, size=2` → option data length
+/// - `offset=4, size=N` → first N bytes of option data
+///
+/// Returns 0 if the range is out of bounds.
+///
+/// Mirrors `opt6_uint()` in `rfc3315.c` (where the C version uses a DATA
+/// pointer and negative offsets; here we use the full option slice with
+/// zero-based offsets from the header start, which avoids unsafe indexing).
+#[cfg(feature = "dhcp6")]
+pub fn opt6_uint(opt: &[u8], offset: usize, size: usize) -> u32 {
+    let end = offset.saturating_add(size);
+    if size == 0 || size > 4 || end > opt.len() { return 0; }
+    let mut result: u32 = 0;
+    for &b in &opt[offset..end] {
+        result = (result << 8) | (b as u32);
+    }
+    result
+}
+
+/// Return the option code of a full-option slice.
+#[cfg(feature = "dhcp6")]
+pub fn opt6_type(opt: &[u8]) -> u16 {
+    opt6_uint(opt, 0, 2) as u16
+}
+
+/// Return the data length of a full-option slice.
+#[cfg(feature = "dhcp6")]
+pub fn opt6_len(opt: &[u8]) -> usize {
+    opt6_uint(opt, 2, 2) as usize
+}
+
+/// Return the data portion of a full-option slice (everything after the 4-byte header).
+#[cfg(feature = "dhcp6")]
+pub fn opt6_data(opt: &[u8]) -> &[u8] {
+    if opt.len() > 4 { &opt[4..] } else { &[] }
+}
+
+// ─── DHCPv6 logging helpers ───────────────────────────────────────────────────
+
+/// Build a log line for a single DHCPv6 option (and recursively for IA sub-options).
+///
+/// Returns a list of log strings (one per option / sub-option level).
+/// The caller is responsible for emitting them via `log::info!` or similar.
+///
+/// Mirrors `log6_opts()` in `rfc3315.c`.
+#[cfg(feature = "dhcp6")]
+pub fn log6_opts(opts: &[u8], xid: u32, nest: bool) -> Vec<String> {
+    use crate::dhcp6_protocol::{OPTION6_IA_NA, OPTION6_IA_TA, OPTION6_IAADDR, OPTION6_STATUS_CODE};
+
+    let desc = if nest { "nest" } else { "sent" };
+    let mut lines = Vec::new();
+    let mut cursor = opts;
+
+    loop {
+        if cursor.len() < 4 { break; }
+
+        let opt_len  = opt6_len(cursor);
+        let opt_type = opt6_type(cursor);
+        let data     = opt6_data(cursor);
+
+        let (optname, detail, ia_opts_start) = if opt_type == OPTION6_IA_NA {
+            let iaid = opt6_uint(cursor, 4, 4);
+            let t1   = opt6_uint(cursor, 8, 4);
+            let t2   = opt6_uint(cursor, 12, 4);
+            let detail = format!("IAID={iaid} T1={t1} T2={t2}");
+            let sub = if data.len() > 12 { Some(&data[12..]) } else { None };
+            ("ia-na", detail, sub)
+        } else if opt_type == OPTION6_IA_TA {
+            let iaid   = opt6_uint(cursor, 4, 4);
+            let detail = format!("IAID={iaid}");
+            let sub    = if data.len() > 4 { Some(&data[4..]) } else { None };
+            ("ia-ta", detail, sub)
+        } else if opt_type == OPTION6_IAADDR {
+            let addr_bytes: [u8; 16] = data.get(..16)
+                .and_then(|b| b.try_into().ok())
+                .unwrap_or([0u8; 16]);
+            let addr  = std::net::Ipv6Addr::from(addr_bytes);
+            let pref  = opt6_uint(cursor, 4 + 16, 4);
+            let valid = opt6_uint(cursor, 4 + 20, 4);
+            let detail = format!("{addr} PL={pref} VL={valid}");
+            let sub = if data.len() > 24 { Some(&data[24..]) } else { None };
+            ("iaaddr", detail, sub)
+        } else if opt_type == OPTION6_STATUS_CODE {
+            let code = opt6_uint(cursor, 4, 2);
+            let msg  = std::str::from_utf8(data.get(2..).unwrap_or(&[])).unwrap_or("").to_string();
+            let detail = format!("{code} {msg}");
+            ("status", detail, None)
+        } else {
+            let detail = format!("{} bytes", opt_len);
+            ("unknown", detail, None)
+        };
+
+        lines.push(format!(
+            "{xid} {desc} size:{opt_len:3} option:{opt_type:3} {optname}  {detail}"
+        ));
+
+        if let Some(sub) = ia_opts_start {
+            let sub_lines = log6_opts(sub, xid, true);
+            lines.extend(sub_lines);
+        }
+
+        match opt6_next(cursor) {
+            Some(next) => cursor = next,
+            None       => break,
+        }
+    }
+    lines
+}
+
+/// Build a formatted log line for a DHCPv6 packet event.
+///
+/// Returns a `String` like:
+/// `"<xid> <type>(<iface>) <addr_str><clid_hex> <extra>"`
+///
+/// Mirrors `log6_packet()` in `rfc3315.c` but returns a `String` rather
+/// than calling `my_syslog` directly, so callers can route to any logger.
+#[cfg(feature = "dhcp6")]
+pub fn log6_packet(
+    xid:       u32,
+    msg_type:  &str,
+    iface:     &str,
+    clid:      &[u8],
+    addr:      Option<std::net::Ipv6Addr>,
+    extra:     Option<&str>,
+    log_opts:  bool,
+) -> String {
+    // Format client-id as colon-separated hex (up to 100 bytes).
+    let clid_display: String = clid.iter()
+        .take(100)
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":");
+
+    let addr_str = match addr {
+        Some(a) => format!("{a} "),
+        None    => String::new(),
+    };
+
+    let extra_str = extra.unwrap_or("");
+
+    if log_opts {
+        format!("{xid} {msg_type}({iface}) {addr_str}{clid_display} {extra_str}")
+    } else {
+        format!("{msg_type}({iface}) {addr_str}{clid_display} {extra_str}")
+    }
+}
+
+/// Conditionally build a log line for a DHCPv6 packet.
+///
+/// Returns `Some(log_line)` if logging should occur (either `log_opts` is true
+/// or `quiet` is false), otherwise `None`.
+///
+/// Mirrors `log6_quiet()` in `rfc3315.c` (which calls `log6_packet` unless
+/// both `OPT_QUIET_DHCP6` is set and `OPT_LOG_OPTS` is unset).
+#[cfg(feature = "dhcp6")]
+pub fn log6_quiet(
+    log_opts:  bool,
+    quiet:     bool,
+    xid:       u32,
+    msg_type:  &str,
+    iface:     &str,
+    clid:      &[u8],
+    addr:      Option<std::net::Ipv6Addr>,
+    extra:     Option<&str>,
+) -> Option<String> {
+    if log_opts || !quiet {
+        Some(log6_packet(xid, msg_type, iface, clid, addr, extra, log_opts))
+    } else {
+        None
+    }
+}
+
 #[cfg(all(test, feature = "dhcp6"))]
 mod tests {
     use super::*;
@@ -296,5 +515,159 @@ mod tests {
         assert_eq!(reply.msg_type, Dhcp6MsgType::Reply);
         assert_eq!(reply.txn_id, req.txn_id);
         assert!(find_option6(&reply.options, OPTION6_IA_NA).is_some());
+    }
+
+    // Helper: build a minimal raw options buffer with one option.
+    fn raw_option(code: u16, data: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&code.to_be_bytes());
+        v.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        v.extend_from_slice(data);
+        v
+    }
+
+    // ── opt6_find ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn opt6_find_finds_first_match() {
+        let mut buf = raw_option(1, &[0xAA, 0xBB]);
+        buf.extend(raw_option(2, &[0xCC]));
+        let found = opt6_find(&buf, 1, 2).unwrap();
+        assert_eq!(opt6_type(found), 1);
+        assert_eq!(opt6_data(found), &[0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn opt6_find_skips_to_second_option() {
+        let mut buf = raw_option(1, &[0xAA]);
+        buf.extend(raw_option(2, &[0xBB, 0xCC]));
+        let found = opt6_find(&buf, 2, 1).unwrap();
+        assert_eq!(opt6_type(found), 2);
+        assert_eq!(opt6_data(found), &[0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn opt6_find_none_on_missing() {
+        let buf = raw_option(1, &[0xAA]);
+        assert!(opt6_find(&buf, 99, 0).is_none());
+    }
+
+    #[test]
+    fn opt6_find_minsize_filter() {
+        let buf = raw_option(1, &[0xAA]); // data len = 1
+        // Require minsize=2 → should not match
+        assert!(opt6_find(&buf, 1, 2).is_none());
+    }
+
+    // ── opt6_next ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn opt6_next_advances_to_second() {
+        let mut buf = raw_option(1, &[0xAA, 0xBB]);
+        buf.extend(raw_option(2, &[0xCC]));
+        let next = opt6_next(&buf).unwrap();
+        assert_eq!(opt6_type(next), 2);
+    }
+
+    #[test]
+    fn opt6_next_returns_none_when_only_one() {
+        let buf = raw_option(1, &[0xAA]);
+        assert!(opt6_next(&buf).is_none());
+    }
+
+    // ── opt6_uint ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn opt6_uint_reads_code_and_len() {
+        let buf = raw_option(0x0042, &[0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(opt6_uint(&buf, 0, 2), 0x0042, "code");
+        assert_eq!(opt6_uint(&buf, 2, 2), 4,      "len");
+        assert_eq!(opt6_uint(&buf, 4, 4), 0x01020304, "data");
+    }
+
+    #[test]
+    fn opt6_uint_out_of_bounds_returns_zero() {
+        let buf = raw_option(1, &[0xAA]);
+        assert_eq!(opt6_uint(&buf, 100, 2), 0);
+    }
+
+    // ── opt6_type / opt6_len / opt6_data ──────────────────────────────────────
+
+    #[test]
+    fn opt6_type_len_data_helpers() {
+        let data = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let buf  = raw_option(0x001A, &data);
+        assert_eq!(opt6_type(&buf), 0x001A);
+        assert_eq!(opt6_len(&buf),  4);
+        assert_eq!(opt6_data(&buf), data.as_slice());
+    }
+
+    // ── log6_packet / log6_quiet ──────────────────────────────────────────────
+
+    #[test]
+    fn log6_packet_includes_key_fields() {
+        let line = log6_packet(
+            0xABCD, "Solicit", "eth0",
+            &[0x01, 0x02], None, Some("hostname"), true,
+        );
+        assert!(line.contains("Solicit"));
+        assert!(line.contains("eth0"));
+        assert!(line.contains("01:02"));
+        assert!(line.contains("hostname"));
+    }
+
+    #[test]
+    fn log6_packet_with_addr() {
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let line = log6_packet(0x1234, "Reply", "eth0", &[], Some(addr), None, false);
+        assert!(line.contains("2001:db8"));
+    }
+
+    #[test]
+    fn log6_quiet_suppresses_when_quiet_and_no_log_opts() {
+        let r = log6_quiet(false, true, 1, "Solicit", "eth0", &[], None, None);
+        assert!(r.is_none(), "quiet=true, log_opts=false → no output");
+    }
+
+    #[test]
+    fn log6_quiet_emits_when_not_quiet() {
+        let r = log6_quiet(false, false, 1, "Solicit", "eth0", &[], None, None);
+        assert!(r.is_some());
+    }
+
+    #[test]
+    fn log6_quiet_emits_when_log_opts_even_if_quiet() {
+        let r = log6_quiet(true, true, 1, "Solicit", "eth0", &[], None, None);
+        assert!(r.is_some());
+    }
+
+    // ── log6_opts ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn log6_opts_empty_returns_empty() {
+        let lines = log6_opts(&[], 1, false);
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn log6_opts_single_unknown_option() {
+        let buf = raw_option(999, &[0x01, 0x02, 0x03]);
+        let lines = log6_opts(&buf, 0xABCD, false);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("999"));
+        assert!(lines[0].contains("sent"));
+    }
+
+    #[test]
+    fn log6_opts_status_code_option() {
+        use crate::dhcp6_protocol::OPTION6_STATUS_CODE;
+        // Status code 0 (Success), no message
+        let mut data = vec![0x00, 0x00];
+        data.extend_from_slice(b"Success");
+        let buf = raw_option(OPTION6_STATUS_CODE, &data);
+        let lines = log6_opts(&buf, 1, false);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("status"));
+        assert!(lines[0].contains('0'));
     }
 }

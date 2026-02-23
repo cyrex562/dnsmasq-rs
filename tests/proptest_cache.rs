@@ -8,7 +8,7 @@
 
 use dnsmasq_rs::cache::{CacheRecord, DnsCache, type_flags};
 use dnsmasq_rs::types::addr::AllAddr;
-use dnsmasq_rs::types::constants::{F_FORWARD, F_IPV4, F_IPV6, F_NEG, F_NXDOMAIN, F_IMMORTAL};
+use dnsmasq_rs::types::constants::{F_FORWARD, F_IPV4, F_IPV6, F_NEG, F_NXDOMAIN, F_IMMORTAL, UID_NONE};
 use proptest::prelude::*;
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
@@ -37,6 +37,7 @@ fn make_a_record(name: String, ip: Ipv4Addr, ttl: u32, now: Instant) -> CacheRec
         expires: now + Duration::from_secs(u64::from(ttl) + 60),
         addr: Some(AllAddr::Addr4(ip)),
         rdata: None,
+        uid: UID_NONE,
     }
 }
 
@@ -86,6 +87,7 @@ proptest! {
             expires: now - Duration::from_secs(1), // already expired
             addr:    Some(AllAddr::Addr4(Ipv4Addr::new(1, 2, 3, 4))),
             rdata:   None,
+            uid:     UID_NONE,
         };
         let mut cache = DnsCache::new(100);
         cache.insert(rec);
@@ -107,6 +109,7 @@ proptest! {
             expires: now - Duration::from_secs(999_999),
             addr:    Some(AllAddr::Addr4(Ipv4Addr::new(127, 0, 0, 1))),
             rdata:   None,
+            uid:     UID_NONE,
         };
         let mut cache = DnsCache::new(100);
         cache.insert(rec);

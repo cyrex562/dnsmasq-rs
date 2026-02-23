@@ -8,6 +8,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
 use crate::cache::{CacheRecord, DnsCache};
+use crate::types::constants::UID_NONE;
 use crate::dns_protocol::{DnsHeader, RrType, HB3_AA, HB3_QR, HB3_TC, HB4_AD, HB4_RA};
 use crate::types::addr::{AllAddr, CnameAddr, RrDataAddr};
 use crate::types::constants::{
@@ -670,6 +671,7 @@ pub fn extract_addresses(
                     expires: now + Duration::from_secs(u64::from(ttl)),
                     addr:    Some(ip_addr.clone()),
                     rdata:   None,
+                    uid:     UID_NONE,
                 });
                 found = true;
             }
@@ -717,6 +719,7 @@ pub fn extract_addresses(
                         uid:          0,
                     })),
                     rdata: None,
+                    uid:   UID_NONE,
                 });
                 cname_hops += 1;
                 current_name = target;
@@ -758,6 +761,7 @@ pub fn extract_addresses(
                 expires: now + Duration::from_secs(u64::from(ttl)),
                 addr:    Some(addr),
                 rdata:   None,
+                uid:     UID_NONE,
             });
             found = true;
         }
@@ -782,6 +786,7 @@ pub fn extract_addresses(
                 expires: now + Duration::from_secs(u64::from(ttl)),
                 addr:    None,
                 rdata:   None,
+                uid:     UID_NONE,
             });
         }
     }
@@ -1254,6 +1259,7 @@ pub fn check_for_bogus_wildcard(
                             expires: now + Duration::from_secs(u64::from(local_ttl)),
                             addr:    None,
                             rdata:   None,
+                            uid:     UID_NONE,
                         });
                     }
                     return true;
@@ -1991,6 +1997,7 @@ mod tests {
             expires: now + std::time::Duration::from_secs(300),
             addr:    None,
             rdata:   None,
+            uid:     crate::types::constants::UID_NONE,
         });
         let cfg   = empty_config();
         let query = make_query("noexist.local", 1);

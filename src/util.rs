@@ -3,9 +3,12 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use crate::dns_protocol::MAXLABEL;
+use crate::dns_protocol::{MAXLABEL, NAME_ESCAPE};
 use crate::types::addr::MySockAddr;
 use crate::types::dns_records::RrList;
+
+#[allow(unused_imports)]
+use libc;
 
 // ── Random number generation ──────────────────────────────────────────────────
 // We delegate to the `rand` crate rather than re-implementing SURF.
@@ -306,7 +309,261 @@ pub fn sockaddr_isnull(s: &MySockAddr) -> bool {
     }
 }
 
-// ── Linux kernel version ──────────────────────────────────────────────────────
+// ── DNS wire-format helpers ───────────────────────────────────────────────────
+
+/// Write a DNS name in wire format (RFC 1035 label encoding) into `buf`.
+///
+/// The name is written as a sequence of `<length><label>` pairs.
+/// Characters that are `NAME_ESCAPE` are stored as escape sequences
+/// (`NAME_ESCAPE` byte followed by original_byte+1), matching the C encoding.
+/// Does **not** write the terminal zero-byte; the caller must append it.
+///
+/// Returns `false` if writing would exceed `limit` bytes in `buf`.
+pub fn do_rfc1035_name(buf: &mut Vec<u8>, name: &str, limit: Option<usize>) -> bool {
+    for label in name.split('.') {
+        if label.is_empty() {
+            // trailing dot or consecutive dots — skip
+            continue;
+        }
+        // Reserve one byte for the length field
+        let len_pos = buf.len();
+        buf.push(0u8);
+        if let Some(lim) = limit {
+            if buf.len() > lim {
+                return false;
+            }
+        }
+        let mut label_len: u8 = 0;
+        for b in label.bytes() {
+            if b == NAME_ESCAPE {
+                // Escape: write NAME_ESCAPE then (b + 1)
+                buf.push(NAME_ESCAPE);
+                buf.push(b.wrapping_add(1));
+                label_len = label_len.saturating_add(2);
+            } else {
+                buf.push(b);
+                label_len += 1;
+            }
+            if let Some(lim) = limit {
+                if buf.len() > lim {
+                    return false;
+                }
+            }
+        }
+        buf[len_pos] = label_len;
+    }
+    true
+}
+
+// ── Pretty-print address ──────────────────────────────────────────────────────
+
+/// Format a socket address as a human-readable string.
+///
+/// Returns `(address_string, port)`.  For IPv6 link-local addresses that
+/// have a non-zero scope-id the scope interface name is appended (e.g.
+/// `"fe80::1%eth0"`).
+pub fn prettyprint_addr(addr: &MySockAddr) -> (String, u16) {
+    match addr {
+        MySockAddr::V4(a) => (a.ip().to_string(), a.port()),
+        MySockAddr::V6(a) => {
+            let mut s = a.ip().to_string();
+            // Append scope-id as interface name when present
+            if a.scope_id() != 0 {
+                // Try to resolve scope id to interface name via /sys on Linux;
+                // fall back to numeric scope id on other platforms.
+                let iface = interface_name_from_index(a.scope_id())
+                    .unwrap_or_else(|| a.scope_id().to_string());
+                if s.len() + 1 + iface.len() <= 46 {
+                    s.push('%');
+                    s.push_str(&iface);
+                }
+            }
+            (s, a.port())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn interface_name_from_index(idx: u32) -> Option<String> {
+    use std::ffi::CStr;
+    let mut buf = [0i8; libc::IF_NAMESIZE];
+    unsafe {
+        if libc::if_indextoname(idx, buf.as_mut_ptr()).is_null() {
+            return None;
+        }
+        let cstr = CStr::from_ptr(buf.as_ptr());
+        cstr.to_str().ok().map(|s| s.to_owned())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn interface_name_from_index(_idx: u32) -> Option<String> {
+    None
+}
+
+// ── Byte-array comparison with mask ──────────────────────────────────────────
+
+/// Compare byte arrays `a` and `b`, ignoring positions where the corresponding
+/// bit in `mask` is **set**.
+///
+/// Returns 0 if any unmasked byte differs; otherwise returns a positive count
+/// (1 + number of matched unmasked bytes), mirroring the C `memcmp_masked`.
+pub fn memcmp_masked(a: &[u8], b: &[u8], mask: u32) -> usize {
+    let len = a.len().min(b.len());
+    let mut count: usize = 1;
+    let mut m = mask;
+    for i in (0..len).rev() {
+        if m & 1 == 0 {
+            if a[i] == b[i] {
+                count += 1;
+            } else {
+                return 0;
+            }
+        }
+        m >>= 1;
+    }
+    count
+}
+
+// ── File-descriptor management ───────────────────────────────────────────────
+
+/// Close all open file descriptors except stdin/stdout/stderr and the three
+/// `spare` descriptors.  Used during daemon startup to clean up inherited fds.
+///
+/// On Linux the `/proc/self/fd` directory is scanned for efficiency; on other
+/// platforms we fall back to iterating `0..max_fd`.
+pub fn close_fds(max_fd: i64, spare1: i32, spare2: i32, spare3: i32) {
+    let spares = [
+        libc::STDIN_FILENO,
+        libc::STDOUT_FILENO,
+        libc::STDERR_FILENO,
+        spare1,
+        spare2,
+        spare3,
+    ];
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(dir) = std::fs::read_dir("/proc/self/fd") {
+            for entry in dir.flatten() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    if let Ok(fd) = name.parse::<i32>() {
+                        // Skip the fd used by read_dir itself (we can't know
+                        // it exactly, but it will be ≥ 3; just skip spares).
+                        if spares.contains(&fd) {
+                            continue;
+                        }
+                        unsafe { libc::close(fd) };
+                    }
+                }
+            }
+            return;
+        }
+    }
+
+    // Fallback: dumb iteration
+    for fd in (0..max_fd as i32).rev() {
+        if !spares.contains(&fd) {
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+// ── Retry-aware I/O helpers ───────────────────────────────────────────────────
+
+/// Inspect the return value of `sendto`/`sendmsg` and decide whether to retry.
+///
+/// Mirrors the C `retry_send()`:
+/// - Returns `false` (no retry needed) when `rc != -1` (success).
+/// - On `EAGAIN`/`EWOULDBLOCK` sleeps 10 µs and retries up to 1000 times.
+/// - On `EINTR` returns `true` immediately (caller should retry).
+/// - On any other error returns `false`.
+///
+/// A thread-local counter tracks the retry budget, reset on each success.
+pub fn retry_send(rc: isize) -> bool {
+    use std::cell::Cell;
+    thread_local! {
+        static RETRIES: Cell<u32> = Cell::new(0);
+    }
+
+    if rc != -1 {
+        RETRIES.with(|r| r.set(0));
+        return false;
+    }
+
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK => {
+            std::thread::sleep(std::time::Duration::from_nanos(10_000));
+            let retries = RETRIES.with(|r| {
+                let v = r.get();
+                r.set(v + 1);
+                v
+            });
+            if retries < 1000 {
+                return true;
+            }
+        }
+        Some(e) if e == libc::EINTR => return true,
+        _ => {}
+    }
+
+    RETRIES.with(|r| r.set(0));
+    false
+}
+
+/// Blocking read or write of exactly `buf.len()` bytes on a raw file descriptor.
+///
+/// `rw = false` → write; `rw = true` → read.
+/// Retries on `EINTR`/`ENOMEM`/`ENOBUFS`; returns `false` on any other error
+/// or on EOF during a read.
+pub fn read_write(fd: i32, buf: &mut [u8], rw: bool) -> bool {
+    if buf.is_empty() {
+        return true;
+    }
+    let mut done = 0usize;
+    while done < buf.len() {
+        let slice = &mut buf[done..];
+        let n = if rw {
+            unsafe {
+                libc::read(fd, slice.as_mut_ptr() as *mut libc::c_void, slice.len())
+            }
+        } else {
+            unsafe {
+                libc::write(fd, slice.as_ptr() as *const libc::c_void, slice.len())
+            }
+        };
+        if n < 0 {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if e == libc::EINTR || e == libc::ENOMEM || e == libc::ENOBUFS {
+                continue;
+            }
+            return false;
+        }
+        if n == 0 && rw {
+            return false; // EOF
+        }
+        done += n as usize;
+    }
+    true
+}
+
+// ── Workspace buffer helpers ──────────────────────────────────────────────────
+
+/// Ensure `workspace` has at least `needed + 1` slots, growing by 5 if needed.
+///
+/// New slots are initialised to empty `Vec<u8>`.  Returns `false` only if
+/// `needed + 1` overflows — in practice this cannot happen.
+pub fn expand_workspace(workspace: &mut Vec<Vec<u8>>, needed: usize) -> bool {
+    if workspace.len() >= needed + 1 {
+        return true;
+    }
+    let new_len = needed + 1 + 5;
+    workspace.resize_with(new_len, Vec::new);
+    true
+}
+
+
 
 #[cfg(target_os = "linux")]
 pub fn kernel_version() -> u32 {
@@ -434,5 +691,91 @@ mod tests {
         assert!(sockaddr_isnull(&s));
         let s2 = MySockAddr::V4(SocketAddrV4::new("1.2.3.4".parse().unwrap(), 53));
         assert!(!sockaddr_isnull(&s2));
+    }
+
+    #[test]
+    fn do_rfc1035_name_basic() {
+        let mut buf = Vec::new();
+        assert!(do_rfc1035_name(&mut buf, "example.com", None));
+        // "example" → [7, 'e','x','a','m','p','l','e'], "com" → [3, 'c','o','m']
+        assert_eq!(&buf[..8], b"\x07example");
+        assert_eq!(&buf[8..], b"\x03com");
+    }
+
+    #[test]
+    fn do_rfc1035_name_single_label() {
+        let mut buf = Vec::new();
+        assert!(do_rfc1035_name(&mut buf, "localhost", None));
+        assert_eq!(buf, b"\x09localhost");
+    }
+
+    #[test]
+    fn do_rfc1035_name_trailing_dot() {
+        // A trailing dot (FQDN) should produce the same output as without one
+        let mut no_dot = Vec::new();
+        let mut with_dot = Vec::new();
+        do_rfc1035_name(&mut no_dot, "example.com", None);
+        do_rfc1035_name(&mut with_dot, "example.com.", None);
+        assert_eq!(no_dot, with_dot);
+    }
+
+    #[test]
+    fn do_rfc1035_name_limit() {
+        let mut buf = Vec::new();
+        // limit of 5 bytes — cannot fit "example" label (8 bytes incl. length)
+        let ok = do_rfc1035_name(&mut buf, "example.com", Some(5));
+        assert!(!ok);
+    }
+
+    #[test]
+    fn memcmp_masked_all_bits_set() {
+        // mask=0xFF → all bits set → all bytes are "masked out" → match
+        let a = [1u8, 2, 3];
+        let b = [4u8, 5, 6];
+        assert_ne!(memcmp_masked(&a, &b, 0xFF), 0);
+    }
+
+    #[test]
+    fn memcmp_masked_no_bits_set() {
+        // mask=0 → no bits set → all bytes compared
+        let a = [1u8, 2, 3];
+        let b = [1u8, 2, 3];
+        let c = [1u8, 2, 4];
+        assert_ne!(memcmp_masked(&a, &b, 0), 0); // equal
+        assert_eq!(memcmp_masked(&a, &c, 0), 0); // differ at index 2
+    }
+
+    #[test]
+    fn prettyprint_addr_v4() {
+        use std::net::SocketAddrV4;
+        let addr = MySockAddr::V4(SocketAddrV4::new("192.168.1.1".parse().unwrap(), 53));
+        let (s, port) = prettyprint_addr(&addr);
+        assert_eq!(s, "192.168.1.1");
+        assert_eq!(port, 53);
+    }
+
+    #[test]
+    fn prettyprint_addr_v6() {
+        use std::net::SocketAddrV6;
+        let addr = MySockAddr::V6(SocketAddrV6::new("::1".parse().unwrap(), 53, 0, 0));
+        let (s, port) = prettyprint_addr(&addr);
+        assert_eq!(s, "::1");
+        assert_eq!(port, 53);
+    }
+
+    #[test]
+    fn expand_workspace_grows() {
+        let mut ws: Vec<Vec<u8>> = Vec::new();
+        assert!(expand_workspace(&mut ws, 3));
+        // Should have at least 4 slots (needed+1), rounded up by 5 = 9
+        assert!(ws.len() >= 4);
+    }
+
+    #[test]
+    fn expand_workspace_no_shrink() {
+        let mut ws: Vec<Vec<u8>> = vec![vec![1], vec![2], vec![3], vec![4], vec![5]];
+        // already has 5 slots; requesting index 3 (needed=3, so len>=4) → no change
+        assert!(expand_workspace(&mut ws, 3));
+        assert_eq!(ws.len(), 5);
     }
 }

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use dnsmasq_rs::cache::{CacheRecord, DnsCache};
 use dnsmasq_rs::types::addr::AllAddr;
-use dnsmasq_rs::types::constants::{F_FORWARD, F_IMMORTAL, F_IPV4, F_IPV6};
+use dnsmasq_rs::types::constants::{F_FORWARD, F_IMMORTAL, F_IPV4, F_IPV6, UID_NONE};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -19,6 +19,7 @@ fn make_a_record(name: &str, ip: Ipv4Addr, ttl: u32, expires: Instant) -> CacheR
         expires,
         addr: Some(AllAddr::Addr4(ip)),
         rdata: None,
+        uid: UID_NONE,
     }
 }
 

@@ -1,5 +1,10 @@
 /// DNS name and glob pattern matching.
-/// Ported from `pattern.c` (originally `#ifdef HAVE_CONNTRACK`).
+/// Ported from `pattern.c`.
+///
+/// The C source gates this file with `#ifdef HAVE_CONNTRACK` because it is
+/// only used by the conntrack subsystem there.  In Rust the functions are
+/// exposed unconditionally as standalone utilities; the conntrack-specific
+/// callers are in `conntrack.rs` (gated by `#[cfg(feature = "conntrack")]`).
 
 /// Match a value string against a glob pattern containing `*` wildcards.
 /// Case-insensitive.  `*` matches zero or more characters (but NOT a dot
@@ -78,11 +83,19 @@ pub fn is_valid_dns_name(name: &str) -> bool {
 }
 
 /// Returns true if `pattern` is a valid DNS name pattern.
-/// Like `is_valid_dns_name` but allows up to two `*` per label, except in
-/// the final two labels.
+///
+/// Like `is_valid_dns_name` but allows up to two `*` wildcards per label,
+/// except in the **final two labels** which must be wildcard-free.
+///
+/// Leading/trailing hyphens are checked against the full label string
+/// (including wildcards), matching the C implementation which uses
+/// `c[-1] == '-'` on the raw bytes.  This means `"api-*"` is valid
+/// (last literal char before `*` is `-`, but the raw label ends with `*`,
+/// not `-`), while `"api-"` remains invalid.
 pub fn is_valid_dns_name_pattern(pattern: &str) -> bool {
-    let stripped = pattern.replace('*', "x"); // treat * as a regular char for length checks
-    if stripped.is_empty() || stripped.len() > 253 {
+    // Total length excluding wildcards must be 1–253.
+    let non_wc_len: usize = pattern.chars().filter(|&c| c != '*').count();
+    if non_wc_len == 0 || non_wc_len > 253 {
         return false;
     }
     let labels: Vec<&str> = pattern.split('.').collect();
@@ -91,29 +104,36 @@ pub fn is_valid_dns_name_pattern(pattern: &str) -> bool {
     }
     for (i, label) in labels.iter().enumerate() {
         let wildcard_count = label.chars().filter(|&c| c == '*').count();
-        let effective_len = label.len() - wildcard_count;
-        if effective_len > 63 || label.is_empty() {
+        // Non-wildcard length must fit in a DNS label (≤63).
+        let non_wc_label_len = label.len() - wildcard_count;
+        if label.is_empty() || non_wc_label_len > 63 {
             return false;
         }
-        let non_star: String = label.chars().filter(|&c| c != '*').collect();
-        if non_star.starts_with('-') || non_star.ends_with('-') {
+        // Check leading/trailing hyphen on the RAW label (including wildcards),
+        // matching C's `*c == '-'` at label start and `c[-1] == '-'` at label end.
+        if label.starts_with('-') || label.ends_with('-') {
             return false;
         }
-        for c in non_star.chars() {
-            if !c.is_ascii_alphanumeric() && c != '-' {
+        // All non-wildcard characters must be alphanumeric or hyphen.
+        for c in label.chars() {
+            if c != '*' && !c.is_ascii_alphanumeric() && c != '-' {
                 return false;
             }
         }
-        // Final two labels must be wildcard-free
+        // Final two labels must be wildcard-free.
         let is_last_two = i >= labels.len() - 2;
         if is_last_two && wildcard_count > 0 {
             return false;
         }
+        // At most two wildcards per label.
         if wildcard_count > 2 {
             return false;
         }
+        // Final label must not be fully numeric and not "local".
         if i == labels.len() - 1 {
-            if non_star.chars().all(|c| c.is_ascii_digit()) {
+            let non_star: String = label.chars().filter(|&c| c != '*').collect();
+            // A label with any wildcard is automatically non-numeric (wildcard is not a digit).
+            if wildcard_count == 0 && non_star.chars().all(|c| c.is_ascii_digit()) {
                 return false;
             }
             if non_star.eq_ignore_ascii_case("local") {
@@ -140,6 +160,8 @@ pub fn is_dns_name_matching_pattern(name: &str, pattern: &str) -> bool {
 mod tests {
     use super::*;
 
+    // ── glob_match ─────────────────────────────────────────────────────────────
+
     #[test]
     fn glob_match_exact() {
         assert!(glob_match("foo", "FOO"));
@@ -160,22 +182,84 @@ mod tests {
     }
 
     #[test]
+    fn glob_match_empty_value() {
+        assert!(glob_match("", "*"));
+        assert!(!glob_match("", "a*"));
+        assert!(!glob_match("", "*a"));
+    }
+
+    #[test]
+    fn glob_match_multi_wildcard() {
+        assert!(glob_match("abcdef", "a*c*f"));
+        assert!(!glob_match("abcde",  "a*c*f"));
+    }
+
+    // ── is_valid_dns_name ──────────────────────────────────────────────────────
+
+    #[test]
     fn is_valid_dns_name_cases() {
         assert!(is_valid_dns_name("example.com"));
         assert!(is_valid_dns_name("sub.example.com"));
+        assert!(is_valid_dns_name("FOO.BAR"));
         assert!(!is_valid_dns_name("example"));          // single label
         assert!(!is_valid_dns_name("example.local"));    // pseudo-TLD
         assert!(!is_valid_dns_name("8.8.8.8"));          // all-numeric TLD
         assert!(!is_valid_dns_name("-bad.com"));         // leading hyphen
+        assert!(!is_valid_dns_name("bad-.com"));         // trailing hyphen
+        assert!(!is_valid_dns_name(""));                 // empty
+        assert!(!is_valid_dns_name("a.b.c."));           // trailing dot
     }
+
+    #[test]
+    fn is_valid_dns_name_length_limits() {
+        // 63-char label is OK
+        let long_label = "a".repeat(63);
+        assert!(is_valid_dns_name(&format!("{}.com", long_label)));
+        // 64-char label is too long
+        let too_long = "a".repeat(64);
+        assert!(!is_valid_dns_name(&format!("{}.com", too_long)));
+    }
+
+    // ── is_valid_dns_name_pattern ─────────────────────────────────────────────
 
     #[test]
     fn is_valid_dns_name_pattern_cases() {
         assert!(is_valid_dns_name_pattern("*.example.com"));
         assert!(is_valid_dns_name_pattern("api*.example.com"));
+        assert!(is_valid_dns_name_pattern("*-prod-*.example.com"));
+        assert!(is_valid_dns_name_pattern("api*.*.example.com"));
         assert!(!is_valid_dns_name_pattern("*.com"));       // only one literal label
         assert!(!is_valid_dns_name_pattern("a.b.c.*"));     // wildcard in last label
+        assert!(!is_valid_dns_name_pattern("a.b.*.c"));     // wildcard in second-to-last
+        assert!(!is_valid_dns_name_pattern("*"));           // single label
     }
+
+    #[test]
+    fn is_valid_dns_name_pattern_hyphen_at_label_boundary() {
+        // "api-*" — last RAW char is *, not -, so this must be valid (C behaviour).
+        assert!(is_valid_dns_name_pattern("api-*.example.com"));
+        // "*-api" — first RAW char is *, not -, so this must be valid (C behaviour).
+        assert!(is_valid_dns_name_pattern("*-api.example.com"));
+        // "api-" (no wildcard) — trailing hyphen in literal label → invalid.
+        assert!(!is_valid_dns_name_pattern("api-.example.com"));
+        // "-api" (no wildcard) — leading hyphen → invalid.
+        assert!(!is_valid_dns_name_pattern("-api.example.com"));
+    }
+
+    #[test]
+    fn is_valid_dns_name_pattern_too_many_wildcards() {
+        // Three wildcards in a single label → invalid.
+        assert!(!is_valid_dns_name_pattern("***service.example.com"));
+    }
+
+    #[test]
+    fn is_valid_dns_name_pattern_plain_name_is_valid() {
+        // A literal DNS name is also a valid pattern (zero wildcards).
+        assert!(is_valid_dns_name_pattern("example.com"));
+        assert!(is_valid_dns_name_pattern("sub.example.com"));
+    }
+
+    // ── is_dns_name_matching_pattern ─────────────────────────────────────────
 
     #[test]
     fn dns_name_matching_pattern() {
@@ -183,5 +267,17 @@ mod tests {
         assert!(is_dns_name_matching_pattern("video42.example.com", "video*.example.com"));
         assert!(!is_dns_name_matching_pattern("api.other.com", "*.example.com"));
         assert!(!is_dns_name_matching_pattern("deep.api.example.com", "*.example.com")); // label count mismatch
+    }
+
+    #[test]
+    fn dns_name_matching_pattern_case_insensitive() {
+        assert!(is_dns_name_matching_pattern("API.Example.COM", "*.example.com"));
+    }
+
+    #[test]
+    fn dns_name_matching_pattern_multi_wildcard_label() {
+        // "*-prod-*" should match "web-prod-us" in the same label position
+        assert!(is_dns_name_matching_pattern("web-prod-us.example.com", "*-prod-*.example.com"));
+        assert!(!is_dns_name_matching_pattern("web-stage-us.example.com", "*-prod-*.example.com"));
     }
 }
