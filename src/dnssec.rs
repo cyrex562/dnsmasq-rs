@@ -703,6 +703,73 @@ pub fn dnskey_keytag(alg: u8, flags: u16, key: &[u8]) -> u16 {
     }
 }
 
+// ─── NSEC type bitmap checking (ported from dnssec.c NSEC handling) ──────────
+
+/// Check if `rr_type` is present in an NSEC/NSEC3 type bitmap.
+///
+/// The bitmap is a sequence of window blocks:
+///   window(1) | bitmap_len(1) | bitmap(bitmap_len)
+/// Each window covers 256 types starting at `window * 256`.
+/// Port of the type-bitmap checking logic used in `prove_non_existence_nsec`.
+pub fn type_in_bitmap(bitmap: &[u8], rr_type: u16) -> bool {
+    let window_wanted = (rr_type >> 8) as u8;
+    let offset = ((rr_type & 0xff) >> 3) as usize;
+    let mask = 0x80u8 >> (rr_type & 0x07);
+
+    let mut i = 0;
+    while i + 2 <= bitmap.len() {
+        let window = bitmap[i];
+        let bm_len = bitmap[i + 1] as usize;
+        if i + 2 + bm_len > bitmap.len() {
+            break;
+        }
+        if window == window_wanted {
+            if offset < bm_len {
+                return (bitmap[i + 2 + offset] & mask) != 0;
+            }
+            return false;
+        }
+        i += 2 + bm_len;
+    }
+    false
+}
+
+// ─── DNSSEC query builder (ported from dnssec.c:2353-2378) ───────────────────
+
+/// Build a DNS query packet for DNSSEC key retrieval (DNSKEY or DS).
+///
+/// Returns a complete DNS packet with RD set, a single question, and no
+/// additional records. The DO bit should be added separately via
+/// `edns0::add_do_bit`.
+/// Port of `dnssec_generate_query()` from dnssec.c:2353-2378.
+pub fn dnssec_generate_query(name: &str, qclass: u16, qtype: u16, id: u16) -> Vec<u8> {
+    let mut pkt = Vec::with_capacity(128);
+
+    // DNS header (12 bytes)
+    pkt.extend_from_slice(&id.to_be_bytes());       // ID
+    pkt.push(0x01); // hb3: RD=1
+    pkt.push(0x00); // hb4: 0 (or CD for debug)
+    pkt.extend_from_slice(&1u16.to_be_bytes());     // QDCOUNT=1
+    pkt.extend_from_slice(&0u16.to_be_bytes());     // ANCOUNT=0
+    pkt.extend_from_slice(&0u16.to_be_bytes());     // NSCOUNT=0
+    pkt.extend_from_slice(&0u16.to_be_bytes());     // ARCOUNT=0
+
+    // Question: encode name as wire-format labels
+    for label in name.trim_end_matches('.').split('.') {
+        if label.is_empty() {
+            continue;
+        }
+        pkt.push(label.len() as u8);
+        pkt.extend_from_slice(label.as_bytes());
+    }
+    pkt.push(0); // root label
+
+    pkt.extend_from_slice(&qtype.to_be_bytes());    // QTYPE
+    pkt.extend_from_slice(&qclass.to_be_bytes());   // QCLASS
+
+    pkt
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1197,5 +1264,89 @@ mod tests {
     fn dnskey_keytag_empty_key() {
         let tag = dnskey_keytag(8, 256, &[]);
         assert!(tag > 0); // still produces a tag from flags+alg
+    }
+
+    // ─── type_in_bitmap ──────────────────────────────────────────────────────
+
+    #[test]
+    fn type_in_bitmap_a_record() {
+        // Window 0, bitmap length 4, bits for types 0-31
+        // Type A = 1, so byte offset = 1>>3 = 0, mask = 0x80 >> 1 = 0x40
+        let bitmap = vec![0u8, 4, 0x40, 0x00, 0x00, 0x00]; // A bit set
+        assert!(type_in_bitmap(&bitmap, 1)); // A
+        assert!(!type_in_bitmap(&bitmap, 2)); // NS not set
+    }
+
+    #[test]
+    fn type_in_bitmap_ns_and_soa() {
+        // Type NS=2: byte 0, mask 0x20
+        // Type SOA=6: byte 0, mask 0x02
+        let bitmap = vec![0u8, 1, 0x22]; // NS (0x20) + SOA (0x02)
+        assert!(type_in_bitmap(&bitmap, 2));  // NS
+        assert!(type_in_bitmap(&bitmap, 6));  // SOA
+        assert!(!type_in_bitmap(&bitmap, 1)); // A not set
+    }
+
+    #[test]
+    fn type_in_bitmap_high_type() {
+        // RRSIG = 46. Window 0, byte offset = 46>>3 = 5, mask = 0x80>>(46&7) = 0x80>>6 = 0x02
+        let mut bitmap = vec![0u8, 6, 0, 0, 0, 0, 0, 0x02];
+        assert!(type_in_bitmap(&bitmap, 46)); // RRSIG
+        assert!(!type_in_bitmap(&bitmap, 45));
+    }
+
+    #[test]
+    fn type_in_bitmap_empty() {
+        assert!(!type_in_bitmap(&[], 1));
+    }
+
+    #[test]
+    fn type_in_bitmap_type_not_in_any_window() {
+        // Only window 0, types 0-7
+        let bitmap = vec![0u8, 1, 0xFF]; // all types 0-7 set
+        assert!(!type_in_bitmap(&bitmap, 256)); // window 1 — not present
+    }
+
+    // ─── dnssec_generate_query ───────────────────────────────────────────────
+
+    #[test]
+    fn dnssec_generate_query_structure() {
+        let pkt = dnssec_generate_query("example.com", 1, 48, 0x1234); // DNSKEY=48, IN=1
+        // Header check
+        assert_eq!(pkt[0], 0x12); // ID high
+        assert_eq!(pkt[1], 0x34); // ID low
+        assert_eq!(pkt[2], 0x01); // RD=1
+        // QDCOUNT=1
+        assert_eq!(u16::from_be_bytes([pkt[4], pkt[5]]), 1);
+        // ANCOUNT, NSCOUNT, ARCOUNT = 0
+        assert_eq!(u16::from_be_bytes([pkt[6], pkt[7]]), 0);
+        assert_eq!(u16::from_be_bytes([pkt[8], pkt[9]]), 0);
+        assert_eq!(u16::from_be_bytes([pkt[10], pkt[11]]), 0);
+        // QNAME starts at offset 12
+        assert_eq!(pkt[12], 7); // "example" label length
+        assert_eq!(&pkt[13..20], b"example");
+        assert_eq!(pkt[20], 3); // "com" label length
+        assert_eq!(&pkt[21..24], b"com");
+        assert_eq!(pkt[24], 0); // root
+        // QTYPE=48 (DNSKEY)
+        assert_eq!(u16::from_be_bytes([pkt[25], pkt[26]]), 48);
+        // QCLASS=1 (IN)
+        assert_eq!(u16::from_be_bytes([pkt[27], pkt[28]]), 1);
+    }
+
+    #[test]
+    fn dnssec_generate_query_ds() {
+        let pkt = dnssec_generate_query("sub.example.com", 1, 43, 0xABCD); // DS=43
+        assert_eq!(u16::from_be_bytes([pkt[0], pkt[1]]), 0xABCD);
+        // Check label: "sub"(3) "example"(7) "com"(3)
+        assert_eq!(pkt[12], 3);
+        assert_eq!(&pkt[13..16], b"sub");
+    }
+
+    #[test]
+    fn dnssec_generate_query_trailing_dot() {
+        let pkt1 = dnssec_generate_query("example.com.", 1, 48, 1);
+        let pkt2 = dnssec_generate_query("example.com", 1, 48, 1);
+        assert_eq!(pkt1, pkt2);
     }
 }

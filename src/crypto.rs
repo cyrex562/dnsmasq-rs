@@ -230,6 +230,64 @@ pub fn verify_sig(
 
 
 
+// ─── Digest/Algorithm name lookups (ported from crypto.c:422-472) ────────────
+
+/// Return the hash algorithm name for a DS digest type.
+///
+/// Per IANA ds-rr-types registry.
+/// Port of `ds_digest_name()` from crypto.c:422-434.
+pub fn ds_digest_name(digest: u8) -> Option<&'static str> {
+    match digest {
+        1 => Some("sha1"),
+        2 => Some("sha256"),
+        4 => Some("sha384"),
+        _ => None,
+    }
+}
+
+/// Return the hash algorithm name for a DNSSEC signing algorithm.
+///
+/// Per IANA dns-sec-alg-numbers registry.
+/// Port of `algo_digest_name()` from crypto.c:437-462.
+pub fn algo_digest_name(algo: u8) -> Option<&'static str> {
+    match algo {
+        1 => None,              // RSA/MD5 — Must Not Implement (RFC 6944)
+        2 => None,              // Diffie-Hellman
+        3 => None,              // DSA/SHA1 — Must Not Implement (RFC 8624)
+        5 => Some("sha1"),      // RSA/SHA1
+        6 => None,              // DSA-NSEC3-SHA1 — Must Not Implement (RFC 8624)
+        7 => Some("sha1"),      // RSASHA1-NSEC3-SHA1
+        8 => Some("sha256"),    // RSA/SHA-256
+        10 => Some("sha512"),   // RSA/SHA-512
+        13 => Some("sha256"),   // ECDSAP256SHA256
+        14 => Some("sha384"),   // ECDSAP384SHA384
+        15 => Some("null_hash"), // ED25519
+        16 => Some("null_hash"), // ED448
+        _ => None,
+    }
+}
+
+/// Return the hash algorithm name for an NSEC3 digest type.
+///
+/// Per IANA dnssec-nsec3-parameters registry.
+/// Port of `nsec3_digest_name()` from crypto.c:465-472.
+pub fn nsec3_digest_name(digest: u8) -> Option<&'static str> {
+    match digest {
+        1 => Some("sha1"),
+        _ => None,
+    }
+}
+
+/// Check if a DNSSEC algorithm is supported for signature verification.
+pub fn algo_supported(algo: u8) -> bool {
+    algo_digest_name(algo).is_some()
+}
+
+/// Check if a DS digest type is supported.
+pub fn ds_digest_supported(digest: u8) -> bool {
+    ds_digest_name(digest).is_some()
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -478,5 +536,90 @@ mod tests {
             DnssecPublicKey::RsaSha256(_) => {} // RSA/SHA-1 stored as RsaSha256
             _ => panic!("expected RsaSha256 variant for RSA/SHA-1"),
         }
+    }
+
+    // ── ds_digest_name ───────────────────────────────────────────────────────
+
+    #[test]
+    fn ds_digest_name_sha1() {
+        assert_eq!(ds_digest_name(1), Some("sha1"));
+    }
+
+    #[test]
+    fn ds_digest_name_sha256() {
+        assert_eq!(ds_digest_name(2), Some("sha256"));
+    }
+
+    #[test]
+    fn ds_digest_name_sha384() {
+        assert_eq!(ds_digest_name(4), Some("sha384"));
+    }
+
+    #[test]
+    fn ds_digest_name_unknown() {
+        assert_eq!(ds_digest_name(99), None);
+    }
+
+    // ── algo_digest_name ─────────────────────────────────────────────────────
+
+    #[test]
+    fn algo_digest_name_rsa_sha256() {
+        assert_eq!(algo_digest_name(8), Some("sha256"));
+    }
+
+    #[test]
+    fn algo_digest_name_rsa_sha512() {
+        assert_eq!(algo_digest_name(10), Some("sha512"));
+    }
+
+    #[test]
+    fn algo_digest_name_ecdsa_p256() {
+        assert_eq!(algo_digest_name(13), Some("sha256"));
+    }
+
+    #[test]
+    fn algo_digest_name_ed25519() {
+        assert_eq!(algo_digest_name(15), Some("null_hash"));
+    }
+
+    #[test]
+    fn algo_digest_name_rsa_md5_not_impl() {
+        assert_eq!(algo_digest_name(1), None);
+    }
+
+    #[test]
+    fn algo_digest_name_dsa_not_impl() {
+        assert_eq!(algo_digest_name(3), None);
+    }
+
+    // ── nsec3_digest_name ────────────────────────────────────────────────────
+
+    #[test]
+    fn nsec3_digest_name_sha1() {
+        assert_eq!(nsec3_digest_name(1), Some("sha1"));
+    }
+
+    #[test]
+    fn nsec3_digest_name_unknown() {
+        assert_eq!(nsec3_digest_name(0), None);
+        assert_eq!(nsec3_digest_name(2), None);
+    }
+
+    // ── algo_supported / ds_digest_supported ─────────────────────────────────
+
+    #[test]
+    fn algo_supported_checks() {
+        assert!(algo_supported(8));  // RSA/SHA-256
+        assert!(algo_supported(15)); // ED25519
+        assert!(!algo_supported(1)); // RSA/MD5 (not implemented)
+        assert!(!algo_supported(99));
+    }
+
+    #[test]
+    fn ds_digest_supported_checks() {
+        assert!(ds_digest_supported(1));  // SHA-1
+        assert!(ds_digest_supported(2));  // SHA-256
+        assert!(!ds_digest_supported(0));
+        assert!(!ds_digest_supported(99));
     }
 }
