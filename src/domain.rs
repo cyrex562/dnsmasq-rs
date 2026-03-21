@@ -107,6 +107,131 @@ fn strip_prefix<'a>(name: &'a str, prefix: Option<&str>) -> Option<&'a str> {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Reverse synthesis: address → hostname (ported from domain.c:153-215)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Generate a synthetic hostname from an IPv4 address and matching conditional domain.
+///
+/// For indexed domains: `<prefix><index>.<domain>` where index = addr - start.
+/// For dashed domains: `<prefix><a-b-c-d>.<domain>`.
+/// Port of the IPv4 path of `is_rev_synth()` from domain.c:153-182.
+pub fn rev_synth_ipv4(addr: Ipv4Addr, domains: &[CondDomain]) -> Option<String> {
+    for c in domains {
+        if c.is6 {
+            continue;
+        }
+        if !ipv4_in_range(addr, c.start, c.end) {
+            continue;
+        }
+        let prefix = c.prefix.as_deref().unwrap_or("");
+        let name = if c.indexed {
+            let index = u32::from(addr) - u32::from(c.start);
+            format!("{prefix}{index}.{}", c.domain)
+        } else {
+            let dotted = addr.to_string();
+            let dashed = dotted.replace('.', "-");
+            format!("{prefix}{dashed}.{}", c.domain)
+        };
+        return Some(name);
+    }
+    None
+}
+
+/// Generate a synthetic hostname from an IPv6 address and matching conditional domain.
+///
+/// For indexed domains: `<prefix><index>.<domain>` where index = low64(addr) - low64(start).
+/// For hex domains: `<prefix><xxxx-xxxx-...-xxxx>.<domain>` (8 groups of 2 hex bytes).
+/// Port of the IPv6 path of `is_rev_synth()` from domain.c:184-212.
+pub fn rev_synth_ipv6(addr: Ipv6Addr, domains: &[CondDomain]) -> Option<String> {
+    for c in domains {
+        if !c.is6 {
+            continue;
+        }
+        if !ipv6_in_range(addr, c.start6, c.end6) {
+            continue;
+        }
+        let prefix = c.prefix.as_deref().unwrap_or("");
+        let name = if c.indexed {
+            let index = ipv6_low64(addr) - ipv6_low64(c.start6);
+            format!("{prefix}{index}.{}", c.domain)
+        } else {
+            let octets = addr.octets();
+            let hex_parts: Vec<String> = (0..8)
+                .map(|i| format!("{:02x}{:02x}", octets[i * 2], octets[i * 2 + 1]))
+                .collect();
+            let hex_str = hex_parts.join("-");
+            format!("{prefix}{hex_str}.{}", c.domain)
+        };
+        return Some(name);
+    }
+    None
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Domain matching and search (ported from domain.c:218-301)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Check if an IPv4 address matches a conditional domain's range.
+///
+/// Port of `match_domain()` from domain.c:218-234.
+pub fn match_domain(addr: Ipv4Addr, c: &CondDomain) -> bool {
+    if c.is6 {
+        return false;
+    }
+    let a = u32::from(addr);
+    let s = u32::from(c.start);
+    let e = u32::from(c.end);
+    a >= s && a <= e
+}
+
+/// Search a list of conditional domains for one matching the IPv4 address.
+///
+/// Port of `search_domain()` from domain.c:236-243.
+pub fn search_domain<'a>(addr: Ipv4Addr, domains: &'a [CondDomain]) -> Option<&'a CondDomain> {
+    domains.iter().find(|c| match_domain(addr, c))
+}
+
+/// Get the domain suffix for an IPv4 address from conditional domains, with fallback.
+///
+/// Port of `get_domain()` from domain.c:245-253.
+pub fn get_domain(addr: Ipv4Addr, domains: &[CondDomain], default: &str) -> String {
+    match search_domain(addr, domains) {
+        Some(c) => c.domain.clone(),
+        None => default.to_string(),
+    }
+}
+
+/// Check if an IPv6 address matches a conditional domain's range.
+///
+/// Port of `match_domain6()` from domain.c:255-282.
+pub fn match_domain6(addr: Ipv6Addr, c: &CondDomain) -> bool {
+    if !c.is6 {
+        return false;
+    }
+    let a = ipv6_low64(addr);
+    let s = ipv6_low64(c.start6);
+    let e = ipv6_low64(c.end6);
+    a >= s && a <= e
+}
+
+/// Search a list of conditional domains for one matching the IPv6 address.
+///
+/// Port of `search_domain6()` from domain.c:284-291.
+pub fn search_domain6<'a>(addr: Ipv6Addr, domains: &'a [CondDomain]) -> Option<&'a CondDomain> {
+    domains.iter().find(|c| match_domain6(addr, c))
+}
+
+/// Get the domain suffix for an IPv6 address from conditional domains, with fallback.
+///
+/// Port of `get_domain6()` from domain.c:293-301.
+pub fn get_domain6(addr: Ipv6Addr, domains: &[CondDomain], default: &str) -> String {
+    match search_domain6(addr, domains) {
+        Some(c) => c.domain.clone(),
+        None => default.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +462,153 @@ mod tests {
     #[test]
     fn synth_ipv4_empty_domains_returns_none() {
         assert!(synthesize_ipv4("10-0-0-1.example.com", &[]).is_none());
+    }
+
+    // ── rev_synth_ipv4 ──────────────────────────────────────────────────────
+
+    #[test]
+    fn rev_synth_ipv4_dashed() {
+        let d = make_domain("example.com", None, "10.0.0.0".parse().unwrap(), "10.0.0.255".parse().unwrap());
+        let name = rev_synth_ipv4("10.0.0.42".parse().unwrap(), &[d]);
+        assert_eq!(name.as_deref(), Some("10-0-0-42.example.com"));
+    }
+
+    #[test]
+    fn rev_synth_ipv4_indexed() {
+        let mut d = make_domain("example.com", None, "10.0.0.0".parse().unwrap(), "10.0.0.255".parse().unwrap());
+        d.indexed = true;
+        let name = rev_synth_ipv4("10.0.0.5".parse().unwrap(), &[d]);
+        assert_eq!(name.as_deref(), Some("5.example.com"));
+    }
+
+    #[test]
+    fn rev_synth_ipv4_with_prefix() {
+        let d = make_domain("example.com", Some("ip-"), "10.0.0.0".parse().unwrap(), "10.0.0.255".parse().unwrap());
+        let name = rev_synth_ipv4("10.0.0.7".parse().unwrap(), &[d]);
+        assert_eq!(name.as_deref(), Some("ip-10-0-0-7.example.com"));
+    }
+
+    #[test]
+    fn rev_synth_ipv4_out_of_range() {
+        let d = make_domain("example.com", None, "10.0.0.0".parse().unwrap(), "10.0.0.10".parse().unwrap());
+        assert!(rev_synth_ipv4("10.0.0.50".parse().unwrap(), &[d]).is_none());
+    }
+
+    // ── rev_synth_ipv6 ──────────────────────────────────────────────────────
+
+    fn make_v6_domain(domain: &str, prefix: Option<&str>, start6: Ipv6Addr, end6: Ipv6Addr, indexed: bool) -> CondDomain {
+        CondDomain {
+            domain: domain.to_string(),
+            prefix: prefix.map(|s| s.to_string()),
+            start: Ipv4Addr::UNSPECIFIED,
+            end: Ipv4Addr::UNSPECIFIED,
+            start6,
+            end6,
+            is6: true,
+            indexed,
+        }
+    }
+
+    #[test]
+    fn rev_synth_ipv6_hex() {
+        let d = make_v6_domain("example.com", None, "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(), false);
+        let name = rev_synth_ipv6("2001:db8::42".parse().unwrap(), &[d]);
+        let n = name.unwrap();
+        assert!(n.ends_with(".example.com"));
+        assert!(n.contains("2001"));
+    }
+
+    #[test]
+    fn rev_synth_ipv6_indexed() {
+        let d = make_v6_domain("example.com", None, "2001:db8::100".parse().unwrap(), "2001:db8::200".parse().unwrap(), true);
+        let name = rev_synth_ipv6("2001:db8::105".parse().unwrap(), &[d]);
+        assert_eq!(name.as_deref(), Some("5.example.com"));
+    }
+
+    #[test]
+    fn rev_synth_ipv6_with_prefix() {
+        let d = make_v6_domain("example.com", Some("host-"), "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(), true);
+        let name = rev_synth_ipv6("2001:db8::3".parse().unwrap(), &[d]);
+        assert_eq!(name.as_deref(), Some("host-2.example.com"));
+    }
+
+    #[test]
+    fn rev_synth_ipv6_out_of_range() {
+        let d = make_v6_domain("example.com", None, "2001:db8::1".parse().unwrap(), "2001:db8::10".parse().unwrap(), false);
+        assert!(rev_synth_ipv6("2001:db8::ff".parse().unwrap(), &[d]).is_none());
+    }
+
+    // ── match_domain / search_domain ─────────────────────────────────────────
+
+    #[test]
+    fn match_domain_in_range() {
+        let d = make_domain("example.com", None, "10.0.0.0".parse().unwrap(), "10.0.0.255".parse().unwrap());
+        assert!(match_domain("10.0.0.42".parse().unwrap(), &d));
+    }
+
+    #[test]
+    fn match_domain_out_of_range() {
+        let d = make_domain("example.com", None, "10.0.0.0".parse().unwrap(), "10.0.0.10".parse().unwrap());
+        assert!(!match_domain("10.0.0.50".parse().unwrap(), &d));
+    }
+
+    #[test]
+    fn match_domain_skips_v6() {
+        let d = make_v6_domain("example.com", None, "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(), false);
+        assert!(!match_domain("10.0.0.1".parse().unwrap(), &d));
+    }
+
+    #[test]
+    fn search_domain_finds_match() {
+        let d = make_domain("example.com", None, "10.0.0.0".parse().unwrap(), "10.0.0.255".parse().unwrap());
+        assert!(search_domain("10.0.0.42".parse().unwrap(), &[d]).is_some());
+    }
+
+    #[test]
+    fn search_domain_no_match() {
+        let d = make_domain("example.com", None, "10.0.0.0".parse().unwrap(), "10.0.0.10".parse().unwrap());
+        assert!(search_domain("192.168.1.1".parse().unwrap(), &[d]).is_none());
+    }
+
+    #[test]
+    fn get_domain_match() {
+        let d = make_domain("my.lan", None, "10.0.0.0".parse().unwrap(), "10.0.0.255".parse().unwrap());
+        assert_eq!(get_domain("10.0.0.1".parse().unwrap(), &[d], "default.lan"), "my.lan");
+    }
+
+    #[test]
+    fn get_domain_fallback() {
+        assert_eq!(get_domain("192.168.1.1".parse().unwrap(), &[], "default.lan"), "default.lan");
+    }
+
+    // ── match_domain6 / search_domain6 ───────────────────────────────────────
+
+    #[test]
+    fn match_domain6_in_range() {
+        let d = make_v6_domain("example.com", None, "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(), false);
+        assert!(match_domain6("2001:db8::42".parse().unwrap(), &d));
+    }
+
+    #[test]
+    fn match_domain6_out_of_range() {
+        let d = make_v6_domain("example.com", None, "2001:db8::1".parse().unwrap(), "2001:db8::10".parse().unwrap(), false);
+        assert!(!match_domain6("2001:db8::ff".parse().unwrap(), &d));
+    }
+
+    #[test]
+    fn search_domain6_finds_match() {
+        let d = make_v6_domain("v6.lan", None, "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(), false);
+        assert!(search_domain6("2001:db8::42".parse().unwrap(), &[d]).is_some());
+    }
+
+    #[test]
+    fn get_domain6_match() {
+        let d = make_v6_domain("v6.lan", None, "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(), false);
+        assert_eq!(get_domain6("2001:db8::5".parse().unwrap(), &[d], "default.lan"), "v6.lan");
+    }
+
+    #[test]
+    fn get_domain6_fallback() {
+        assert_eq!(get_domain6("fe80::1".parse().unwrap(), &[], "default.lan"), "default.lan");
     }
 }

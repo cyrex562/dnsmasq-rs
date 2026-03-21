@@ -10,7 +10,7 @@ Rust port of [dnsmasq](https://thekelleys.org.uk/dnsmasq/doc.html), a DNS forwar
 cargo build                          # default features
 cargo build --all-features           # all features
 cargo build --no-default-features    # minimal build
-cargo test                           # all tests (1004+ unit + integration)
+cargo test                           # all tests (1034+ unit + integration)
 cargo test <name>                    # run specific test by substring
 cargo test --test dns_roundtrip      # specific integration test
 cargo test proptest                  # property-based tests only
@@ -62,9 +62,9 @@ RUST_LOG=debug cargo run             # run with debug logging
 | `loop_detect.rs` | loop.c | 212 | 113 | Complete |
 | `ipset.rs` | ipset.c | 209 | 216 | Mostly complete |
 | `conntrack.rs` | conntrack.c | 199 | 85 | Complete (expanded) |
-| `domain.rs` | domain.c | 184 | 301 | Partial (~61%) |
+| `domain.rs` | domain.c | 614 | 301 | Complete (expanded) |
 | `blockdata.rs` | blockdata.c | 149 | 241 | Complete |
-| `slaac.rs` | slaac.c | 151 | 213 | Mostly complete |
+| `slaac.rs` | slaac.c | 365 | 213 | Complete (expanded) |
 | `ubus.rs` | ubus.c | 142 | 391 | Partial (~36%) |
 | `inotify.rs` | inotify.c | 142 | 372 | Partial (~38%) |
 | `nftset.rs` | nftset.c | 140 | 100 | Complete |
