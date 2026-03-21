@@ -383,8 +383,9 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
 
         "dhcp-lease-max" => {
             let v = require_value("dhcp-lease-max")?;
-            let n: i32 = v.parse().map_err(|_| invalid(v, "expected an integer"))?;
-            daemon.dhcp_max = n;
+            let _n: i32 = v.parse().map_err(|_| invalid(v, "expected an integer"))?;
+            #[cfg(feature = "dhcp")]
+            { daemon.dhcp_max = _n; }
         }
 
         "dhcp-ignore" => {

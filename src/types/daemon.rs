@@ -112,6 +112,10 @@ pub struct Daemon {
     pub randport_limit:  i32,
     /// Incremented each time a config reload (SIGHUP) is processed.
     pub reload_count:    u32,
+    /// Set when DNS data has been modified and needs re-serving.
+    pub dns_dirty:       bool,
+    /// The next scheduled alarm time (if any).
+    pub next_alarm:      Option<std::time::Instant>,
 
     // ── DHCP state (feature-gated) ────────────────────────────────────────────
     #[cfg(feature = "dhcp")]
@@ -289,6 +293,8 @@ impl Default for Daemon {
             max_procs: 0,
             randport_limit: 0,
             reload_count: 0,
+            dns_dirty: false,
+            next_alarm: None,
 
             #[cfg(feature = "dhcp")]
             dhcp: vec![],

@@ -141,6 +141,135 @@ pub fn build_oack(options: &[(&str, &str)]) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// Transfer state machine
+// ---------------------------------------------------------------------------
+
+/// Represents an active TFTP transfer.
+pub struct TftpTransfer {
+    pub filename: String,
+    pub block: u16,
+    pub block_size: usize,
+    pub file_size: Option<u64>,
+    pub complete: bool,
+    pub retries: u32,
+    pub max_retries: u32,
+}
+
+impl TftpTransfer {
+    /// Create a new transfer for the given filename and block size.
+    pub fn new(filename: &str, block_size: usize) -> Self {
+        TftpTransfer {
+            filename: filename.to_string(),
+            block: 0,
+            block_size,
+            file_size: None,
+            complete: false,
+            retries: 0,
+            max_retries: 5,
+        }
+    }
+
+    /// Build a DATA packet for the next block from provided file data.
+    /// Increments block number. Marks complete if data length < block_size.
+    pub fn next_block(&mut self, data: &[u8]) -> Vec<u8> {
+        self.block = self.block.wrapping_add(1);
+        if data.len() < self.block_size {
+            self.complete = true;
+        }
+        build_data(self.block, data)
+    }
+
+    /// Process an ACK packet. Returns true if the ACK matches the current block.
+    /// Resets retries on match, increments retries on mismatch.
+    pub fn handle_ack(&mut self, block: u16) -> bool {
+        if block == self.block {
+            self.retries = 0;
+            true
+        } else {
+            self.retries += 1;
+            false
+        }
+    }
+
+    /// Check if retries exceeded max_retries.
+    pub fn is_timed_out(&self) -> bool {
+        self.retries > self.max_retries
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Filename sanitization
+// ---------------------------------------------------------------------------
+
+/// Validate and sanitize a TFTP filename.
+/// Rejects paths with "..", leading "/", or null bytes.
+/// Converts backslashes to forward slashes.
+pub fn sanitize_filename(name: &str) -> Option<String> {
+    // Reject null bytes
+    if name.contains('\0') {
+        return None;
+    }
+
+    // Convert backslashes to forward slashes
+    let name = name.replace('\\', "/");
+
+    // Reject leading slash
+    if name.starts_with('/') {
+        return None;
+    }
+
+    // Reject ".." path components
+    for component in name.split('/') {
+        if component == ".." {
+            return None;
+        }
+    }
+
+    // Reject empty filenames
+    if name.is_empty() {
+        return None;
+    }
+
+    Some(name)
+}
+
+// ---------------------------------------------------------------------------
+// Option negotiation (RFC 2347)
+// ---------------------------------------------------------------------------
+
+/// Process TFTP option negotiation (RFC 2347).
+/// Handles "blksize" and "tsize" options.
+/// Returns the list of acknowledged options with their negotiated values.
+pub fn negotiate_options(
+    requested: &[(String, String)],
+    max_block_size: usize,
+) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+
+    for (key, value) in requested {
+        match key.to_lowercase().as_str() {
+            "blksize" => {
+                if let Ok(requested_size) = value.parse::<usize>() {
+                    // Clamp to [8, max_block_size]
+                    let negotiated = requested_size.clamp(8, max_block_size);
+                    result.push(("blksize".to_string(), negotiated.to_string()));
+                }
+            }
+            "tsize" => {
+                // Echo back the tsize option; the caller fills in the actual
+                // file size. We acknowledge with "0" to indicate we accept it.
+                result.push(("tsize".to_string(), value.clone()));
+            }
+            _ => {
+                // Unknown options are silently ignored per RFC 2347
+            }
+        }
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -228,5 +357,243 @@ mod tests {
         let pkt = build_oack(&[("blksize", "512")]);
         assert_eq!(u16::from_be_bytes([pkt[0], pkt[1]]), TftpOpcode::Oack as u16);
         assert!(pkt[2..].starts_with(b"blksize\0512\0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // TftpTransfer tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn transfer_new_defaults() {
+        let t = TftpTransfer::new("boot.img", 512);
+        assert_eq!(t.filename, "boot.img");
+        assert_eq!(t.block, 0);
+        assert_eq!(t.block_size, 512);
+        assert!(!t.complete);
+        assert_eq!(t.retries, 0);
+        assert_eq!(t.max_retries, 5);
+        assert!(t.file_size.is_none());
+    }
+
+    #[test]
+    fn transfer_next_block_increments() {
+        let mut t = TftpTransfer::new("file", 512);
+        let data = vec![0xABu8; 512];
+        let pkt = t.next_block(&data);
+        assert_eq!(t.block, 1);
+        assert!(!t.complete);
+        let (block, payload) = parse_data(&pkt).unwrap();
+        assert_eq!(block, 1);
+        assert_eq!(payload.len(), 512);
+    }
+
+    #[test]
+    fn transfer_next_block_marks_complete_on_short() {
+        let mut t = TftpTransfer::new("file", 512);
+        let data = vec![0u8; 100]; // less than block_size
+        let _pkt = t.next_block(&data);
+        assert_eq!(t.block, 1);
+        assert!(t.complete);
+    }
+
+    #[test]
+    fn transfer_next_block_marks_complete_on_empty() {
+        let mut t = TftpTransfer::new("file", 512);
+        let _pkt = t.next_block(&[]);
+        assert!(t.complete);
+    }
+
+    #[test]
+    fn transfer_next_block_sequential() {
+        let mut t = TftpTransfer::new("file", 512);
+        let full = vec![0u8; 512];
+        t.next_block(&full);
+        assert_eq!(t.block, 1);
+        t.next_block(&full);
+        assert_eq!(t.block, 2);
+        t.next_block(&full);
+        assert_eq!(t.block, 3);
+        assert!(!t.complete);
+    }
+
+    #[test]
+    fn transfer_handle_ack_matching() {
+        let mut t = TftpTransfer::new("file", 512);
+        t.block = 5;
+        t.retries = 3;
+        assert!(t.handle_ack(5));
+        assert_eq!(t.retries, 0);
+    }
+
+    #[test]
+    fn transfer_handle_ack_mismatch() {
+        let mut t = TftpTransfer::new("file", 512);
+        t.block = 5;
+        assert!(!t.handle_ack(4));
+        assert_eq!(t.retries, 1);
+        assert!(!t.handle_ack(3));
+        assert_eq!(t.retries, 2);
+    }
+
+    #[test]
+    fn transfer_is_timed_out() {
+        let mut t = TftpTransfer::new("file", 512);
+        t.max_retries = 3;
+        assert!(!t.is_timed_out());
+        t.retries = 3;
+        assert!(!t.is_timed_out());
+        t.retries = 4;
+        assert!(t.is_timed_out());
+    }
+
+    #[test]
+    fn transfer_full_session() {
+        let mut t = TftpTransfer::new("test.bin", 4);
+        // Block 1: full block
+        let pkt1 = t.next_block(&[1, 2, 3, 4]);
+        assert!(!t.complete);
+        let (b, d) = parse_data(&pkt1).unwrap();
+        assert_eq!(b, 1);
+        assert_eq!(d, &[1, 2, 3, 4]);
+        assert!(t.handle_ack(1));
+
+        // Block 2: partial (last block)
+        let pkt2 = t.next_block(&[5, 6]);
+        assert!(t.complete);
+        let (b, d) = parse_data(&pkt2).unwrap();
+        assert_eq!(b, 2);
+        assert_eq!(d, &[5, 6]);
+        assert!(t.handle_ack(2));
+    }
+
+    // -----------------------------------------------------------------------
+    // sanitize_filename tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sanitize_normal_filename() {
+        assert_eq!(sanitize_filename("boot/pxelinux.0"), Some("boot/pxelinux.0".to_string()));
+    }
+
+    #[test]
+    fn sanitize_simple_name() {
+        assert_eq!(sanitize_filename("file.txt"), Some("file.txt".to_string()));
+    }
+
+    #[test]
+    fn sanitize_rejects_dotdot() {
+        assert_eq!(sanitize_filename("../etc/passwd"), None);
+        assert_eq!(sanitize_filename("boot/../secret"), None);
+        assert_eq!(sanitize_filename(".."), None);
+    }
+
+    #[test]
+    fn sanitize_rejects_leading_slash() {
+        assert_eq!(sanitize_filename("/etc/passwd"), None);
+        assert_eq!(sanitize_filename("/boot/file"), None);
+    }
+
+    #[test]
+    fn sanitize_rejects_null_bytes() {
+        assert_eq!(sanitize_filename("file\0.txt"), None);
+    }
+
+    #[test]
+    fn sanitize_rejects_empty() {
+        assert_eq!(sanitize_filename(""), None);
+    }
+
+    #[test]
+    fn sanitize_converts_backslashes() {
+        assert_eq!(sanitize_filename("boot\\pxe\\file.0"), Some("boot/pxe/file.0".to_string()));
+    }
+
+    #[test]
+    fn sanitize_rejects_backslash_dotdot() {
+        assert_eq!(sanitize_filename("boot\\..\\secret"), None);
+    }
+
+    #[test]
+    fn sanitize_allows_dots_in_names() {
+        assert_eq!(sanitize_filename("file.tar.gz"), Some("file.tar.gz".to_string()));
+        assert_eq!(sanitize_filename(".hidden"), Some(".hidden".to_string()));
+    }
+
+    #[test]
+    fn sanitize_allows_single_dot_component() {
+        // "." as a path component is fine, ".." is not
+        assert_eq!(sanitize_filename("./file.txt"), Some("./file.txt".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // negotiate_options tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn negotiate_blksize_within_range() {
+        let opts = vec![("blksize".to_string(), "1024".to_string())];
+        let result = negotiate_options(&opts, 1428);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], ("blksize".to_string(), "1024".to_string()));
+    }
+
+    #[test]
+    fn negotiate_blksize_clamped_to_max() {
+        let opts = vec![("blksize".to_string(), "65535".to_string())];
+        let result = negotiate_options(&opts, 1428);
+        assert_eq!(result[0], ("blksize".to_string(), "1428".to_string()));
+    }
+
+    #[test]
+    fn negotiate_blksize_clamped_to_min() {
+        let opts = vec![("blksize".to_string(), "2".to_string())];
+        let result = negotiate_options(&opts, 1428);
+        assert_eq!(result[0], ("blksize".to_string(), "8".to_string()));
+    }
+
+    #[test]
+    fn negotiate_tsize_echoed() {
+        let opts = vec![("tsize".to_string(), "0".to_string())];
+        let result = negotiate_options(&opts, 512);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], ("tsize".to_string(), "0".to_string()));
+    }
+
+    #[test]
+    fn negotiate_multiple_options() {
+        let opts = vec![
+            ("blksize".to_string(), "1024".to_string()),
+            ("tsize".to_string(), "0".to_string()),
+        ];
+        let result = negotiate_options(&opts, 1428);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn negotiate_unknown_option_ignored() {
+        let opts = vec![("windowsize".to_string(), "4".to_string())];
+        let result = negotiate_options(&opts, 512);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn negotiate_case_insensitive() {
+        let opts = vec![("BLKSIZE".to_string(), "512".to_string())];
+        let result = negotiate_options(&opts, 1428);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "blksize");
+    }
+
+    #[test]
+    fn negotiate_invalid_blksize_ignored() {
+        let opts = vec![("blksize".to_string(), "not_a_number".to_string())];
+        let result = negotiate_options(&opts, 512);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn negotiate_empty_options() {
+        let result = negotiate_options(&[], 512);
+        assert!(result.is_empty());
     }
 }

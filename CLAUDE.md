@@ -10,7 +10,7 @@ Rust port of [dnsmasq](https://thekelleys.org.uk/dnsmasq/doc.html), a DNS forwar
 cargo build                          # default features
 cargo build --all-features           # all features
 cargo build --no-default-features    # minimal build
-cargo test                           # all tests (760+ unit + integration)
+cargo test                           # all tests (847+ unit + integration)
 cargo test <name>                    # run specific test by substring
 cargo test --test dns_roundtrip      # specific integration test
 cargo test proptest                  # property-based tests only
@@ -37,28 +37,28 @@ RUST_LOG=debug cargo run             # run with debug logging
 | `network.rs` | network.c | 1487 | 1812 | Mostly complete |
 | `dhcp_common.rs` | dhcp-common.c | 1449 | 1081 | Complete |
 | `netlink.rs` | netlink.c | 1144 | 414 | Complete (expanded) |
-| `option.rs` | option.c | 1097 | 6322 | Partial (~17%) |
+| `lease.rs` | lease.c | 1238 | 1346 | Mostly complete |
+| `option.rs` | option.c | 1098 | 6322 | Partial (~17%) |
 | `dnssec.rs` | dnssec.c | 997 | 2410 | Partial (~41%) |
 | `domain_match.rs` | domain-match.c | 913 | 778 | Complete |
+| `dnsmasq.rs` | dnsmasq.c | 863 | 2478 | Partial (~35%) |
 | `util.rs` | util.c | 781 | 1006 | Mostly complete |
 | `rfc3315.rs` | rfc3315.c | 673 | 2348 | Partial (~29%) |
 | `auth.rs` | auth.c | 654 | 915 | Partial (~71%) |
+| `tftp.rs` | tftp.c | 599 | 1040 | Partial (~58%) |
+| `radv.rs` | radv.c | 539 | 1039 | Partial (~52%) |
 | `dump.rs` | dump.c | 513 | 303 | Complete (expanded) |
+| `helper.rs` | helper.c | 500 | 948 | Partial (~53%) |
 | `arp.rs` | arp.c | 498 | 240 | Complete (expanded) |
 | `edns0.rs` | edns0.c | 482 | 574 | Mostly complete |
 | `log.rs` | log.c | 416 | 494 | Mostly complete |
-| `dnsmasq.rs` | dnsmasq.c | 363 | 2478 | Partial (~15%) |
 | `outpacket.rs` | outpacket.c | 361 | 118 | Complete |
 | `dhcp.rs` | dhcp.c | 336 | 1124 | Partial (~30%) |
 | `crypto.rs` | crypto.c | 316 | 504 | Partial (~63%) |
-| `lease.rs` | lease.c | 313 | 1346 | Partial (~23%) |
 | `dhcp6.rs` | dhcp6.c | 294 | 881 | Partial (~33%) |
 | `rrfilter.rs` | rrfilter.c | 287 | 413 | Mostly complete |
 | `pattern.rs` | pattern.c | 283 | 386 | Mostly complete |
-| `radv.rs` | radv.c | 271 | 1039 | Partial (~26%) |
 | `poll.rs` | poll.c | 259 | 118 | Complete (expanded) |
-| `tftp.rs` | tftp.c | 232 | 1040 | Partial (~22%) |
-| `helper.rs` | helper.c | 220 | 948 | Partial (~23%) |
 | `loop_detect.rs` | loop.c | 212 | 113 | Complete |
 | `ipset.rs` | ipset.c | 209 | 216 | Mostly complete |
 | `conntrack.rs` | conntrack.c | 199 | 85 | Complete (expanded) |
@@ -75,16 +75,16 @@ RUST_LOG=debug cargo run             # run with debug logging
 
 ### Porting Priority (files needing most work)
 
-1. **option.rs** — Config parser is only ~17% ported (1097 vs 6322 LOC). Critical for full functionality.
-2. **dnsmasq.rs** — Main daemon logic only ~15% ported (363 vs 2478 LOC). Event loop is skeletal.
+1. **option.rs** — Config parser is only ~17% ported (1098 vs 6322 LOC). Critical for full functionality.
+2. **dnsmasq.rs** — Main daemon logic ~35% ported (863 vs 2478 LOC). Event system and resolv monitor added.
 3. **rfc2131.rs** — DHCP server ~51% ported. Missing many option handlers.
 4. **rfc3315.rs** — DHCPv6 ~29% ported.
-5. **radv.rs** — Router advertisements ~26% ported.
-6. **lease.rs** — Lease management ~23% ported.
-7. **helper.rs** — DHCP script helper ~23% ported.
-8. **tftp.rs** — TFTP server ~22% ported.
-9. **dbus.rs** — D-Bus integration ~9% ported.
-10. **dnssec.rs** — DNSSEC validation ~41% ported.
+5. **dnssec.rs** — DNSSEC validation ~41% ported.
+6. **dhcp.rs** — DHCP listener ~30% ported.
+7. **dhcp6.rs** — DHCPv6 listener ~33% ported.
+8. **dbus.rs** — D-Bus integration ~9% ported.
+9. **bpf.rs** — BPF support ~31% ported.
+10. **ubus.rs** — uBus integration ~36% ported.
 
 ### Type System
 
@@ -129,19 +129,23 @@ Feature-gated code uses `#[cfg(feature = "...")]` on mod declarations and implem
 | Module | Tests | Notes |
 |--------|-------|-------|
 | cache.rs | 71 | Excellent — LRU, TTL, eviction, flags |
+| lease.rs | 60 | Excellent — allocate, expire, hwaddr, hostname, file I/O |
 | forward.rs | 54 | Good — forwarding, retry, TCP fallback |
 | dhcp_common.rs | 53 | Good — DHCP utilities |
 | rfc2131.rs | 48 | Good — DHCP protocol |
 | rfc1035.rs | 47 | Good — DNS parser/encoder |
 | network.rs | 41 | Good (1 env-dependent failure) |
+| tftp.rs | 36 | Good — packet ops, transfer state, sanitization, options |
 | option.rs | 32 | Moderate — config parsing |
 | dnssec.rs | 29 | Good — validation logic |
 | domain_match.rs | 26 | Good |
 | util.rs | 24 | Good |
 | rfc3315.rs | 24 | Good — DHCPv6 |
-| crypto.rs | 19 | Good — RSA, ECDSA, Ed25519 parsing + verification |
-| domain.rs | 18 | Good — range checks, synthesis |
-| lease.rs | 14 | Good — CRUD, serialization, error paths |
+| helper.rs | 24 | Good — script exec, format, queue, roundtrip |
+| dnsmasq.rs | 22 | Good — event system, resolv monitor, ICMP pinger |
+| domain.rs | 21 | Good — range checks, synthesis, IPv6 helpers |
+| radv.rs | 20 | Good — RA scheduling, priority, interval calc |
+| crypto.rs | 20 | Good — RSA, ECDSA, Ed25519 parsing + verification |
 | pattern.rs | 14 | Good |
 | netlink.rs | 14 | Good |
 | arp.rs | 14 | Good |

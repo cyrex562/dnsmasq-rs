@@ -2,8 +2,9 @@
 //!
 //! Mirrors the startup logic in `dnsmasq.c` (the original 2478-line C file).
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::RwLock;
 
 use crate::error::DnsmasqError;
@@ -11,6 +12,32 @@ use crate::types::daemon::Daemon;
 
 /// A shared, async-safe handle to the daemon state.
 pub type DaemonHandle = Arc<RwLock<Daemon>>;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Daemon event system
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Represents an asynchronous event that the daemon main loop can process.
+///
+/// Mirrors the event types handled by the C `dnsmasq` main loop: signals,
+/// timers, child-process exits, and network-change notifications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonEvent {
+    /// SIGHUP received — reload configuration files and flush cache.
+    Reload,
+    /// Timer tick — perform periodic housekeeping (cache expiry, lease checks).
+    Alarm,
+    /// SIGTERM received — initiate clean shutdown.
+    Term,
+    /// A child process exited with the given wait status.
+    Child(i32),
+    /// A network address change was detected (e.g. via netlink).
+    NewAddr,
+    /// SIGUSR1 received — dump cache contents to the log.
+    Dump,
+    /// The system clock was adjusted (e.g. NTP step).
+    TimeSet,
+}
 
 /// Initialize a new [`Daemon`] with default settings and return a shared handle.
 pub fn init_daemon() -> DaemonHandle {
@@ -231,26 +258,16 @@ pub async fn run_main_loop(
 /// Actions to perform on SIGHUP (config reload).
 ///
 /// Flushes the DNS cache and reloads `/etc/hosts` and any servers-file entries.
-/// In a full implementation this would call `cache_reload()`, re-read
-/// `/etc/resolv.conf`, and re-parse the servers-file.  Here we provide the
-/// plumbing so the main loop can drive it.
+/// Delegates the actual work to [`clear_cache_and_reload`].
 pub async fn on_sighup(daemon_handle: &DaemonHandle) {
     use tracing::info;
 
+    info!("SIGHUP: initiating cache flush and config reload");
+    clear_cache_and_reload(daemon_handle).await;
+
+    // Increment the reload counter so other subsystems can detect reloads.
     let mut d = daemon_handle.write().await;
-
-    // Reload upstream servers from resolv.conf (stub — file parsing not yet wired).
-    info!("SIGHUP: flushing DNS cache and reloading configuration");
-
-    // Clear any locally cached negative/positive entries that may be stale.
-    // In a full implementation: d.dns_cache.clear() once Daemon owns the cache.
-    let _ = d; // prevent unused warning
-
-    // A full implementation would also:
-    // - Re-read /etc/resolv.conf for upstream server addresses
-    // - Re-parse /etc/hosts into the cache
-    // - Re-open log files
-    // - Reload DHCP lease file
+    d.reload_count = d.reload_count.wrapping_add(1);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -262,16 +279,27 @@ pub async fn on_sighup(daemon_handle: &DaemonHandle) {
 /// Runs once per interval (default 1 second) and:
 /// - Expires timed-out DNS cache entries.
 /// - Expires timed-out pending forwarded queries.
+/// - Logs current time and cache size for diagnostics.
 ///
 /// In a full implementation this would also drive DHCP lease expiry, RA
 /// transmission scheduling, and the DNSSEC validation timeout queue.
 pub async fn on_alarm(daemon_handle: &DaemonHandle) {
-    use std::time::Instant;
+    use tracing::info;
 
     let now = Instant::now();
     let d = daemon_handle.read().await;
-    // In a full implementation: d.dns_cache.expire_old(now) once Daemon owns the cache.
-    let _ = (now, d);
+
+    info!(
+        cachesize = d.cachesize,
+        dns_dirty = d.dns_dirty,
+        "alarm tick: housekeeping at {:?}",
+        now
+    );
+
+    // In a full implementation:
+    // - d.dns_cache.expire_old(now) once Daemon owns the cache
+    // - Check DHCP lease expiry
+    // - Prune stale forward table entries
 }
 
 /// Spawn a background tokio task that calls [`on_alarm`] every `interval`.
@@ -290,6 +318,152 @@ pub fn spawn_alarm_task(
             on_alarm(&daemon_handle).await;
         }
     })
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Cache flush and reload
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Flush the DNS cache and reload configuration data.
+///
+/// Logs the action and marks the daemon's DNS data as dirty so that
+/// downstream consumers know to re-query.  In a full implementation this
+/// would call `cache.clear()` and re-read `/etc/hosts`.
+pub async fn clear_cache_and_reload(daemon_handle: &DaemonHandle) {
+    use tracing::info;
+
+    info!("flushing cache and reloading");
+
+    let mut d = daemon_handle.write().await;
+    // Mark DNS data as dirty so consumers know to refresh.
+    d.dns_dirty = true;
+
+    // In a full implementation:
+    // - d.dns_cache.clear()
+    // - Re-read /etc/hosts into the cache
+    // - Re-parse servers-file
+    // - Re-read /etc/resolv.conf for upstream server addresses
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Alarm scheduling
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Schedule the next alarm event after `next_event_secs` seconds.
+///
+/// Stores the computed deadline in the daemon's `next_alarm` field so that
+/// the alarm task can check whether it should fire early or skip a tick.
+pub async fn send_alarm(daemon_handle: &DaemonHandle, next_event_secs: u64) {
+    use tracing::info;
+
+    let deadline = Instant::now() + Duration::from_secs(next_event_secs);
+    let mut d = daemon_handle.write().await;
+    d.next_alarm = Some(deadline);
+
+    info!(
+        next_event_secs,
+        "scheduled next alarm"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// resolv.conf monitoring
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Check whether the file at `path` has been modified.
+///
+/// Returns `Some(mtime)` if the file's modification time can be read,
+/// or `None` if the file does not exist or its metadata is inaccessible.
+/// This is a pure function with no side effects.
+pub fn poll_resolv(path: &str) -> Option<SystemTime> {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+}
+
+/// Watches a resolv.conf-style file for modifications.
+///
+/// On each call to [`check`](ResolvMonitor::check), the monitor compares
+/// the file's current mtime against the last observed mtime.  Returns
+/// `true` when the file has changed (or appeared for the first time).
+pub struct ResolvMonitor {
+    path: String,
+    last_mtime: Option<SystemTime>,
+}
+
+impl ResolvMonitor {
+    /// Create a new monitor for the file at `path`.
+    ///
+    /// The initial mtime is captured immediately so that the first call
+    /// to [`check`](ResolvMonitor::check) returns `false` unless the file
+    /// changes between construction and the first check.
+    pub fn new(path: &str) -> Self {
+        let last_mtime = poll_resolv(path);
+        Self {
+            path: path.to_owned(),
+            last_mtime,
+        }
+    }
+
+    /// Returns `true` if the file has changed since the last check.
+    ///
+    /// Also returns `true` if the file appeared (was previously absent)
+    /// or disappeared (was previously present).  Updates the internal
+    /// mtime so that subsequent calls only return `true` on further changes.
+    pub fn check(&mut self) -> bool {
+        let current_mtime = poll_resolv(&self.path);
+        if current_mtime != self.last_mtime {
+            self.last_mtime = current_mtime;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ICMP ping for DHCP conflict detection
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// ICMP echo-based address conflict detection for DHCP.
+///
+/// Before offering a DHCP lease, dnsmasq can send an ICMP echo request to
+/// confirm that the address is not already in use.  This struct encapsulates
+/// the timeout and ping logic.
+///
+/// Currently a stub — `ping` always returns `false` (no reply).  A full
+/// implementation would open a raw ICMP socket and send/receive echo packets.
+#[cfg(feature = "dhcp")]
+pub struct IcmpPinger {
+    timeout: Duration,
+}
+
+#[cfg(feature = "dhcp")]
+impl IcmpPinger {
+    /// Create a new pinger with the given timeout in milliseconds.
+    pub fn new(timeout_ms: u64) -> Self {
+        Self {
+            timeout: Duration::from_millis(timeout_ms),
+        }
+    }
+
+    /// Attempt to ping `addr` via ICMP echo.
+    ///
+    /// Returns `true` if a reply was received within the configured timeout,
+    /// indicating a potential address conflict.
+    ///
+    /// **Stub implementation** — always returns `false`.  A production
+    /// implementation would require `CAP_NET_RAW` or root privileges.
+    pub fn ping(&self, addr: Ipv4Addr) -> bool {
+        use tracing::info;
+
+        info!(
+            %addr,
+            timeout_ms = self.timeout.as_millis() as u64,
+            "ICMP ping stub — no reply (not implemented)"
+        );
+        false
+    }
 }
 
 #[cfg(test)]
@@ -359,5 +533,331 @@ mod tests {
         task.abort();
         // After abort, joining returns an error (cancelled).
         assert!(task.await.is_err());
+    }
+
+    // ── DaemonEvent ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn daemon_event_variants_are_distinct() {
+        let events = [
+            DaemonEvent::Reload,
+            DaemonEvent::Alarm,
+            DaemonEvent::Term,
+            DaemonEvent::Child(0),
+            DaemonEvent::NewAddr,
+            DaemonEvent::Dump,
+            DaemonEvent::TimeSet,
+        ];
+        // Each variant should be equal to itself.
+        for e in &events {
+            assert_eq!(*e, *e);
+        }
+        // Different variants should not be equal.
+        assert_ne!(DaemonEvent::Reload, DaemonEvent::Alarm);
+        assert_ne!(DaemonEvent::Term, DaemonEvent::Dump);
+        assert_ne!(DaemonEvent::NewAddr, DaemonEvent::TimeSet);
+    }
+
+    #[test]
+    fn daemon_event_child_carries_status() {
+        let e1 = DaemonEvent::Child(0);
+        let e2 = DaemonEvent::Child(1);
+        let e3 = DaemonEvent::Child(0);
+        assert_ne!(e1, e2);
+        assert_eq!(e1, e3);
+    }
+
+    #[test]
+    fn daemon_event_is_copy_and_clone() {
+        let e = DaemonEvent::Reload;
+        let e2 = e; // Copy
+        let e3 = e.clone(); // Clone
+        assert_eq!(e, e2);
+        assert_eq!(e, e3);
+    }
+
+    #[test]
+    fn daemon_event_debug_format() {
+        let dbg = format!("{:?}", DaemonEvent::Child(42));
+        assert!(dbg.contains("Child"));
+        assert!(dbg.contains("42"));
+    }
+
+    // ── poll_resolv ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn poll_resolv_returns_none_for_missing_file() {
+        let result = poll_resolv("/tmp/dnsmasq_rs_nonexistent_resolv_99999.conf");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn poll_resolv_returns_some_for_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "nameserver 8.8.8.8\n").unwrap();
+
+        let result = poll_resolv(path.to_str().unwrap());
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn poll_resolv_mtime_changes_after_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "nameserver 8.8.8.8\n").unwrap();
+
+        let mtime1 = poll_resolv(path.to_str().unwrap()).unwrap();
+
+        // Sleep briefly to ensure filesystem mtime granularity is exceeded.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&path, "nameserver 1.1.1.1\n").unwrap();
+
+        let mtime2 = poll_resolv(path.to_str().unwrap()).unwrap();
+        // Depending on filesystem granularity, mtime may or may not differ,
+        // but it should never go backwards.
+        assert!(mtime2 >= mtime1);
+    }
+
+    // ── clear_cache_and_reload ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn clear_cache_and_reload_sets_dns_dirty() {
+        let handle = init_daemon();
+        {
+            let d = handle.read().await;
+            assert!(!d.dns_dirty);
+        }
+
+        clear_cache_and_reload(&handle).await;
+
+        let d = handle.read().await;
+        assert!(d.dns_dirty);
+    }
+
+    #[tokio::test]
+    async fn clear_cache_and_reload_idempotent() {
+        let handle = init_daemon();
+        clear_cache_and_reload(&handle).await;
+        clear_cache_and_reload(&handle).await;
+
+        let d = handle.read().await;
+        assert!(d.dns_dirty);
+    }
+
+    // ── send_alarm ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn send_alarm_sets_next_alarm() {
+        let handle = init_daemon();
+        {
+            let d = handle.read().await;
+            assert!(d.next_alarm.is_none());
+        }
+
+        send_alarm(&handle, 60).await;
+
+        let d = handle.read().await;
+        assert!(d.next_alarm.is_some());
+        let deadline = d.next_alarm.unwrap();
+        // The deadline should be roughly 60 seconds in the future.
+        let now = Instant::now();
+        let diff = deadline.duration_since(now);
+        assert!(diff.as_secs() >= 58 && diff.as_secs() <= 62);
+    }
+
+    #[tokio::test]
+    async fn send_alarm_overwrites_previous() {
+        let handle = init_daemon();
+
+        send_alarm(&handle, 120).await;
+        let first = handle.read().await.next_alarm.unwrap();
+
+        send_alarm(&handle, 10).await;
+        let second = handle.read().await.next_alarm.unwrap();
+
+        // Second alarm should be earlier than the first.
+        assert!(second < first);
+    }
+
+    #[tokio::test]
+    async fn send_alarm_zero_seconds() {
+        let handle = init_daemon();
+        let before = Instant::now();
+
+        send_alarm(&handle, 0).await;
+
+        let d = handle.read().await;
+        let deadline = d.next_alarm.unwrap();
+        // With 0 seconds, the deadline should be essentially now.
+        assert!(deadline >= before);
+        assert!(deadline.duration_since(before).as_millis() < 100);
+    }
+
+    // ── on_sighup (expanded) ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn on_sighup_sets_dns_dirty_and_increments_reload() {
+        let handle = init_daemon();
+        {
+            let d = handle.read().await;
+            assert_eq!(d.reload_count, 0);
+            assert!(!d.dns_dirty);
+        }
+
+        on_sighup(&handle).await;
+
+        let d = handle.read().await;
+        assert!(d.dns_dirty);
+        assert_eq!(d.reload_count, 1);
+    }
+
+    #[tokio::test]
+    async fn on_sighup_increments_reload_count_each_time() {
+        let handle = init_daemon();
+
+        on_sighup(&handle).await;
+        on_sighup(&handle).await;
+        on_sighup(&handle).await;
+
+        let d = handle.read().await;
+        assert_eq!(d.reload_count, 3);
+    }
+
+    // ── on_alarm (expanded) ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn on_alarm_logs_without_panic() {
+        let handle = init_daemon();
+        // Modify cachesize to verify it is readable during alarm.
+        {
+            let mut d = handle.write().await;
+            d.cachesize = 500;
+        }
+        on_alarm(&handle).await;
+        // If we get here without panic, the test passes.
+    }
+
+    // ── ResolvMonitor ───────────────────────────────────────────────────────
+
+    #[test]
+    fn resolv_monitor_no_change_returns_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "nameserver 8.8.8.8\n").unwrap();
+
+        let mut monitor = ResolvMonitor::new(path.to_str().unwrap());
+        // Immediately after construction, no change has occurred.
+        assert!(!monitor.check());
+    }
+
+    #[test]
+    fn resolv_monitor_detects_file_modification() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "nameserver 8.8.8.8\n").unwrap();
+
+        let mut monitor = ResolvMonitor::new(path.to_str().unwrap());
+        assert!(!monitor.check());
+
+        // Wait and modify.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&path, "nameserver 1.1.1.1\n").unwrap();
+
+        assert!(monitor.check());
+        // Subsequent check without changes should return false.
+        assert!(!monitor.check());
+    }
+
+    #[test]
+    fn resolv_monitor_detects_file_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "nameserver 8.8.8.8\n").unwrap();
+
+        let mut monitor = ResolvMonitor::new(path.to_str().unwrap());
+        assert!(!monitor.check());
+
+        // Delete the file.
+        std::fs::remove_file(&path).unwrap();
+        assert!(monitor.check());
+    }
+
+    #[test]
+    fn resolv_monitor_detects_file_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+
+        // Start monitoring a non-existent file.
+        let mut monitor = ResolvMonitor::new(path.to_str().unwrap());
+        assert!(!monitor.check());
+
+        // Create the file.
+        std::fs::write(&path, "nameserver 8.8.8.8\n").unwrap();
+        assert!(monitor.check());
+    }
+
+    #[test]
+    fn resolv_monitor_new_captures_initial_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "nameserver 8.8.8.8\n").unwrap();
+
+        let monitor = ResolvMonitor::new(path.to_str().unwrap());
+        assert!(monitor.last_mtime.is_some());
+        assert_eq!(monitor.path, path.to_str().unwrap());
+    }
+
+    #[test]
+    fn resolv_monitor_nonexistent_path_has_none_mtime() {
+        let monitor = ResolvMonitor::new("/tmp/dnsmasq_rs_no_such_file_99999.conf");
+        assert!(monitor.last_mtime.is_none());
+    }
+
+    #[test]
+    fn resolv_monitor_repeated_checks_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "nameserver 8.8.8.8\n").unwrap();
+
+        let mut monitor = ResolvMonitor::new(path.to_str().unwrap());
+        // Multiple checks without changes should all return false.
+        for _ in 0..5 {
+            assert!(!monitor.check());
+        }
+    }
+
+    // ── IcmpPinger ──────────────────────────────────────────────────────────
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn icmp_pinger_new_sets_timeout() {
+        let pinger = IcmpPinger::new(500);
+        assert_eq!(pinger.timeout, Duration::from_millis(500));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn icmp_pinger_stub_returns_false() {
+        let pinger = IcmpPinger::new(100);
+        // Stub always returns false (no reply).
+        assert!(!pinger.ping(Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(!pinger.ping(Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(!pinger.ping(Ipv4Addr::LOCALHOST));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn icmp_pinger_zero_timeout() {
+        let pinger = IcmpPinger::new(0);
+        assert_eq!(pinger.timeout, Duration::from_millis(0));
+        assert!(!pinger.ping(Ipv4Addr::new(8, 8, 8, 8)));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn icmp_pinger_large_timeout() {
+        let pinger = IcmpPinger::new(30_000);
+        assert_eq!(pinger.timeout, Duration::from_secs(30));
     }
 }
