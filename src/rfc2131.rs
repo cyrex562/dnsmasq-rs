@@ -1061,6 +1061,134 @@ pub fn has_opt_raw(opts: &[u8], opt: u8) -> bool {
     false
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Lease time / server-id / sanitise (ported from rfc2131.c:1859-1906)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Calculate lease time: minimum of context default, config override, and client request.
+///
+/// `config_time` is the per-host config lease time (or `None` for default).
+/// `context_time` is the pool's default lease time.
+/// `requested` is the client-requested time from option 51 (or `None`).
+/// Returns the final lease duration in seconds.
+/// Port of `calc_time()` from rfc2131.c:1859-1873.
+#[cfg(feature = "dhcp")]
+pub fn calc_time(context_time: u32, config_time: Option<u32>, requested: Option<u32>) -> u32 {
+    let mut time = config_time.unwrap_or(context_time);
+
+    if let Some(mut req) = requested {
+        if req < 120 {
+            req = 120; // sanity minimum
+        }
+        if time == 0xFFFFFFFF || (req != 0xFFFFFFFF && req < time) {
+            time = req;
+        }
+    }
+
+    time
+}
+
+/// Determine the DHCP Server Identifier (option 54) address.
+///
+/// Priority: explicit override > context local address > fallback.
+/// Port of `server_id()` from rfc2131.c:1875-1883.
+#[cfg(feature = "dhcp")]
+pub fn server_id(
+    context_local: Option<Ipv4Addr>,
+    override_addr: Option<Ipv4Addr>,
+    fallback: Ipv4Addr,
+) -> Ipv4Addr {
+    if let Some(o) = override_addr {
+        if o != Ipv4Addr::UNSPECIFIED {
+            return o;
+        }
+    }
+    if let Some(l) = context_local {
+        if l != Ipv4Addr::UNSPECIFIED {
+            return l;
+        }
+    }
+    fallback
+}
+
+/// Sanitise a DHCP option value to a printable ASCII string.
+///
+/// Non-printable bytes are dropped. Used for logging client hostnames etc.
+/// Port of `sanitise()` from rfc2131.c:1885-1906.
+#[cfg(feature = "dhcp")]
+pub fn sanitise(data: &[u8]) -> String {
+    data.iter()
+        .filter(|&&b| b >= 0x20 && b < 0x7f)
+        .map(|&b| b as char)
+        .collect()
+}
+
+/// Format a DHCP log line for a packet event.
+///
+/// Port of `log_packet()` from rfc2131.c:1918-1960.
+#[cfg(feature = "dhcp")]
+pub fn log_packet(
+    msg_type: &str,
+    addr: Option<Ipv4Addr>,
+    mac: Option<&[u8]>,
+    interface: &str,
+    hostname: Option<&str>,
+    xid: u32,
+    log_opts: bool,
+) -> String {
+    let addr_str = match addr {
+        Some(a) if a != Ipv4Addr::UNSPECIFIED => a.to_string(),
+        _ => String::new(),
+    };
+
+    let mac_str = match mac {
+        Some(m) if !m.is_empty() => m.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":"),
+        _ => String::new(),
+    };
+
+    let host_str = hostname.unwrap_or("");
+
+    if log_opts {
+        format!("{xid:08x} {msg_type}({interface}) {addr_str} {mac_str} {host_str}").trim().to_string()
+    } else {
+        format!("{msg_type}({interface}) {addr_str} {mac_str} {host_str}").trim().to_string()
+    }
+}
+
+/// Check if a DHCP option value looks like a PXE client identifier.
+///
+/// PXE clients send option 60 starting with "PXEClient".
+/// Port of `is_pxe_client()` from rfc2131.c:2582-2604.
+#[cfg(feature = "dhcp")]
+pub fn is_pxe_client(vendor_class: Option<&[u8]>) -> bool {
+    match vendor_class {
+        Some(vc) => vc.starts_with(b"PXEClient"),
+        None => false,
+    }
+}
+
+/// Find the boot server config matching a network tag.
+///
+/// Port of `find_boot()` from rfc2131.c:2565-2581.
+#[cfg(feature = "dhcp")]
+pub fn find_boot<'a>(
+    boot_configs: &'a [crate::types::dhcp::DhcpBoot],
+    netid: Option<&str>,
+) -> Option<&'a crate::types::dhcp::DhcpBoot> {
+    // First try to find one with a matching tag
+    if let Some(tag) = netid {
+        for b in boot_configs {
+            if let Some(ref n) = b.netid {
+                if n.net == tag {
+                    return Some(b);
+                }
+            }
+        }
+    }
+    // Fall back to untagged entry
+    boot_configs.iter().find(|b| b.netid.is_none())
+}
+
 #[cfg(all(test, feature = "dhcp"))]
 mod tests {
     use super::*;
@@ -1664,5 +1792,161 @@ mod tests {
         };
         do_options(&mut pkt, &mut cfg);
         assert!(has_opt_raw(&pkt.options, crate::dhcp_protocol::OPTION_VENDOR_ID));
+    }
+
+    // ── calc_time ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn calc_time_context_default() {
+        assert_eq!(calc_time(3600, None, None), 3600);
+    }
+
+    #[test]
+    fn calc_time_config_override() {
+        assert_eq!(calc_time(3600, Some(7200), None), 7200);
+    }
+
+    #[test]
+    fn calc_time_client_request_lower() {
+        assert_eq!(calc_time(3600, None, Some(1800)), 1800);
+    }
+
+    #[test]
+    fn calc_time_client_request_minimum_120() {
+        assert_eq!(calc_time(3600, None, Some(10)), 120);
+    }
+
+    #[test]
+    fn calc_time_infinite_context_uses_request() {
+        assert_eq!(calc_time(0xFFFFFFFF, None, Some(3600)), 3600);
+    }
+
+    #[test]
+    fn calc_time_infinite_request_keeps_context() {
+        assert_eq!(calc_time(3600, None, Some(0xFFFFFFFF)), 3600);
+    }
+
+    // ── server_id ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn server_id_override_wins() {
+        let o = Some(Ipv4Addr::new(10, 0, 0, 99));
+        let c = Some(Ipv4Addr::new(10, 0, 0, 1));
+        let f = Ipv4Addr::new(1, 2, 3, 4);
+        assert_eq!(server_id(c, o, f), Ipv4Addr::new(10, 0, 0, 99));
+    }
+
+    #[test]
+    fn server_id_context_local() {
+        let c = Some(Ipv4Addr::new(10, 0, 0, 1));
+        let f = Ipv4Addr::new(1, 2, 3, 4);
+        assert_eq!(server_id(c, None, f), Ipv4Addr::new(10, 0, 0, 1));
+    }
+
+    #[test]
+    fn server_id_fallback() {
+        let f = Ipv4Addr::new(1, 2, 3, 4);
+        assert_eq!(server_id(None, None, f), Ipv4Addr::new(1, 2, 3, 4));
+    }
+
+    // ── sanitise ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sanitise_printable() {
+        assert_eq!(sanitise(b"hello"), "hello");
+    }
+
+    #[test]
+    fn sanitise_strips_control() {
+        assert_eq!(sanitise(b"he\x01llo\x7f"), "hello");
+    }
+
+    #[test]
+    fn sanitise_empty() {
+        assert_eq!(sanitise(b""), "");
+    }
+
+    // ── log_packet ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn log_packet_basic() {
+        let s = log_packet("DHCPOFFER", Some(Ipv4Addr::new(10,0,0,5)), Some(&[0xaa,0xbb,0xcc]), "eth0", Some("host1"), 0x1234, false);
+        assert!(s.contains("DHCPOFFER(eth0)"));
+        assert!(s.contains("10.0.0.5"));
+        assert!(s.contains("aa:bb:cc"));
+        assert!(s.contains("host1"));
+    }
+
+    #[test]
+    fn log_packet_with_xid() {
+        let s = log_packet("DHCPACK", None, None, "eth0", None, 0xDEAD, true);
+        assert!(s.contains("0000dead"));
+        assert!(s.contains("DHCPACK(eth0)"));
+    }
+
+    #[test]
+    fn log_packet_no_addr_no_mac() {
+        let s = log_packet("DHCPNAK", None, None, "br0", None, 0, false);
+        assert!(s.contains("DHCPNAK(br0)"));
+    }
+
+    // ── is_pxe_client ────────────────────────────────────────────────────────
+
+    #[test]
+    fn is_pxe_client_yes() {
+        assert!(is_pxe_client(Some(b"PXEClient:Arch:00000")));
+    }
+
+    #[test]
+    fn is_pxe_client_no() {
+        assert!(!is_pxe_client(Some(b"MSFT 5.0")));
+    }
+
+    #[test]
+    fn is_pxe_client_none() {
+        assert!(!is_pxe_client(None));
+    }
+
+    // ── find_boot ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn find_boot_tagged() {
+        use crate::types::dhcp::{DhcpBoot, DhcpNetid};
+        let boots = vec![
+            DhcpBoot {
+                file: Some("default.img".into()),
+                sname: None, tftp_sname: None,
+                next_server: Ipv4Addr::UNSPECIFIED,
+                netid: None,
+            },
+            DhcpBoot {
+                file: Some("special.img".into()),
+                sname: None, tftp_sname: None,
+                next_server: Ipv4Addr::UNSPECIFIED,
+                netid: Some(DhcpNetid { net: "lab".into() }),
+            },
+        ];
+        let result = find_boot(&boots, Some("lab"));
+        assert_eq!(result.unwrap().file.as_deref(), Some("special.img"));
+    }
+
+    #[test]
+    fn find_boot_untagged_fallback() {
+        use crate::types::dhcp::DhcpBoot;
+        let boots = vec![
+            DhcpBoot {
+                file: Some("default.img".into()),
+                sname: None, tftp_sname: None,
+                next_server: Ipv4Addr::UNSPECIFIED,
+                netid: None,
+            },
+        ];
+        let result = find_boot(&boots, Some("nomatch"));
+        assert_eq!(result.unwrap().file.as_deref(), Some("default.img"));
+    }
+
+    #[test]
+    fn find_boot_empty() {
+        assert!(find_boot(&[], Some("x")).is_none());
     }
 }

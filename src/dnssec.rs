@@ -591,6 +591,118 @@ fn rr_ttl(rrset: &[crate::rfc1035::DnsRr]) -> u32 {
     rrset.iter().map(|r| r.ttl).min().unwrap_or(u32::MAX)
 }
 
+// ─── Canonical DNS name comparison (ported from dnssec.c:1183-1244) ──────────
+
+/// Compare two DNS names in canonical (RFC 4034 §6.1) order.
+///
+/// Labels are compared right-to-left, case-insensitively.
+/// Returns `Ordering::Less`, `Equal`, or `Greater`.
+pub fn hostname_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let a_labels: Vec<&str> = a.trim_end_matches('.').split('.').collect();
+    let b_labels: Vec<&str> = b.trim_end_matches('.').split('.').collect();
+
+    let mut ai = a_labels.len();
+    let mut bi = b_labels.len();
+
+    loop {
+        if ai == 0 && bi == 0 {
+            return std::cmp::Ordering::Equal;
+        }
+        if ai == 0 {
+            return std::cmp::Ordering::Less;
+        }
+        if bi == 0 {
+            return std::cmp::Ordering::Greater;
+        }
+
+        ai -= 1;
+        bi -= 1;
+
+        let la = a_labels[ai].to_ascii_lowercase();
+        let lb = b_labels[bi].to_ascii_lowercase();
+
+        match la.cmp(&lb) {
+            std::cmp::Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+}
+
+// ─── Error flags to EDE mapping (ported from dnssec.c:2380-2409) ─────────────
+
+/// DNSSEC failure flag constants.
+pub const DNSSEC_FAIL_UPSTREAM:    u32 = 1 << 0;
+pub const DNSSEC_FAIL_NYV:        u32 = 1 << 1;
+pub const DNSSEC_FAIL_EXP:        u32 = 1 << 2;
+pub const DNSSEC_FAIL_NOKEYSUP:   u32 = 1 << 3;
+pub const DNSSEC_FAIL_NOZONE:     u32 = 1 << 4;
+pub const DNSSEC_FAIL_NOKEY:      u32 = 1 << 5;
+pub const DNSSEC_FAIL_NODSSUP:    u32 = 1 << 6;
+pub const DNSSEC_FAIL_NSEC3_ITERS: u32 = 1 << 7;
+pub const DNSSEC_FAIL_NONSEC:     u32 = 1 << 8;
+pub const DNSSEC_FAIL_INDET:      u32 = 1 << 9;
+pub const DNSSEC_FAIL_NOSIG:      u32 = 1 << 10;
+
+/// Extended DNS Error (EDE) codes.
+pub const EDE_UNSET:        u16 = 0;
+pub const EDE_US_SERVFAIL:  u16 = 23;
+pub const EDE_SIG_NYV:      u16 = 8;
+pub const EDE_SIG_EXP:      u16 = 7;
+pub const EDE_USUPDNSKEY:   u16 = 11;
+pub const EDE_NO_ZONEKEY:   u16 = 9;
+pub const EDE_NO_DNSKEY:    u16 = 10;
+pub const EDE_USUPDS:       u16 = 12;
+pub const EDE_UNS_NS3_ITER: u16 = 27;
+pub const EDE_NO_NSEC:      u16 = 14;
+pub const EDE_DNSSEC_IND:   u16 = 13;
+pub const EDE_NO_RRSIG:     u16 = 15;
+
+/// Map DNSSEC failure flags to the highest-priority EDE code.
+///
+/// When multiple flags are set, returns the most specific error.
+/// Port of `errflags_to_ede()` from dnssec.c:2380-2409.
+pub fn errflags_to_ede(status: u32) -> u16 {
+    if status & DNSSEC_FAIL_UPSTREAM != 0    { EDE_US_SERVFAIL }
+    else if status & DNSSEC_FAIL_NYV != 0    { EDE_SIG_NYV }
+    else if status & DNSSEC_FAIL_EXP != 0    { EDE_SIG_EXP }
+    else if status & DNSSEC_FAIL_NOKEYSUP != 0 { EDE_USUPDNSKEY }
+    else if status & DNSSEC_FAIL_NOZONE != 0 { EDE_NO_ZONEKEY }
+    else if status & DNSSEC_FAIL_NOKEY != 0  { EDE_NO_DNSKEY }
+    else if status & DNSSEC_FAIL_NODSSUP != 0 { EDE_USUPDS }
+    else if status & DNSSEC_FAIL_NSEC3_ITERS != 0 { EDE_UNS_NS3_ITER }
+    else if status & DNSSEC_FAIL_NONSEC != 0 { EDE_NO_NSEC }
+    else if status & DNSSEC_FAIL_INDET != 0  { EDE_DNSSEC_IND }
+    else if status & DNSSEC_FAIL_NOSIG != 0  { EDE_NO_RRSIG }
+    else { EDE_UNSET }
+}
+
+/// Compute the DNSKEY key tag per RFC 4034 Appendix B.
+///
+/// Algorithm 1 (RSAMD5) uses a special calculation; all others use the
+/// standard checksum. `alg`, `flags`, and `key` come from the DNSKEY RDATA.
+/// Port of `dnskey_keytag()` from dnssec.c:2332-2351.
+pub fn dnskey_keytag(alg: u8, flags: u16, key: &[u8]) -> u16 {
+    if alg == 1 {
+        // RSAMD5 special case
+        if key.len() >= 4 {
+            (key[key.len() - 4] as u16) * 256 + key[key.len() - 3] as u16
+        } else {
+            0
+        }
+    } else {
+        let mut ac: u32 = flags as u32 + 0x300 + alg as u32;
+        for (i, &b) in key.iter().enumerate() {
+            if i & 1 != 0 {
+                ac += b as u32;
+            } else {
+                ac += (b as u32) << 8;
+            }
+        }
+        ac += (ac >> 16) & 0xffff;
+        (ac & 0xffff) as u16
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -993,5 +1105,97 @@ mod tests {
         );
         // expired → all sigs fail → Bogus
         assert!(matches!(result, RrsetValidation::Bogus(_)));
+    }
+
+    // ─── hostname_cmp ────────────────────────────────────────────────────────
+
+    #[test]
+    fn hostname_cmp_equal() {
+        assert_eq!(hostname_cmp("example.com", "example.com"), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn hostname_cmp_case_insensitive() {
+        assert_eq!(hostname_cmp("Example.COM", "example.com"), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn hostname_cmp_different_tld() {
+        // "com" < "org"
+        assert_eq!(hostname_cmp("a.com", "a.org"), std::cmp::Ordering::Less);
+        assert_eq!(hostname_cmp("a.org", "a.com"), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn hostname_cmp_subdomain_before_parent() {
+        // "a.example.com" < "b.example.com" (label 'a' < 'b')
+        assert_eq!(hostname_cmp("a.example.com", "b.example.com"), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn hostname_cmp_fewer_labels_is_less() {
+        // "com" < "example.com"
+        assert_eq!(hostname_cmp("com", "example.com"), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn hostname_cmp_trailing_dot() {
+        assert_eq!(hostname_cmp("example.com.", "example.com"), std::cmp::Ordering::Equal);
+    }
+
+    // ─── errflags_to_ede ─────────────────────────────────────────────────────
+
+    #[test]
+    fn errflags_to_ede_upstream() {
+        assert_eq!(errflags_to_ede(DNSSEC_FAIL_UPSTREAM), EDE_US_SERVFAIL);
+    }
+
+    #[test]
+    fn errflags_to_ede_expired() {
+        assert_eq!(errflags_to_ede(DNSSEC_FAIL_EXP), EDE_SIG_EXP);
+    }
+
+    #[test]
+    fn errflags_to_ede_nosig() {
+        assert_eq!(errflags_to_ede(DNSSEC_FAIL_NOSIG), EDE_NO_RRSIG);
+    }
+
+    #[test]
+    fn errflags_to_ede_zero() {
+        assert_eq!(errflags_to_ede(0), EDE_UNSET);
+    }
+
+    #[test]
+    fn errflags_to_ede_priority_upstream_wins() {
+        // Multiple flags: upstream should take priority
+        assert_eq!(
+            errflags_to_ede(DNSSEC_FAIL_UPSTREAM | DNSSEC_FAIL_NOSIG),
+            EDE_US_SERVFAIL
+        );
+    }
+
+    // ─── dnskey_keytag ───────────────────────────────────────────────────────
+
+    #[test]
+    fn dnskey_keytag_standard() {
+        // flags=256, alg=8 (RSASHA256), key=[0x03, 0x01, 0x00, 0x01, ...]
+        let key = vec![0x03, 0x01, 0x00, 0x01, 0xAB, 0xCD];
+        let tag = dnskey_keytag(8, 256, &key);
+        assert!(tag > 0);
+    }
+
+    #[test]
+    fn dnskey_keytag_rsamd5_special() {
+        // Algorithm 1 uses special calculation from last 4 bytes
+        let key = vec![0x00, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
+        let tag = dnskey_keytag(1, 256, &key);
+        // key[len-4]*256 + key[len-3] = 0xDE*256 + 0xAD = 57005
+        assert_eq!(tag, 0xDE * 256 + 0xAD);
+    }
+
+    #[test]
+    fn dnskey_keytag_empty_key() {
+        let tag = dnskey_keytag(8, 256, &[]);
+        assert!(tag > 0); // still produces a tag from flags+alg
     }
 }
