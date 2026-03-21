@@ -310,4 +310,87 @@ mod tests {
         assert!(found.is_some());
         assert_eq!(found.unwrap().addr, addr);
     }
+
+    #[test]
+    fn find_by_addr_nonexistent() {
+        let db = LeaseDb::new();
+        assert!(db.find_by_addr(Ipv4Addr::new(10, 0, 0, 99)).is_none());
+    }
+
+    #[test]
+    fn find_by_client_id_nonexistent() {
+        let db = LeaseDb::new();
+        assert!(db.find_by_client_id(&[0xaa, 0xbb]).is_none());
+    }
+
+    #[test]
+    fn prune_empty_db() {
+        let mut db = LeaseDb::new();
+        let pruned = db.prune(1_000_000);
+        assert!(pruned.is_empty());
+    }
+
+    #[test]
+    fn prune_all_expired() {
+        let mut db = LeaseDb::new();
+        db.insert(make_lease(Ipv4Addr::new(10, 0, 0, 1), [0x01, 0, 0, 0, 0, 0], Some(100)));
+        db.insert(make_lease(Ipv4Addr::new(10, 0, 0, 2), [0x02, 0, 0, 0, 0, 0], Some(200)));
+        let pruned = db.prune(300);
+        assert_eq!(pruned.len(), 2);
+        assert!(db.find_by_addr(Ipv4Addr::new(10, 0, 0, 1)).is_none());
+        assert!(db.find_by_addr(Ipv4Addr::new(10, 0, 0, 2)).is_none());
+    }
+
+    #[test]
+    fn prune_keeps_no_expiry_leases() {
+        let mut db = LeaseDb::new();
+        // Lease with no expiry (permanent)
+        db.insert(make_lease(Ipv4Addr::new(10, 0, 0, 1), [0x01, 0, 0, 0, 0, 0], None));
+        let pruned = db.prune(9_999_999_999);
+        assert!(pruned.is_empty());
+        assert!(db.find_by_addr(Ipv4Addr::new(10, 0, 0, 1)).is_some());
+    }
+
+    #[test]
+    fn deserialize_malformed_too_few_fields() {
+        let result = LeaseDb::deserialize("100 10.0.0.1 aa:bb");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn deserialize_malformed_invalid_ip() {
+        let result = LeaseDb::deserialize("100 not.an.ip aa:bb:cc:dd:ee:ff host1 *");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn deserialize_malformed_invalid_expires() {
+        let result = LeaseDb::deserialize("notanumber 10.0.0.1 aa:bb:cc:dd:ee:ff host1 *");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn deserialize_empty_string() {
+        let db = LeaseDb::deserialize("").expect("empty should be ok");
+        assert!(db.find_by_addr(Ipv4Addr::new(10, 0, 0, 1)).is_none());
+    }
+
+    #[test]
+    fn insert_replaces_existing_lease() {
+        let mut db = LeaseDb::new();
+        let hw = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        db.insert(make_lease(Ipv4Addr::new(10, 0, 0, 1), hw, Some(100)));
+        db.insert(make_lease(Ipv4Addr::new(10, 0, 0, 2), hw, Some(200)));
+        // Same hwaddr => same key => replaced
+        assert!(db.find_by_addr(Ipv4Addr::new(10, 0, 0, 1)).is_none());
+        assert!(db.find_by_addr(Ipv4Addr::new(10, 0, 0, 2)).is_some());
+    }
+
+    #[test]
+    fn serialize_no_expiry_produces_zero() {
+        let mut db = LeaseDb::new();
+        db.insert(make_lease(Ipv4Addr::new(10, 0, 0, 1), [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff], None));
+        let text = db.serialize();
+        assert!(text.starts_with("0 "));
+    }
 }

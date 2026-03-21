@@ -146,4 +146,46 @@ mod tests {
         assert_eq!(stats.count, 1);
         assert_eq!(stats.hwm, 2); // hwm doesn't decrease
     }
+
+    #[test]
+    fn stats_report_format() {
+        let mut stats = BlockdataStats::default();
+        stats.on_alloc(KEYBLOCK_LEN * 3);
+        stats.on_free(KEYBLOCK_LEN);
+        let report = stats.report();
+        assert!(report.contains("pool memory in use"));
+        assert!(report.contains(&format!("{}", 2 * KEYBLOCK_LEN))); // current
+        assert!(report.contains(&format!("{}", 3 * KEYBLOCK_LEN))); // hwm and allocated
+    }
+
+    #[test]
+    fn stats_on_free_saturates_at_zero() {
+        let mut stats = BlockdataStats::default();
+        stats.on_alloc(KEYBLOCK_LEN);
+        stats.on_free(KEYBLOCK_LEN * 10); // free more than allocated
+        assert_eq!(stats.count, 0); // doesn't underflow
+    }
+
+    #[test]
+    fn stats_on_alloc_rounds_up() {
+        let mut stats = BlockdataStats::default();
+        stats.on_alloc(1); // 1 byte still needs 1 block
+        assert_eq!(stats.count, 1);
+        stats.on_alloc(KEYBLOCK_LEN + 1); // needs 2 blocks
+        assert_eq!(stats.count, 3);
+    }
+
+    #[test]
+    fn blockdata_clone() {
+        let bd = Blockdata::alloc(b"clone me");
+        let bd2 = bd.clone();
+        assert_eq!(bd.retrieve(), bd2.retrieve());
+    }
+
+    #[test]
+    fn read_from_short_data_errors() {
+        let data = vec![1u8, 2, 3];
+        let result = Blockdata::read_from(&mut data.as_slice(), 10);
+        assert!(result.is_err());
+    }
 }

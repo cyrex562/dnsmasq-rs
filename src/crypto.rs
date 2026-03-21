@@ -313,4 +313,170 @@ mod tests {
         let result = verify_sig(data, signature.to_bytes().as_ref(), &dnskey, DnssecAlgorithm::Ed25519);
         assert!(matches!(result, Ok(true)));
     }
+
+    // ── Algorithm TryFrom tests ──
+
+    #[test]
+    fn algorithm_try_from_valid() {
+        assert_eq!(DnssecAlgorithm::try_from(5).unwrap(), DnssecAlgorithm::RsaSha1);
+        assert_eq!(DnssecAlgorithm::try_from(8).unwrap(), DnssecAlgorithm::RsaSha256);
+        assert_eq!(DnssecAlgorithm::try_from(10).unwrap(), DnssecAlgorithm::RsaSha512);
+        assert_eq!(DnssecAlgorithm::try_from(13).unwrap(), DnssecAlgorithm::EcdsaP256);
+        assert_eq!(DnssecAlgorithm::try_from(14).unwrap(), DnssecAlgorithm::EcdsaP384);
+        assert_eq!(DnssecAlgorithm::try_from(15).unwrap(), DnssecAlgorithm::Ed25519);
+        assert_eq!(DnssecAlgorithm::try_from(16).unwrap(), DnssecAlgorithm::Ed448);
+    }
+
+    #[test]
+    fn algorithm_try_from_invalid() {
+        for bad in [0u8, 1, 2, 3, 4, 6, 7, 9, 11, 12, 17, 255] {
+            assert!(matches!(
+                DnssecAlgorithm::try_from(bad),
+                Err(CryptoError::UnsupportedAlgorithm(v)) if v == bad
+            ));
+        }
+    }
+
+    // ── RSA key parsing tests ──
+
+    #[test]
+    fn parse_rsa_key_empty_data() {
+        let result = parse_dnskey(8, &[]);
+        assert!(matches!(result, Err(CryptoError::InvalidKey)));
+    }
+
+    #[test]
+    fn parse_rsa_key_short_exponent_length_zero() {
+        // First byte 0 means next 2 bytes are exponent length, but only 1 byte follows
+        let result = parse_dnskey(8, &[0, 0]);
+        assert!(matches!(result, Err(CryptoError::InvalidKey)));
+    }
+
+    #[test]
+    fn parse_rsa_key_exponent_longer_than_data() {
+        // exp_len=10 but only 2 bytes of data after length
+        let result = parse_dnskey(8, &[10, 0x01, 0x02]);
+        assert!(matches!(result, Err(CryptoError::InvalidKey)));
+    }
+
+    #[test]
+    fn parse_rsa_key_no_modulus() {
+        // exp_len=3, exponent=3 bytes, no modulus
+        let result = parse_dnskey(8, &[3, 0x01, 0x00, 0x01]);
+        assert!(matches!(result, Err(CryptoError::InvalidKey)));
+    }
+
+    /// Build a minimal DNSKEY wire-format RSA key: [exp_len][exponent][modulus]
+    /// Uses e=65537 and a 256-byte (2048-bit) random modulus.
+    fn make_rsa_wire_key() -> Vec<u8> {
+        let e_bytes: [u8; 3] = [0x01, 0x00, 0x01]; // 65537
+        // 256 bytes of 0xff is not a valid RSA modulus mathematically,
+        // but we just need the parser to accept the structure.
+        // Use a large odd number for the modulus.
+        let mut n_bytes = vec![0xffu8; 256];
+        n_bytes[0] = 0x00; // leading zero won't matter, BigUint strips it
+        n_bytes[1] = 0xc1; // make it look like a real modulus
+
+        let mut wire = Vec::new();
+        wire.push(e_bytes.len() as u8);
+        wire.extend_from_slice(&e_bytes);
+        wire.extend_from_slice(&n_bytes);
+        wire
+    }
+
+    #[test]
+    fn parse_rsa_key_valid() {
+        let wire = make_rsa_wire_key();
+        let result = parse_dnskey(8, &wire);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            DnssecPublicKey::RsaSha256(_) => {} // expected
+            _ => panic!("expected RsaSha256 variant"),
+        }
+    }
+
+    #[test]
+    fn parse_rsa_sha512_returns_correct_variant() {
+        let wire = make_rsa_wire_key();
+        let result = parse_dnskey(10, &wire);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            DnssecPublicKey::RsaSha512(_) => {} // expected
+            _ => panic!("expected RsaSha512 variant"),
+        }
+    }
+
+    // ── ECDSA key parsing tests ──
+
+    #[test]
+    fn parse_ecdsa_p256_wrong_size() {
+        let result = parse_dnskey(13, &[0u8; 63]); // should be 64
+        assert!(matches!(result, Err(CryptoError::InvalidKey)));
+        let result = parse_dnskey(13, &[0u8; 65]); // should be 64
+        assert!(matches!(result, Err(CryptoError::InvalidKey)));
+    }
+
+    #[test]
+    fn parse_ecdsa_p384_wrong_size() {
+        let result = parse_dnskey(14, &[0u8; 95]); // should be 96
+        assert!(matches!(result, Err(CryptoError::InvalidKey)));
+        let result = parse_dnskey(14, &[0u8; 97]); // should be 96
+        assert!(matches!(result, Err(CryptoError::InvalidKey)));
+    }
+
+    #[test]
+    fn parse_ed25519_wrong_size() {
+        let result = parse_dnskey(15, &[0u8; 31]); // should be 32
+        assert!(matches!(result, Err(CryptoError::InvalidKey)));
+        let result = parse_dnskey(15, &[0u8; 33]); // should be 32
+        assert!(matches!(result, Err(CryptoError::InvalidKey)));
+    }
+
+    #[test]
+    fn parse_ed448_returns_unsupported() {
+        let result = parse_dnskey(16, &[0u8; 57]);
+        assert!(matches!(result, Err(CryptoError::UnsupportedAlgorithm(16))));
+    }
+
+    // ── verify_sig algorithm mismatch ──
+
+    #[test]
+    fn verify_sig_algorithm_key_mismatch() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let vk = signing_key.verifying_key();
+        let dnskey = DnssecPublicKey::Ed25519(vk);
+
+        // Try to verify with wrong algorithm
+        let result = verify_sig(b"data", &[0u8; 64], &dnskey, DnssecAlgorithm::RsaSha256);
+        assert!(matches!(result, Err(CryptoError::UnsupportedAlgorithm(_))));
+    }
+
+    #[test]
+    fn verify_sig_ed25519_wrong_sig_size() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let vk = signing_key.verifying_key();
+        let dnskey = DnssecPublicKey::Ed25519(vk);
+
+        let result = verify_sig(b"data", &[0u8; 32], &dnskey, DnssecAlgorithm::Ed25519);
+        assert!(matches!(result, Err(CryptoError::InvalidSignature)));
+    }
+
+    // ── RSA SHA-1 shares key format with SHA-256 ──
+
+    #[test]
+    fn parse_rsa_sha1_uses_sha256_variant() {
+        let wire = make_rsa_wire_key();
+        let result = parse_dnskey(5, &wire);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            DnssecPublicKey::RsaSha256(_) => {} // RSA/SHA-1 stored as RsaSha256
+            _ => panic!("expected RsaSha256 variant for RSA/SHA-1"),
+        }
+    }
 }
