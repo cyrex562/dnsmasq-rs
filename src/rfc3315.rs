@@ -423,6 +423,131 @@ pub fn log6_quiet(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// IA option helpers (ported from rfc3315.c:1579-1650)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// DHCPv6 IA (Identity Association) type constants.
+#[cfg(feature = "dhcp6")]
+pub const IA_NA: u8 = 3;  // Non-temporary Address
+#[cfg(feature = "dhcp6")]
+pub const IA_TA: u8 = 4;  // Temporary Address
+
+/// Validate an IA_NA or IA_TA option payload and extract the IAID.
+///
+/// Returns `Some((iaid, ia_type))` if the payload is well-formed, `None` otherwise.
+/// IA_NA must have at least 12 bytes (IAID + T1 + T2), IA_TA at least 4 (IAID).
+/// Port of `check_ia()` from rfc3315.c:1579-1606.
+#[cfg(feature = "dhcp6")]
+pub fn check_ia(ia_type: u8, opt_data: &[u8]) -> Option<(u32, u8)> {
+    match ia_type {
+        IA_NA => {
+            if opt_data.len() < 12 {
+                return None;
+            }
+            let iaid = u32::from_be_bytes([opt_data[0], opt_data[1], opt_data[2], opt_data[3]]);
+            Some((iaid, IA_NA))
+        }
+        IA_TA => {
+            if opt_data.len() < 4 {
+                return None;
+            }
+            let iaid = u32::from_be_bytes([opt_data[0], opt_data[1], opt_data[2], opt_data[3]]);
+            Some((iaid, IA_TA))
+        }
+        _ => None,
+    }
+}
+
+/// Build an IA_NA option payload: IAID(4) + T1(4) + T2(4).
+///
+/// Port of `build_ia()` from rfc3315.c:1609-1626.
+#[cfg(feature = "dhcp6")]
+pub fn build_ia(iaid: u32, t1: u32, t2: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(12);
+    buf.extend_from_slice(&iaid.to_be_bytes());
+    buf.extend_from_slice(&t1.to_be_bytes());
+    buf.extend_from_slice(&t2.to_be_bytes());
+    buf
+}
+
+/// Backfill T1/T2 values into an existing IA_NA payload.
+///
+/// `buf` must be at least 12 bytes. If `fuzz` is true, T1 and T2 are
+/// reduced by up to 1/20th to prevent all clients from renewing at once.
+/// Port of `end_ia()` from rfc3315.c:1628-1650.
+#[cfg(feature = "dhcp6")]
+pub fn end_ia(buf: &mut [u8], t1: u32, t2: u32, fuzz: bool) {
+    if buf.len() < 12 {
+        return;
+    }
+    let (t1_val, t2_val) = if fuzz && t1 > 20 && t2 > 20 {
+        // Reduce by up to 1/20th
+        let fuzz_t1 = t1 / 20;
+        let fuzz_t2 = t2 / 20;
+        (t1 - fuzz_t1, t2 - fuzz_t2)
+    } else {
+        (t1, t2)
+    };
+    buf[4..8].copy_from_slice(&t1_val.to_be_bytes());
+    buf[8..12].copy_from_slice(&t2_val.to_be_bytes());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lifetime calculation (ported from rfc3315.c:1823-1868)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Calculate DHCPv6 preferred/valid lifetimes and T1/T2 timers.
+///
+/// Per RFC 3315 §22.4:
+/// - T1 = 0.5 * preferred_lifetime (when to start RENEW)
+/// - T2 = 0.8 * preferred_lifetime (when to start REBIND)
+///
+/// `lease_time` is the configured lease duration in seconds.
+/// Returns `(preferred, valid, t1, t2)`.
+/// Port of `calculate_times()` from rfc3315.c:1823-1868.
+#[cfg(feature = "dhcp6")]
+pub fn calculate_times(lease_time: u32) -> (u32, u32, u32, u32) {
+    if lease_time == 0xFFFFFFFF {
+        // Infinite lease
+        return (0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF);
+    }
+    let preferred = lease_time;
+    let valid = lease_time;
+    let t1 = preferred / 2;       // 0.5 * preferred
+    let t2 = (preferred * 4) / 5; // 0.8 * preferred
+    (preferred, valid, t1, t2)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Status code option builder (ported from rfc3315.c option 13 handling)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// DHCPv6 status codes (RFC 3315 §24.4).
+#[cfg(feature = "dhcp6")]
+pub const STATUS_SUCCESS:        u16 = 0;
+#[cfg(feature = "dhcp6")]
+pub const STATUS_UNSPEC_FAIL:    u16 = 1;
+#[cfg(feature = "dhcp6")]
+pub const STATUS_NO_ADDRS_AVAIL: u16 = 2;
+#[cfg(feature = "dhcp6")]
+pub const STATUS_NO_BINDING:     u16 = 3;
+#[cfg(feature = "dhcp6")]
+pub const STATUS_NOT_ON_LINK:    u16 = 4;
+#[cfg(feature = "dhcp6")]
+pub const STATUS_USE_MULTICAST:  u16 = 5;
+
+/// Build a DHCPv6 Status Code option payload (option 13).
+///
+/// Wire format: status-code(2) + status-message(variable).
+#[cfg(feature = "dhcp6")]
+pub fn build_status_code(code: u16, message: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(2 + message.len());
+    buf.extend_from_slice(&code.to_be_bytes());
+    buf.extend_from_slice(message.as_bytes());
+    buf
+}
+
 #[cfg(all(test, feature = "dhcp6"))]
 mod tests {
     use super::*;
@@ -669,5 +794,168 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("status"));
         assert!(lines[0].contains('0'));
+    }
+
+    // ── check_ia ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn check_ia_valid_na() {
+        // IAID(4) + T1(4) + T2(4) = 12 bytes minimum
+        let mut data = Vec::new();
+        data.extend_from_slice(&42u32.to_be_bytes()); // IAID
+        data.extend_from_slice(&1800u32.to_be_bytes()); // T1
+        data.extend_from_slice(&2880u32.to_be_bytes()); // T2
+        let result = check_ia(IA_NA, &data);
+        assert_eq!(result, Some((42, IA_NA)));
+    }
+
+    #[test]
+    fn check_ia_valid_ta() {
+        let data = 99u32.to_be_bytes().to_vec();
+        let result = check_ia(IA_TA, &data);
+        assert_eq!(result, Some((99, IA_TA)));
+    }
+
+    #[test]
+    fn check_ia_na_too_short() {
+        assert!(check_ia(IA_NA, &[0; 11]).is_none());
+    }
+
+    #[test]
+    fn check_ia_ta_too_short() {
+        assert!(check_ia(IA_TA, &[0; 3]).is_none());
+    }
+
+    #[test]
+    fn check_ia_unknown_type() {
+        assert!(check_ia(99, &[0; 12]).is_none());
+    }
+
+    // ── build_ia ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn build_ia_roundtrip() {
+        let buf = build_ia(42, 1800, 2880);
+        assert_eq!(buf.len(), 12);
+        let (iaid, ia_type) = check_ia(IA_NA, &buf).unwrap();
+        assert_eq!(iaid, 42);
+        assert_eq!(ia_type, IA_NA);
+        let t1 = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let t2 = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        assert_eq!(t1, 1800);
+        assert_eq!(t2, 2880);
+    }
+
+    #[test]
+    fn build_ia_zero_timers() {
+        let buf = build_ia(1, 0, 0);
+        let t1 = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let t2 = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        assert_eq!(t1, 0);
+        assert_eq!(t2, 0);
+    }
+
+    // ── end_ia ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn end_ia_overwrites_t1_t2() {
+        let mut buf = build_ia(1, 0, 0);
+        end_ia(&mut buf, 900, 1440, false);
+        let t1 = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let t2 = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        assert_eq!(t1, 900);
+        assert_eq!(t2, 1440);
+    }
+
+    #[test]
+    fn end_ia_fuzz_reduces() {
+        let mut buf = build_ia(1, 0, 0);
+        end_ia(&mut buf, 1000, 2000, true);
+        let t1 = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let t2 = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        // 1000 - 1000/20 = 950, 2000 - 2000/20 = 1900
+        assert_eq!(t1, 950);
+        assert_eq!(t2, 1900);
+    }
+
+    #[test]
+    fn end_ia_fuzz_no_effect_when_small() {
+        let mut buf = build_ia(1, 0, 0);
+        end_ia(&mut buf, 10, 15, true);
+        let t1 = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let t2 = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        assert_eq!(t1, 10);
+        assert_eq!(t2, 15);
+    }
+
+    #[test]
+    fn end_ia_short_buf_noop() {
+        let mut buf = vec![0u8; 4]; // too short
+        end_ia(&mut buf, 100, 200, false);
+        assert_eq!(buf, vec![0; 4]); // unchanged
+    }
+
+    // ── calculate_times ──────────────────────────────────────────────────────
+
+    #[test]
+    fn calculate_times_standard() {
+        let (pref, valid, t1, t2) = calculate_times(3600);
+        assert_eq!(pref, 3600);
+        assert_eq!(valid, 3600);
+        assert_eq!(t1, 1800);  // 0.5 * 3600
+        assert_eq!(t2, 2880);  // 0.8 * 3600
+    }
+
+    #[test]
+    fn calculate_times_infinite() {
+        let (pref, valid, t1, t2) = calculate_times(0xFFFFFFFF);
+        assert_eq!(pref, 0xFFFFFFFF);
+        assert_eq!(valid, 0xFFFFFFFF);
+        assert_eq!(t1, 0xFFFFFFFF);
+        assert_eq!(t2, 0xFFFFFFFF);
+    }
+
+    #[test]
+    fn calculate_times_zero() {
+        let (pref, valid, t1, t2) = calculate_times(0);
+        assert_eq!(pref, 0);
+        assert_eq!(valid, 0);
+        assert_eq!(t1, 0);
+        assert_eq!(t2, 0);
+    }
+
+    #[test]
+    fn calculate_times_small() {
+        let (pref, valid, t1, t2) = calculate_times(100);
+        assert_eq!(pref, 100);
+        assert_eq!(valid, 100);
+        assert_eq!(t1, 50);
+        assert_eq!(t2, 80);
+    }
+
+    // ── build_status_code ────────────────────────────────────────────────────
+
+    #[test]
+    fn build_status_code_success() {
+        let buf = build_status_code(STATUS_SUCCESS, "success");
+        assert_eq!(buf[0], 0);
+        assert_eq!(buf[1], 0);
+        assert_eq!(&buf[2..], b"success");
+    }
+
+    #[test]
+    fn build_status_code_no_addrs() {
+        let buf = build_status_code(STATUS_NO_ADDRS_AVAIL, "no addresses available");
+        let code = u16::from_be_bytes([buf[0], buf[1]]);
+        assert_eq!(code, 2);
+        assert_eq!(&buf[2..], b"no addresses available");
+    }
+
+    #[test]
+    fn build_status_code_not_on_link() {
+        let buf = build_status_code(STATUS_NOT_ON_LINK, "");
+        let code = u16::from_be_bytes([buf[0], buf[1]]);
+        assert_eq!(code, 4);
+        assert_eq!(buf.len(), 2); // no message
     }
 }

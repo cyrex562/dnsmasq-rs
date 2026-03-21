@@ -207,6 +207,146 @@ pub fn reply_dest(pkt: &DhcpPacket) -> SocketAddr {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Network utilities (ported from dhcp.c)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Check if two IPv4 addresses are on the same network given a netmask.
+///
+/// Port of `is_same_net()` used throughout dhcp.c.
+pub fn is_same_net(a: Ipv4Addr, b: Ipv4Addr, netmask: Ipv4Addr) -> bool {
+    let mask = u32::from(netmask);
+    (u32::from(a) & mask) == (u32::from(b) & mask)
+}
+
+/// Compute the Internet checksum (RFC 1071) used for ICMP echo requests.
+///
+/// Ones-complement sum of 16-bit words, with carry folded back in.
+pub fn icmp_checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < data.len() {
+        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < data.len() {
+        sum += (data[i] as u32) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Address pool helpers (ported from dhcp.c:687-763)
+// ─────────────────────────────────────────────────────────────────────────────
+
+use crate::types::dhcp::{DhcpContext, DhcpConfig, CONTEXT_STATIC, CONTEXT_PROXY, CONFIG_ADDR};
+
+/// Check if `addr` is available in one of the DHCP contexts.
+///
+/// Returns `true` if `addr` falls within any non-static, non-proxy context
+/// range and is not the router address of any context.
+/// Port of `address_available()` from dhcp.c:687-715.
+pub fn address_available(contexts: &[DhcpContext], addr: Ipv4Addr) -> bool {
+    let a = u32::from(addr);
+
+    // Reject if addr is any context's router (server) address.
+    for ctx in contexts {
+        if addr == ctx.router {
+            return false;
+        }
+    }
+
+    for ctx in contexts {
+        if ctx.flags & (CONTEXT_STATIC | CONTEXT_PROXY) != 0 {
+            continue;
+        }
+        let start = u32::from(ctx.start);
+        let end = u32::from(ctx.end);
+        if a >= start && a <= end {
+            return true;
+        }
+    }
+    false
+}
+
+/// Find the DHCP context that best matches `addr`.
+///
+/// Prefers a pool range match (via [`address_available`]), then a static
+/// context on the same subnet, then any context on the same subnet.
+/// Port of `narrow_context()` from dhcp.c:717-752.
+pub fn narrow_context<'a>(contexts: &'a [DhcpContext], addr: Ipv4Addr) -> Option<&'a DhcpContext> {
+    // Try pool range first.
+    if address_available(contexts, addr) {
+        for ctx in contexts {
+            if ctx.flags & (CONTEXT_STATIC | CONTEXT_PROXY) != 0 {
+                continue;
+            }
+            let a = u32::from(addr);
+            if a >= u32::from(ctx.start) && a <= u32::from(ctx.end) {
+                return Some(ctx);
+            }
+        }
+    }
+
+    // Try static context on same subnet.
+    for ctx in contexts {
+        if ctx.flags & CONTEXT_STATIC != 0
+            && ctx.netmask != Ipv4Addr::UNSPECIFIED
+            && is_same_net(addr, ctx.start, ctx.netmask)
+        {
+            return Some(ctx);
+        }
+    }
+
+    // Any context on same subnet (non-proxy).
+    for ctx in contexts {
+        if ctx.flags & CONTEXT_PROXY != 0 {
+            continue;
+        }
+        if ctx.netmask != Ipv4Addr::UNSPECIFIED && is_same_net(addr, ctx.start, ctx.netmask) {
+            return Some(ctx);
+        }
+    }
+
+    None
+}
+
+/// Find a static DHCP host config entry by IPv4 address.
+///
+/// Port of `config_find_by_address()` from dhcp.c:754-763.
+pub fn config_find_by_address(configs: &[DhcpConfig], addr: Ipv4Addr) -> Option<&DhcpConfig> {
+    configs
+        .iter()
+        .find(|c| c.flags & CONFIG_ADDR != 0 && c.addr == addr)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Packet validation (ported from dhcp.c:130-176)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Validate a raw DHCP packet without fully parsing it.
+///
+/// Checks minimum size, op=1 (BOOTREQUEST), hlen<=16, and magic cookie.
+pub fn dhcp_packet_validate(data: &[u8]) -> Result<(), &'static str> {
+    if data.len() < 240 {
+        return Err("packet too short");
+    }
+    if data[0] != 1 {
+        return Err("not a BOOTREQUEST");
+    }
+    if data[2] > DHCP_CHADDR_MAX as u8 {
+        return Err("hlen exceeds maximum");
+    }
+    let cookie = u32::from_be_bytes([data[236], data[237], data[238], data[239]]);
+    if cookie != DHCP_COOKIE {
+        return Err("bad magic cookie");
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -332,5 +472,273 @@ mod tests {
         data[238] = 0xBE;
         data[239] = 0xEF;
         assert!(parse_dhcp_packet(&data).is_none());
+    }
+
+    // ── is_same_net ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn is_same_net_same_subnet() {
+        let mask = Ipv4Addr::new(255, 255, 255, 0);
+        assert!(is_same_net("10.0.0.5".parse().unwrap(), "10.0.0.200".parse().unwrap(), mask));
+    }
+
+    #[test]
+    fn is_same_net_different_subnet() {
+        let mask = Ipv4Addr::new(255, 255, 255, 0);
+        assert!(!is_same_net("10.0.0.5".parse().unwrap(), "10.0.1.5".parse().unwrap(), mask));
+    }
+
+    #[test]
+    fn is_same_net_slash32() {
+        let mask = Ipv4Addr::new(255, 255, 255, 255);
+        assert!(is_same_net("10.0.0.1".parse().unwrap(), "10.0.0.1".parse().unwrap(), mask));
+        assert!(!is_same_net("10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap(), mask));
+    }
+
+    #[test]
+    fn is_same_net_slash0() {
+        let mask = Ipv4Addr::UNSPECIFIED;
+        assert!(is_same_net("1.2.3.4".parse().unwrap(), "5.6.7.8".parse().unwrap(), mask));
+    }
+
+    #[test]
+    fn is_same_net_slash16() {
+        let mask = Ipv4Addr::new(255, 255, 0, 0);
+        assert!(is_same_net("172.16.5.1".parse().unwrap(), "172.16.200.1".parse().unwrap(), mask));
+        assert!(!is_same_net("172.16.5.1".parse().unwrap(), "172.17.5.1".parse().unwrap(), mask));
+    }
+
+    // ── icmp_checksum ────────────────────────────────────────────────────────
+
+    #[test]
+    fn icmp_checksum_empty() {
+        assert_eq!(icmp_checksum(&[]), 0xffff);
+    }
+
+    #[test]
+    fn icmp_checksum_known_value() {
+        // ICMP echo request: type=8, code=0, cksum=0, id=1, seq=1
+        let mut pkt = vec![0x08, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01];
+        let cksum = icmp_checksum(&pkt);
+        // Place checksum and verify it zeros out
+        pkt[2] = (cksum >> 8) as u8;
+        pkt[3] = (cksum & 0xff) as u8;
+        assert_eq!(icmp_checksum(&pkt), 0);
+    }
+
+    #[test]
+    fn icmp_checksum_odd_length() {
+        let data = vec![0x01, 0x02, 0x03];
+        let cksum = icmp_checksum(&data);
+        assert_ne!(cksum, 0); // just check it doesn't panic
+    }
+
+    // ── address_available ────────────────────────────────────────────────────
+
+    fn make_ctx(start: Ipv4Addr, end: Ipv4Addr, router: Ipv4Addr, flags: u32) -> DhcpContext {
+        DhcpContext {
+            start,
+            end,
+            router,
+            flags,
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::BROADCAST,
+            local: Ipv4Addr::UNSPECIFIED,
+            lease_time: 3600,
+            addr_epoch: 0,
+            netid: crate::types::dhcp::DhcpNetid { net: String::new() },
+            filter: None,
+            #[cfg(feature = "dhcp6")]
+            start6: std::net::Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            end6: std::net::Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            local6: std::net::Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            prefix: 0,
+            #[cfg(feature = "dhcp6")]
+            if_index: 0,
+            #[cfg(feature = "dhcp6")]
+            valid: 0,
+            #[cfg(feature = "dhcp6")]
+            preferred: 0,
+        }
+    }
+
+    #[test]
+    fn address_available_in_range() {
+        let ctx = make_ctx(
+            "10.0.0.100".parse().unwrap(),
+            "10.0.0.200".parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+            0,
+        );
+        assert!(address_available(&[ctx], "10.0.0.150".parse().unwrap()));
+    }
+
+    #[test]
+    fn address_available_out_of_range() {
+        let ctx = make_ctx(
+            "10.0.0.100".parse().unwrap(),
+            "10.0.0.200".parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+            0,
+        );
+        assert!(!address_available(&[ctx], "10.0.0.50".parse().unwrap()));
+    }
+
+    #[test]
+    fn address_available_rejects_router() {
+        let ctx = make_ctx(
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.254".parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+            0,
+        );
+        assert!(!address_available(&[ctx], "10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn address_available_skips_static() {
+        let ctx = make_ctx(
+            "10.0.0.100".parse().unwrap(),
+            "10.0.0.200".parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+            CONTEXT_STATIC,
+        );
+        assert!(!address_available(&[ctx], "10.0.0.150".parse().unwrap()));
+    }
+
+    #[test]
+    fn address_available_empty_contexts() {
+        assert!(!address_available(&[], "10.0.0.1".parse().unwrap()));
+    }
+
+    // ── narrow_context ───────────────────────────────────────────────────────
+
+    #[test]
+    fn narrow_context_pool_match() {
+        let contexts = [make_ctx(
+            "10.0.0.100".parse().unwrap(),
+            "10.0.0.200".parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+            0,
+        )];
+        let result = narrow_context(&contexts, "10.0.0.150".parse().unwrap());
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn narrow_context_static_fallback() {
+        let contexts = [make_ctx(
+            "10.0.0.0".parse().unwrap(),
+            "10.0.0.0".parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+            CONTEXT_STATIC,
+        )];
+        // addr on same subnet but not in pool (static context)
+        let result = narrow_context(&contexts, "10.0.0.50".parse().unwrap());
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn narrow_context_no_match() {
+        let contexts = [make_ctx(
+            "10.0.0.100".parse().unwrap(),
+            "10.0.0.200".parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+            0,
+        )];
+        let result = narrow_context(&contexts, "192.168.1.1".parse().unwrap());
+        assert!(result.is_none());
+    }
+
+    // ── config_find_by_address ───────────────────────────────────────────────
+
+    #[test]
+    fn config_find_by_address_found() {
+        let cfg = DhcpConfig {
+            flags: CONFIG_ADDR,
+            addr: "10.0.0.50".parse().unwrap(),
+            clid: None,
+            hostname: None,
+            domain: None,
+            netid: vec![],
+            filter: None,
+            decline_time: None,
+            lease_time: 0,
+            hwaddrs: vec![],
+            #[cfg(feature = "dhcp6")]
+            addr6: vec![],
+        };
+        assert!(config_find_by_address(&[cfg], "10.0.0.50".parse().unwrap()).is_some());
+    }
+
+    #[test]
+    fn config_find_by_address_not_found() {
+        let cfg = DhcpConfig {
+            flags: CONFIG_ADDR,
+            addr: "10.0.0.50".parse().unwrap(),
+            clid: None,
+            hostname: None,
+            domain: None,
+            netid: vec![],
+            filter: None,
+            decline_time: None,
+            lease_time: 0,
+            hwaddrs: vec![],
+            #[cfg(feature = "dhcp6")]
+            addr6: vec![],
+        };
+        assert!(config_find_by_address(&[cfg], "10.0.0.99".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn config_find_by_address_empty() {
+        assert!(config_find_by_address(&[], "10.0.0.1".parse().unwrap()).is_none());
+    }
+
+    // ── dhcp_packet_validate ─────────────────────────────────────────────────
+
+    #[test]
+    fn validate_too_short() {
+        assert!(dhcp_packet_validate(&[0u8; 100]).is_err());
+    }
+
+    #[test]
+    fn validate_bad_op() {
+        let mut data = vec![0u8; 300];
+        data[0] = 2; // BOOTREPLY, not BOOTREQUEST
+        let cookie = DHCP_COOKIE.to_be_bytes();
+        data[236..240].copy_from_slice(&cookie);
+        assert_eq!(dhcp_packet_validate(&data), Err("not a BOOTREQUEST"));
+    }
+
+    #[test]
+    fn validate_bad_hlen() {
+        let mut data = vec![0u8; 300];
+        data[0] = 1;
+        data[2] = 255; // hlen too big
+        let cookie = DHCP_COOKIE.to_be_bytes();
+        data[236..240].copy_from_slice(&cookie);
+        assert_eq!(dhcp_packet_validate(&data), Err("hlen exceeds maximum"));
+    }
+
+    #[test]
+    fn validate_bad_cookie() {
+        let mut data = vec![0u8; 300];
+        data[0] = 1;
+        data[2] = 6;
+        assert_eq!(dhcp_packet_validate(&data), Err("bad magic cookie"));
+    }
+
+    #[test]
+    fn validate_good_packet() {
+        let mut data = vec![0u8; 300];
+        data[0] = 1;
+        data[2] = 6;
+        let cookie = DHCP_COOKIE.to_be_bytes();
+        data[236..240].copy_from_slice(&cookie);
+        assert!(dhcp_packet_validate(&data).is_ok());
     }
 }
