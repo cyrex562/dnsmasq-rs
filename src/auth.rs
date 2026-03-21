@@ -60,6 +60,94 @@ pub fn in_zone(name: &str, zone_name: &str) -> bool {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Zone subnet/exclude filtering (ported from auth.c:21-70)
+// ──────────────────────────────────────────────────────────────────────────────
+
+use crate::types::addr::AllAddr;
+use crate::types::dns_records::{Addrlist, AuthZone, ADDRLIST_IPV6};
+
+/// Inline IPv6 same-prefix check (avoids dependency on feature-gated dhcp6 module).
+fn is_same_net6_inline(a: &Ipv6Addr, b: &Ipv6Addr, prefix_len: i32) -> bool {
+    let a_oct = a.octets();
+    let b_oct = b.octets();
+    let mut remaining = prefix_len as usize;
+    for i in 0..16 {
+        if remaining == 0 { break; }
+        if remaining >= 8 {
+            if a_oct[i] != b_oct[i] { return false; }
+            remaining -= 8;
+        } else {
+            let mask = 0xFF << (8 - remaining);
+            if (a_oct[i] & mask) != (b_oct[i] & mask) { return false; }
+            remaining = 0;
+        }
+    }
+    true
+}
+
+/// Check if `addr` matches any entry in the address list (subnet or exclude).
+///
+/// For IPv4: compares using a netmask derived from the prefix length.
+/// For IPv6: compares using `is_same_net6`.
+/// Port of `find_addrlist()` from auth.c:21-42.
+pub fn find_addrlist(list: &[Addrlist], addr: &AllAddr) -> Option<usize> {
+    for (i, entry) in list.iter().enumerate() {
+        match (&entry.addr, addr) {
+            (AllAddr::Addr4(net), AllAddr::Addr4(a)) if entry.flags & ADDRLIST_IPV6 == 0 => {
+                let prefix = entry.prefixlen.min(32).max(0) as u32;
+                let mask = if prefix == 0 { 0u32 } else { !0u32 << (32 - prefix) };
+                if (u32::from(*a) & mask) == (u32::from(*net) & mask) {
+                    return Some(i);
+                }
+            }
+            (AllAddr::Addr6(net), AllAddr::Addr6(a)) if entry.flags & ADDRLIST_IPV6 != 0 => {
+                if is_same_net6_inline(a, net, entry.prefixlen) {
+                    return Some(i);
+                }
+            }
+            _ => continue,
+        }
+    }
+    None
+}
+
+/// Check if `addr` matches a subnet entry in the zone.
+///
+/// Port of `find_subnet()` from auth.c:44-50.
+pub fn find_subnet(zone: &AuthZone, addr: &AllAddr) -> bool {
+    if zone.subnet.is_empty() {
+        return false;
+    }
+    find_addrlist(&zone.subnet, addr).is_some()
+}
+
+/// Check if `addr` matches an exclude entry in the zone.
+///
+/// Port of `find_exclude()` from auth.c:52-58.
+pub fn find_exclude(zone: &AuthZone, addr: &AllAddr) -> bool {
+    if zone.exclude.is_empty() {
+        return false;
+    }
+    find_addrlist(&zone.exclude, addr).is_some()
+}
+
+/// Filter an address against a zone's subnet/exclude lists.
+///
+/// Returns `true` if the address should be included (not excluded, and either
+/// no subnet filter or matches a subnet).
+/// Port of `filter_zone()` from auth.c:60-70.
+pub fn filter_zone(zone: &AuthZone, addr: &AllAddr) -> bool {
+    if find_exclude(zone, addr) {
+        return false;
+    }
+    // No subnets specified means no filter — allow everything.
+    if zone.subnet.is_empty() {
+        return true;
+    }
+    find_subnet(zone, addr)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // make_soa_rr
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -650,5 +738,125 @@ mod tests {
         let pkt = DnsPacket::parse(&bytes).expect("valid packet");
         assert!(pkt.answers.is_empty());
         assert_eq!(pkt.header.rcode(), 0); // NOERROR (NODATA)
+    }
+
+    // ── find_addrlist / find_subnet / find_exclude / filter_zone ─────────────
+
+    fn make_auth_zone(subnet: Vec<Addrlist>, exclude: Vec<Addrlist>) -> AuthZone {
+        AuthZone {
+            domain: "example.com".into(),
+            interface_names: vec![],
+            subnet,
+            exclude,
+        }
+    }
+
+    fn addrlist_v4(addr: Ipv4Addr, prefix: i32) -> Addrlist {
+        Addrlist {
+            addr: AllAddr::Addr4(addr),
+            flags: 0,
+            prefixlen: prefix,
+            decline_time: None,
+        }
+    }
+
+    fn addrlist_v6(addr: Ipv6Addr, prefix: i32) -> Addrlist {
+        Addrlist {
+            addr: AllAddr::Addr6(addr),
+            flags: ADDRLIST_IPV6,
+            prefixlen: prefix,
+            decline_time: None,
+        }
+    }
+
+    #[test]
+    fn find_addrlist_v4_match() {
+        let list = vec![addrlist_v4("10.0.0.0".parse().unwrap(), 24)];
+        let addr = AllAddr::Addr4("10.0.0.42".parse().unwrap());
+        assert!(find_addrlist(&list, &addr).is_some());
+    }
+
+    #[test]
+    fn find_addrlist_v4_no_match() {
+        let list = vec![addrlist_v4("10.0.0.0".parse().unwrap(), 24)];
+        let addr = AllAddr::Addr4("10.0.1.1".parse().unwrap());
+        assert!(find_addrlist(&list, &addr).is_none());
+    }
+
+    #[test]
+    fn find_addrlist_v6_match() {
+        let list = vec![addrlist_v6("2001:db8::".parse().unwrap(), 48)];
+        let addr = AllAddr::Addr6("2001:db8::1".parse().unwrap());
+        assert!(find_addrlist(&list, &addr).is_some());
+    }
+
+    #[test]
+    fn find_addrlist_v6_no_match() {
+        let list = vec![addrlist_v6("2001:db8:1::".parse().unwrap(), 48)];
+        let addr = AllAddr::Addr6("2001:db8:2::1".parse().unwrap());
+        assert!(find_addrlist(&list, &addr).is_none());
+    }
+
+    #[test]
+    fn find_addrlist_empty() {
+        let addr = AllAddr::Addr4("10.0.0.1".parse().unwrap());
+        assert!(find_addrlist(&[], &addr).is_none());
+    }
+
+    #[test]
+    fn find_subnet_returns_false_when_empty() {
+        let zone = make_auth_zone(vec![], vec![]);
+        let addr = AllAddr::Addr4("10.0.0.1".parse().unwrap());
+        assert!(!find_subnet(&zone, &addr));
+    }
+
+    #[test]
+    fn find_subnet_matches() {
+        let zone = make_auth_zone(vec![addrlist_v4("10.0.0.0".parse().unwrap(), 24)], vec![]);
+        let addr = AllAddr::Addr4("10.0.0.42".parse().unwrap());
+        assert!(find_subnet(&zone, &addr));
+    }
+
+    #[test]
+    fn find_exclude_matches() {
+        let zone = make_auth_zone(vec![], vec![addrlist_v4("10.0.0.0".parse().unwrap(), 24)]);
+        let addr = AllAddr::Addr4("10.0.0.42".parse().unwrap());
+        assert!(find_exclude(&zone, &addr));
+    }
+
+    #[test]
+    fn filter_zone_no_subnet_allows_all() {
+        let zone = make_auth_zone(vec![], vec![]);
+        let addr = AllAddr::Addr4("192.168.1.1".parse().unwrap());
+        assert!(filter_zone(&zone, &addr));
+    }
+
+    #[test]
+    fn filter_zone_excludes_matching_addr() {
+        let zone = make_auth_zone(
+            vec![addrlist_v4("10.0.0.0".parse().unwrap(), 8)],
+            vec![addrlist_v4("10.0.1.0".parse().unwrap(), 24)],
+        );
+        // 10.0.1.5 is in subnet 10/8 but excluded by 10.0.1/24
+        let addr = AllAddr::Addr4("10.0.1.5".parse().unwrap());
+        assert!(!filter_zone(&zone, &addr));
+    }
+
+    #[test]
+    fn filter_zone_allows_non_excluded() {
+        let zone = make_auth_zone(
+            vec![addrlist_v4("10.0.0.0".parse().unwrap(), 8)],
+            vec![addrlist_v4("10.0.1.0".parse().unwrap(), 24)],
+        );
+        // 10.0.2.5 is in subnet 10/8 and NOT excluded
+        let addr = AllAddr::Addr4("10.0.2.5".parse().unwrap());
+        assert!(filter_zone(&zone, &addr));
+    }
+
+    #[test]
+    fn filter_zone_rejects_not_in_subnet() {
+        let zone = make_auth_zone(vec![addrlist_v4("10.0.0.0".parse().unwrap(), 24)], vec![]);
+        let addr = AllAddr::Addr4("192.168.1.1".parse().unwrap());
+        assert!(!filter_zone(&zone, &addr));
     }
 }

@@ -10,7 +10,7 @@ Rust port of [dnsmasq](https://thekelleys.org.uk/dnsmasq/doc.html), a DNS forwar
 cargo build                          # default features
 cargo build --all-features           # all features
 cargo build --no-default-features    # minimal build
-cargo test                           # all tests (982+ unit + integration)
+cargo test                           # all tests (1004+ unit + integration)
 cargo test <name>                    # run specific test by substring
 cargo test --test dns_roundtrip      # specific integration test
 cargo test proptest                  # property-based tests only
@@ -43,8 +43,8 @@ RUST_LOG=debug cargo run             # run with debug logging
 | `domain_match.rs` | domain-match.c | 913 | 778 | Complete |
 | `dnsmasq.rs` | dnsmasq.c | 863 | 2478 | Partial (~35%) |
 | `util.rs` | util.c | 781 | 1006 | Mostly complete |
-| `rfc3315.rs` | rfc3315.c | 961 | 2348 | Partial (~41%) |
-| `auth.rs` | auth.c | 654 | 915 | Partial (~71%) |
+| `rfc3315.rs` | rfc3315.c | 1195 | 2348 | Partial (~51%) |
+| `auth.rs` | auth.c | 862 | 915 | Mostly complete |
 | `tftp.rs` | tftp.c | 599 | 1040 | Partial (~58%) |
 | `radv.rs` | radv.c | 539 | 1039 | Partial (~52%) |
 | `dump.rs` | dump.c | 513 | 303 | Complete (expanded) |
@@ -78,7 +78,7 @@ RUST_LOG=debug cargo run             # run with debug logging
 1. **option.rs** — Config parser is only ~17% ported (1098 vs 6322 LOC). Critical for full functionality.
 2. **dnsmasq.rs** — Main daemon logic ~35% ported (863 vs 2478 LOC). Event system and resolv monitor added.
 3. **rfc2131.rs** — DHCP server ~60% ported. Missing some option handlers.
-4. **rfc3315.rs** — DHCPv6 ~41% ported.
+4. **rfc3315.rs** — DHCPv6 ~51% ported.
 5. **dnssec.rs** — DNSSEC validation ~50% ported.
 6. **dhcp.rs** — DHCP listener ~66% ported.
 7. **dhcp6.rs** — DHCPv6 listener ~60% ported.
