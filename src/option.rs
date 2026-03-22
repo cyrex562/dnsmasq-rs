@@ -965,6 +965,109 @@ pub fn domain_rev6(addr: std::net::Ipv6Addr, prefix_len: u8) -> String {
     }
 }
 
+// ── DHCP tag helpers (ported from option.c:1322-1376) ─────────────────────────
+
+/// Check if a string starts with "net:" or "tag:" prefix.
+///
+/// Port of `is_tag_prefix()` from option.c:1322-1328.
+#[cfg(feature = "dhcp")]
+pub fn is_tag_prefix(arg: &str) -> bool {
+    arg.starts_with("net:") || arg.starts_with("tag:")
+}
+
+/// Strip "set:" prefix if present, otherwise return the string unchanged.
+///
+/// Port of `set_prefix()` from option.c:1330-1336.
+#[cfg(feature = "dhcp")]
+pub fn set_prefix(arg: &str) -> &str {
+    arg.strip_prefix("set:").unwrap_or(arg)
+}
+
+/// Parse tag prefixes from a comma-separated option string.
+///
+/// Collects all leading "tag:xxx" or "net:xxx" entries and returns
+/// (tags, remaining) where tags is a Vec of tag names.
+/// Port of `dhcp_tags()` from option.c:1360-1376.
+#[cfg(feature = "dhcp")]
+pub fn dhcp_tags(input: &str) -> (Vec<String>, &str) {
+    let mut tags = Vec::new();
+    let mut remaining = input;
+    while is_tag_prefix(remaining) {
+        if let Some((before, after)) = split(remaining) {
+            // Strip "tag:" or "net:" prefix (4 chars)
+            tags.push(before[4..].to_string());
+            remaining = after;
+        } else {
+            // No comma — the entire remaining is the tag
+            tags.push(remaining[4..].to_string());
+            return (tags, "");
+        }
+    }
+    (tags, remaining)
+}
+
+// ── Canonicalise option helper (ported from option.c:721-742) ─────────────────
+
+/// Normalize a domain name from an option value.
+///
+/// Converts to lowercase, strips trailing dots, validates DNS label rules.
+/// Port of `canonicalise_opt()` from option.c:721-742.
+pub fn canonicalise_opt(s: &str) -> Option<String> {
+    if s.is_empty() {
+        return Some(String::new());
+    }
+    let lower = s.to_ascii_lowercase();
+    let trimmed = lower.trim_end_matches('.');
+    // Basic DNS label validation
+    for label in trimmed.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return None;
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return None;
+        }
+    }
+    Some(trimmed.to_string())
+}
+
+// ── Config file filter (ported from option.c:5717-5730) ───────────────────────
+
+/// Filter predicate for config directory scanning.
+///
+/// Rejects empty names, emacs backup files (~), emacs auto-save (#...#),
+/// and dotfiles.
+/// Port of `file_filter()` from option.c:5717-5730.
+pub fn file_filter(filename: &str) -> bool {
+    if filename.is_empty() {
+        return false;
+    }
+    if filename.ends_with('~') {
+        return false;
+    }
+    if filename.starts_with('#') && filename.ends_with('#') {
+        return false;
+    }
+    if filename.starts_with('.') {
+        return false;
+    }
+    true
+}
+
+/// Parse an IPv4 or IPv6 socket address string.
+///
+/// Supports formats: "1.2.3.4", "::1", "1.2.3.4#5353" (# for port).
+/// Port of `parse_mysockaddr()` from option.c:888-898.
+pub fn parse_mysockaddr(s: &str) -> Result<std::net::SocketAddr, String> {
+    let (addr_str, port) = if let Some(idx) = s.rfind('#') {
+        let port: u16 = s[idx + 1..].parse().map_err(|_| format!("bad port in '{}'", s))?;
+        (&s[..idx], port)
+    } else {
+        (s, 0)
+    };
+    let ip: std::net::IpAddr = addr_str.parse().map_err(|_| format!("bad address '{}'", addr_str))?;
+    Ok(std::net::SocketAddr::new(ip, port))
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1429,5 +1532,154 @@ mod tests {
     fn domain_rev6_slash0() {
         let s = domain_rev6("::".parse().unwrap(), 0);
         assert_eq!(s, "ip6.arpa");
+    }
+
+    // ── is_tag_prefix / set_prefix ───────────────────────────────────────────
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn is_tag_prefix_tag() {
+        assert!(is_tag_prefix("tag:lan"));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn is_tag_prefix_net() {
+        assert!(is_tag_prefix("net:internal"));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn is_tag_prefix_no_prefix() {
+        assert!(!is_tag_prefix("192.168.1.1"));
+        assert!(!is_tag_prefix(""));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn set_prefix_strips() {
+        assert_eq!(set_prefix("set:mynet"), "mynet");
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn set_prefix_no_prefix() {
+        assert_eq!(set_prefix("something"), "something");
+    }
+
+    // ── dhcp_tags ────────────────────────────────────────────────────────────
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn dhcp_tags_single() {
+        let (tags, rest) = dhcp_tags("tag:lan,192.168.1.0");
+        assert_eq!(tags, vec!["lan"]);
+        assert_eq!(rest, "192.168.1.0");
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn dhcp_tags_multiple() {
+        let (tags, rest) = dhcp_tags("tag:lan,tag:vip,10.0.0.0");
+        assert_eq!(tags, vec!["lan", "vip"]);
+        assert_eq!(rest, "10.0.0.0");
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn dhcp_tags_none() {
+        let (tags, rest) = dhcp_tags("192.168.1.0");
+        assert!(tags.is_empty());
+        assert_eq!(rest, "192.168.1.0");
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn dhcp_tags_only_tag() {
+        let (tags, rest) = dhcp_tags("tag:solo");
+        assert_eq!(tags, vec!["solo"]);
+        assert_eq!(rest, "");
+    }
+
+    // ── canonicalise_opt ─────────────────────────────────────────────────────
+
+    #[test]
+    fn canonicalise_opt_normal() {
+        assert_eq!(canonicalise_opt("Example.COM"), Some("example.com".to_string()));
+    }
+
+    #[test]
+    fn canonicalise_opt_trailing_dot() {
+        assert_eq!(canonicalise_opt("example.com."), Some("example.com".to_string()));
+    }
+
+    #[test]
+    fn canonicalise_opt_empty() {
+        assert_eq!(canonicalise_opt(""), Some(String::new()));
+    }
+
+    #[test]
+    fn canonicalise_opt_invalid_label() {
+        assert_eq!(canonicalise_opt("-bad.com"), None);
+        assert_eq!(canonicalise_opt("bad-.com"), None);
+    }
+
+    #[test]
+    fn canonicalise_opt_long_label() {
+        let long = "a".repeat(64);
+        assert_eq!(canonicalise_opt(&format!("{}.com", long)), None);
+    }
+
+    // ── file_filter ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn file_filter_normal() {
+        assert!(file_filter("dnsmasq.conf"));
+    }
+
+    #[test]
+    fn file_filter_rejects_backup() {
+        assert!(!file_filter("dnsmasq.conf~"));
+    }
+
+    #[test]
+    fn file_filter_rejects_emacs_autosave() {
+        assert!(!file_filter("#dnsmasq.conf#"));
+    }
+
+    #[test]
+    fn file_filter_rejects_dotfile() {
+        assert!(!file_filter(".hidden"));
+    }
+
+    #[test]
+    fn file_filter_rejects_empty() {
+        assert!(!file_filter(""));
+    }
+
+    // ── parse_mysockaddr ─────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_mysockaddr_ipv4() {
+        let addr = parse_mysockaddr("10.0.0.1").unwrap();
+        assert_eq!(addr.ip(), "10.0.0.1".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(addr.port(), 0);
+    }
+
+    #[test]
+    fn parse_mysockaddr_ipv4_with_port() {
+        let addr = parse_mysockaddr("10.0.0.1#5353").unwrap();
+        assert_eq!(addr.port(), 5353);
+    }
+
+    #[test]
+    fn parse_mysockaddr_ipv6() {
+        let addr = parse_mysockaddr("::1").unwrap();
+        assert!(addr.ip().is_ipv6());
+    }
+
+    #[test]
+    fn parse_mysockaddr_invalid() {
+        assert!(parse_mysockaddr("not.an.addr").is_err());
     }
 }

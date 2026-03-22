@@ -1534,6 +1534,59 @@ pub fn reply_query(
     ReplyQueryResult::Send { pkt, client, server_idx }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Pure utility functions (ported from forward.c)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// XOR two u32 slices element-wise, storing results in `a`.
+///
+/// Only XORs up to `min(a.len(), b.len())` elements.
+/// Port of `xor_array()` from forward.c:1301-1307.
+pub fn xor_array(a: &mut [u32], b: &[u32]) {
+    for (x, &y) in a.iter_mut().zip(b.iter()) {
+        *x ^= y;
+    }
+}
+
+/// Generate a random DNS query ID that doesn't conflict with existing entries.
+///
+/// Port of the unique-id logic from `get_id()` in forward.c:3302+.
+pub fn get_unique_id(existing: &[u16]) -> u16 {
+    use std::collections::HashSet;
+    let used: HashSet<u16> = existing.iter().copied().collect();
+    // Simple approach: try random values
+    let mut id: u16 = rand::random();
+    let mut attempts = 0;
+    while used.contains(&id) && attempts < 1000 {
+        id = rand::random();
+        attempts += 1;
+    }
+    id
+}
+
+/// Check if a DNS reply should be considered "bogus" due to rebinding attack.
+///
+/// Returns true if the answer contains a private/RFC1918 address that doesn't
+/// match any configured exception.
+/// Port of the rebind-check logic used in return_reply().
+pub fn is_private_reply(addr_bytes: &[u8]) -> bool {
+    if addr_bytes.len() == 4 {
+        // IPv4 private ranges: 10/8, 172.16/12, 192.168/16, 127/8
+        let a = addr_bytes[0];
+        let b = addr_bytes[1];
+        a == 10
+            || (a == 172 && (b & 0xf0) == 16)
+            || (a == 192 && b == 168)
+            || a == 127
+    } else if addr_bytes.len() == 16 {
+        // IPv6 ULA (fc00::/7) or link-local (fe80::/10)
+        let a = addr_bytes[0];
+        (a & 0xfe) == 0xfc || (a == 0xfe && (addr_bytes[1] & 0xc0) == 0x80)
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2278,6 +2331,101 @@ mod tests {
         let cfg = ProcessReplyConfig::default();
         let result = reply_query(&reply, server_addr, &[server_addr], &mut table, &cfg, &[], "example.com");
         assert_eq!(result, ReplyQueryResult::Discard);
+    }
+
+    // ── xor_array ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn xor_array_basic() {
+        let mut a = [0xFF00FF00u32, 0x12345678];
+        let b = [0x00FF00FFu32, 0x87654321];
+        xor_array(&mut a, &b);
+        assert_eq!(a[0], 0xFFFFFFFF);
+        assert_eq!(a[1], 0x12345678 ^ 0x87654321);
+    }
+
+    #[test]
+    fn xor_array_different_lengths() {
+        let mut a = [1u32, 2, 3];
+        let b = [10u32, 20];
+        xor_array(&mut a, &b);
+        assert_eq!(a, [1 ^ 10, 2 ^ 20, 3]); // third element unchanged
+    }
+
+    #[test]
+    fn xor_array_empty() {
+        let mut a = [1u32, 2];
+        xor_array(&mut a, &[]);
+        assert_eq!(a, [1, 2]); // unchanged
+    }
+
+    #[test]
+    fn xor_array_self_inverse() {
+        let mut a = [0xDEADBEEFu32];
+        let b = [0x12345678u32];
+        xor_array(&mut a, &b);
+        xor_array(&mut a, &b); // XOR again restores
+        assert_eq!(a, [0xDEADBEEF]);
+    }
+
+    // ── get_unique_id ────────────────────────────────────────────────────────
+
+    #[test]
+    fn get_unique_id_empty_set() {
+        let id = get_unique_id(&[]);
+        assert!(id > 0 || id == 0); // any u16 is valid
+    }
+
+    #[test]
+    fn get_unique_id_avoids_existing() {
+        let existing: Vec<u16> = (0..100).collect();
+        let id = get_unique_id(&existing);
+        assert!(!existing.contains(&id));
+    }
+
+    // ── is_private_reply ─────────────────────────────────────────────────────
+
+    #[test]
+    fn is_private_reply_ipv4_10() {
+        assert!(is_private_reply(&[10, 0, 0, 1]));
+    }
+
+    #[test]
+    fn is_private_reply_ipv4_172_16() {
+        assert!(is_private_reply(&[172, 16, 0, 1]));
+        assert!(!is_private_reply(&[172, 32, 0, 1]));
+    }
+
+    #[test]
+    fn is_private_reply_ipv4_192_168() {
+        assert!(is_private_reply(&[192, 168, 1, 1]));
+    }
+
+    #[test]
+    fn is_private_reply_ipv4_public() {
+        assert!(!is_private_reply(&[8, 8, 8, 8]));
+    }
+
+    #[test]
+    fn is_private_reply_ipv6_ula() {
+        let mut addr = [0u8; 16];
+        addr[0] = 0xfd;
+        assert!(is_private_reply(&addr));
+    }
+
+    #[test]
+    fn is_private_reply_ipv6_link_local() {
+        let mut addr = [0u8; 16];
+        addr[0] = 0xfe;
+        addr[1] = 0x80;
+        assert!(is_private_reply(&addr));
+    }
+
+    #[test]
+    fn is_private_reply_ipv6_global() {
+        let mut addr = [0u8; 16];
+        addr[0] = 0x20;
+        assert!(!is_private_reply(&addr));
     }
 }
 

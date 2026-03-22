@@ -467,6 +467,111 @@ impl LeaseDb {
     pub fn iter(&self) -> impl Iterator<Item = &DhcpLease> {
         self.leases.values()
     }
+
+    /// Compute FQDNs for all leases with hostnames.
+    ///
+    /// Sets `lease.fqdn = hostname + "." + domain` for each lease.
+    /// Port of `lease_calc_fqdns()` from lease.c:1024-1052.
+    pub fn calc_fqdns(&mut self, domain: &str) {
+        for lease in self.leases.values_mut() {
+            if let Some(ref hostname) = lease.hostname {
+                if !domain.is_empty() {
+                    lease.fqdn = Some(format!("{}.{}", hostname, domain));
+                } else {
+                    lease.fqdn = None;
+                }
+            }
+        }
+    }
+
+    /// Find a DHCPv6 lease by CLID, IAID, and address.
+    ///
+    /// Port of `lease6_find()` from lease.c:696-718.
+    #[cfg(feature = "dhcp6")]
+    pub fn find_v6_by_clid_iaid(
+        &self,
+        clid: &[u8],
+        iaid: u32,
+        addr: &std::net::Ipv6Addr,
+    ) -> Option<&DhcpLease> {
+        use crate::types::dhcp::{LEASE_TA, LEASE_NA};
+        self.leases.values().find(|l| {
+            (l.flags & (LEASE_TA | LEASE_NA) != 0)
+                && l.iaid == iaid
+                && l.addr6 == *addr
+                && l.clid.as_deref() == Some(clid)
+        })
+    }
+
+    /// Find a DHCPv6 lease by exact IPv6 address.
+    ///
+    /// Port of `lease6_find_by_plain_addr()` from lease.c:776-790.
+    #[cfg(feature = "dhcp6")]
+    pub fn find_v6_by_addr(&self, addr: &std::net::Ipv6Addr) -> Option<&DhcpLease> {
+        use crate::types::dhcp::{LEASE_TA, LEASE_NA};
+        self.leases.values().find(|l| {
+            (l.flags & (LEASE_TA | LEASE_NA) != 0) && l.addr6 == *addr
+        })
+    }
+
+    /// Allocate a new DHCPv6 lease.
+    ///
+    /// Port of `lease6_allocate()` from lease.c:873-887.
+    #[cfg(feature = "dhcp6")]
+    pub fn allocate_v6(
+        &mut self,
+        addr: std::net::Ipv6Addr,
+        lease_type: u32,
+    ) -> Option<&mut DhcpLease> {
+        use crate::types::dhcp::LEASE_NEW;
+
+        if self.leases.len() >= self.max_leases {
+            return None;
+        }
+
+        let lease = DhcpLease {
+            clid: None,
+            hostname: None,
+            fqdn: None,
+            old_hostname: None,
+            flags: LEASE_NEW | lease_type,
+            expires: None,
+            hwaddr: [0u8; DHCP_CHADDR_MAX],
+            hwaddr_len: 0,
+            hwaddr_type: 0,
+            addr: Ipv4Addr::UNSPECIFIED,
+            giaddr: Ipv4Addr::UNSPECIFIED,
+            extradata: Vec::new(),
+            last_interface: 0,
+            new_interface: 0,
+            new_prefixlen: 0,
+            agent_id: None,
+            vendorclass: None,
+            addr6: addr,
+            iaid: 0,
+            slaac_address: Vec::new(),
+            vendorclass_count: 0,
+        };
+
+        let key = lease_key(&lease);
+        self.leases.insert(key, lease);
+        self.file_dirty = true;
+        self.dns_dirty = true;
+        self.leases.get_mut(&key)
+    }
+
+    /// Clear LEASE_USED flags on all DHCPv6 leases.
+    ///
+    /// Port of `lease6_reset()` from lease.c:721-727.
+    #[cfg(feature = "dhcp6")]
+    pub fn reset_v6_used(&mut self) {
+        use crate::types::dhcp::{LEASE_TA, LEASE_NA, LEASE_USED};
+        for lease in self.leases.values_mut() {
+            if lease.flags & (LEASE_TA | LEASE_NA) != 0 {
+                lease.flags &= !LEASE_USED;
+            }
+        }
+    }
 }
 
 /// Parse a colon-separated hex string (e.g. `"de:ad:be:ef"`) into bytes.
@@ -1234,5 +1339,113 @@ mod tests {
         let lease = loaded.find_by_addr(addr).unwrap();
         assert_eq!(lease.hostname.as_deref(), Some("testbox"));
         assert_eq!(&lease.hwaddr[..6], &[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01]);
+    }
+
+    // ── calc_fqdns ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn calc_fqdns_sets_fqdn() {
+        let mut db = LeaseDb::new();
+        let addr = Ipv4Addr::new(10, 0, 0, 1);
+        db.allocate_v4(addr);
+        db.set_hostname(addr, Some("myhost"), true);
+        db.calc_fqdns("example.com");
+        let lease = db.find_by_addr(addr).unwrap();
+        assert_eq!(lease.fqdn.as_deref(), Some("myhost.example.com"));
+    }
+
+    #[test]
+    fn calc_fqdns_no_hostname_no_fqdn() {
+        let mut db = LeaseDb::new();
+        let addr = Ipv4Addr::new(10, 0, 0, 2);
+        db.allocate_v4(addr);
+        db.calc_fqdns("example.com");
+        let lease = db.find_by_addr(addr).unwrap();
+        assert!(lease.fqdn.is_none());
+    }
+
+    #[test]
+    fn calc_fqdns_empty_domain_no_fqdn() {
+        let mut db = LeaseDb::new();
+        let addr = Ipv4Addr::new(10, 0, 0, 3);
+        db.allocate_v4(addr);
+        db.set_hostname(addr, Some("host"), true);
+        db.calc_fqdns("");
+        let lease = db.find_by_addr(addr).unwrap();
+        assert!(lease.fqdn.is_none());
+    }
+
+    // ── DHCPv6 lease functions ───────────────────────────────────────────────
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn allocate_v6_basic() {
+        use crate::types::dhcp::LEASE_NA;
+        let mut db = LeaseDb::new();
+        let addr: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let lease = db.allocate_v6(addr, LEASE_NA);
+        assert!(lease.is_some());
+        assert_eq!(db.count(), 1);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn find_v6_by_addr_found() {
+        use crate::types::dhcp::LEASE_NA;
+        let mut db = LeaseDb::new();
+        let addr: std::net::Ipv6Addr = "2001:db8::42".parse().unwrap();
+        db.allocate_v6(addr, LEASE_NA);
+        assert!(db.find_v6_by_addr(&addr).is_some());
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn find_v6_by_addr_not_found() {
+        let db = LeaseDb::new();
+        let addr: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        assert!(db.find_v6_by_addr(&addr).is_none());
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn find_v6_by_clid_iaid() {
+        use crate::types::dhcp::LEASE_NA;
+        let mut db = LeaseDb::new();
+        let addr: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let clid = vec![0x00, 0x01, 0xAA, 0xBB];
+        {
+            let lease = db.allocate_v6(addr, LEASE_NA).unwrap();
+            lease.clid = Some(clid.clone());
+            lease.iaid = 42;
+        }
+        assert!(db.find_v6_by_clid_iaid(&clid, 42, &addr).is_some());
+        assert!(db.find_v6_by_clid_iaid(&clid, 99, &addr).is_none()); // wrong iaid
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn reset_v6_used_clears_flag() {
+        use crate::types::dhcp::{LEASE_NA, LEASE_USED};
+        let mut db = LeaseDb::new();
+        let addr: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        {
+            let lease = db.allocate_v6(addr, LEASE_NA).unwrap();
+            lease.flags |= LEASE_USED;
+        }
+        db.reset_v6_used();
+        let lease = db.find_v6_by_addr(&addr).unwrap();
+        assert_eq!(lease.flags & LEASE_USED, 0);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn allocate_v6_respects_max() {
+        use crate::types::dhcp::LEASE_NA;
+        let mut db = LeaseDb::new();
+        db.max_leases = 1;
+        let a1: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let a2: std::net::Ipv6Addr = "2001:db8::2".parse().unwrap();
+        assert!(db.allocate_v6(a1, LEASE_NA).is_some());
+        assert!(db.allocate_v6(a2, LEASE_NA).is_none());
     }
 }
