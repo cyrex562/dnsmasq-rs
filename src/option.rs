@@ -805,6 +805,166 @@ fn apply_conf_dir(daemon: &mut Daemon, dir: &str) -> Result<(), ConfigError> {
     load_conf_dir(daemon, dir)
 }
 
+// ── Metacharacter encoding (ported from option.c:631-659) ─────────────────────
+
+/// The metacharacter table: characters that need encoding to prevent parsing
+/// issues in option values.
+const META: &[u8] = b"\x00123456 \x08\t\n78\r90abcdefABCDE\x1bF:,.";
+
+/// Encode a character as its metacharacter index, or return it unchanged.
+///
+/// Port of `hide_meta()` from option.c:633-642.
+pub fn hide_meta(c: u8) -> u8 {
+    for (i, &m) in META.iter().enumerate() {
+        if c == m {
+            return i as u8;
+        }
+    }
+    c
+}
+
+/// Decode a metacharacter index back to its original character.
+///
+/// Port of `unhide_meta()` from option.c:644-652.
+pub fn unhide_meta(c: u8) -> u8 {
+    if (c as usize) < META.len() {
+        META[c as usize]
+    } else {
+        c
+    }
+}
+
+/// Decode all metacharacters in a byte string in-place.
+///
+/// Port of `unhide_metas()` from option.c:654-659.
+pub fn unhide_metas(data: &mut [u8]) {
+    for b in data.iter_mut() {
+        *b = unhide_meta(*b);
+    }
+}
+
+// ── String splitting (ported from option.c:698-719) ───────────────────────────
+
+/// Split a string at the first occurrence of delimiter `c`.
+///
+/// Returns `(before, after)` where `before` is trimmed of trailing spaces
+/// and `after` is trimmed of leading spaces. Returns `None` if delimiter not found.
+/// Port of `split_chr()` from option.c:698-714.
+pub fn split_chr(s: &str, c: char) -> Option<(&str, &str)> {
+    let idx = s.find(c)?;
+    let before = s[..idx].trim_end();
+    let after = s[idx + c.len_utf8()..].trim_start();
+    Some((before, after))
+}
+
+/// Split a string at the first comma.
+///
+/// Convenience wrapper for `split_chr(s, ',')`.
+/// Port of `split()` from option.c:716-719.
+pub fn split(s: &str) -> Option<(&str, &str)> {
+    split_chr(s, ',')
+}
+
+// ── Numeric validation (ported from option.c:744-802) ─────────────────────────
+
+/// Check if a string contains only decimal digits.
+///
+/// Port of `numeric_check()` from option.c:744-758.
+pub fn numeric_check(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Parse a string as an i32, returning `None` if it's not all digits.
+///
+/// Port of `atoi_check()` from option.c:760-766.
+pub fn atoi_check(s: &str) -> Option<i32> {
+    if !numeric_check(s) {
+        return None;
+    }
+    s.parse::<i32>().ok()
+}
+
+/// Parse a string as a u32, returning `None` if it's not all digits.
+///
+/// Port of `strtoul_check()` from option.c:768-781.
+pub fn strtoul_check(s: &str) -> Option<u32> {
+    if !numeric_check(s) {
+        return None;
+    }
+    s.parse::<u32>().ok()
+}
+
+/// Parse a string as an i32 in the range [0, 65535].
+///
+/// Port of `atoi_check16()` from option.c:783-791.
+pub fn atoi_check16(s: &str) -> Option<u16> {
+    let v = atoi_check(s)?;
+    if v < 0 || v > 0xFFFF {
+        return None;
+    }
+    Some(v as u16)
+}
+
+/// Parse a string as an i32 in the range [0, 255].
+///
+/// Port of `atoi_check8()` from option.c:794-802.
+pub fn atoi_check8(s: &str) -> Option<u8> {
+    let v = atoi_check(s)?;
+    if v < 0 || v > 0xFF {
+        return None;
+    }
+    Some(v as u8)
+}
+
+// ── Reverse DNS zone generators (ported from option.c:1135-1307) ──────────────
+
+/// Generate the `in-addr.arpa` domain for an IPv4 CIDR block.
+///
+/// E.g. `10.0.0.0/24` → `"0.0.10.in-addr.arpa"`.
+/// Handles prefix lengths that are multiples of 8.
+/// Port of `domain_rev4()` from option.c:1135-1219.
+pub fn domain_rev4(addr: std::net::Ipv4Addr, prefix_len: u8) -> String {
+    let octets = addr.octets();
+    let full_octets = (prefix_len / 8) as usize;
+    // Build reversed octets for the prefix
+    let parts: Vec<String> = octets[..full_octets.min(4)]
+        .iter()
+        .rev()
+        .map(|o| o.to_string())
+        .collect();
+    if parts.is_empty() {
+        "in-addr.arpa".to_string()
+    } else {
+        format!("{}.in-addr.arpa", parts.join("."))
+    }
+}
+
+/// Generate the `ip6.arpa` domain for an IPv6 CIDR block.
+///
+/// E.g. `2001:db8::/32` → `"8.b.d.0.1.0.0.2.ip6.arpa"`.
+/// Port of `domain_rev6()` from option.c:1221-1307.
+pub fn domain_rev6(addr: std::net::Ipv6Addr, prefix_len: u8) -> String {
+    let octets = addr.octets();
+    // Each hex nibble = 4 bits of prefix
+    let nibble_count = (prefix_len / 4) as usize;
+    let mut nibbles = Vec::with_capacity(nibble_count);
+    for i in 0..nibble_count.min(32) {
+        let byte_idx = i / 2;
+        let nibble = if i % 2 == 0 {
+            (octets[byte_idx] >> 4) & 0x0f
+        } else {
+            octets[byte_idx] & 0x0f
+        };
+        nibbles.push(format!("{:x}", nibble));
+    }
+    nibbles.reverse();
+    if nibbles.is_empty() {
+        "ip6.arpa".to_string()
+    } else {
+        format!("{}.ip6.arpa", nibbles.join("."))
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1094,5 +1254,180 @@ mod tests {
         assert_eq!(d.reload_count, 1);
         reread_dhcp(&mut d).unwrap();
         assert_eq!(d.reload_count, 2);
+    }
+
+    // ── hide_meta / unhide_meta ──────────────────────────────────────────────
+
+    #[test]
+    fn hide_meta_encodes_space() {
+        let encoded = hide_meta(b' ');
+        assert_ne!(encoded, b' ');
+        assert_eq!(unhide_meta(encoded), b' ');
+    }
+
+    #[test]
+    fn hide_meta_encodes_colon() {
+        let encoded = hide_meta(b':');
+        assert_ne!(encoded, b':');
+        assert_eq!(unhide_meta(encoded), b':');
+    }
+
+    #[test]
+    fn hide_meta_passes_through_normal() {
+        assert_eq!(hide_meta(b'x'), b'x');
+        assert_eq!(hide_meta(b'Z'), b'Z');
+    }
+
+    #[test]
+    fn unhide_metas_decodes_all() {
+        let mut data = vec![hide_meta(b' '), hide_meta(b':'), b'x'];
+        unhide_metas(&mut data);
+        assert_eq!(data, vec![b' ', b':', b'x']);
+    }
+
+    #[test]
+    fn hide_unhide_roundtrip() {
+        for c in 0..=255u8 {
+            let hidden = hide_meta(c);
+            let unhidden = unhide_meta(hidden);
+            // For characters in META table, roundtrip should restore original
+            if META.contains(&c) {
+                assert_eq!(unhidden, c, "roundtrip failed for {c:#04x}");
+            }
+        }
+    }
+
+    // ── split_chr / split ────────────────────────────────────────────────────
+
+    #[test]
+    fn split_chr_comma() {
+        let (before, after) = split_chr("hello, world", ',').unwrap();
+        assert_eq!(before, "hello");
+        assert_eq!(after, "world");
+    }
+
+    #[test]
+    fn split_chr_no_delimiter() {
+        assert!(split_chr("hello world", ',').is_none());
+    }
+
+    #[test]
+    fn split_chr_trims_spaces() {
+        let (before, after) = split_chr("key  =  value", '=').unwrap();
+        assert_eq!(before, "key");
+        assert_eq!(after, "value");
+    }
+
+    #[test]
+    fn split_convenience() {
+        let (a, b) = split("a,b,c").unwrap();
+        assert_eq!(a, "a");
+        assert_eq!(b, "b,c"); // only splits at first comma
+    }
+
+    // ── numeric_check / atoi_check / atoi_check16 / atoi_check8 ─────────────
+
+    #[test]
+    fn numeric_check_valid() {
+        assert!(numeric_check("12345"));
+        assert!(numeric_check("0"));
+    }
+
+    #[test]
+    fn numeric_check_invalid() {
+        assert!(!numeric_check(""));
+        assert!(!numeric_check("12a45"));
+        assert!(!numeric_check("-1"));
+    }
+
+    #[test]
+    fn atoi_check_valid() {
+        assert_eq!(atoi_check("42"), Some(42));
+        assert_eq!(atoi_check("0"), Some(0));
+    }
+
+    #[test]
+    fn atoi_check_invalid() {
+        assert_eq!(atoi_check("abc"), None);
+        assert_eq!(atoi_check(""), None);
+    }
+
+    #[test]
+    fn atoi_check16_valid() {
+        assert_eq!(atoi_check16("53"), Some(53));
+        assert_eq!(atoi_check16("65535"), Some(65535));
+    }
+
+    #[test]
+    fn atoi_check16_out_of_range() {
+        assert_eq!(atoi_check16("65536"), None);
+    }
+
+    #[test]
+    fn atoi_check8_valid() {
+        assert_eq!(atoi_check8("255"), Some(255));
+        assert_eq!(atoi_check8("0"), Some(0));
+    }
+
+    #[test]
+    fn atoi_check8_out_of_range() {
+        assert_eq!(atoi_check8("256"), None);
+    }
+
+    #[test]
+    fn strtoul_check_valid() {
+        assert_eq!(strtoul_check("4294967295"), Some(u32::MAX));
+        assert_eq!(strtoul_check("0"), Some(0));
+    }
+
+    #[test]
+    fn strtoul_check_overflow() {
+        assert_eq!(strtoul_check("4294967296"), None);
+    }
+
+    // ── domain_rev4 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn domain_rev4_slash24() {
+        let s = domain_rev4("10.0.0.0".parse().unwrap(), 24);
+        assert_eq!(s, "0.0.10.in-addr.arpa");
+    }
+
+    #[test]
+    fn domain_rev4_slash16() {
+        let s = domain_rev4("172.16.0.0".parse().unwrap(), 16);
+        assert_eq!(s, "16.172.in-addr.arpa");
+    }
+
+    #[test]
+    fn domain_rev4_slash8() {
+        let s = domain_rev4("10.0.0.0".parse().unwrap(), 8);
+        assert_eq!(s, "10.in-addr.arpa");
+    }
+
+    #[test]
+    fn domain_rev4_slash0() {
+        let s = domain_rev4("0.0.0.0".parse().unwrap(), 0);
+        assert_eq!(s, "in-addr.arpa");
+    }
+
+    // ── domain_rev6 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn domain_rev6_slash32() {
+        let s = domain_rev6("2001:0db8::".parse().unwrap(), 32);
+        assert_eq!(s, "8.b.d.0.1.0.0.2.ip6.arpa");
+    }
+
+    #[test]
+    fn domain_rev6_slash48() {
+        let s = domain_rev6("2001:0db8:abcd::".parse().unwrap(), 48);
+        assert_eq!(s, "d.c.b.a.8.b.d.0.1.0.0.2.ip6.arpa");
+    }
+
+    #[test]
+    fn domain_rev6_slash0() {
+        let s = domain_rev6("::".parse().unwrap(), 0);
+        assert_eq!(s, "ip6.arpa");
     }
 }

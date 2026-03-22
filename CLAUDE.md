@@ -10,7 +10,7 @@ Rust port of [dnsmasq](https://thekelleys.org.uk/dnsmasq/doc.html), a DNS forwar
 cargo build                          # default features
 cargo build --all-features           # all features
 cargo build --no-default-features    # minimal build
-cargo test                           # all tests (1066+ unit + integration)
+cargo test                           # all tests (1097+ unit + integration)
 cargo test <name>                    # run specific test by substring
 cargo test --test dns_roundtrip      # specific integration test
 cargo test proptest                  # property-based tests only
@@ -33,12 +33,12 @@ RUST_LOG=debug cargo run             # run with debug logging
 | `rfc1035.rs` | rfc1035.c | 2200 | 2400 | Complete |
 | `cache.rs` | cache.c | 2298 | 2500 | Complete |
 | `forward.rs` | forward.c | 2283 | 3319 | Mostly complete |
-| `rfc2131.rs` | rfc2131.c | 1952 | 3265 | Partial (~60%) |
+| `rfc2131.rs` | rfc2131.c | 2019 | 3265 | Partial (~62%) |
 | `network.rs` | network.c | 1487 | 1812 | Mostly complete |
 | `dhcp_common.rs` | dhcp-common.c | 1449 | 1081 | Complete |
 | `netlink.rs` | netlink.c | 1144 | 414 | Complete (expanded) |
 | `lease.rs` | lease.c | 1238 | 1346 | Mostly complete |
-| `option.rs` | option.c | 1098 | 6322 | Partial (~17%) |
+| `option.rs` | option.c | 1433 | 6322 | Partial (~23%) |
 | `dnssec.rs` | dnssec.c | 1352 | 2410 | Partial (~56%) |
 | `domain_match.rs` | domain-match.c | 913 | 778 | Complete |
 | `dnsmasq.rs` | dnsmasq.c | 863 | 2478 | Partial (~35%) |
@@ -75,9 +75,9 @@ RUST_LOG=debug cargo run             # run with debug logging
 
 ### Porting Priority (files needing most work)
 
-1. **option.rs** — Config parser is only ~17% ported (1098 vs 6322 LOC). Critical for full functionality.
+1. **option.rs** — Config parser ~23% ported (1433 vs 6322 LOC). Critical for full functionality.
 2. **dnsmasq.rs** — Main daemon logic ~35% ported (863 vs 2478 LOC). Event system and resolv monitor added.
-3. **rfc2131.rs** — DHCP server ~60% ported. Missing some option handlers.
+3. **rfc2131.rs** — DHCP server ~62% ported. Missing some option handlers.
 4. **rfc3315.rs** — DHCPv6 ~51% ported.
 5. **dnssec.rs** — DNSSEC validation ~56% ported.
 6. **dhcp.rs** — DHCP listener ~66% ported.

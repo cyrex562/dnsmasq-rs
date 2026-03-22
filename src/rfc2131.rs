@@ -1155,6 +1155,35 @@ pub fn log_packet(
     }
 }
 
+/// Select the best hardware address for a DHCP client.
+///
+/// Prefers the actual hwaddr if available; falls back to extracting
+/// the address from the client-id if the hardware address length is 0
+/// and the client-id starts with the hardware type byte.
+/// Port of `extended_hwaddr()` from rfc2131.c:1832-1857.
+#[cfg(feature = "dhcp")]
+pub fn extended_hwaddr<'a>(
+    hwtype: u8,
+    hwaddr: &'a [u8],
+    clid: Option<&'a [u8]>,
+) -> &'a [u8] {
+    if hwaddr.is_empty() {
+        if let Some(clid) = clid {
+            if clid.len() > 3 {
+                if clid[0] == hwtype {
+                    return &clid[1..];
+                }
+                // EUI-64 / IEEE 1394 fallback
+                if clid[0] == 27 && hwtype == 24 {
+                    return &clid[1..];
+                }
+                return clid;
+            }
+        }
+    }
+    hwaddr
+}
+
 /// Check if a DHCP option value looks like a PXE client identifier.
 ///
 /// PXE clients send option 60 starting with "PXEClient".
@@ -1888,6 +1917,44 @@ mod tests {
     fn log_packet_no_addr_no_mac() {
         let s = log_packet("DHCPNAK", None, None, "br0", None, 0, false);
         assert!(s.contains("DHCPNAK(br0)"));
+    }
+
+    // ── extended_hwaddr ───────────────────────────────────────────────────────
+
+    #[test]
+    fn extended_hwaddr_uses_hwaddr_when_available() {
+        let hw = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let result = extended_hwaddr(1, &hw, Some(&[1, 0x11, 0x22, 0x33, 0x44]));
+        assert_eq!(result, &hw);
+    }
+
+    #[test]
+    fn extended_hwaddr_falls_back_to_clid_matching_type() {
+        // hwaddr empty, clid starts with hwtype=1
+        let clid = [1u8, 0xAA, 0xBB, 0xCC, 0xDD];
+        let result = extended_hwaddr(1, &[], Some(&clid));
+        assert_eq!(result, &[0xAA, 0xBB, 0xCC, 0xDD]); // skip type byte
+    }
+
+    #[test]
+    fn extended_hwaddr_falls_back_to_full_clid_mismatched_type() {
+        // hwaddr empty, clid type doesn't match
+        let clid = [2u8, 0xAA, 0xBB, 0xCC, 0xDD];
+        let result = extended_hwaddr(1, &[], Some(&clid));
+        assert_eq!(result, &clid[..]); // full clid
+    }
+
+    #[test]
+    fn extended_hwaddr_empty_hwaddr_no_clid() {
+        let result = extended_hwaddr(1, &[], None);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn extended_hwaddr_empty_hwaddr_short_clid() {
+        // clid too short (<=3), returns hwaddr (empty)
+        let result = extended_hwaddr(1, &[], Some(&[1, 2, 3]));
+        assert!(result.is_empty());
     }
 
     // ── is_pxe_client ────────────────────────────────────────────────────────
