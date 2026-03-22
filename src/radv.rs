@@ -310,6 +310,96 @@ pub fn priority_byte(prio: RaPriority) -> u8 {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// RA interface config (ported from radv.c types)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Per-interface RA configuration parameters.
+///
+/// Mirrors C `struct ra_interface` from dnsmasq.h.
+#[cfg(feature = "dhcp6")]
+#[derive(Debug, Clone)]
+pub struct RaInterfaceParam {
+    pub name: String,
+    pub interval: u32,   // MaxRtrAdvInterval, 0 = default 600
+    pub lifetime: i32,   // -1 = not specified
+    pub prio: u32,       // 0=medium, 1=high, 2=low
+    pub mtu: u32,        // 0 = not set
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pure helper functions (ported from radv.c:973-1037)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Extract priority value from RA interface config.
+///
+/// Port of `calc_prio()` from radv.c:1031-1037.
+#[cfg(feature = "dhcp6")]
+pub fn calc_prio(ra: Option<&RaInterfaceParam>) -> u32 {
+    match ra {
+        Some(p) => p.prio,
+        None => 0, // medium
+    }
+}
+
+/// Find RA interface config matching an interface name (with wildcard support).
+///
+/// Port of `find_iface_param()` from radv.c:986-995.
+#[cfg(feature = "dhcp6")]
+pub fn find_iface_param<'a>(
+    ra_interfaces: &'a [RaInterfaceParam],
+    iface: &str,
+) -> Option<&'a RaInterfaceParam> {
+    ra_interfaces.iter().find(|p| crate::pattern::glob_match(iface, &p.name))
+}
+
+/// Calculate the next RA transmission timeout with jitter.
+///
+/// During the "short period" (first 60 seconds), uses 5-20 second range.
+/// After that, uses 3/4 to 1× `adv_interval`.
+/// `rand_val` provides randomness (0-65535) for jitter.
+/// Port of `new_timeout()` from radv.c:973-984.
+#[cfg(feature = "dhcp6")]
+pub fn new_timeout(
+    elapsed_since_start: Duration,
+    adv_interval: u32,
+    rand_val: u16,
+) -> Duration {
+    let short_period = Duration::from_secs(60);
+    if elapsed_since_start < short_period {
+        // Short period: 5 + rand(0..15)
+        let jitter = ((rand_val as u64) * 15) / 65536;
+        Duration::from_secs(5 + jitter)
+    } else {
+        // Normal: 3/4 * interval + rand(0..1/4 * interval)
+        let interval = if adv_interval == 0 { 600 } else { adv_interval } as u64;
+        let base = (interval * 3) / 4;
+        let range = interval / 4;
+        let jitter = if range > 0 { ((rand_val as u64) * range) / 65536 } else { 0 };
+        Duration::from_secs(base + jitter)
+    }
+}
+
+/// Append an ICMPv6 Source Link-Layer Address option to a buffer.
+///
+/// Type = 1 (Source Link-Layer Address), length in 8-byte units, padded with zeros.
+/// Port of `add_lla()` from radv.c:766-787.
+#[cfg(feature = "dhcp6")]
+pub fn add_lla(buf: &mut Vec<u8>, mac: &[u8]) {
+    use crate::radv_protocol::ICMP6_OPT_SOURCE_MAC;
+    // Option: type(1) + len(1) + mac(N) + padding to 8-byte boundary
+    let total = 2 + mac.len();
+    let padded = ((total + 7) / 8) * 8;
+    let len_field = (padded / 8) as u8;
+    buf.push(ICMP6_OPT_SOURCE_MAC);
+    buf.push(len_field);
+    buf.extend_from_slice(mac);
+    // Pad with zeros
+    for _ in 0..(padded - total) {
+        buf.push(0);
+    }
+}
+
 #[cfg(all(test, feature = "dhcp6"))]
 mod tests {
     use super::*;
@@ -535,5 +625,162 @@ mod tests {
         assert_eq!(flags_with_prio, 0x08);
         let flags_with_low = buf2[5] | priority_byte(RaPriority::Low);
         assert_eq!(flags_with_low, 0x18);
+    }
+
+    // ── calc_prio ────────────────────────────────────────────────────────────
+
+    fn make_ra_param(name: &str, prio: u32) -> RaInterfaceParam {
+        RaInterfaceParam { name: name.to_string(), interval: 0, lifetime: -1, prio, mtu: 0 }
+    }
+
+    #[test]
+    fn calc_prio_none_returns_zero() {
+        assert_eq!(calc_prio(None), 0);
+    }
+
+    #[test]
+    fn calc_prio_medium() {
+        let p = make_ra_param("eth0", 0);
+        assert_eq!(calc_prio(Some(&p)), 0);
+    }
+
+    #[test]
+    fn calc_prio_high() {
+        let p = make_ra_param("eth0", 1);
+        assert_eq!(calc_prio(Some(&p)), 1);
+    }
+
+    #[test]
+    fn calc_prio_low() {
+        let p = make_ra_param("eth0", 2);
+        assert_eq!(calc_prio(Some(&p)), 2);
+    }
+
+    // ── find_iface_param ─────────────────────────────────────────────────────
+
+    #[test]
+    fn find_iface_param_exact() {
+        let params = vec![make_ra_param("eth0", 1)];
+        assert!(find_iface_param(&params, "eth0").is_some());
+    }
+
+    #[test]
+    fn find_iface_param_wildcard() {
+        let params = vec![make_ra_param("eth*", 1)];
+        assert!(find_iface_param(&params, "eth0").is_some());
+        assert!(find_iface_param(&params, "eth1").is_some());
+    }
+
+    #[test]
+    fn find_iface_param_no_match() {
+        let params = vec![make_ra_param("eth0", 1)];
+        assert!(find_iface_param(&params, "wlan0").is_none());
+    }
+
+    #[test]
+    fn find_iface_param_empty_list() {
+        assert!(find_iface_param(&[], "eth0").is_none());
+    }
+
+    #[test]
+    fn find_iface_param_first_wins() {
+        let params = vec![make_ra_param("eth*", 1), make_ra_param("eth0", 2)];
+        let found = find_iface_param(&params, "eth0").unwrap();
+        assert_eq!(found.prio, 1); // first match
+    }
+
+    // ── new_timeout ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn new_timeout_short_period_min() {
+        let d = new_timeout(Duration::from_secs(0), 600, 0);
+        assert_eq!(d.as_secs(), 5);
+    }
+
+    #[test]
+    fn new_timeout_short_period_max() {
+        let d = new_timeout(Duration::from_secs(0), 600, 65535);
+        assert!(d.as_secs() >= 19 && d.as_secs() <= 20);
+    }
+
+    #[test]
+    fn new_timeout_short_period_mid() {
+        let d = new_timeout(Duration::from_secs(30), 600, 32768);
+        assert!(d.as_secs() >= 12 && d.as_secs() <= 13);
+    }
+
+    #[test]
+    fn new_timeout_long_period_min() {
+        let d = new_timeout(Duration::from_secs(120), 600, 0);
+        assert_eq!(d.as_secs(), 450); // 3/4 * 600
+    }
+
+    #[test]
+    fn new_timeout_long_period_max() {
+        let d = new_timeout(Duration::from_secs(120), 600, 65535);
+        assert!(d.as_secs() >= 599 && d.as_secs() <= 600);
+    }
+
+    #[test]
+    fn new_timeout_default_interval() {
+        // interval=0 should use default 600
+        let d = new_timeout(Duration::from_secs(120), 0, 0);
+        assert_eq!(d.as_secs(), 450);
+    }
+
+    #[test]
+    fn new_timeout_boundary_at_60s() {
+        // At exactly 59s → short period
+        let d59 = new_timeout(Duration::from_secs(59), 600, 0);
+        assert_eq!(d59.as_secs(), 5);
+        // At 60s → long period
+        let d60 = new_timeout(Duration::from_secs(60), 600, 0);
+        assert_eq!(d60.as_secs(), 450);
+    }
+
+    // ── add_lla ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn add_lla_6byte_mac() {
+        use crate::radv_protocol::ICMP6_OPT_SOURCE_MAC;
+        let mut buf = Vec::new();
+        add_lla(&mut buf, &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        assert_eq!(buf.len(), 8); // 2 + 6 = 8 (already aligned)
+        assert_eq!(buf[0], ICMP6_OPT_SOURCE_MAC);
+        assert_eq!(buf[1], 1); // 8/8 = 1
+    }
+
+    #[test]
+    fn add_lla_8byte_mac() {
+        let mut buf = Vec::new();
+        add_lla(&mut buf, &[0; 8]);
+        assert_eq!(buf.len(), 16); // 2 + 8 = 10, padded to 16
+        assert_eq!(buf[1], 2); // 16/8 = 2
+    }
+
+    #[test]
+    fn add_lla_mac_bytes_preserved() {
+        let mut buf = Vec::new();
+        let mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        add_lla(&mut buf, &mac);
+        assert_eq!(&buf[2..8], &mac);
+    }
+
+    #[test]
+    fn add_lla_padding_is_zero() {
+        let mut buf = Vec::new();
+        add_lla(&mut buf, &[0xFF; 5]); // 2+5=7, padded to 8
+        assert_eq!(buf.len(), 8);
+        assert_eq!(buf[7], 0); // padding byte
+    }
+
+    #[test]
+    fn add_lla_appends_to_existing() {
+        use crate::radv_protocol::ICMP6_OPT_SOURCE_MAC;
+        let mut buf = vec![0xDE, 0xAD];
+        add_lla(&mut buf, &[0; 6]);
+        assert_eq!(buf[0], 0xDE);
+        assert_eq!(buf[1], 0xAD);
+        assert_eq!(buf[2], ICMP6_OPT_SOURCE_MAC);
     }
 }

@@ -21,6 +21,7 @@ pub enum TftpOpcode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum TftpError {
+    NotDefined        = 0,
     FileNotFound      = 1,
     AccessViolation   = 2,
     DiskFull          = 3,
@@ -267,6 +268,184 @@ pub fn negotiate_options(
     }
 
     result
+}
+
+// ---------------------------------------------------------------------------
+// String extraction (ported from tftp.c:840-853)
+// ---------------------------------------------------------------------------
+
+/// Extract a null-terminated string from a buffer, advancing position.
+///
+/// Returns the bytes before the null terminator, or `None` if no null found
+/// or the string would be empty.
+/// Port of `next()` from tftp.c:840-853.
+pub fn next_cstring<'a>(buf: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
+    if *pos >= buf.len() {
+        return None;
+    }
+    let start = *pos;
+    let remaining = &buf[start..];
+    let null_pos = remaining.iter().position(|&b| b == 0)?;
+    if null_pos == 0 {
+        return None; // empty string
+    }
+    *pos = start + null_pos + 1;
+    Some(&buf[start..start + null_pos])
+}
+
+/// Remove non-printable characters from a string, keeping only 0x20-0x7E.
+///
+/// Port of `sanitise()` from tftp.c:857-871.
+pub fn tftp_sanitise(input: &str) -> String {
+    input.chars().filter(|&c| c >= ' ' && c <= '~').collect()
+}
+
+// ---------------------------------------------------------------------------
+// Error packet builders (ported from tftp.c:874-902)
+// ---------------------------------------------------------------------------
+
+/// Maximum TFTP error message length.
+const TFTP_MAX_MESSAGE: usize = 500;
+
+/// Build a TFTP error response packet with message truncation and sanitization.
+///
+/// Port of `tftp_err()` from tftp.c:874-894.
+pub fn tftp_err_packet(code: TftpError, message: &str) -> Vec<u8> {
+    let clean = tftp_sanitise(message);
+    let truncated = if clean.len() > TFTP_MAX_MESSAGE {
+        &clean[..TFTP_MAX_MESSAGE]
+    } else {
+        &clean
+    };
+    build_error(code, truncated)
+}
+
+/// Build a TFTP error packet for a file read error.
+///
+/// Format: "cannot read {filename}: {error}"
+/// Port of `tftp_err_oops()` from tftp.c:896-902.
+pub fn tftp_err_oops(filename: &str, err: &std::io::Error) -> Vec<u8> {
+    let clean_name = tftp_sanitise(filename);
+    let msg = format!("cannot read {}: {}", clean_name, err);
+    tftp_err_packet(TftpError::NotDefined, &msg)
+}
+
+// ---------------------------------------------------------------------------
+// ACK handling (ported from tftp.c:752-824)
+// ---------------------------------------------------------------------------
+
+/// Result of handling an incoming TFTP packet for an active transfer.
+#[derive(Debug, PartialEq)]
+pub enum TftpHandleResult {
+    /// ACK received for expected block.
+    AckOk { block: u32 },
+    /// ACK for an already-acknowledged or out-of-range block (ignored).
+    AckIgnored,
+    /// Client sent an ERROR packet.
+    Error { code: u16, message: String },
+    /// Packet too short or unrecognized opcode.
+    InvalidPacket,
+}
+
+/// Process an incoming TFTP packet (ACK or ERROR) for an active transfer.
+///
+/// Handles 16-bit block number wraparound.
+/// Port of `handle_tftp()` from tftp.c:752-824.
+pub fn handle_tftp_packet(transfer: &mut TftpTransfer, packet: &[u8]) -> TftpHandleResult {
+    if packet.len() < 4 {
+        return TftpHandleResult::InvalidPacket;
+    }
+    let opcode = u16::from_be_bytes([packet[0], packet[1]]);
+    match opcode {
+        4 => { // ACK
+            let block_num = u16::from_be_bytes([packet[2], packet[3]]);
+            let expected = transfer.block;
+            if block_num == expected {
+                transfer.retries = 0;
+                TftpHandleResult::AckOk { block: block_num as u32 }
+            } else {
+                TftpHandleResult::AckIgnored
+            }
+        }
+        5 => { // ERROR
+            let code = u16::from_be_bytes([packet[2], packet[3]]);
+            let msg = if packet.len() > 4 {
+                let end = packet[4..].iter().position(|&b| b == 0).unwrap_or(packet.len() - 4);
+                String::from_utf8_lossy(&packet[4..4 + end]).to_string()
+            } else {
+                String::new()
+            };
+            TftpHandleResult::Error { code, message: msg }
+        }
+        _ => TftpHandleResult::InvalidPacket,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Block reading (ported from tftp.c:905-1021)
+// ---------------------------------------------------------------------------
+
+/// Result of reading a file block for a TFTP transfer.
+#[derive(Debug)]
+pub enum GetBlockResult {
+    /// Block 0: send OACK with negotiated options.
+    Oack(Vec<u8>),
+    /// Data block to send.
+    Data(Vec<u8>),
+    /// Transfer complete (past end of file).
+    Done,
+}
+
+/// Read a file block for the next DATA packet.
+///
+/// Block 0 returns an OACK with negotiated options.
+/// Blocks 1+ return data from the file with optional netascii LF→CRLF expansion.
+/// Port of `get_block()` from tftp.c:905-1021.
+pub fn get_block(
+    block: u16,
+    file_data: &[u8],
+    blocksize: usize,
+    netascii: bool,
+    opt_blocksize: bool,
+    opt_transize: bool,
+) -> GetBlockResult {
+    if block == 0 {
+        // Build OACK
+        let mut opts: Vec<(String, String)> = Vec::new();
+        if opt_blocksize {
+            opts.push(("blksize".to_string(), blocksize.to_string()));
+        }
+        if opt_transize {
+            opts.push(("tsize".to_string(), file_data.len().to_string()));
+        }
+        let refs: Vec<(&str, &str)> = opts.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let pkt = build_oack(&refs);
+        return GetBlockResult::Oack(pkt);
+    }
+
+    let offset = (block as usize - 1) * blocksize;
+    if offset >= file_data.len() {
+        return GetBlockResult::Done;
+    }
+
+    let end = (offset + blocksize).min(file_data.len());
+    let raw = &file_data[offset..end];
+
+    let data = if netascii {
+        // LF → CRLF expansion
+        let mut expanded = Vec::with_capacity(raw.len() * 2);
+        for &b in raw {
+            if b == b'\n' {
+                expanded.push(b'\r');
+            }
+            expanded.push(b);
+        }
+        expanded
+    } else {
+        raw.to_vec()
+    };
+
+    GetBlockResult::Data(build_data(block, &data))
 }
 
 // ---------------------------------------------------------------------------
@@ -595,5 +774,244 @@ mod tests {
     fn negotiate_empty_options() {
         let result = negotiate_options(&[], 512);
         assert!(result.is_empty());
+    }
+
+    // ── next_cstring ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn next_cstring_basic() {
+        let buf = b"hello\0world";
+        let mut pos = 0;
+        let s = next_cstring(buf, &mut pos).unwrap();
+        assert_eq!(s, b"hello");
+        assert_eq!(pos, 6);
+    }
+
+    #[test]
+    fn next_cstring_second_string() {
+        let buf = b"first\0second\0";
+        let mut pos = 0;
+        let _ = next_cstring(buf, &mut pos).unwrap();
+        let s2 = next_cstring(buf, &mut pos).unwrap();
+        assert_eq!(s2, b"second");
+    }
+
+    #[test]
+    fn next_cstring_no_null() {
+        let mut pos = 0;
+        assert!(next_cstring(b"hello", &mut pos).is_none());
+    }
+
+    #[test]
+    fn next_cstring_empty_returns_none() {
+        let mut pos = 0;
+        assert!(next_cstring(b"\0rest", &mut pos).is_none());
+    }
+
+    #[test]
+    fn next_cstring_at_end() {
+        let mut pos = 5;
+        assert!(next_cstring(b"hello", &mut pos).is_none());
+    }
+
+    #[test]
+    fn next_cstring_single_char() {
+        let mut pos = 0;
+        let s = next_cstring(b"x\0", &mut pos).unwrap();
+        assert_eq!(s, b"x");
+    }
+
+    // ── tftp_sanitise ────────────────────────────────────────────────────────
+
+    #[test]
+    fn tftp_sanitise_printable() {
+        assert_eq!(tftp_sanitise("hello world"), "hello world");
+    }
+
+    #[test]
+    fn tftp_sanitise_removes_control() {
+        assert_eq!(tftp_sanitise("hel\x01lo"), "hello");
+    }
+
+    #[test]
+    fn tftp_sanitise_removes_null() {
+        assert_eq!(tftp_sanitise("hel\x00lo"), "hello");
+    }
+
+    #[test]
+    fn tftp_sanitise_empty() {
+        assert_eq!(tftp_sanitise(""), "");
+    }
+
+    #[test]
+    fn tftp_sanitise_all_unprintable() {
+        assert_eq!(tftp_sanitise("\x01\x02\x03"), "");
+    }
+
+    // ── tftp_err_packet ──────────────────────────────────────────────────────
+
+    #[test]
+    fn tftp_err_packet_basic() {
+        let pkt = tftp_err_packet(TftpError::FileNotFound, "File not found");
+        assert_eq!(u16::from_be_bytes([pkt[0], pkt[1]]), 5); // ERROR opcode
+        assert_eq!(u16::from_be_bytes([pkt[2], pkt[3]]), 1); // error code
+        assert!(pkt.len() > 4);
+    }
+
+    #[test]
+    fn tftp_err_packet_truncates_long() {
+        let long_msg = "x".repeat(600);
+        let pkt = tftp_err_packet(TftpError::NotDefined, &long_msg);
+        // Message after header (4 bytes) should be ≤ 500 + null
+        assert!(pkt.len() <= 4 + 500 + 1);
+    }
+
+    #[test]
+    fn tftp_err_packet_null_terminated() {
+        let pkt = tftp_err_packet(TftpError::NotDefined, "test");
+        assert_eq!(*pkt.last().unwrap(), 0);
+    }
+
+    #[test]
+    fn tftp_err_packet_sanitises() {
+        let pkt = tftp_err_packet(TftpError::NotDefined, "bad\x01msg");
+        let msg_bytes = &pkt[4..pkt.len() - 1]; // skip header and null
+        let msg = std::str::from_utf8(msg_bytes).unwrap();
+        assert_eq!(msg, "badmsg");
+    }
+
+    // ── tftp_err_oops ────────────────────────────────────────────────────────
+
+    #[test]
+    fn tftp_err_oops_contains_filename() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "not found");
+        let pkt = tftp_err_oops("test.bin", &err);
+        let msg = String::from_utf8_lossy(&pkt[4..]);
+        assert!(msg.contains("test.bin"));
+    }
+
+    #[test]
+    fn tftp_err_oops_contains_error() {
+        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let pkt = tftp_err_oops("file", &err);
+        let msg = String::from_utf8_lossy(&pkt[4..]);
+        assert!(msg.contains("denied"));
+    }
+
+    #[test]
+    fn tftp_err_oops_error_code_zero() {
+        let err = std::io::Error::new(std::io::ErrorKind::Other, "oops");
+        let pkt = tftp_err_oops("f", &err);
+        assert_eq!(u16::from_be_bytes([pkt[2], pkt[3]]), 0);
+    }
+
+    // ── handle_tftp_packet ───────────────────────────────────────────────────
+
+    #[test]
+    fn handle_tftp_ack_basic() {
+        let mut t = TftpTransfer::new("file", 512);
+        t.block = 1;
+        t.retries = 2;
+        let ack = [0, 4, 0, 1]; // ACK block 1
+        let result = handle_tftp_packet(&mut t, &ack);
+        assert_eq!(result, TftpHandleResult::AckOk { block: 1 });
+        assert_eq!(t.retries, 0);
+    }
+
+    #[test]
+    fn handle_tftp_ack_mismatch_ignored() {
+        let mut t = TftpTransfer::new("file", 512);
+        t.block = 5;
+        let ack = [0, 4, 0, 3]; // ACK block 3 (wrong)
+        assert_eq!(handle_tftp_packet(&mut t, &ack), TftpHandleResult::AckIgnored);
+    }
+
+    #[test]
+    fn handle_tftp_error_packet() {
+        let mut t = TftpTransfer::new("file", 512);
+        let mut pkt = vec![0, 5, 0, 1]; // ERROR code 1
+        pkt.extend_from_slice(b"File not found\0");
+        let result = handle_tftp_packet(&mut t, &pkt);
+        match result {
+            TftpHandleResult::Error { code, message } => {
+                assert_eq!(code, 1);
+                assert_eq!(message, "File not found");
+            }
+            _ => panic!("expected Error"),
+        }
+    }
+
+    #[test]
+    fn handle_tftp_too_short() {
+        let mut t = TftpTransfer::new("file", 512);
+        assert_eq!(handle_tftp_packet(&mut t, &[0, 4]), TftpHandleResult::InvalidPacket);
+    }
+
+    #[test]
+    fn handle_tftp_unknown_opcode() {
+        let mut t = TftpTransfer::new("file", 512);
+        let pkt = [0, 99, 0, 0];
+        assert_eq!(handle_tftp_packet(&mut t, &pkt), TftpHandleResult::InvalidPacket);
+    }
+
+    // ── get_block ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn get_block_zero_oack() {
+        let result = get_block(0, b"hello", 512, false, true, true);
+        match result {
+            GetBlockResult::Oack(pkt) => {
+                assert_eq!(u16::from_be_bytes([pkt[0], pkt[1]]), 6); // OACK opcode
+            }
+            _ => panic!("expected Oack"),
+        }
+    }
+
+    #[test]
+    fn get_block_first_data() {
+        let file = b"hello world!!!"; // 14 bytes
+        let result = get_block(1, file, 512, false, false, false);
+        match result {
+            GetBlockResult::Data(pkt) => {
+                let (block, data) = parse_data(&pkt).unwrap();
+                assert_eq!(block, 1);
+                assert_eq!(data, b"hello world!!!");
+            }
+            _ => panic!("expected Data"),
+        }
+    }
+
+    #[test]
+    fn get_block_past_eof() {
+        let result = get_block(2, b"hello", 512, false, false, false);
+        assert!(matches!(result, GetBlockResult::Done));
+    }
+
+    #[test]
+    fn get_block_netascii_lf_to_crlf() {
+        let file = b"line1\nline2\n";
+        let result = get_block(1, file, 512, true, false, false);
+        match result {
+            GetBlockResult::Data(pkt) => {
+                let (_, data) = parse_data(&pkt).unwrap();
+                assert!(data.windows(2).any(|w| w == b"\r\n"), "should contain CRLF");
+                assert!(!data.windows(2).any(|w| w == b"\n\n"), "bare LF should be gone");
+            }
+            _ => panic!("expected Data"),
+        }
+    }
+
+    #[test]
+    fn get_block_last_block_short() {
+        let file = vec![0xAA; 600]; // 600 bytes, blocksize=512
+        let result = get_block(2, &file, 512, false, false, false);
+        match result {
+            GetBlockResult::Data(pkt) => {
+                let (block, data) = parse_data(&pkt).unwrap();
+                assert_eq!(block, 2);
+                assert_eq!(data.len(), 88); // 600 - 512 = 88
+            }
+            _ => panic!("expected Data"),
+        }
     }
 }

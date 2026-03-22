@@ -10,7 +10,7 @@ Rust port of [dnsmasq](https://thekelleys.org.uk/dnsmasq/doc.html), a DNS forwar
 cargo build                          # default features
 cargo build --all-features           # all features
 cargo build --no-default-features    # minimal build
-cargo test                           # all tests (1097+ unit + integration)
+cargo test                           # all tests (1165+ unit + integration)
 cargo test <name>                    # run specific test by substring
 cargo test --test dns_roundtrip      # specific integration test
 cargo test proptest                  # property-based tests only
@@ -45,10 +45,10 @@ RUST_LOG=debug cargo run             # run with debug logging
 | `util.rs` | util.c | 781 | 1006 | Mostly complete |
 | `rfc3315.rs` | rfc3315.c | 1195 | 2348 | Partial (~51%) |
 | `auth.rs` | auth.c | 862 | 915 | Mostly complete |
-| `tftp.rs` | tftp.c | 599 | 1040 | Partial (~58%) |
-| `radv.rs` | radv.c | 539 | 1039 | Partial (~52%) |
+| `tftp.rs` | tftp.c | 1017 | 1040 | Mostly complete |
+| `radv.rs` | radv.c | 786 | 1039 | Mostly complete |
 | `dump.rs` | dump.c | 513 | 303 | Complete (expanded) |
-| `helper.rs` | helper.c | 500 | 948 | Partial (~53%) |
+| `helper.rs` | helper.c | 803 | 948 | Mostly complete |
 | `arp.rs` | arp.c | 498 | 240 | Complete (expanded) |
 | `edns0.rs` | edns0.c | 664 | 574 | Complete (expanded) |
 | `log.rs` | log.c | 416 | 494 | Mostly complete |
