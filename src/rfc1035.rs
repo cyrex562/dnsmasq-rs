@@ -1400,6 +1400,88 @@ pub fn resize_packet(pkt: &[u8], edns_opt: Option<&[u8]>) -> Vec<u8> {
 }
 
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Name safety and TTL helpers (ported from rfc1035.c)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Check if a domain name contains only printable ASCII characters.
+///
+/// Used to filter names before passing to external systems (uBus, conntrack).
+/// Port of `safe_name()` from rfc1035.c:1137-1146.
+pub fn safe_name(name: &str) -> bool {
+    name.bytes().all(|b| b >= 0x20 && b < 0x7f)
+}
+
+/// Parse a TXT record payload into printable strings.
+///
+/// TXT records contain length-prefixed strings. Non-printable characters are
+/// stripped. Returns the list of decoded strings.
+/// Port of `log_txt()` from rfc1035.c:653-682.
+pub fn parse_txt_record(data: &[u8]) -> Option<Vec<String>> {
+    let mut result = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let len = data[pos] as usize;
+        pos += 1;
+        if pos + len > data.len() {
+            return None; // bad packet
+        }
+        let s: String = data[pos..pos + len]
+            .iter()
+            .filter(|&&b| b >= 0x20 && b < 0x7f)
+            .map(|&b| b as char)
+            .collect();
+        result.push(s);
+        pos += len;
+    }
+    Some(result)
+}
+
+/// Check if a cache record is stale (TTL expired).
+///
+/// Returns true if the record is not immortal and its TTD is in the past.
+/// Port of `crec_isstale()` from rfc1035.c:1565-1568.
+pub fn crec_isstale(ttd: u64, immortal: bool, now: u64) -> bool {
+    !immortal && ttd < now
+}
+
+/// Calculate the remaining TTL for a cache record.
+///
+/// Handles DHCP entries (configurable TTL), immortal entries (TTL in TTD field),
+/// stale entries (0), and normal entries (clamped to max_ttl).
+/// Port of `crec_ttl()` from rfc1035.c:1570-1601.
+pub fn crec_ttl(ttd: u64, now: u64, flags: u32, max_ttl: u32, local_ttl: u32) -> u32 {
+    use crate::types::constants::{F_DHCP, F_IMMORTAL};
+
+    let ttl = if ttd >= now { (ttd - now) as i64 } else { -1 };
+
+    // DHCP entries use configured TTL, capped by actual lease length
+    if flags & F_DHCP != 0 {
+        let conf_ttl = local_ttl;
+        if flags & F_IMMORTAL == 0 && (ttl >= 0) && (ttl as u32) < conf_ttl {
+            return ttl as u32;
+        }
+        return conf_ttl;
+    }
+
+    // Immortal entries (local records) hold TTL in TTD field
+    if flags & F_IMMORTAL != 0 {
+        return ttd as u32;
+    }
+
+    // Stale
+    if ttl < 0 {
+        return 0;
+    }
+
+    // Clamp to max_ttl if configured
+    if max_ttl == 0 || (ttl as u32) < max_ttl {
+        ttl as u32
+    } else {
+        max_ttl
+    }
+}
+
 mod tests {
     use super::*;
     use crate::dns_protocol::{HB3_QR, HB3_RD, HB4_RA};
@@ -2194,6 +2276,125 @@ mod tests {
         let result = resize_packet(&pkt, Some(&edns_opt));
         // No EDNS appended because arcount was already 1.
         assert_eq!(result.len(), original_len);
+    }
+
+    // ── safe_name ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn safe_name_printable() {
+        assert!(safe_name("example.com"));
+        assert!(safe_name("hello world"));
+    }
+
+    #[test]
+    fn safe_name_control_chars() {
+        assert!(!safe_name("bad\x01name"));
+        assert!(!safe_name("bad\x00name"));
+    }
+
+    #[test]
+    fn safe_name_high_bytes() {
+        assert!(!safe_name("café")); // non-ASCII
+    }
+
+    #[test]
+    fn safe_name_empty() {
+        assert!(safe_name("")); // empty is safe (no bad chars)
+    }
+
+    // ── parse_txt_record ─────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_txt_record_single() {
+        let data = [5, b'h', b'e', b'l', b'l', b'o'];
+        let result = parse_txt_record(&data).unwrap();
+        assert_eq!(result, vec!["hello"]);
+    }
+
+    #[test]
+    fn parse_txt_record_multiple() {
+        let data = [2, b'h', b'i', 3, b'b', b'y', b'e'];
+        let result = parse_txt_record(&data).unwrap();
+        assert_eq!(result, vec!["hi", "bye"]);
+    }
+
+    #[test]
+    fn parse_txt_record_strips_control() {
+        let data = [3, b'a', 0x01, b'b'];
+        let result = parse_txt_record(&data).unwrap();
+        assert_eq!(result, vec!["ab"]); // 0x01 stripped
+    }
+
+    #[test]
+    fn parse_txt_record_bad_length() {
+        let data = [10, b'x']; // claims 10 bytes but only 1 available
+        assert!(parse_txt_record(&data).is_none());
+    }
+
+    #[test]
+    fn parse_txt_record_empty() {
+        let result = parse_txt_record(&[]).unwrap();
+        assert!(result.is_empty());
+    }
+
+    // ── crec_isstale ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn crec_isstale_expired() {
+        assert!(crec_isstale(100, false, 200));
+    }
+
+    #[test]
+    fn crec_isstale_not_expired() {
+        assert!(!crec_isstale(200, false, 100));
+    }
+
+    #[test]
+    fn crec_isstale_immortal_never_stale() {
+        assert!(!crec_isstale(0, true, 999));
+    }
+
+    // ── crec_ttl ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn crec_ttl_normal() {
+        use crate::types::constants::F_IMMORTAL;
+        let ttl = crec_ttl(200, 100, 0, 0, 0);
+        assert_eq!(ttl, 100);
+    }
+
+    #[test]
+    fn crec_ttl_clamped_by_max() {
+        let ttl = crec_ttl(1100, 100, 0, 300, 0);
+        assert_eq!(ttl, 300); // max_ttl=300 < actual 1000
+    }
+
+    #[test]
+    fn crec_ttl_stale() {
+        let ttl = crec_ttl(50, 100, 0, 0, 0);
+        assert_eq!(ttl, 0);
+    }
+
+    #[test]
+    fn crec_ttl_immortal() {
+        use crate::types::constants::F_IMMORTAL;
+        let ttl = crec_ttl(3600, 100, F_IMMORTAL, 0, 0);
+        assert_eq!(ttl, 3600); // TTD field holds TTL directly
+    }
+
+    #[test]
+    fn crec_ttl_dhcp() {
+        use crate::types::constants::F_DHCP;
+        let ttl = crec_ttl(500, 100, F_DHCP, 0, 60);
+        assert_eq!(ttl, 60); // local_ttl=60
+    }
+
+    #[test]
+    fn crec_ttl_dhcp_capped_by_lease() {
+        use crate::types::constants::F_DHCP;
+        // Lease has 30s remaining but local_ttl=60 → cap at 30
+        let ttl = crec_ttl(130, 100, F_DHCP, 0, 60);
+        assert_eq!(ttl, 30);
     }
 }
 

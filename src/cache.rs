@@ -1292,6 +1292,41 @@ fn addr_matches(haystack: &Option<AllAddr>, needle: &AllAddr) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Non-terminal and DHCP record helpers (ported from cache.c)
+// ---------------------------------------------------------------------------
+
+/// Check if a name exists as an intermediate (non-terminal) domain in the cache.
+///
+/// Returns true if any non-expired, non-NXDOMAIN forward record exists for the name.
+/// Port of `cache_find_non_terminal()` from cache.c:1150-1163.
+pub fn cache_find_non_terminal(name: &str, now: Instant, cache: &DnsCache) -> bool {
+    use crate::types::constants::{F_FORWARD, F_NXDOMAIN};
+    cache.iter_live(now).any(|r| {
+        r.flags & F_FORWARD != 0
+            && r.flags & F_NXDOMAIN == 0
+            && r.name.eq_ignore_ascii_case(name)
+    })
+}
+
+/// Remove all DHCP-sourced records from the cache.
+///
+/// Returns the number of records removed.
+/// Port of `cache_unhash_dhcp()` from cache.c:1732-1746.
+pub fn cache_unhash_dhcp(cache: &mut DnsCache, now: Instant) -> usize {
+    use crate::types::constants::F_DHCP;
+    // Collect UIDs of DHCP entries then remove them.
+    let dhcp_uids: Vec<u32> = cache.iter_live(now)
+        .filter(|r| r.flags & F_DHCP != 0)
+        .map(|r| r.uid)
+        .collect();
+    let mut removed = 0;
+    for uid in dhcp_uids {
+        removed += cache.remove_by_uid(uid) as usize;
+    }
+    removed
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2294,5 +2329,60 @@ mod tests {
         cache.insert(make_a_record("b.test", Ipv4Addr::new(2,2,2,2), 300, future));
         let lines = dump_cache(&cache, now);
         assert_eq!(lines.len(), 2);
+    }
+
+    // ── cache_find_non_terminal ──────────────────────────────────────────────
+
+    #[test]
+    fn cache_find_non_terminal_present() {
+        let mut cache = DnsCache::new(16);
+        let now = Instant::now();
+        let future = now + Duration::from_secs(300);
+        cache.insert(make_a_record("example.com", Ipv4Addr::new(1,2,3,4), 300, future));
+        assert!(cache_find_non_terminal("example.com", now, &cache));
+    }
+
+    #[test]
+    fn cache_find_non_terminal_absent() {
+        let cache = DnsCache::new(16);
+        let now = Instant::now();
+        assert!(!cache_find_non_terminal("noexist.com", now, &cache));
+    }
+
+    #[test]
+    fn cache_find_non_terminal_case_insensitive() {
+        let mut cache = DnsCache::new(16);
+        let now = Instant::now();
+        let future = now + Duration::from_secs(300);
+        cache.insert(make_a_record("Example.COM", Ipv4Addr::new(1,2,3,4), 300, future));
+        assert!(cache_find_non_terminal("example.com", now, &cache));
+    }
+
+    // ── cache_unhash_dhcp ────────────────────────────────────────────────────
+
+    #[test]
+    fn cache_unhash_dhcp_removes_dhcp_entries() {
+        use crate::types::constants::F_DHCP;
+        let mut cache = DnsCache::new(16);
+        let now = Instant::now();
+        let future = now + Duration::from_secs(300);
+        let mut rec = make_a_record("dhcp-host.lan", Ipv4Addr::new(10,0,0,1), 300, future);
+        rec.flags |= F_DHCP;
+        rec.uid = 99; // non-zero so remove_by_uid works
+        cache.insert(rec);
+        let mut rec2 = make_a_record("normal.com", Ipv4Addr::new(8,8,8,8), 300, future);
+        rec2.uid = 100;
+        cache.insert(rec2);
+        assert_eq!(cache.len(), 2);
+        let removed = cache_unhash_dhcp(&mut cache, now);
+        assert_eq!(removed, 1);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn cache_unhash_dhcp_empty_cache() {
+        let mut cache = DnsCache::new(16);
+        let now = Instant::now();
+        assert_eq!(cache_unhash_dhcp(&mut cache, now), 0);
     }
 }
