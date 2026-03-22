@@ -976,6 +976,83 @@ pub fn clean_interfaces(ifaces: &mut Vec<IfaceRecord>) -> usize {
     before - ifaces.len()
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// resolv.conf parsing (ported from network.c:1699-1775)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parse a resolv.conf-format text and extract nameserver addresses.
+///
+/// Each line should be "nameserver <ip>" or "server <ip>".
+/// Supports IPv4, IPv6, and IPv6 with scope IDs (%eth0).
+/// Port of `reload_servers()` from network.c:1699-1775.
+pub fn parse_resolv_conf(text: &str, dns_port: u16) -> Vec<std::net::SocketAddr> {
+    let mut servers = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let mut tokens = line.split_whitespace();
+        let keyword = match tokens.next() {
+            Some(k) => k,
+            None => continue,
+        };
+        if keyword != "nameserver" && keyword != "server" {
+            continue;
+        }
+        let addr_str = match tokens.next() {
+            Some(a) => a,
+            None => continue,
+        };
+        // Strip scope ID for IPv6 (e.g. "fe80::1%eth0" → "fe80::1")
+        let clean = if let Some(idx) = addr_str.find('%') {
+            &addr_str[..idx]
+        } else {
+            addr_str
+        };
+        if let Ok(ip) = clean.parse::<std::net::IpAddr>() {
+            servers.push(std::net::SocketAddr::new(ip, dns_port));
+        }
+    }
+    servers
+}
+
+/// Check if an interface address is non-local/non-private and should trigger a warning.
+///
+/// Returns true for globally-routable addresses that should be warned about
+/// when using --bind-interfaces without --bind-dynamic.
+/// Port of the logic in `warn_bound_listeners()` from network.c:1251-1274.
+pub fn is_globally_routable(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            !(octets[0] == 10
+                || (octets[0] == 172 && (octets[1] & 0xf0) == 16)
+                || (octets[0] == 192 && octets[1] == 168)
+                || octets[0] == 127
+                || v4 == Ipv4Addr::UNSPECIFIED)
+        }
+        IpAddr::V6(v6) => {
+            let octets = v6.octets();
+            !((octets[0] & 0xfe) == 0xfc  // ULA
+                || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80) // link-local
+                || v6 == Ipv6Addr::LOCALHOST
+                || v6 == Ipv6Addr::UNSPECIFIED)
+        }
+    }
+}
+
+/// Validate an upstream server address.
+///
+/// Returns `None` if the address is valid, or `Some(reason)` if invalid.
+pub fn validate_server_addr(addr: &std::net::SocketAddr) -> Option<&'static str> {
+    if addr.port() == 0 {
+        return Some("port is zero");
+    }
+    match addr.ip() {
+        IpAddr::V4(v4) if v4 == Ipv4Addr::UNSPECIFIED => Some("address is 0.0.0.0"),
+        IpAddr::V6(v6) if v6 == Ipv6Addr::UNSPECIFIED => Some("address is ::"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1483,5 +1560,114 @@ mod tests {
         let mut ifaces: Vec<IfaceRecord> = vec![];
         let removed = clean_interfaces(&mut ifaces);
         assert_eq!(removed, 0);
+    }
+
+    // ── parse_resolv_conf ────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_resolv_conf_ipv4() {
+        let text = "nameserver 8.8.8.8\nnameserver 8.8.4.4\n";
+        let servers = parse_resolv_conf(text, 53);
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].ip(), "8.8.8.8".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(servers[0].port(), 53);
+    }
+
+    #[test]
+    fn parse_resolv_conf_ipv6() {
+        let text = "nameserver ::1\n";
+        let servers = parse_resolv_conf(text, 53);
+        assert_eq!(servers.len(), 1);
+        assert!(servers[0].ip().is_ipv6());
+    }
+
+    #[test]
+    fn parse_resolv_conf_ipv6_scope() {
+        let text = "nameserver fe80::1%eth0\n";
+        let servers = parse_resolv_conf(text, 53);
+        assert_eq!(servers.len(), 1);
+    }
+
+    #[test]
+    fn parse_resolv_conf_skips_comments() {
+        let text = "# comment\nnameserver 1.1.1.1\nsearch example.com\n";
+        let servers = parse_resolv_conf(text, 53);
+        assert_eq!(servers.len(), 1);
+    }
+
+    #[test]
+    fn parse_resolv_conf_empty() {
+        let servers = parse_resolv_conf("", 53);
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn parse_resolv_conf_server_keyword() {
+        let text = "server 9.9.9.9\n";
+        let servers = parse_resolv_conf(text, 53);
+        assert_eq!(servers.len(), 1);
+    }
+
+    #[test]
+    fn parse_resolv_conf_custom_port() {
+        let servers = parse_resolv_conf("nameserver 1.2.3.4\n", 5353);
+        assert_eq!(servers[0].port(), 5353);
+    }
+
+    #[test]
+    fn parse_resolv_conf_invalid_addr_skipped() {
+        let text = "nameserver not.valid\nnameserver 8.8.8.8\n";
+        let servers = parse_resolv_conf(text, 53);
+        assert_eq!(servers.len(), 1);
+    }
+
+    // ── is_globally_routable ─────────────────────────────────────────────────
+
+    #[test]
+    fn globally_routable_public_ipv4() {
+        assert!(is_globally_routable("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn globally_routable_private_ipv4() {
+        assert!(!is_globally_routable("10.0.0.1".parse().unwrap()));
+        assert!(!is_globally_routable("172.16.0.1".parse().unwrap()));
+        assert!(!is_globally_routable("192.168.1.1".parse().unwrap()));
+        assert!(!is_globally_routable("127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn globally_routable_public_ipv6() {
+        assert!(is_globally_routable("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn globally_routable_ula_ipv6() {
+        assert!(!is_globally_routable("fd00::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn globally_routable_link_local_ipv6() {
+        assert!(!is_globally_routable("fe80::1".parse().unwrap()));
+    }
+
+    // ── validate_server_addr ─────────────────────────────────────────────────
+
+    #[test]
+    fn validate_server_addr_good() {
+        let addr: std::net::SocketAddr = "8.8.8.8:53".parse().unwrap();
+        assert!(validate_server_addr(&addr).is_none());
+    }
+
+    #[test]
+    fn validate_server_addr_zero_port() {
+        let addr: std::net::SocketAddr = "8.8.8.8:0".parse().unwrap();
+        assert!(validate_server_addr(&addr).is_some());
+    }
+
+    #[test]
+    fn validate_server_addr_unspecified() {
+        let addr: std::net::SocketAddr = "0.0.0.0:53".parse().unwrap();
+        assert!(validate_server_addr(&addr).is_some());
     }
 }

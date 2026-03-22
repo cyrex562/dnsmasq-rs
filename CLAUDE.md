@@ -10,7 +10,7 @@ Rust port of [dnsmasq](https://thekelleys.org.uk/dnsmasq/doc.html), a DNS forwar
 cargo build                          # default features
 cargo build --all-features           # all features
 cargo build --no-default-features    # minimal build
-cargo test                           # all tests (1210+ unit + integration)
+cargo test                           # all tests (1240+ unit + integration)
 cargo test <name>                    # run specific test by substring
 cargo test --test dns_roundtrip      # specific integration test
 cargo test proptest                  # property-based tests only
@@ -34,7 +34,7 @@ RUST_LOG=debug cargo run             # run with debug logging
 | `cache.rs` | cache.c | 2298 | 2500 | Complete |
 | `forward.rs` | forward.c | 2431 | 3319 | Mostly complete |
 | `rfc2131.rs` | rfc2131.c | 2019 | 3265 | Partial (~62%) |
-| `network.rs` | network.c | 1487 | 1812 | Mostly complete |
+| `network.rs` | network.c | 1673 | 1812 | Mostly complete |
 | `dhcp_common.rs` | dhcp-common.c | 1449 | 1081 | Complete |
 | `netlink.rs` | netlink.c | 1144 | 414 | Complete (expanded) |
 | `lease.rs` | lease.c | 1451 | 1346 | Complete (expanded) |
@@ -42,7 +42,7 @@ RUST_LOG=debug cargo run             # run with debug logging
 | `dnssec.rs` | dnssec.c | 1352 | 2410 | Partial (~56%) |
 | `domain_match.rs` | domain-match.c | 913 | 778 | Complete |
 | `dnsmasq.rs` | dnsmasq.c | 863 | 2478 | Partial (~35%) |
-| `util.rs` | util.c | 781 | 1006 | Mostly complete |
+| `util.rs` | util.c | 937 | 1006 | Mostly complete |
 | `rfc3315.rs` | rfc3315.c | 1195 | 2348 | Partial (~51%) |
 | `auth.rs` | auth.c | 862 | 915 | Mostly complete |
 | `tftp.rs` | tftp.c | 1017 | 1040 | Mostly complete |

@@ -581,6 +581,83 @@ pub fn kernel_version() -> u32 {
         | parts.get(2).copied().unwrap_or(0)
 }
 
+// ── Domain name validation (ported from util.c:137-202) ──────────────────────
+
+/// Maximum DNS name length.
+const MAXDNAME: usize = 1025;
+
+/// Result of checking a domain name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameCheckResult {
+    /// Invalid name (empty, too long, control chars, etc.).
+    Invalid,
+    /// Valid ASCII-only name.
+    Valid,
+    /// Valid name with non-ASCII characters requiring IDN encoding.
+    NeedsIdn,
+}
+
+/// Validate a domain name string.
+///
+/// Checks: non-empty, total length ≤ MAXDNAME, labels ≤ 63 chars,
+/// no control characters, not all whitespace. Non-ASCII chars return
+/// `NeedsIdn`. Trailing dot is stripped.
+/// Port of `check_name()` from util.c:137-202.
+pub fn check_name(name: &str) -> NameCheckResult {
+    let trimmed = name.trim_end_matches('.');
+    if trimmed.is_empty() || trimmed.len() > MAXDNAME {
+        return NameCheckResult::Invalid;
+    }
+
+    let mut has_idn = false;
+    let mut has_non_space = name.ends_with('.');  // trailing dot counts as non-space input
+
+    for label in trimmed.split('.') {
+        if label.len() > MAXLABEL {
+            return NameCheckResult::Invalid;
+        }
+        for c in label.chars() {
+            if c.is_ascii_control() {
+                return NameCheckResult::Invalid;
+            }
+            if !c.is_ascii() {
+                has_idn = true;
+            }
+            if c != ' ' {
+                has_non_space = true;
+            }
+        }
+    }
+
+    // Reject all-whitespace names
+    if !has_non_space {
+        return NameCheckResult::Invalid;
+    }
+
+    // Uppercase ASCII also suggests IDN processing might be needed
+    if trimmed.chars().any(|c| c.is_ascii_uppercase()) {
+        has_idn = true;
+    }
+
+    if has_idn {
+        NameCheckResult::NeedsIdn
+    } else {
+        NameCheckResult::Valid
+    }
+}
+
+/// Validate a hostname (more restricted than a domain name).
+///
+/// Only the first label is checked: allowed chars are a-z, A-Z, 0-9, '-', '_'.
+/// Port of `legal_hostname()` from util.c:204+ (already partially ported).
+pub fn check_hostname_label(name: &str) -> bool {
+    let first_label = name.split('.').next().unwrap_or("");
+    if first_label.is_empty() {
+        return false;
+    }
+    first_label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -777,5 +854,84 @@ mod tests {
         // already has 5 slots; requesting index 3 (needed=3, so len>=4) → no change
         assert!(expand_workspace(&mut ws, 3));
         assert_eq!(ws.len(), 5);
+    }
+
+    // ── check_name ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn check_name_valid_simple() {
+        assert_eq!(check_name("example.com"), NameCheckResult::Valid);
+    }
+
+    #[test]
+    fn check_name_valid_trailing_dot() {
+        // Trailing dot should be stripped; result is valid
+        assert_ne!(check_name("example.com."), NameCheckResult::Invalid);
+    }
+
+    #[test]
+    fn check_name_empty() {
+        assert_eq!(check_name(""), NameCheckResult::Invalid);
+    }
+
+    #[test]
+    fn check_name_control_char() {
+        assert_eq!(check_name("bad\x01name.com"), NameCheckResult::Invalid);
+    }
+
+    #[test]
+    fn check_name_label_too_long() {
+        let long_label = "a".repeat(64);
+        assert_eq!(check_name(&format!("{}.com", long_label)), NameCheckResult::Invalid);
+    }
+
+    #[test]
+    fn check_name_label_max_ok() {
+        let label = "a".repeat(63);
+        assert_ne!(check_name(&format!("{}.com", label)), NameCheckResult::Invalid);
+    }
+
+    #[test]
+    fn check_name_uppercase_needs_idn() {
+        assert_eq!(check_name("Example.COM"), NameCheckResult::NeedsIdn);
+    }
+
+    #[test]
+    fn check_name_non_ascii_needs_idn() {
+        assert_eq!(check_name("münchen.de"), NameCheckResult::NeedsIdn);
+    }
+
+    #[test]
+    fn check_name_all_spaces_invalid() {
+        assert_eq!(check_name("   "), NameCheckResult::Invalid);
+    }
+
+    #[test]
+    fn check_name_single_label() {
+        assert_eq!(check_name("localhost"), NameCheckResult::Valid);
+    }
+
+    // ── check_hostname_label ─────────────────────────────────────────────────
+
+    #[test]
+    fn check_hostname_label_valid() {
+        assert!(check_hostname_label("my-host_1"));
+    }
+
+    #[test]
+    fn check_hostname_label_fqdn() {
+        // Only checks first label
+        assert!(check_hostname_label("host.example.com"));
+    }
+
+    #[test]
+    fn check_hostname_label_invalid_chars() {
+        assert!(!check_hostname_label("host name")); // space
+        assert!(!check_hostname_label("host@name")); // @
+    }
+
+    #[test]
+    fn check_hostname_label_empty() {
+        assert!(!check_hostname_label(""));
     }
 }
