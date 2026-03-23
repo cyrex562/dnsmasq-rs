@@ -10,7 +10,7 @@ Rust port of [dnsmasq](https://thekelleys.org.uk/dnsmasq/doc.html), a DNS forwar
 cargo build                          # default features
 cargo build --all-features           # all features
 cargo build --no-default-features    # minimal build
-cargo test                           # all tests (1274+ unit + integration)
+cargo test                           # all tests (1306+ unit + integration)
 cargo test <name>                    # run specific test by substring
 cargo test --test dns_roundtrip      # specific integration test
 cargo test proptest                  # property-based tests only
@@ -39,7 +39,7 @@ RUST_LOG=debug cargo run             # run with debug logging
 | `netlink.rs` | netlink.c | 1144 | 414 | Complete (expanded) |
 | `lease.rs` | lease.c | 1451 | 1346 | Complete (expanded) |
 | `option.rs` | option.c | 1685 | 6322 | Partial (~27%) |
-| `dnssec.rs` | dnssec.c | 1352 | 2410 | Partial (~56%) |
+| `dnssec.rs` | dnssec.c | 1580 | 2410 | Partial (~66%) |
 | `domain_match.rs` | domain-match.c | 913 | 778 | Complete |
 | `dnsmasq.rs` | dnsmasq.c | 863 | 2478 | Partial (~35%) |
 | `util.rs` | util.c | 937 | 1006 | Mostly complete |
@@ -53,9 +53,9 @@ RUST_LOG=debug cargo run             # run with debug logging
 | `edns0.rs` | edns0.c | 664 | 574 | Complete (expanded) |
 | `log.rs` | log.c | 416 | 494 | Mostly complete |
 | `outpacket.rs` | outpacket.c | 361 | 118 | Complete |
-| `dhcp.rs` | dhcp.c | 744 | 1124 | Partial (~66%) |
+| `dhcp.rs` | dhcp.c | 870 | 1124 | Partial (~77%) |
 | `crypto.rs` | crypto.c | 625 | 504 | Complete (expanded) |
-| `dhcp6.rs` | dhcp6.c | 530 | 881 | Partial (~60%) |
+| `dhcp6.rs` | dhcp6.c | 616 | 881 | Partial (~70%) |
 | `rrfilter.rs` | rrfilter.c | 287 | 413 | Mostly complete |
 | `pattern.rs` | pattern.c | 283 | 386 | Mostly complete |
 | `poll.rs` | poll.c | 259 | 118 | Complete (expanded) |
@@ -79,9 +79,9 @@ RUST_LOG=debug cargo run             # run with debug logging
 2. **dnsmasq.rs** — Main daemon logic ~35% ported (863 vs 2478 LOC). Event system and resolv monitor added.
 3. **rfc2131.rs** — DHCP server ~62% ported. Missing some option handlers.
 4. **rfc3315.rs** — DHCPv6 ~51% ported.
-5. **dnssec.rs** — DNSSEC validation ~56% ported.
-6. **dhcp.rs** — DHCP listener ~66% ported.
-7. **dhcp6.rs** — DHCPv6 listener ~60% ported.
+5. **dnssec.rs** — DNSSEC validation ~66% ported.
+6. **dhcp.rs** — DHCP listener ~77% ported.
+7. **dhcp6.rs** — DHCPv6 listener ~70% ported.
 8. **dbus.rs** — D-Bus integration ~9% ported.
 9. **bpf.rs** — BPF support ~31% ported.
 10. **ubus.rs** — uBus integration ~36% ported.

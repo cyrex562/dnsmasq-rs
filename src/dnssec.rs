@@ -770,6 +770,135 @@ pub fn dnssec_generate_query(name: &str, qclass: u16, qtype: u16, id: u16) -> Ve
     pkt
 }
 
+// ─── DNSSEC timestamp validation (ported from dnssec.c:114-141) ──────────────
+
+/// Check if DNSSEC timestamp validation should be performed.
+///
+/// If a timestamp file is configured, timestamps are only checked after
+/// the system time has advanced past the timestamp file's mtime
+/// (indicating the clock is set correctly).
+/// Port of `is_check_date()` from dnssec.c:114-141.
+pub fn is_check_date(
+    has_timestamp_file: bool,
+    back_to_the_future: bool,
+    no_time_check: bool,
+) -> bool {
+    if has_timestamp_file {
+        back_to_the_future
+    } else {
+        !no_time_check
+    }
+}
+
+/// Check if a DNSSEC signature's time window is valid.
+///
+/// Returns true if `now` falls within `[inception, expiration]`.
+/// Handles serial-number arithmetic for wraparound.
+pub fn check_signature_time(inception: u32, expiration: u32, now: u32) -> bool {
+    // RFC 4034 §3.1.5: using serial number arithmetic
+    // sig_inception <= now <= sig_expiration
+    let now_after_inception = now.wrapping_sub(inception) < 0x80000000;
+    let now_before_expiry = expiration.wrapping_sub(now) < 0x80000000;
+    now_after_inception && now_before_expiry
+}
+
+// ─── RR data canonicalization (ported from dnssec.c:152-218) ─────────────────
+
+/// RR type descriptor for canonicalization.
+///
+/// Describes the structure of an RR's RDATA for DNSSEC signature verification.
+/// Each entry is either:
+/// - A positive value: number of plain data bytes
+/// - 0: a domain name (to be lowercased/canonicalized)
+/// - -1: remaining bytes to the end (terminal)
+#[derive(Debug, Clone)]
+pub struct RrDescriptor {
+    pub fields: Vec<i16>,
+}
+
+impl RrDescriptor {
+    /// Get the descriptor for common RR types.
+    ///
+    /// Returns field descriptions for canonicalization.
+    pub fn for_type(rr_type: u16) -> Self {
+        let fields = match rr_type {
+            // A: 4 bytes address
+            1 => vec![-1],
+            // NS, CNAME, PTR: domain name
+            2 | 5 | 12 => vec![0],
+            // SOA: mname, rname, 5*u32
+            6 => vec![0, 0, -1],
+            // MX: 2-byte preference + domain name
+            15 => vec![2, 0],
+            // AAAA: 16 bytes
+            28 => vec![-1],
+            // SRV: 6 bytes + domain name
+            33 => vec![6, 0],
+            // RRSIG: 18 bytes + signer name + signature
+            46 => vec![18, 0, -1],
+            // DNSKEY, DS, NSEC, NSEC3, TLSA, etc.: all plain bytes
+            _ => vec![-1],
+        };
+        Self { fields }
+    }
+}
+
+/// Canonicalize RDATA for DNSSEC signature verification.
+///
+/// Domain names in the RDATA are lowercased. Plain data bytes are left unchanged.
+/// Returns the canonicalized bytes, or `None` on malformed data.
+/// Port of `get_rdata()` iteration from dnssec.c:159-218.
+pub fn canonicalize_rdata(rdata: &[u8], rr_type: u16) -> Option<Vec<u8>> {
+    let desc = RrDescriptor::for_type(rr_type);
+    let mut result = Vec::with_capacity(rdata.len());
+    let mut pos = 0;
+
+    for &field in &desc.fields {
+        if field == -1 {
+            // Remaining bytes to end
+            result.extend_from_slice(&rdata[pos..]);
+            pos = rdata.len();
+            break;
+        } else if field == 0 {
+            // Domain name: read wire-format labels and lowercase
+            let start = pos;
+            loop {
+                if pos >= rdata.len() {
+                    return None;
+                }
+                let label_len = rdata[pos] as usize;
+                if label_len == 0 {
+                    result.push(0); // root label
+                    pos += 1;
+                    break;
+                }
+                if label_len >= 0xc0 {
+                    // Compression pointer — shouldn't appear in canonical form
+                    return None;
+                }
+                if pos + 1 + label_len > rdata.len() {
+                    return None;
+                }
+                result.push(label_len as u8);
+                for i in 0..label_len {
+                    result.push(rdata[pos + 1 + i].to_ascii_lowercase());
+                }
+                pos += 1 + label_len;
+            }
+        } else {
+            // Plain data bytes
+            let n = field as usize;
+            if pos + n > rdata.len() {
+                return None;
+            }
+            result.extend_from_slice(&rdata[pos..pos + n]);
+            pos += n;
+        }
+    }
+
+    Some(result)
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1348,5 +1477,104 @@ mod tests {
         let pkt1 = dnssec_generate_query("example.com.", 1, 48, 1);
         let pkt2 = dnssec_generate_query("example.com", 1, 48, 1);
         assert_eq!(pkt1, pkt2);
+    }
+
+    // ─── is_check_date ───────────────────────────────────────────────────────
+
+    #[test]
+    fn is_check_date_no_timestamp_file() {
+        assert!(is_check_date(false, false, false));
+        assert!(!is_check_date(false, false, true)); // no_time_check → don't check
+    }
+
+    #[test]
+    fn is_check_date_with_timestamp_file() {
+        assert!(!is_check_date(true, false, false)); // not yet back_to_the_future
+        assert!(is_check_date(true, true, false)); // back_to_the_future → check
+    }
+
+    // ─── check_signature_time ────────────────────────────────────────────────
+
+    #[test]
+    fn check_signature_time_valid() {
+        assert!(check_signature_time(100, 200, 150));
+    }
+
+    #[test]
+    fn check_signature_time_at_boundaries() {
+        assert!(check_signature_time(100, 200, 100)); // at inception
+        assert!(check_signature_time(100, 200, 200)); // at expiry
+    }
+
+    #[test]
+    fn check_signature_time_expired() {
+        assert!(!check_signature_time(100, 200, 201));
+    }
+
+    #[test]
+    fn check_signature_time_not_yet_valid() {
+        assert!(!check_signature_time(100, 200, 99));
+    }
+
+    #[test]
+    fn check_signature_time_wraparound() {
+        // inception near max u32, expiry after wrap
+        assert!(check_signature_time(u32::MAX - 10, 10, u32::MAX));
+        assert!(check_signature_time(u32::MAX - 10, 10, 5));
+    }
+
+    // ─── RrDescriptor ────────────────────────────────────────────────────────
+
+    #[test]
+    fn rr_descriptor_a_record() {
+        let desc = RrDescriptor::for_type(1);
+        assert_eq!(desc.fields, vec![-1]); // all plain bytes
+    }
+
+    #[test]
+    fn rr_descriptor_mx() {
+        let desc = RrDescriptor::for_type(15);
+        assert_eq!(desc.fields, vec![2, 0]); // 2 bytes pref + domain
+    }
+
+    #[test]
+    fn rr_descriptor_soa() {
+        let desc = RrDescriptor::for_type(6);
+        assert_eq!(desc.fields, vec![0, 0, -1]); // mname, rname, rest
+    }
+
+    // ─── canonicalize_rdata ──────────────────────────────────────────────────
+
+    #[test]
+    fn canonicalize_rdata_a_record() {
+        let rdata = [1, 2, 3, 4];
+        let result = canonicalize_rdata(&rdata, 1).unwrap();
+        assert_eq!(result, rdata);
+    }
+
+    #[test]
+    fn canonicalize_rdata_ns_lowercases() {
+        // NS record: domain name "Example.COM" in wire format
+        let rdata = [7, b'E', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'C', b'O', b'M', 0];
+        let result = canonicalize_rdata(&rdata, 2).unwrap();
+        // Should be lowercased
+        let expected = [7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0];
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn canonicalize_rdata_mx() {
+        // MX: 2 bytes preference + domain name
+        let mut rdata = vec![0x00, 0x0A]; // preference = 10
+        rdata.extend_from_slice(&[4, b'M', b'A', b'I', b'L', 0]); // "MAIL."
+        let result = canonicalize_rdata(&rdata, 15).unwrap();
+        assert_eq!(&result[0..2], &[0x00, 0x0A]); // preference unchanged
+        assert_eq!(result[3], b'm'); // lowercased
+    }
+
+    #[test]
+    fn canonicalize_rdata_empty() {
+        let result = canonicalize_rdata(&[], 1).unwrap();
+        assert!(result.is_empty());
     }
 }

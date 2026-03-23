@@ -347,6 +347,54 @@ pub fn dhcp_packet_validate(data: &[u8]) -> Result<(), &'static str> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SDBM hash for address allocation (ported from dhcp.c:838-845)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Compute SDBM hash of a hardware address for DHCP address allocation.
+///
+/// Used as seed for distributing clients across the address pool.
+/// Port of the SDBM hash in dhcp.c:840-845.
+pub fn sdbm_hash(hwaddr: &[u8]) -> u32 {
+    let mut j: u32 = 0;
+    for &b in hwaddr {
+        j = (b as u32).wrapping_add(j.wrapping_shl(6)).wrapping_add(j.wrapping_shl(16)).wrapping_sub(j);
+    }
+    if j == 0 { 1 } else { j } // 0 is a sentinel marker
+}
+
+/// Calculate the starting address for DHCP allocation using hash-based seeding.
+///
+/// Maps the hash into the range [start, end] using modular arithmetic.
+/// Port of the address calculation in dhcp.c:860-861.
+pub fn hash_to_addr(hash: u32, epoch: u32, start: Ipv4Addr, end: Ipv4Addr) -> Ipv4Addr {
+    let s = u32::from(start);
+    let e = u32::from(end);
+    let range = e.wrapping_sub(s).wrapping_add(1);
+    if range == 0 {
+        return start; // full u32 range
+    }
+    let offset = hash.wrapping_add(epoch) % range;
+    Ipv4Addr::from(s.wrapping_add(offset))
+}
+
+/// Check if an IPv4 address is safe to allocate (avoids Windows .0 and .255 issues).
+///
+/// In class-C ranges, addresses ending in .0 or .255 cause Windows problems.
+/// Port of the Windows workaround check in dhcp.c:877-881.
+pub fn is_allocatable_addr(addr: Ipv4Addr) -> bool {
+    let a = u32::from(addr);
+    // Class C check: first octet 192-223
+    let first_octet = (a >> 24) & 0xff;
+    if first_octet >= 192 && first_octet <= 223 {
+        let last_octet = a & 0xff;
+        if last_octet == 0 || last_octet == 0xff {
+            return false;
+        }
+    }
+    true
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -740,5 +788,83 @@ mod tests {
         let cookie = DHCP_COOKIE.to_be_bytes();
         data[236..240].copy_from_slice(&cookie);
         assert!(dhcp_packet_validate(&data).is_ok());
+    }
+
+    // ── sdbm_hash ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sdbm_hash_deterministic() {
+        let mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        assert_eq!(sdbm_hash(&mac), sdbm_hash(&mac));
+    }
+
+    #[test]
+    fn sdbm_hash_different_macs_differ() {
+        let h1 = sdbm_hash(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        let h2 = sdbm_hash(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn sdbm_hash_never_zero() {
+        // All-zero MAC would normally hash to 0, but we return 1 instead
+        assert_eq!(sdbm_hash(&[0; 6]), 1);
+    }
+
+    #[test]
+    fn sdbm_hash_empty() {
+        assert_eq!(sdbm_hash(&[]), 1); // 0 → 1
+    }
+
+    // ── hash_to_addr ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn hash_to_addr_in_range() {
+        let start = "10.0.0.100".parse().unwrap();
+        let end = "10.0.0.200".parse().unwrap();
+        let addr = hash_to_addr(42, 0, start, end);
+        let a = u32::from(addr);
+        let s = u32::from(start);
+        let e = u32::from(end);
+        assert!(a >= s && a <= e);
+    }
+
+    #[test]
+    fn hash_to_addr_single_address() {
+        let start: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let addr = hash_to_addr(999, 0, start, start);
+        assert_eq!(addr, start);
+    }
+
+    #[test]
+    fn hash_to_addr_epoch_shifts() {
+        let start = "10.0.0.0".parse().unwrap();
+        let end = "10.0.0.255".parse().unwrap();
+        let a1 = hash_to_addr(42, 0, start, end);
+        let a2 = hash_to_addr(42, 1, start, end);
+        assert_ne!(a1, a2);
+    }
+
+    // ── is_allocatable_addr ──────────────────────────────────────────────────
+
+    #[test]
+    fn is_allocatable_normal() {
+        assert!(is_allocatable_addr("192.168.1.100".parse().unwrap()));
+    }
+
+    #[test]
+    fn is_allocatable_rejects_class_c_255() {
+        assert!(!is_allocatable_addr("192.168.1.255".parse().unwrap()));
+    }
+
+    #[test]
+    fn is_allocatable_rejects_class_c_0() {
+        assert!(!is_allocatable_addr("192.168.1.0".parse().unwrap()));
+    }
+
+    #[test]
+    fn is_allocatable_allows_10_net_255() {
+        // 10.x.x.255 is NOT class C, so it's fine
+        assert!(is_allocatable_addr("10.0.0.255".parse().unwrap()));
     }
 }
