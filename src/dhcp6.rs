@@ -495,7 +495,7 @@ mod tests {
             lease_time: 3600,
             addr_epoch: 0,
             netid: crate::types::dhcp::DhcpNetid { net: String::new() },
-            filter: None,
+            filter: vec![],
             start6,
             end6,
             local6: Ipv6Addr::UNSPECIFIED,

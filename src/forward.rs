@@ -14,6 +14,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::hash_questions::hash_questions;
 use crate::metrics::{inc_metric, Metric};
+use crate::rfc1035::{private_net, private_net6, DnsPacket};
 use crate::types::constants::{F_IPV4, F_IPV6, F_SERVER};
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1434,10 +1435,29 @@ pub fn process_reply(
 
     // Rebind check for NOERROR answers.
     if config.check_rebind && rcode == 0 && !domain_no_rebind(name, no_rebind) {
-        // TODO: inspect A/AAAA records for RFC-1918 addresses.
-        // For now surface the policy check result to callers.
-        // A real implementation would call extract_addresses() and check
-        // whether any returned address is private-space.
+        let parsed = match DnsPacket::parse(pkt) {
+            Ok(pkt) => pkt,
+            Err(_) => return ProcessReplyResult::Discard,
+        };
+
+        let rebind = parsed.answers.iter().any(|rr| match rr.rtype {
+            1 if rr.class == 1 && rr.rdata.len() >= 4 => {
+                let ip = Ipv4Addr::new(rr.rdata[0], rr.rdata[1], rr.rdata[2], rr.rdata[3]);
+                private_net(ip, true)
+            }
+            28 if rr.class == 1 && rr.rdata.len() >= 16 => {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&rr.rdata[..16]);
+                private_net6(&Ipv6Addr::from(octets), true)
+            }
+            _ => false,
+        });
+
+        if rebind {
+            return ProcessReplyResult::RebindAttack {
+                name: name.to_string(),
+            };
+        }
     }
 
     // DNSSEC: bogus answers become SERVFAIL (if CD bit not set).
@@ -1590,7 +1610,10 @@ pub fn is_private_reply(addr_bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::BytesMut;
     use std::net::SocketAddr;
+    use crate::rfc1035::{write_name, write_question};
+    use crate::rfc1035::DnsQuestion;
 
     fn dummy_addr() -> SocketAddr {
         "127.0.0.1:1234".parse().unwrap()
@@ -2247,6 +2270,32 @@ mod tests {
         pkt
     }
 
+    fn reply_with_single_answer(name: &str, rtype: u16, rdata: &[u8]) -> Vec<u8> {
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&0x0001u16.to_be_bytes()); // ID
+        pkt.push(0x80); // QR=1
+        pkt.push(0x00); // RCODE=NOERROR
+        pkt.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+        pkt.extend_from_slice(&1u16.to_be_bytes()); // ANCOUNT
+        pkt.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+        pkt.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+
+        let mut body = BytesMut::new();
+        write_question(&mut body, &DnsQuestion {
+            name: name.to_string(),
+            qtype: rtype,
+            qclass: 1,
+        });
+        write_name(&mut body, name);
+        body.extend_from_slice(&rtype.to_be_bytes());
+        body.extend_from_slice(&1u16.to_be_bytes()); // class IN
+        body.extend_from_slice(&60u32.to_be_bytes()); // ttl
+        body.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        body.extend_from_slice(rdata);
+        pkt.extend_from_slice(&body);
+        pkt
+    }
+
     #[test]
     fn process_reply_noerror_forwards() {
         let pkt = minimal_reply(0, true, 0, false);
@@ -2276,6 +2325,53 @@ mod tests {
         let cfg = ProcessReplyConfig::default();
         let result = process_reply(&[0u8; 5], "x", &cfg, &[]);
         assert_eq!(result, ProcessReplyResult::Discard);
+    }
+
+    #[test]
+    fn process_reply_rebind_attack_ipv4_detected() {
+        let pkt = reply_with_single_answer("example.com", 1, &[192, 168, 1, 10]);
+        let cfg = ProcessReplyConfig {
+            check_rebind: true,
+            ..ProcessReplyConfig::default()
+        };
+        let result = process_reply(&pkt, "example.com", &cfg, &[]);
+        assert_eq!(
+            result,
+            ProcessReplyResult::RebindAttack {
+                name: "example.com".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn process_reply_rebind_attack_ipv6_detected() {
+        let pkt = reply_with_single_answer(
+            "example.com",
+            28,
+            &Ipv6Addr::LOCALHOST.octets(),
+        );
+        let cfg = ProcessReplyConfig {
+            check_rebind: true,
+            ..ProcessReplyConfig::default()
+        };
+        let result = process_reply(&pkt, "example.com", &cfg, &[]);
+        assert_eq!(
+            result,
+            ProcessReplyResult::RebindAttack {
+                name: "example.com".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn process_reply_rebind_exclusion_allows_private_answer() {
+        let pkt = reply_with_single_answer("router.home.arpa", 1, &[192, 168, 1, 1]);
+        let cfg = ProcessReplyConfig {
+            check_rebind: true,
+            ..ProcessReplyConfig::default()
+        };
+        let result = process_reply(&pkt, "router.home.arpa", &cfg, &[rebind("home.arpa")]);
+        assert_eq!(result, ProcessReplyResult::Forward { rcode: 0 });
     }
 
     // ── reply_query ───────────────────────────────────────────────────────────
@@ -2428,4 +2524,3 @@ mod tests {
         assert!(!is_private_reply(&addr));
     }
 }
-

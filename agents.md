@@ -1,122 +1,151 @@
-# agents.md — dnsmasq-rs Agent Instructions
+# agents.md
 
 ## Project Context
 
-This is a Rust port of dnsmasq (C DNS forwarder + DHCP server). See `CLAUDE.md` for full architecture, module map, and conventions.
+This repository is a Rust port of the upstream `dnsmasq` binary. The goal is behavioral parity for the supported feature set, not merely compiling modules with similar names.
+
+Primary references:
+
+- Upstream C source: `original_dnsmasq_src/dnsmasq-master/src/`
+- Earlier Rust attempt: `old/`
+- Central tracker: `tasks.md`
+- Project overview and test expectations: `CLAUDE.md`
+
+The upstream source and `old/` tree are reference-only.
+
+## Core Rule
+
+Port observable behavior first. Do not claim progress from line counts, module presence, or broad API similarity alone. A port is only complete when the Rust implementation behaves like upstream under unit, property-based, and black-box parity tests.
 
 ## Agent Roles
 
 ### Porting Agent
 
-**Goal:** Port remaining C functions to idiomatic Rust.
+Goal:
 
-**Process:**
-1. Read the C source file in `original_dnsmasq_src/dnsmasq-master/src/`
-2. Read the corresponding Rust file in `src/`
-3. Identify functions present in C but missing or stubbed in Rust
-4. Implement missing functions using Rust idioms (see conventions below)
-5. Add unit tests for each new function
-6. Verify `cargo test` passes
+- Translate upstream behavior into safe Rust while preserving semantics.
 
-**Priority order** (by impact and % remaining):
-1. `option.rs` ← `option.c` (6322 LOC, ~17% done) — config parser
-2. `dnsmasq.rs` ← `dnsmasq.c` (2478 LOC, ~15% done) — main daemon
-3. `rfc2131.rs` ← `rfc2131.c` (3265 LOC, ~51% done) — DHCP
-4. `rfc3315.rs` ← `rfc3315.c` (2348 LOC, ~29% done) — DHCPv6
-5. `radv.rs` ← `radv.c` (1039 LOC, ~26% done) — router ads
-6. `lease.rs` ← `lease.c` (1346 LOC, ~23% done) — lease mgmt
-7. `helper.rs` ← `helper.c` (948 LOC, ~23% done) — DHCP helper
-8. `tftp.rs` ← `tftp.c` (1040 LOC, ~22% done) — TFTP server
-9. `dbus.rs` ← `dbus.c` (1106 LOC, ~9% done) — D-Bus
-10. `dnssec.rs` ← `dnssec.c` (2410 LOC, ~41% done) — DNSSEC
+Process:
+
+1. Read the upstream C implementation for the target behavior.
+2. Read the current Rust module and identify gaps, simplifications, and stubs.
+3. Port the next coherent behavior slice end to end.
+4. Add or update tests before marking the slice complete.
+5. Verify the behavior with the strongest available test layer:
+   - unit tests
+   - property tests where invariants apply
+   - parity fixtures if the behavior is externally observable
+
+Priority areas:
+
+1. `src/option.rs`
+2. `src/dnsmasq.rs` and `src/main.rs`
+3. Runtime listener and socket behavior in `src/network.rs`, `src/forward.rs`, and `src/dhcp_common.rs`
+4. Config-driven DHCP and local DNS data behavior
+5. Remaining feature-gated integrations
 
 ### Testing Agent
 
-**Goal:** Increase test coverage across all modules.
+Goal:
 
-**Process:**
-1. Read the Rust source file
-2. Identify public functions without test coverage
-3. Write unit tests that exercise:
-   - Happy path
-   - Edge cases (empty input, boundary values, overflow)
-   - Error paths (invalid input, missing data)
-4. For protocol code, add roundtrip tests (encode → decode → compare)
-5. For parsers, add proptest property-based tests
-6. Run `cargo test` to verify
+- Prove that the Rust port matches upstream behavior and remains robust under malformed input.
 
-**Test patterns:**
-- Unit tests: `#[cfg(test)] mod tests { use super::*; ... }`
-- Integration tests: `tests/` directory, import via `dnsmasq_rs::*`
-- Property tests: `proptest! { ... }` macro with `proptest::prelude::*`
-- Feature-gated tests: `#[cfg(all(test, feature = "dhcp"))]`
+Process:
+
+1. Identify the behavior under test and whether it is internal logic or externally observable.
+2. Prefer the strongest useful test form:
+   - unit tests for deterministic logic
+   - property tests for parsers, encoders, invariants, and panic-freedom
+   - black-box parity tests for executable behavior
+3. Add regression coverage for every bug or parity mismatch found.
+4. Keep environment-sensitive tests isolated from pure logic tests.
+
+Required test patterns:
+
+- Happy path
+- Boundary or edge cases
+- Invalid or malformed input
+- Error path if `Result` is returned
+- Property tests for protocol parsing or roundtrip invariants where applicable
+- Fixture-based parity tests for user-visible behavior
 
 ### Review Agent
 
-**Goal:** Review ported code for correctness, safety, and Rust idioms.
+Goal:
 
-**Process:**
-1. Compare Rust implementation against C source function-by-function
-2. Check for:
-   - Off-by-one errors in buffer/packet parsing
-   - Missing bounds checks (C relies on caller discipline)
-   - Integer overflow (C uses implicit wrapping)
-   - Correct feature gating
-   - Proper error propagation (no silent failures)
-   - Memory safety (no `unsafe` unless absolutely necessary)
-3. Verify tests cover the reviewed code
-4. Flag any deviations from C behavior that may be intentional vs bugs
+- Check correctness against upstream behavior, not only Rust style.
 
-## Conventions for All Agents
+Review checklist:
 
-### Porting Rules
+- Does the Rust implementation preserve the same observable semantics as upstream?
+- Were any edge cases silently simplified?
+- Are config directives either implemented correctly or rejected clearly?
+- Are feature gates correct and complete?
+- Are capability-dependent tests isolated so restricted environments do not create false failures?
+- Is every parity bug backed by regression coverage?
 
-- C `union` → Rust `enum`
-- C null pointer → `Option<T>`
-- C `goto` → early return, `loop`/`break`, or helper functions
-- C global state → access via `DaemonHandle` (never raw `Daemon`)
-- C `#ifdef HAVE_X` → `#[cfg(feature = "x")]`
-- C `malloc`/`free` → Rust ownership, `Vec`, `Box`
-- C raw sockets → `socket2`, `nix`, or `tokio` abstractions
-- C `syslog` → `tracing::info!`, `tracing::warn!`, `tracing::error!`
-- C string manipulation → `&str`, `String`, standard library methods
+## Porting Rules
 
-### Error Handling
+- C `union` maps to Rust `enum` or a typed wrapper.
+- C null pointer maps to `Option<T>`.
+- C globals map to explicit shared state, but that shared state must not invent new semantics.
+- C `#ifdef HAVE_X` maps to `#[cfg(feature = "x")]`.
+- C allocation patterns map to ownership-based Rust types.
+- Prefer safe Rust. Introduce `unsafe` only when required by the platform boundary and keep it tightly scoped.
 
-- Return `Result<T, DnsmasqError>` from public functions
-- Use `?` operator for propagation
-- Module-local error types implement `From<LocalError> for DnsmasqError`
-- Never panic in library code — reserve `unwrap()`/`expect()` for truly impossible cases
+Additional rules for this repo:
 
-### Naming
+- Do not silently drop upstream behavior because the Rust shape is cleaner.
+- Preserve flag semantics and wire-format behavior exactly unless there is an explicit documented deviation.
+- Keep naming traceable to upstream where that improves reviewability.
+- When refactoring, keep a direct path back to the upstream behavior for reviewers.
 
-- Module files: C `dhcp-common.c` → Rust `dhcp_common.rs`
-- Functions: C `cache_find_non_terminal()` → Rust `cache_find_non_terminal()`
-- Types: C `struct crec` → Rust `CacheRecord`
-- Constants: C `F_IPV4` → Rust `F_IPV4` (keep same names for traceability)
+## Config Parser Rules
 
-### Testing Requirements
+- `src/option.rs` is a parity-critical module.
+- A directive is not complete until:
+  - it parses valid forms
+  - it rejects invalid forms clearly
+  - it mutates daemon state correctly
+  - it affects runtime behavior correctly where applicable
+  - it has directive-level tests and integration coverage
 
-Every new function should have at least:
-- 1 happy-path test
-- 1 edge-case test (empty/zero/boundary)
-- 1 error-path test (if function returns Result)
+- Never accept a directive as a placeholder no-op unless that no-op is explicitly documented and tracked in `tasks.md`.
 
-For packet parsing functions, add proptest roundtrip tests.
+## Testing Requirements
 
-### Build Verification
+Every new behavior slice should add:
 
-After any change, verify:
-```bash
-cargo build --all-features
-cargo test
-cargo check --no-default-features
-```
+- Unit tests for deterministic logic
+- Error-path tests for malformed input or invalid state
+- Property tests for parsers, roundtrips, invariants, or panic-freedom where appropriate
+- A regression test when fixing a bug
 
-## Reference Files
+For externally visible behavior, add parity-oriented tests when possible:
 
-- `original_dnsmasq_src/dnsmasq-master/src/` — C source (read-only)
-- `old/` — Prior Rust attempt (read-only reference, may contain useful patterns)
-- `tasks.md` — Detailed 12-phase porting plan
-- `.github/copilot-instructions.md` — Architecture guide
-- `CLAUDE.md` — Project overview and module status
+- same fixture config
+- same query or packet input
+- compare normalized behavior against upstream dnsmasq
+
+## Environment-Sensitive Tests
+
+Some tests in this repo require socket operations, interface enumeration, bind-to-device behavior, or other capabilities that may fail in restricted environments.
+
+Rules:
+
+- Pure logic tests must stay deterministic and capability-independent.
+- Capability-dependent tests must be clearly separated, gated, skipped, or made expectation-aware.
+- Do not use restricted-environment failures as evidence that the implementation is wrong.
+- Do not leave permission-sensitive tests written as unconditional logic tests.
+
+## Completion Standard
+
+Do not mark work complete because a module exists or because many tests pass.
+
+A behavior is complete when:
+
+- the implementation matches upstream for the supported case
+- the code is safe and reviewable
+- unit and property tests cover the behavior
+- externally visible behavior is covered by parity fixtures where applicable
+- unsupported cases are explicitly documented

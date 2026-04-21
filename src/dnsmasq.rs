@@ -9,6 +9,10 @@ use tokio::sync::RwLock;
 
 use crate::error::DnsmasqError;
 use crate::types::daemon::Daemon;
+#[cfg(feature = "dhcp")]
+use crate::dhcp::DhcpServerConfig;
+#[cfg(feature = "dhcp")]
+use crate::types::addr::MySockAddr;
 
 /// A shared, async-safe handle to the daemon state.
 pub type DaemonHandle = Arc<RwLock<Daemon>>;
@@ -42,6 +46,11 @@ pub enum DaemonEvent {
 /// Initialize a new [`Daemon`] with default settings and return a shared handle.
 pub fn init_daemon() -> DaemonHandle {
     Arc::new(RwLock::new(Daemon::default()))
+}
+
+/// Initialize a shared daemon handle from a resolved daemon configuration.
+pub fn init_daemon_with(daemon: Daemon) -> DaemonHandle {
+    Arc::new(RwLock::new(daemon))
 }
 
 /// Drop process privileges to the given `uid`/`gid`.
@@ -161,6 +170,76 @@ pub enum RunResult {
     IoError,
 }
 
+#[cfg(feature = "dhcp")]
+#[derive(Debug, Clone)]
+struct DhcpDaemonRuntime {
+    bind_addr: SocketAddr,
+    bind_interface: Option<String>,
+    server: DhcpServerConfig,
+    loop_opts: crate::dhcp::DhcpLoopOptions,
+}
+
+#[cfg(feature = "dhcp")]
+fn first_ipv4_listen_addr(addrs: &[crate::types::network::Iname]) -> Option<Ipv4Addr> {
+    addrs.iter().find_map(|iname| match iname.addr.as_ref() {
+        Some(MySockAddr::V4(sock)) => Some(*sock.ip()),
+        _ => None,
+    })
+}
+
+#[cfg(feature = "dhcp")]
+fn first_bind_interface(daemon: &Daemon) -> Option<String> {
+    daemon
+        .if_names
+        .iter()
+        .filter_map(|iname| iname.name.as_ref())
+        .find(|name| {
+            !name.contains('*')
+                && !daemon
+                    .if_except
+                    .iter()
+                    .any(|excluded| excluded.name.as_deref() == Some(name.as_str()))
+        })
+        .cloned()
+}
+
+#[cfg(feature = "dhcp")]
+fn daemon_dhcp_runtime(daemon: &Daemon) -> Option<DhcpDaemonRuntime> {
+    let ctx = daemon.dhcp.first()?;
+    let server_port = u16::try_from(daemon.dhcp_server_port).ok()?;
+    let client_port = u16::try_from(daemon.dhcp_client_port).ok()?;
+    let bind_ip = first_ipv4_listen_addr(&daemon.if_addrs).unwrap_or(Ipv4Addr::UNSPECIFIED);
+    let bind_interface = first_bind_interface(daemon);
+
+    Some(DhcpDaemonRuntime {
+        bind_addr: SocketAddr::from((bind_ip, server_port)),
+        bind_interface,
+        server: DhcpServerConfig {
+            pool_start: ctx.start,
+            pool_end: ctx.end,
+            server_ip: if ctx.router != Ipv4Addr::UNSPECIFIED {
+                ctx.router
+            } else {
+                ctx.start
+            },
+            max_packet: 1500,
+            configs: daemon.dhcp_conf.clone(),
+            vendor_rules: daemon.dhcp_vendors.clone(),
+            user_class_rules: daemon.dhcp_userclasses.clone(),
+            mac_rules: daemon.dhcp_macs.clone(),
+            relay_id_rules: daemon.dhcp_relay_ids.clone(),
+            reply_delays: daemon.dhcp_reply_delays.clone(),
+            contexts: daemon.dhcp.clone(),
+            dhcp_opts: daemon.dhcp_opts.clone(),
+            boot_configs: daemon.boot_config.clone(),
+            domain_suffix: daemon.domain_suffix.clone(),
+        },
+        loop_opts: crate::dhcp::DhcpLoopOptions {
+            reply_port_override: (client_port != 68).then_some(client_port),
+        },
+    })
+}
+
 /// Run the main daemon event loop.
 ///
 /// This function:
@@ -179,20 +258,28 @@ pub async fn run_main_loop(
 ) -> RunResult {
     use std::sync::Arc;
     use tokio::net::UdpSocket;
+    #[cfg(feature = "dhcp")]
+    use tokio::sync::watch;
     use tokio::signal::unix::{signal, SignalKind};
     use tracing::{error, info, warn};
 
     use crate::forward::{ForwardConfig, ForwardEngine, run_forward_loop};
+    #[cfg(feature = "dhcp")]
+    use crate::dhcp::{DhcpLoopOptions, run_dhcp_loop};
 
     // ── Resolve configuration ────────────────────────────────────────────────
-    let (port, upstreams) = {
+    let (port, upstreams, dhcp_runtime) = {
         let d = daemon_handle.read().await;
         let ups: Vec<_> = d
             .servers
             .iter()
             .map(|s| SocketAddr::from(s.addr.clone()))
             .collect();
-        (d.port, ups)
+        #[cfg(feature = "dhcp")]
+        let dhcp_runtime = daemon_dhcp_runtime(&d);
+        #[cfg(not(feature = "dhcp"))]
+        let dhcp_runtime = ();
+        (d.port, ups, dhcp_runtime)
     };
 
     // ── Bind the DNS listening socket ────────────────────────────────────────
@@ -218,14 +305,74 @@ pub async fn run_main_loop(
         }
     });
 
+    #[cfg(feature = "dhcp")]
+    let (dhcp_task, dhcp_shutdown_tx) = if let Some(dhcp_runtime) = dhcp_runtime {
+        let bind_addr = dhcp_runtime.bind_addr;
+        let dhcp_sock = match UdpSocket::bind(bind_addr).await {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                error!("failed to bind DHCP socket on {bind_addr}: {e}");
+                fwd_task.abort();
+                return RunResult::IoError;
+            }
+        };
+        info!("listening for DHCP packets on {bind_addr}");
+        #[cfg(all(unix, target_os = "linux"))]
+        if let Some(device) = dhcp_runtime.bind_interface.as_deref() {
+            use std::os::unix::io::AsRawFd;
+            match crate::dhcp_common::bindtodevice(device, dhcp_sock.as_raw_fd()) {
+                Ok(true) => info!("bound DHCP socket to interface {device}"),
+                Ok(false) => warn!("permission denied binding DHCP socket to interface {device}; continuing"),
+                Err(e) => {
+                    error!("failed to bind DHCP socket to interface {device}: {e}");
+                    fwd_task.abort();
+                    return RunResult::IoError;
+                }
+            }
+        }
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            if let Err(e) = run_dhcp_loop(dhcp_sock, dhcp_runtime.server, dhcp_runtime.loop_opts, shutdown_rx).await {
+                error!("dhcp loop exited: {e}");
+            }
+        });
+        (Some(task), Some(shutdown_tx))
+    } else {
+        (None, None)
+    };
+
     // ── Signal handling ──────────────────────────────────────────────────────
     let mut sigterm = match signal(SignalKind::terminate()) {
         Ok(s) => s,
-        Err(_) => { fwd_task.abort(); return RunResult::IoError; }
+        Err(_) => {
+            #[cfg(feature = "dhcp")]
+            {
+                if let Some(tx) = dhcp_shutdown_tx.as_ref() {
+                    let _ = tx.send(true);
+                }
+                if let Some(task) = dhcp_task.as_ref() {
+                    task.abort();
+                }
+            }
+            fwd_task.abort();
+            return RunResult::IoError;
+        }
     };
     let mut sighup = match signal(SignalKind::hangup()) {
         Ok(s) => s,
-        Err(_) => { fwd_task.abort(); return RunResult::IoError; }
+        Err(_) => {
+            #[cfg(feature = "dhcp")]
+            {
+                if let Some(tx) = dhcp_shutdown_tx.as_ref() {
+                    let _ = tx.send(true);
+                }
+                if let Some(task) = dhcp_task.as_ref() {
+                    task.abort();
+                }
+            }
+            fwd_task.abort();
+            return RunResult::IoError;
+        }
     };
 
     let result = loop {
@@ -248,6 +395,15 @@ pub async fn run_main_loop(
     };
 
     fwd_task.abort();
+    #[cfg(feature = "dhcp")]
+    {
+        if let Some(tx) = dhcp_shutdown_tx {
+            let _ = tx.send(true);
+        }
+        if let Some(task) = dhcp_task {
+            let _ = task.await;
+        }
+    }
     result
 }
 
@@ -506,6 +662,114 @@ mod tests {
         let gid = nix::unistd::getgid().as_raw();
         // Should succeed without any syscall since uid/gid already match.
         drop_privileges(uid, gid).expect("drop_privileges failed for current user");
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn daemon_dhcp_runtime_none_without_range() {
+        let daemon = Daemon::default();
+        assert!(daemon_dhcp_runtime(&daemon).is_none());
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn daemon_dhcp_runtime_uses_first_range_and_rules() {
+        use crate::types::dhcp::{DhcpContext, DhcpNetid, DhcpReplyDelay, CONTEXT_DHCP};
+
+        let mut daemon = Daemon::default();
+        daemon.dhcp.push(DhcpContext {
+            lease_time: 3600,
+            addr_epoch: 0,
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::new(10, 0, 0, 255),
+            local: Ipv4Addr::UNSPECIFIED,
+            router: Ipv4Addr::new(10, 0, 0, 1),
+            start: Ipv4Addr::new(10, 0, 0, 100),
+            end: Ipv4Addr::new(10, 0, 0, 150),
+            flags: CONTEXT_DHCP,
+            netid: DhcpNetid { net: "default".into() },
+            filter: vec![],
+            #[cfg(feature = "dhcp6")]
+            start6: std::net::Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            end6: std::net::Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            local6: std::net::Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            prefix: 0,
+            #[cfg(feature = "dhcp6")]
+            if_index: 0,
+            #[cfg(feature = "dhcp6")]
+            valid: 0,
+            #[cfg(feature = "dhcp6")]
+            preferred: 0,
+        });
+        daemon.dhcp_server_port = 1067;
+        daemon.dhcp_reply_delays.push(DhcpReplyDelay {
+            delay_secs: 3,
+            filter: vec![DhcpNetid { net: "pxe".into() }],
+        });
+
+        let runtime = daemon_dhcp_runtime(&daemon).expect("dhcp runtime should be built");
+        assert_eq!(runtime.bind_addr, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 1067)));
+        assert_eq!(runtime.server.pool_start, Ipv4Addr::new(10, 0, 0, 100));
+        assert_eq!(runtime.server.pool_end, Ipv4Addr::new(10, 0, 0, 150));
+        assert_eq!(runtime.server.server_ip, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(runtime.server.reply_delays.len(), 1);
+        assert_eq!(runtime.loop_opts.reply_port_override, None);
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn daemon_dhcp_runtime_uses_listen_address_interface_and_alt_client_port() {
+        use crate::types::dhcp::{DhcpContext, DhcpNetid, CONTEXT_DHCP};
+        use crate::types::network::Iname;
+
+        let mut daemon = Daemon::default();
+        daemon.if_addrs.push(Iname {
+            name: None,
+            addr: Some(MySockAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 0))),
+            flags: 0,
+        });
+        daemon.if_names.push(Iname {
+            name: Some("eth-test".into()),
+            addr: None,
+            flags: 0,
+        });
+        daemon.dhcp.push(DhcpContext {
+            lease_time: 3600,
+            addr_epoch: 0,
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::new(127, 0, 0, 255),
+            local: Ipv4Addr::UNSPECIFIED,
+            router: Ipv4Addr::new(127, 0, 0, 1),
+            start: Ipv4Addr::new(127, 0, 0, 10),
+            end: Ipv4Addr::new(127, 0, 0, 20),
+            flags: CONTEXT_DHCP,
+            netid: DhcpNetid { net: "default".into() },
+            filter: vec![],
+            #[cfg(feature = "dhcp6")]
+            start6: std::net::Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            end6: std::net::Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            local6: std::net::Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            prefix: 0,
+            #[cfg(feature = "dhcp6")]
+            if_index: 0,
+            #[cfg(feature = "dhcp6")]
+            valid: 0,
+            #[cfg(feature = "dhcp6")]
+            preferred: 0,
+        });
+        daemon.dhcp_server_port = 1067;
+        daemon.dhcp_client_port = 1068;
+
+        let runtime = daemon_dhcp_runtime(&daemon).expect("dhcp runtime should be built");
+        assert_eq!(runtime.bind_addr, SocketAddr::from((Ipv4Addr::new(127, 0, 0, 1), 1067)));
+        assert_eq!(runtime.bind_interface.as_deref(), Some("eth-test"));
+        assert_eq!(runtime.loop_opts.reply_port_override, Some(1068));
     }
 
     // ── SIGHUP reload ─────────────────────────────────────────────────────────

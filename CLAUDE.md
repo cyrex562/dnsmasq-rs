@@ -1,171 +1,152 @@
-# CLAUDE.md — dnsmasq-rs
+# CLAUDE.md
 
-## Project Overview
+## Overview
 
-Rust port of [dnsmasq](https://thekelleys.org.uk/dnsmasq/doc.html), a DNS forwarder and DHCP server. The original C source (~47k lines, 42 files) lives in `original_dnsmasq_src/dnsmasq-master/src/` for reference. Prior skeleton/partial files live in `old/` — evaluate before reusing.
+`dnsmasq-rs` is an in-progress Rust port of the upstream `dnsmasq` binary. The target is behavioral parity for the supported feature set, with safe Rust internals and strong regression coverage.
 
-## Build & Test
+This repository already contains broad module coverage and substantial tests, but it should not yet be described as feature-complete or upstream-equivalent.
+
+Primary references:
+
+- Upstream C source: `original_dnsmasq_src/dnsmasq-master/src/`
+- Earlier Rust attempt: `old/`
+- Current execution tracker: `tasks.md`
+
+The upstream tree and `old/` tree are reference-only.
+
+## What Matters Most
+
+Current top priorities:
+
+1. Complete `src/option.rs` enough to support realistic config parity fixtures.
+2. Close the behavioral gap in `src/dnsmasq.rs` and `src/main.rs` for startup, reload, and runtime control flow.
+3. Separate or harden permission-sensitive runtime tests so restricted environments do not produce misleading failures.
+4. Build functional parity tests that compare `dnsmasq-rs` against the original dnsmasq binary under identical fixtures.
+
+Module presence is not the same as parity. Passing unit tests are not the same as executable equivalence.
+
+## Build And Test Reality
+
+Useful commands:
 
 ```bash
-cargo build                          # default features
-cargo build --all-features           # all features
-cargo build --no-default-features    # minimal build
-cargo test                           # all tests (1306+ unit + integration)
-cargo test <name>                    # run specific test by substring
-cargo test --test dns_roundtrip      # specific integration test
-cargo test proptest                  # property-based tests only
-cargo check --all-features           # feature-gate validation
-RUST_LOG=debug cargo run             # run with debug logging
+cargo test -- --list
+cargo test
+cargo test --test dns_roundtrip
+cargo test proptest
+cargo build
+cargo build --no-default-features
+cargo check
 ```
 
-**Known test issue:** `network::tests::make_sock_ipv6_creates_socket` fails in environments without IPv6 support — this is an environment limitation, not a code bug.
+Current state observed in this environment:
 
-## Architecture
+- `cargo test -- --list` reports about `1306` unit and integration tests plus the existing property-based suites.
+- Full `cargo test` is not clean in this sandbox.
+  Observed result: `1287` passed, `19` failed.
+  Failure class: permission-sensitive socket or interface tests in `network`, `forward`, and `dhcp_common`.
+- `cargo check --all-features` was not confirmed in this session because dependency unpacking hit a read-only cargo registry path in the sandbox.
 
-### Central State
+Interpretation:
 
-`DaemonHandle = Arc<RwLock<Daemon>>` in `src/types/daemon.rs`. All async tasks receive a clone. Never store a raw `Daemon`.
+- Core logic coverage is already substantial.
+- Runtime and environment-sensitive behavior still needs work.
+- The repository does not yet have the upstream parity harness required to prove binary-equivalent behavior.
 
-### Module Map
+## Architecture Notes
 
-| Module | C Source | LOC (Rust) | LOC (C) | Status |
-|--------|----------|------------|---------|--------|
-| `rfc1035.rs` | rfc1035.c | 2401 | 2400 | Complete (expanded) |
-| `cache.rs` | cache.c | 2388 | 2500 | Complete |
-| `forward.rs` | forward.c | 2431 | 3319 | Mostly complete |
-| `rfc2131.rs` | rfc2131.c | 2019 | 3265 | Partial (~62%) |
-| `network.rs` | network.c | 1673 | 1812 | Mostly complete |
-| `dhcp_common.rs` | dhcp-common.c | 1668 | 1081 | Complete (expanded) |
-| `netlink.rs` | netlink.c | 1144 | 414 | Complete (expanded) |
-| `lease.rs` | lease.c | 1451 | 1346 | Complete (expanded) |
-| `option.rs` | option.c | 1685 | 6322 | Partial (~27%) |
-| `dnssec.rs` | dnssec.c | 1580 | 2410 | Partial (~66%) |
-| `domain_match.rs` | domain-match.c | 913 | 778 | Complete |
-| `dnsmasq.rs` | dnsmasq.c | 863 | 2478 | Partial (~35%) |
-| `util.rs` | util.c | 937 | 1006 | Mostly complete |
-| `rfc3315.rs` | rfc3315.c | 1195 | 2348 | Partial (~51%) |
-| `auth.rs` | auth.c | 862 | 915 | Mostly complete |
-| `tftp.rs` | tftp.c | 1017 | 1040 | Mostly complete |
-| `radv.rs` | radv.c | 786 | 1039 | Mostly complete |
-| `dump.rs` | dump.c | 513 | 303 | Complete (expanded) |
-| `helper.rs` | helper.c | 803 | 948 | Mostly complete |
-| `arp.rs` | arp.c | 498 | 240 | Complete (expanded) |
-| `edns0.rs` | edns0.c | 664 | 574 | Complete (expanded) |
-| `log.rs` | log.c | 416 | 494 | Mostly complete |
-| `outpacket.rs` | outpacket.c | 361 | 118 | Complete |
-| `dhcp.rs` | dhcp.c | 870 | 1124 | Partial (~77%) |
-| `crypto.rs` | crypto.c | 625 | 504 | Complete (expanded) |
-| `dhcp6.rs` | dhcp6.c | 616 | 881 | Partial (~70%) |
-| `rrfilter.rs` | rrfilter.c | 287 | 413 | Mostly complete |
-| `pattern.rs` | pattern.c | 283 | 386 | Mostly complete |
-| `poll.rs` | poll.c | 259 | 118 | Complete (expanded) |
-| `loop_detect.rs` | loop.c | 212 | 113 | Complete |
-| `ipset.rs` | ipset.c | 209 | 216 | Mostly complete |
-| `conntrack.rs` | conntrack.c | 199 | 85 | Complete (expanded) |
-| `domain.rs` | domain.c | 614 | 301 | Complete (expanded) |
-| `blockdata.rs` | blockdata.c | 149 | 241 | Complete |
-| `slaac.rs` | slaac.c | 365 | 213 | Complete (expanded) |
-| `ubus.rs` | ubus.c | 142 | 391 | Partial (~36%) |
-| `inotify.rs` | inotify.c | 142 | 372 | Partial (~38%) |
-| `nftset.rs` | nftset.c | 140 | 100 | Complete |
-| `bpf.rs` | bpf.c | 135 | 440 | Partial (~31%) |
-| `dbus.rs` | dbus.c | 101 | 1106 | Partial (~9%) |
-| `tables.rs` | tables.c | 95 | 144 | Mostly complete |
-| `metrics/` | metrics.c/h | 128 | 128 | Complete |
+Central state:
 
-### Porting Priority (files needing most work)
+- `DaemonHandle = Arc<RwLock<Daemon>>` in `src/types/daemon.rs`
 
-1. **option.rs** — Config parser ~27% ported (1685 vs 6322 LOC). Critical for full functionality.
-2. **dnsmasq.rs** — Main daemon logic ~35% ported (863 vs 2478 LOC). Event system and resolv monitor added.
-3. **rfc2131.rs** — DHCP server ~62% ported. Missing some option handlers.
-4. **rfc3315.rs** — DHCPv6 ~51% ported.
-5. **dnssec.rs** — DNSSEC validation ~66% ported.
-6. **dhcp.rs** — DHCP listener ~77% ported.
-7. **dhcp6.rs** — DHCPv6 listener ~70% ported.
-8. **dbus.rs** — D-Bus integration ~9% ported.
-9. **bpf.rs** — BPF support ~31% ported.
-10. **ubus.rs** — uBus integration ~36% ported.
+Important modules:
 
-### Type System
+- `src/option.rs`
+  Config parsing and application. This is one of the main parity blockers because many directives are still partial or stubbed.
 
-| Path | Purpose |
-|------|---------|
-| `src/types/daemon.rs` | Central `Daemon` struct (port of C global state) |
-| `src/types/addr.rs` | `AllAddr`, `MySockAddr` etc. |
-| `src/types/constants.rs` | F_* flags, option bits |
-| `src/types/cache.rs` | Cache record types |
-| `src/types/dns_records.rs` | MX, SRV, TXT, CNAME record types |
-| `src/types/server.rs` | Upstream server config |
-| `src/types/network.rs` | Network interface types |
-| `src/types/dhcp.rs` | DHCP types (feature `dhcp`) |
+- `src/dnsmasq.rs` and `src/main.rs`
+  Startup, daemon control flow, signal handling, and reload path. Present, but simplified relative to upstream.
 
-### Protocol Constants
+- `src/rfc1035.rs`, `src/cache.rs`, `src/forward.rs`
+  Core DNS packet, cache, and forwarding logic. Broadly implemented with strong internal coverage, but still need parity validation.
 
-| Path | Source Header |
-|------|--------------|
-| `src/dns_protocol/mod.rs` | dns-protocol.h |
-| `src/dhcp_protocol/mod.rs` | dhcp-protocol.h |
-| `src/dhcp6_protocol/mod.rs` | dhcp6-protocol.h |
-| `src/radv_protocol/mod.rs` | radv-protocol.h |
+- `src/rfc2131.rs`, `src/dhcp.rs`, `src/rfc3315.rs`, `src/dhcp6.rs`, `src/radv.rs`
+  DHCPv4, DHCPv6, and RA behavior. Useful internal coverage exists, but config-driven and executable-level parity is still incomplete.
 
-### Feature Flags
+- `src/network.rs`, `src/dhcp_common.rs`
+  Runtime socket and interface behavior. Important because current failures cluster here in restricted environments.
 
-Default: `dhcp dhcp6 dnssec auth tftp loop inotify dump bpf`
-Optional: `conntrack dbus ubus ipset nftset`
+## Porting Rules
 
-Feature-gated code uses `#[cfg(feature = "...")]` on mod declarations and implementations.
+- Preserve observable upstream behavior first.
+- Prefer safe Rust types and ownership-based design, but do not invent new semantics accidentally.
+- Map C unions, pointers, and flags into reviewable Rust forms without losing wire-format or decision logic.
+- Treat placeholder acceptance of config directives as a bug, not a convenience.
+- Keep unsupported behavior explicit in docs and TODOs.
 
-## Conventions
+## Testing Strategy
 
-- **Types:** C unions → Rust enums, null pointers → `Option<T>`, raw sockets → `socket2`/`nix`/`tokio`
-- **Errors:** Central `DnsmasqError` (thiserror). Module-local errors implement `From` into `DnsmasqError`.
-- **Testing:** Unit tests in `#[cfg(test)]` blocks. Integration tests in `tests/`. Property tests via `proptest`.
-- **Constants:** F_* flags are `const u32` in `types/constants.rs`. Use `cache::type_flags()` for type bits.
-- **Async:** tokio runtime started in `main.rs`. Signal handling via `tokio::signal::unix`. Daemonization must precede tokio start (fork safety).
-- **Naming:** Rust snake_case. Module names match C file names with `-` → `_` (e.g., `dhcp-common.c` → `dhcp_common.rs`).
+This project needs three layers of confidence.
 
-## Test Coverage Summary
+### 1. Unit Tests
 
-| Module | Tests | Notes |
-|--------|-------|-------|
-| cache.rs | 71 | Excellent — LRU, TTL, eviction, flags |
-| lease.rs | 60 | Excellent — allocate, expire, hwaddr, hostname, file I/O |
-| forward.rs | 54 | Good — forwarding, retry, TCP fallback |
-| dhcp_common.rs | 53 | Good — DHCP utilities |
-| rfc2131.rs | 48 | Good — DHCP protocol |
-| rfc1035.rs | 47 | Good — DNS parser/encoder |
-| network.rs | 41 | Good (1 env-dependent failure) |
-| tftp.rs | 36 | Good — packet ops, transfer state, sanitization, options |
-| option.rs | 32 | Moderate — config parsing |
-| dnssec.rs | 29 | Good — validation logic |
-| domain_match.rs | 26 | Good |
-| util.rs | 24 | Good |
-| rfc3315.rs | 42 | Good — DHCPv6, IA helpers, lifetime calc, status codes |
-| helper.rs | 24 | Good — script exec, format, queue, roundtrip |
-| dnsmasq.rs | 22 | Good — event system, resolv monitor, ICMP pinger |
-| domain.rs | 21 | Good — range checks, synthesis, IPv6 helpers |
-| radv.rs | 20 | Good — RA scheduling, priority, interval calc |
-| crypto.rs | 20 | Good — RSA, ECDSA, Ed25519 parsing + verification |
-| pattern.rs | 14 | Good |
-| netlink.rs | 14 | Good |
-| arp.rs | 14 | Good |
-| edns0.rs | 13 | Good |
-| blockdata.rs | 11 | Good — alloc, stats, IO |
-| Integration tests | 6 files | proptest, roundtrip, cache, config |
+Use for deterministic logic:
 
-## Files Not to Modify
+- parsers
+- state transitions
+- cache operations
+- packet construction
+- config application
 
-- `original_dnsmasq_src/` — Reference C source (read-only)
-- `old/` — Prior attempt skeletons (read-only reference)
+### 2. Property-Based Tests
 
-## Key Dependencies
+Use for:
 
-- **Runtime:** tokio (full)
-- **CLI:** clap (derive)
-- **Errors:** thiserror
-- **Logging:** tracing, tracing-subscriber
-- **Network:** nix 0.29, socket2, if-addrs, libc, caps
-- **Crypto:** ring, rsa 0.9, sha2, p256, p384, ed25519-dalek
-- **Collections:** bytes, lru 0.12
-- **Testing:** proptest, tempfile
-- **Optional:** zbus (D-Bus, feature `dbus`)
+- parser panic-freedom
+- protocol roundtrips
+- invariant preservation
+- replacement and expiry behavior in stateful structures
+
+### 3. Functional Parity Tests
+
+This layer is still missing and must be built.
+
+Required shape:
+
+- launch upstream dnsmasq and `dnsmasq-rs` with the same fixture inputs
+- use isolated temp directories and test-specific ports
+- drive both binaries with the same DNS and DHCP requests
+- compare normalized behavior, not brittle log formatting
+
+Required parity areas:
+
+- DNS forwarding and reply semantics
+- cache behavior and expiry
+- config acceptance and rejection
+- DHCPv4 exchanges
+- DHCPv6 and RA behavior for supported scenarios
+- local data, filtering, and rebind protections
+- SIGHUP reload and related runtime state changes
+
+## Guidance For Contributors
+
+When implementing new work:
+
+- Start from upstream behavior, not from line-count completion goals.
+- Add tests in the same change.
+- Add a regression test for every bug found.
+- Keep capability-dependent tests distinct from pure logic tests.
+- Update `tasks.md` when a blocker is resolved or re-scoped.
+
+When reviewing:
+
+- Check for semantic drift against upstream.
+- Check that docs do not overclaim completion.
+- Check that externally visible behavior is either tested or still tracked as incomplete.
+
+## Files To Treat As Read-Only References
+
+- `original_dnsmasq_src/`
+- `old/`
+
+Do not edit those trees as part of the Rust implementation.

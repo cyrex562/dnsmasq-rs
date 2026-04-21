@@ -27,6 +27,10 @@ pub struct DhcpReply {
     pub siaddr: Ipv4Addr,
     /// Relay-agent IP address (`giaddr`).
     pub giaddr: Ipv4Addr,
+    /// Optional BOOTP server host name (`sname`).
+    pub sname: Option<String>,
+    /// Optional BOOTP boot file name (`file`).
+    pub file: Option<String>,
 }
 
 /// Encode a DHCP option-53 (message type) TLV.
@@ -49,7 +53,11 @@ fn pick_offer_addr(
     pool_start: Ipv4Addr,
     pool_end: Ipv4Addr,
     existing_lease: Option<&DhcpLease>,
+    static_addr: Option<Ipv4Addr>,
 ) -> Option<Ipv4Addr> {
+    if let Some(addr) = static_addr {
+        return Some(addr);
+    }
     if let Some(lease) = existing_lease {
         if in_pool(lease.addr, pool_start, pool_end) {
             return Some(lease.addr);
@@ -89,14 +97,17 @@ pub fn handle_discover(
     pool_end: Ipv4Addr,
     existing_lease: Option<&DhcpLease>,
     server_id: Ipv4Addr,
+    static_addr: Option<Ipv4Addr>,
 ) -> Option<DhcpReply> {
-    let yiaddr = pick_offer_addr(pool_start, pool_end, existing_lease)?;
+    let yiaddr = pick_offer_addr(pool_start, pool_end, existing_lease, static_addr)?;
     Some(DhcpReply {
         msg_type: DhcpMsgType::Offer,
         yiaddr,
         options: build_reply_options(DhcpMsgType::Offer, server_id),
         siaddr: server_id,
         giaddr: pkt.giaddr,
+        sname: None,
+        file: None,
     })
 }
 
@@ -110,17 +121,26 @@ pub fn handle_request(
     pool_start: Ipv4Addr,
     pool_end: Ipv4Addr,
     server_id: Ipv4Addr,
+    static_addr: Option<Ipv4Addr>,
 ) -> Option<DhcpReply> {
-    // Find the requested IP (option 50) in the packet options.
-    let requested = find_requested_ip(&pkt.options)?;
+    // Find the requested IP (option 50) in the packet options, falling back to
+    // ciaddr for the renewal/rebind path.
+    let requested = find_requested_ip(&pkt.options)
+        .or_else(|| (pkt.ciaddr != Ipv4Addr::UNSPECIFIED).then_some(pkt.ciaddr))?;
 
-    if in_pool(requested, pool_start, pool_end) {
+    let in_range = static_addr.map(|addr| requested == addr).unwrap_or_else(|| {
+        in_pool(requested, pool_start, pool_end)
+    });
+
+    if in_range {
         Some(DhcpReply {
             msg_type: DhcpMsgType::Ack,
-            yiaddr: requested,
+            yiaddr: static_addr.unwrap_or(requested),
             options: build_reply_options(DhcpMsgType::Ack, server_id),
             siaddr: server_id,
             giaddr: pkt.giaddr,
+            sname: None,
+            file: None,
         })
     } else {
         Some(DhcpReply {
@@ -129,6 +149,8 @@ pub fn handle_request(
             options: build_reply_options(DhcpMsgType::Nak, server_id),
             siaddr: Ipv4Addr::UNSPECIFIED,
             giaddr: pkt.giaddr,
+            sname: None,
+            file: None,
         })
     }
 }
@@ -160,6 +182,8 @@ pub fn handle_inform(pkt: &DhcpPacket, server_id: Ipv4Addr) -> Option<DhcpReply>
         options:  build_reply_options(DhcpMsgType::Ack, server_id),
         siaddr:   server_id,
         giaddr:   pkt.giaddr,
+        sname:    None,
+        file:     None,
     })
 }
 
@@ -789,13 +813,11 @@ pub fn prune_vendor_opts(
     let mut force = false;
     for opt in opts.iter_mut() {
         if (opt.flags & DHOPT_VENDOR_MATCH) != 0 {
-            let opt_netids: Vec<_> = opt.netid.iter().collect();
-            if !match_netid(netid, netid) {
+            if !match_netid(netid, &opt.netid) {
                 opt.flags &= !DHOPT_VENDOR_MATCH;
             } else if (opt.flags & DHOPT_FORCE) != 0 {
                 force = true;
             }
-            let _ = opt_netids; // suppress unused warning
         }
     }
     force
@@ -1207,15 +1229,13 @@ pub fn find_boot<'a>(
     // First try to find one with a matching tag
     if let Some(tag) = netid {
         for b in boot_configs {
-            if let Some(ref n) = b.netid {
-                if n.net == tag {
-                    return Some(b);
-                }
+            if b.netid.iter().any(|n| n.net == tag) {
+                return Some(b);
             }
         }
     }
     // Fall back to untagged entry
-    boot_configs.iter().find(|b| b.netid.is_none())
+    boot_configs.iter().find(|b| b.netid.is_empty())
 }
 
 #[cfg(all(test, feature = "dhcp"))]
@@ -1427,7 +1447,7 @@ mod tests {
         let start = Ipv4Addr::new(192, 168, 1, 10);
         let end = Ipv4Addr::new(192, 168, 1, 200);
         let server = Ipv4Addr::new(192, 168, 1, 1);
-        let reply = handle_discover(&pkt, start, end, None, server).unwrap();
+        let reply = handle_discover(&pkt, start, end, None, server, None).unwrap();
         assert_eq!(reply.msg_type, DhcpMsgType::Offer);
         assert!(in_pool(reply.yiaddr, start, end));
     }
@@ -1467,7 +1487,7 @@ mod tests {
             #[cfg(feature = "dhcp6")]
             vendorclass_count: 0,
         };
-        let reply = handle_discover(&pkt, start, end, Some(&lease), server).unwrap();
+        let reply = handle_discover(&pkt, start, end, Some(&lease), server, None).unwrap();
         assert_eq!(reply.yiaddr, lease_addr);
     }
 
@@ -1479,7 +1499,7 @@ mod tests {
         let requested = Ipv4Addr::new(192, 168, 1, 50);
         let mut pkt = base_packet();
         pkt.options = opts_with_requested_ip(requested);
-        let reply = handle_request(&pkt, start, end, server).unwrap();
+        let reply = handle_request(&pkt, start, end, server, None).unwrap();
         assert_eq!(reply.msg_type, DhcpMsgType::Ack);
         assert_eq!(reply.yiaddr, requested);
     }
@@ -1492,7 +1512,7 @@ mod tests {
         let out_of_pool = Ipv4Addr::new(10, 0, 0, 1);
         let mut pkt = base_packet();
         pkt.options = opts_with_requested_ip(out_of_pool);
-        let reply = handle_request(&pkt, start, end, server).unwrap();
+        let reply = handle_request(&pkt, start, end, server, None).unwrap();
         assert_eq!(reply.msg_type, DhcpMsgType::Nak);
     }
 
@@ -1618,7 +1638,7 @@ mod tests {
     fn do_opt_len_only() {
         use crate::types::dhcp::{DhcpOpt, DHOPT_STRING};
         let opt = DhcpOpt { opt: 15, flags: DHOPT_STRING, val: Some(b"hi".to_vec()),
-                            netid: None, encap: 0, vendor_class: None };
+                            netid: vec![], encap: 0, vendor_class: None };
         // null_term → len + 1
         assert_eq!(do_opt(&opt, None, None, true), 3);
         assert_eq!(do_opt(&opt, None, None, false), 2);
@@ -1628,7 +1648,7 @@ mod tests {
     fn do_opt_writes_data() {
         use crate::types::dhcp::{DhcpOpt, DHOPT_STRING};
         let opt = DhcpOpt { opt: 15, flags: DHOPT_STRING, val: Some(b"hi".to_vec()),
-                            netid: None, encap: 0, vendor_class: None };
+                            netid: vec![], encap: 0, vendor_class: None };
         let mut buf = vec![0u8; 2];
         let n = do_opt(&opt, Some(&mut buf), None, false);
         assert_eq!(n, 2);
@@ -1639,7 +1659,7 @@ mod tests {
     fn do_opt_null_terminator() {
         use crate::types::dhcp::{DhcpOpt, DHOPT_STRING};
         let opt = DhcpOpt { opt: 15, flags: DHOPT_STRING, val: Some(b"hi".to_vec()),
-                            netid: None, encap: 0, vendor_class: None };
+                            netid: vec![], encap: 0, vendor_class: None };
         let mut buf = vec![0u8; 3];
         do_opt(&opt, Some(&mut buf), None, true);
         assert_eq!(buf[2], 0, "null terminator should be appended");
@@ -1653,7 +1673,7 @@ mod tests {
         let mut opts = vec![DhcpOpt {
             opt: 43, flags: DHOPT_VENDOR,
             val: Some(b"v".to_vec()),
-            netid: None, encap: 0,
+            netid: vec![], encap: 0,
             vendor_class: Some(b"PXEClient".to_vec()),
         }];
         match_vendor_opts(Some(b"PXEClient:Arch:00000"), &mut opts);
@@ -1666,7 +1686,7 @@ mod tests {
         let mut opts = vec![DhcpOpt {
             opt: 43, flags: DHOPT_VENDOR,
             val: Some(b"v".to_vec()),
-            netid: None, encap: 0,
+            netid: vec![], encap: 0,
             vendor_class: Some(b"PXEClient".to_vec()),
         }];
         match_vendor_opts(Some(b"MSFT 5.0"), &mut opts);
@@ -1679,7 +1699,7 @@ mod tests {
         let mut opts = vec![DhcpOpt {
             opt: 43, flags: DHOPT_VENDOR | DHOPT_VENDOR_MATCH,
             val: Some(b"v".to_vec()),
-            netid: None, encap: 0,
+            netid: vec![], encap: 0,
             vendor_class: Some(b"PXEClient".to_vec()),
         }];
         // No vc_data → should clear VENDOR_MATCH.
@@ -1984,13 +2004,13 @@ mod tests {
                 file: Some("default.img".into()),
                 sname: None, tftp_sname: None,
                 next_server: Ipv4Addr::UNSPECIFIED,
-                netid: None,
+                netid: vec![],
             },
             DhcpBoot {
                 file: Some("special.img".into()),
                 sname: None, tftp_sname: None,
                 next_server: Ipv4Addr::UNSPECIFIED,
-                netid: Some(DhcpNetid { net: "lab".into() }),
+                netid: vec![DhcpNetid { net: "lab".into() }],
             },
         ];
         let result = find_boot(&boots, Some("lab"));
@@ -2005,7 +2025,7 @@ mod tests {
                 file: Some("default.img".into()),
                 sname: None, tftp_sname: None,
                 next_server: Ipv4Addr::UNSPECIFIED,
-                netid: None,
+                netid: vec![],
             },
         ];
         let result = find_boot(&boots, Some("nomatch"));

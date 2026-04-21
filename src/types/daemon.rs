@@ -127,6 +127,16 @@ pub struct Daemon {
     #[cfg(feature = "dhcp")]
     pub dhcp_opts6:      Vec<DhcpOpt>,
     #[cfg(feature = "dhcp")]
+    pub dhcp_vendors:    Vec<DhcpVendorRule>,
+    #[cfg(feature = "dhcp")]
+    pub dhcp_userclasses: Vec<DhcpUserClassRule>,
+    #[cfg(feature = "dhcp")]
+    pub dhcp_macs:      Vec<DhcpMacRule>,
+    #[cfg(feature = "dhcp")]
+    pub dhcp_relay_ids: Vec<DhcpRelayIdRule>,
+    #[cfg(feature = "dhcp")]
+    pub dhcp_reply_delays: Vec<DhcpReplyDelay>,
+    #[cfg(feature = "dhcp")]
     pub boot_config:     Vec<DhcpBoot>,
     #[cfg(feature = "dhcp")]
     pub dhcp_ttl:        u32,
@@ -194,19 +204,19 @@ pub struct Daemon {
 impl Daemon {
     /// Test whether an option bit is set.
     pub fn option_bool(&self, opt: usize) -> bool {
-        let bits = usize::BITS as usize;
+        let bits = u32::BITS as usize;
         self.options[opt / bits] & (1u32 << (opt % bits)) != 0
     }
 
     /// Set an option bit.
     pub fn set_option(&mut self, opt: usize) {
-        let bits = usize::BITS as usize;
+        let bits = u32::BITS as usize;
         self.options[opt / bits] |= 1u32 << (opt % bits);
     }
 
     /// Clear an option bit.
     pub fn clear_option(&mut self, opt: usize) {
-        let bits = usize::BITS as usize;
+        let bits = u32::BITS as usize;
         self.options[opt / bits] &= !(1u32 << (opt % bits));
     }
 }
@@ -256,7 +266,7 @@ impl Default for Daemon {
             max_cache_ttl: 0,
             auth_ttl: 0,
             cachesize: 150,
-            ftabsize: 1000,
+            ftabsize: 150,
             cache_max_expiry: -1,
             fast_retry_time: 0,
             fast_retry_timeout: 0,
@@ -304,6 +314,16 @@ impl Default for Daemon {
             dhcp_opts: vec![],
             #[cfg(feature = "dhcp")]
             dhcp_opts6: vec![],
+            #[cfg(feature = "dhcp")]
+            dhcp_vendors: vec![],
+            #[cfg(feature = "dhcp")]
+            dhcp_userclasses: vec![],
+            #[cfg(feature = "dhcp")]
+            dhcp_macs: vec![],
+            #[cfg(feature = "dhcp")]
+            dhcp_relay_ids: vec![],
+            #[cfg(feature = "dhcp")]
+            dhcp_reply_delays: vec![],
             #[cfg(feature = "dhcp")]
             boot_config: vec![],
             #[cfg(feature = "dhcp")]
@@ -369,7 +389,7 @@ impl Default for Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::constants::{OPT_DEBUG, OPT_NO_POLL};
+    use crate::types::constants::{OPT_DEBUG, OPT_DNSSEC_VALID, OPT_NO_POLL};
 
     #[test]
     fn option_set_get_clear() {
@@ -391,6 +411,16 @@ mod tests {
         d.clear_option(OPT_DEBUG);
         assert!(!d.option_bool(OPT_DEBUG));
         assert!(d.option_bool(OPT_NO_POLL));
+    }
+
+    #[test]
+    fn high_option_bit_set_get_clear() {
+        let mut d = Daemon::default();
+        assert!(!d.option_bool(OPT_DNSSEC_VALID));
+        d.set_option(OPT_DNSSEC_VALID);
+        assert!(d.option_bool(OPT_DNSSEC_VALID));
+        d.clear_option(OPT_DNSSEC_VALID);
+        assert!(!d.option_bool(OPT_DNSSEC_VALID));
     }
 
     #[test]
