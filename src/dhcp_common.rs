@@ -798,13 +798,7 @@ pub fn option_filter(
         if opt.flags & (DHOPT_ENCAPSULATE | DHOPT_VENDOR | DHOPT_RFC3925) != 0 {
             continue;
         }
-        let netid_matches = match &opt.netid {
-            None        => false, // untagged options handled in phase 3
-            Some(netid) => {
-                let single = std::slice::from_ref(netid);
-                match_netid_wild(single, &tagif)
-            }
-        };
+        let netid_matches = !opt.netid.is_empty() && match_netid_wild(&opt.netid, &tagif);
         if netid_matches && pxe_ok(opt, pxemode) {
             opt.flags |= DHOPT_TAGOK;
         }
@@ -819,10 +813,7 @@ pub fn option_filter(
         for opt in opts.iter_mut() {
             if opt.flags & (DHOPT_ENCAPSULATE | DHOPT_VENDOR | DHOPT_RFC3925) != 0 { continue; }
             if opt.flags & DHOPT_TAGOK == 0 { continue; }
-            let still_ok = match &opt.netid {
-                None        => true,
-                Some(netid) => match_netid_wild(std::slice::from_ref(netid), &tagif_ctx),
-            };
+            let still_ok = opt.netid.is_empty() || match_netid_wild(&opt.netid, &tagif_ctx);
             if !still_ok { opt.flags &= !DHOPT_TAGOK; }
         }
 
@@ -833,10 +824,7 @@ pub fn option_filter(
             .collect();
         for opt in opts.iter_mut() {
             if opt.flags & (DHOPT_ENCAPSULATE | DHOPT_VENDOR | DHOPT_RFC3925 | DHOPT_TAGOK) != 0 { continue; }
-            let matches = match &opt.netid {
-                None        => false,
-                Some(netid) => match_netid_wild(std::slice::from_ref(netid), &tagif_ctx),
-            };
+            let matches = !opt.netid.is_empty() && match_netid_wild(&opt.netid, &tagif_ctx);
             if matches && pxe_ok(opt, pxemode) && !opt_codes.contains(&opt.opt) {
                 opt.flags |= DHOPT_TAGOK;
             }
@@ -845,12 +833,12 @@ pub fn option_filter(
 
     // Phase 3: mark untagged options not overridden by a tagged one.
     let tagged_codes: Vec<i32> = opts.iter()
-        .filter(|o| o.flags & DHOPT_TAGOK != 0 && o.netid.is_some())
+        .filter(|o| o.flags & DHOPT_TAGOK != 0 && !o.netid.is_empty())
         .map(|o| o.opt)
         .collect();
     for opt in opts.iter_mut() {
         if opt.flags & (DHOPT_ENCAPSULATE | DHOPT_VENDOR | DHOPT_RFC3925 | DHOPT_TAGOK) != 0 { continue; }
-        if opt.netid.is_some() { continue; } // has a tag, skip
+        if !opt.netid.is_empty() { continue; } // has a tag, skip
         if pxe_ok(opt, pxemode) && !tagged_codes.contains(&opt.opt) {
             opt.flags |= DHOPT_TAGOK;
         }
@@ -950,6 +938,127 @@ pub fn match_bytes(opt: &DhcpOpt, data: &[u8]) -> bool {
     false
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Config matching (ported from dhcp-common.c:320-451)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Check if a DHCP config entry has a matching hardware address.
+///
+/// Compares against all hwaddr entries in the config, ignoring wildcard entries.
+/// Port of `config_has_mac()` from dhcp-common.c:320-332.
+pub fn config_has_mac(config: &crate::types::dhcp::DhcpConfig, hwaddr: &[u8], hw_type: i32) -> bool {
+    for conf_addr in &config.hwaddrs {
+        if conf_addr.wildcard_mask == 0
+            && conf_addr.hwaddr_len as usize == hwaddr.len()
+            && (conf_addr.hwaddr_type == hw_type || conf_addr.hwaddr_type == 0)
+            && conf_addr.hwaddr[..hwaddr.len()] == *hwaddr
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Find a DHCP config entry matching by client-id, hardware address, or hostname.
+///
+/// Search order: 1) CLID match, 2) exact MAC match, 3) hostname match,
+/// 4) wildcard MAC match (fewest wildcards wins).
+/// Port of `find_config_match()` from dhcp-common.c:369-436.
+pub fn find_config<'a>(
+    configs: &'a [crate::types::dhcp::DhcpConfig],
+    clid: Option<&[u8]>,
+    hwaddr: Option<&[u8]>,
+    hw_type: i32,
+    hostname: Option<&str>,
+    tags: &[crate::types::dhcp::DhcpNetid],
+) -> Option<&'a crate::types::dhcp::DhcpConfig> {
+    use crate::types::dhcp::{CONFIG_CLID, CONFIG_NAME};
+
+    let matches_filter = |config: &crate::types::dhcp::DhcpConfig| {
+        config.filter.is_empty() || match_netid_wild(&config.filter, tags)
+    };
+
+    // 1. Match by client-id
+    if let Some(clid) = clid {
+        for config in configs {
+            if !matches_filter(config) {
+                continue;
+            }
+            if config.flags & CONFIG_CLID != 0 {
+                if let Some(ref cfg_clid) = config.clid {
+                    if cfg_clid == clid {
+                        return Some(config);
+                    }
+                    // dhcpcd workaround: client IDs prefixed with 0x00
+                    if clid.first() == Some(&0)
+                        && clid.len() > 1
+                        && cfg_clid.len() == clid.len() - 1
+                        && *cfg_clid == clid[1..]
+                    {
+                        return Some(config);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Match by exact MAC
+    if let Some(hwaddr) = hwaddr {
+        for config in configs {
+            if !matches_filter(config) {
+                continue;
+            }
+            if config_has_mac(config, hwaddr, hw_type) {
+                return Some(config);
+            }
+        }
+    }
+
+    // 3. Match by hostname
+    if let Some(hostname) = hostname {
+        for config in configs {
+            if !matches_filter(config) {
+                continue;
+            }
+            if config.flags & CONFIG_NAME != 0 {
+                if let Some(ref cfg_name) = config.hostname {
+                    if cfg_name.eq_ignore_ascii_case(hostname) {
+                        return Some(config);
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Wildcard MAC match (fewest wildcards wins)
+    if let Some(hwaddr) = hwaddr {
+        let mut best: Option<&crate::types::dhcp::DhcpConfig> = None;
+        let mut best_count = 0;
+        for config in configs {
+            if !matches_filter(config) {
+                continue;
+            }
+            for conf_addr in &config.hwaddrs {
+                if conf_addr.wildcard_mask != 0
+                    && conf_addr.hwaddr_len as usize == hwaddr.len()
+                    && (conf_addr.hwaddr_type == hw_type || conf_addr.hwaddr_type == 0)
+                {
+                    let count = crate::util::memcmp_masked(&conf_addr.hwaddr[..hwaddr.len()], hwaddr, conf_addr.wildcard_mask);
+                    if count > best_count {
+                        best_count = count;
+                        best = Some(config);
+                    }
+                }
+            }
+        }
+        if best.is_some() {
+            return best;
+        }
+    }
+
+    None
+}
+
 #[cfg(all(test, feature = "dhcp"))]
 mod tests {
     use super::*;
@@ -1001,7 +1110,7 @@ mod tests {
             opt: 12,
             flags: 0,
             val: Some(b"router".to_vec()),
-            netid: None,
+            netid: vec![],
             encap: 0,
             vendor_class: None,
         };
@@ -1131,7 +1240,7 @@ mod tests {
             hostname: Some("myserver.local".into()),
             domain: None,
             netid: vec![],
-            filter: None,
+            filter: vec![],
             addr: std::net::Ipv4Addr::UNSPECIFIED,
             decline_time: None,
             lease_time: 3600,
@@ -1166,7 +1275,7 @@ mod tests {
             hostname: Some("already.local".into()),
             domain: None,
             netid: vec![],
-            filter: None,
+            filter: vec![],
             addr: explicit_ip,
             decline_time: None,
             lease_time: 3600,
@@ -1351,7 +1460,7 @@ mod tests {
     use crate::types::dhcp::DHOPT_PXE_OPT;
 
     fn make_opt(flags: u32) -> DhcpOpt {
-        DhcpOpt { opt: 1, flags, val: None, netid: None, encap: 0, vendor_class: None }
+        DhcpOpt { opt: 1, flags, val: None, netid: vec![], encap: 0, vendor_class: None }
     }
 
     #[test]
@@ -1417,7 +1526,7 @@ mod tests {
     // ── match_bytes ───────────────────────────────────────────────────────────
 
     fn opt_with_val(val: &[u8], flags: u32) -> DhcpOpt {
-        DhcpOpt { opt: 43, flags, val: Some(val.to_vec()), netid: None, encap: 0, vendor_class: None }
+        DhcpOpt { opt: 43, flags, val: Some(val.to_vec()), netid: vec![], encap: 0, vendor_class: None }
     }
 
     #[test]
@@ -1445,5 +1554,141 @@ mod tests {
     fn match_bytes_val_longer_than_data_fails() {
         let opt = opt_with_val(b"toolong", 0);
         assert!(!match_bytes(&opt, b"sh"));
+    }
+
+    // ── config_has_mac ───────────────────────────────────────────────────────
+
+    fn make_config_with_mac(mac: &[u8], hw_type: i32) -> crate::types::dhcp::DhcpConfig {
+        use crate::types::dhcp::{DhcpConfig, HwaddrConfig};
+        use crate::dhcp_protocol::DHCP_CHADDR_MAX;
+        use std::net::Ipv4Addr;
+        let mut hwaddr = [0u8; DHCP_CHADDR_MAX];
+        let len = mac.len().min(DHCP_CHADDR_MAX);
+        hwaddr[..len].copy_from_slice(&mac[..len]);
+        DhcpConfig {
+            flags: 0,
+            clid: None,
+            hostname: None,
+            domain: None,
+            netid: vec![],
+            filter: vec![],
+            addr: Ipv4Addr::UNSPECIFIED,
+            decline_time: None,
+            lease_time: 0,
+            hwaddrs: vec![HwaddrConfig {
+                hwaddr,
+                hwaddr_len: len as i32,
+                hwaddr_type: hw_type,
+                wildcard_mask: 0,
+            }],
+            #[cfg(feature = "dhcp6")]
+            addr6: vec![],
+        }
+    }
+
+    #[test]
+    fn config_has_mac_exact_match() {
+        let cfg = make_config_with_mac(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], 1);
+        assert!(config_has_mac(&cfg, &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], 1));
+    }
+
+    #[test]
+    fn config_has_mac_wrong_addr() {
+        let cfg = make_config_with_mac(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], 1);
+        assert!(!config_has_mac(&cfg, &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66], 1));
+    }
+
+    #[test]
+    fn config_has_mac_wrong_type() {
+        let cfg = make_config_with_mac(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], 1);
+        assert!(!config_has_mac(&cfg, &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], 6));
+    }
+
+    #[test]
+    fn config_has_mac_any_type() {
+        let cfg = make_config_with_mac(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], 0);
+        // type=0 matches any
+        assert!(config_has_mac(&cfg, &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], 6));
+    }
+
+    #[test]
+    fn config_has_mac_wrong_length() {
+        let cfg = make_config_with_mac(&[0xAA, 0xBB, 0xCC], 1);
+        assert!(!config_has_mac(&cfg, &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], 1));
+    }
+
+    // ── find_config ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn find_config_by_clid() {
+        use crate::types::dhcp::CONFIG_CLID;
+        let mut cfg = make_config_with_mac(&[0; 6], 1);
+        cfg.flags = CONFIG_CLID;
+        cfg.clid = Some(vec![0x01, 0x02, 0x03]);
+        let configs = [cfg];
+        assert!(find_config(&configs, Some(&[0x01, 0x02, 0x03]), None, 0, None, &[]).is_some());
+    }
+
+    #[test]
+    fn find_config_by_mac() {
+        let configs = [make_config_with_mac(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], 1)];
+        assert!(find_config(&configs, None, Some(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]), 1, None, &[]).is_some());
+    }
+
+    #[test]
+    fn find_config_by_hostname() {
+        use crate::types::dhcp::CONFIG_NAME;
+        let mut cfg = make_config_with_mac(&[0; 6], 1);
+        cfg.flags = CONFIG_NAME;
+        cfg.hostname = Some("myhost".to_string());
+        let configs = [cfg];
+        assert!(find_config(&configs, None, None, 0, Some("myhost"), &[]).is_some());
+    }
+
+    #[test]
+    fn find_config_hostname_case_insensitive() {
+        use crate::types::dhcp::CONFIG_NAME;
+        let mut cfg = make_config_with_mac(&[0; 6], 1);
+        cfg.flags = CONFIG_NAME;
+        cfg.hostname = Some("MyHost".to_string());
+        let configs = [cfg];
+        assert!(find_config(&configs, None, None, 0, Some("myhost"), &[]).is_some());
+    }
+
+    #[test]
+    fn find_config_no_match() {
+        let configs = [make_config_with_mac(&[0xAA; 6], 1)];
+        assert!(find_config(&configs, None, Some(&[0xBB; 6]), 1, None, &[]).is_none());
+    }
+
+    #[test]
+    fn find_config_clid_dhcpcd_workaround() {
+        use crate::types::dhcp::CONFIG_CLID;
+        let mut cfg = make_config_with_mac(&[0; 6], 1);
+        cfg.flags = CONFIG_CLID;
+        cfg.clid = Some(vec![0x01, 0x02]);
+        let configs = [cfg];
+        assert!(find_config(&configs, Some(&[0x00, 0x01, 0x02]), None, 0, None, &[]).is_some());
+    }
+
+    #[test]
+    fn find_config_respects_tag_filters() {
+        use crate::types::dhcp::{DhcpNetid, CONFIG_NAME};
+
+        let mut cfg = make_config_with_mac(&[0; 6], 1);
+        cfg.flags = CONFIG_NAME;
+        cfg.hostname = Some("myhost".to_string());
+        cfg.filter = vec![DhcpNetid { net: "pxe".into() }, DhcpNetid { net: "lab".into() }];
+        let configs = [cfg];
+
+        assert!(find_config(&configs, None, None, 0, Some("myhost"), &[DhcpNetid { net: "pxe".into() }]).is_none());
+        assert!(find_config(
+            &configs,
+            None,
+            None,
+            0,
+            Some("myhost"),
+            &[DhcpNetid { net: "pxe".into() }, DhcpNetid { net: "lab".into() }]
+        ).is_some());
     }
 }

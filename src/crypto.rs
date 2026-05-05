@@ -230,6 +230,64 @@ pub fn verify_sig(
 
 
 
+// ─── Digest/Algorithm name lookups (ported from crypto.c:422-472) ────────────
+
+/// Return the hash algorithm name for a DS digest type.
+///
+/// Per IANA ds-rr-types registry.
+/// Port of `ds_digest_name()` from crypto.c:422-434.
+pub fn ds_digest_name(digest: u8) -> Option<&'static str> {
+    match digest {
+        1 => Some("sha1"),
+        2 => Some("sha256"),
+        4 => Some("sha384"),
+        _ => None,
+    }
+}
+
+/// Return the hash algorithm name for a DNSSEC signing algorithm.
+///
+/// Per IANA dns-sec-alg-numbers registry.
+/// Port of `algo_digest_name()` from crypto.c:437-462.
+pub fn algo_digest_name(algo: u8) -> Option<&'static str> {
+    match algo {
+        1 => None,              // RSA/MD5 — Must Not Implement (RFC 6944)
+        2 => None,              // Diffie-Hellman
+        3 => None,              // DSA/SHA1 — Must Not Implement (RFC 8624)
+        5 => Some("sha1"),      // RSA/SHA1
+        6 => None,              // DSA-NSEC3-SHA1 — Must Not Implement (RFC 8624)
+        7 => Some("sha1"),      // RSASHA1-NSEC3-SHA1
+        8 => Some("sha256"),    // RSA/SHA-256
+        10 => Some("sha512"),   // RSA/SHA-512
+        13 => Some("sha256"),   // ECDSAP256SHA256
+        14 => Some("sha384"),   // ECDSAP384SHA384
+        15 => Some("null_hash"), // ED25519
+        16 => Some("null_hash"), // ED448
+        _ => None,
+    }
+}
+
+/// Return the hash algorithm name for an NSEC3 digest type.
+///
+/// Per IANA dnssec-nsec3-parameters registry.
+/// Port of `nsec3_digest_name()` from crypto.c:465-472.
+pub fn nsec3_digest_name(digest: u8) -> Option<&'static str> {
+    match digest {
+        1 => Some("sha1"),
+        _ => None,
+    }
+}
+
+/// Check if a DNSSEC algorithm is supported for signature verification.
+pub fn algo_supported(algo: u8) -> bool {
+    algo_digest_name(algo).is_some()
+}
+
+/// Check if a DS digest type is supported.
+pub fn ds_digest_supported(digest: u8) -> bool {
+    ds_digest_name(digest).is_some()
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -312,5 +370,256 @@ mod tests {
 
         let result = verify_sig(data, signature.to_bytes().as_ref(), &dnskey, DnssecAlgorithm::Ed25519);
         assert!(matches!(result, Ok(true)));
+    }
+
+    // ── Algorithm TryFrom tests ──
+
+    #[test]
+    fn algorithm_try_from_valid() {
+        assert_eq!(DnssecAlgorithm::try_from(5).unwrap(), DnssecAlgorithm::RsaSha1);
+        assert_eq!(DnssecAlgorithm::try_from(8).unwrap(), DnssecAlgorithm::RsaSha256);
+        assert_eq!(DnssecAlgorithm::try_from(10).unwrap(), DnssecAlgorithm::RsaSha512);
+        assert_eq!(DnssecAlgorithm::try_from(13).unwrap(), DnssecAlgorithm::EcdsaP256);
+        assert_eq!(DnssecAlgorithm::try_from(14).unwrap(), DnssecAlgorithm::EcdsaP384);
+        assert_eq!(DnssecAlgorithm::try_from(15).unwrap(), DnssecAlgorithm::Ed25519);
+        assert_eq!(DnssecAlgorithm::try_from(16).unwrap(), DnssecAlgorithm::Ed448);
+    }
+
+    #[test]
+    fn algorithm_try_from_invalid() {
+        for bad in [0u8, 1, 2, 3, 4, 6, 7, 9, 11, 12, 17, 255] {
+            assert!(matches!(
+                DnssecAlgorithm::try_from(bad),
+                Err(CryptoError::UnsupportedAlgorithm(v)) if v == bad
+            ));
+        }
+    }
+
+    // ── RSA key parsing tests ──
+
+    #[test]
+    fn parse_rsa_key_empty_data() {
+        let result = parse_dnskey(8, &[]);
+        assert!(matches!(result, Err(CryptoError::InvalidKey)));
+    }
+
+    #[test]
+    fn parse_rsa_key_short_exponent_length_zero() {
+        // First byte 0 means next 2 bytes are exponent length, but only 1 byte follows
+        let result = parse_dnskey(8, &[0, 0]);
+        assert!(matches!(result, Err(CryptoError::InvalidKey)));
+    }
+
+    #[test]
+    fn parse_rsa_key_exponent_longer_than_data() {
+        // exp_len=10 but only 2 bytes of data after length
+        let result = parse_dnskey(8, &[10, 0x01, 0x02]);
+        assert!(matches!(result, Err(CryptoError::InvalidKey)));
+    }
+
+    #[test]
+    fn parse_rsa_key_no_modulus() {
+        // exp_len=3, exponent=3 bytes, no modulus
+        let result = parse_dnskey(8, &[3, 0x01, 0x00, 0x01]);
+        assert!(matches!(result, Err(CryptoError::InvalidKey)));
+    }
+
+    /// Build a minimal DNSKEY wire-format RSA key: [exp_len][exponent][modulus]
+    /// Uses e=65537 and a 256-byte (2048-bit) random modulus.
+    fn make_rsa_wire_key() -> Vec<u8> {
+        let e_bytes: [u8; 3] = [0x01, 0x00, 0x01]; // 65537
+        // 256 bytes of 0xff is not a valid RSA modulus mathematically,
+        // but we just need the parser to accept the structure.
+        // Use a large odd number for the modulus.
+        let mut n_bytes = vec![0xffu8; 256];
+        n_bytes[0] = 0x00; // leading zero won't matter, BigUint strips it
+        n_bytes[1] = 0xc1; // make it look like a real modulus
+
+        let mut wire = Vec::new();
+        wire.push(e_bytes.len() as u8);
+        wire.extend_from_slice(&e_bytes);
+        wire.extend_from_slice(&n_bytes);
+        wire
+    }
+
+    #[test]
+    fn parse_rsa_key_valid() {
+        let wire = make_rsa_wire_key();
+        let result = parse_dnskey(8, &wire);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            DnssecPublicKey::RsaSha256(_) => {} // expected
+            _ => panic!("expected RsaSha256 variant"),
+        }
+    }
+
+    #[test]
+    fn parse_rsa_sha512_returns_correct_variant() {
+        let wire = make_rsa_wire_key();
+        let result = parse_dnskey(10, &wire);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            DnssecPublicKey::RsaSha512(_) => {} // expected
+            _ => panic!("expected RsaSha512 variant"),
+        }
+    }
+
+    // ── ECDSA key parsing tests ──
+
+    #[test]
+    fn parse_ecdsa_p256_wrong_size() {
+        let result = parse_dnskey(13, &[0u8; 63]); // should be 64
+        assert!(matches!(result, Err(CryptoError::InvalidKey)));
+        let result = parse_dnskey(13, &[0u8; 65]); // should be 64
+        assert!(matches!(result, Err(CryptoError::InvalidKey)));
+    }
+
+    #[test]
+    fn parse_ecdsa_p384_wrong_size() {
+        let result = parse_dnskey(14, &[0u8; 95]); // should be 96
+        assert!(matches!(result, Err(CryptoError::InvalidKey)));
+        let result = parse_dnskey(14, &[0u8; 97]); // should be 96
+        assert!(matches!(result, Err(CryptoError::InvalidKey)));
+    }
+
+    #[test]
+    fn parse_ed25519_wrong_size() {
+        let result = parse_dnskey(15, &[0u8; 31]); // should be 32
+        assert!(matches!(result, Err(CryptoError::InvalidKey)));
+        let result = parse_dnskey(15, &[0u8; 33]); // should be 32
+        assert!(matches!(result, Err(CryptoError::InvalidKey)));
+    }
+
+    #[test]
+    fn parse_ed448_returns_unsupported() {
+        let result = parse_dnskey(16, &[0u8; 57]);
+        assert!(matches!(result, Err(CryptoError::UnsupportedAlgorithm(16))));
+    }
+
+    // ── verify_sig algorithm mismatch ──
+
+    #[test]
+    fn verify_sig_algorithm_key_mismatch() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let vk = signing_key.verifying_key();
+        let dnskey = DnssecPublicKey::Ed25519(vk);
+
+        // Try to verify with wrong algorithm
+        let result = verify_sig(b"data", &[0u8; 64], &dnskey, DnssecAlgorithm::RsaSha256);
+        assert!(matches!(result, Err(CryptoError::UnsupportedAlgorithm(_))));
+    }
+
+    #[test]
+    fn verify_sig_ed25519_wrong_sig_size() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let vk = signing_key.verifying_key();
+        let dnskey = DnssecPublicKey::Ed25519(vk);
+
+        let result = verify_sig(b"data", &[0u8; 32], &dnskey, DnssecAlgorithm::Ed25519);
+        assert!(matches!(result, Err(CryptoError::InvalidSignature)));
+    }
+
+    // ── RSA SHA-1 shares key format with SHA-256 ──
+
+    #[test]
+    fn parse_rsa_sha1_uses_sha256_variant() {
+        let wire = make_rsa_wire_key();
+        let result = parse_dnskey(5, &wire);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            DnssecPublicKey::RsaSha256(_) => {} // RSA/SHA-1 stored as RsaSha256
+            _ => panic!("expected RsaSha256 variant for RSA/SHA-1"),
+        }
+    }
+
+    // ── ds_digest_name ───────────────────────────────────────────────────────
+
+    #[test]
+    fn ds_digest_name_sha1() {
+        assert_eq!(ds_digest_name(1), Some("sha1"));
+    }
+
+    #[test]
+    fn ds_digest_name_sha256() {
+        assert_eq!(ds_digest_name(2), Some("sha256"));
+    }
+
+    #[test]
+    fn ds_digest_name_sha384() {
+        assert_eq!(ds_digest_name(4), Some("sha384"));
+    }
+
+    #[test]
+    fn ds_digest_name_unknown() {
+        assert_eq!(ds_digest_name(99), None);
+    }
+
+    // ── algo_digest_name ─────────────────────────────────────────────────────
+
+    #[test]
+    fn algo_digest_name_rsa_sha256() {
+        assert_eq!(algo_digest_name(8), Some("sha256"));
+    }
+
+    #[test]
+    fn algo_digest_name_rsa_sha512() {
+        assert_eq!(algo_digest_name(10), Some("sha512"));
+    }
+
+    #[test]
+    fn algo_digest_name_ecdsa_p256() {
+        assert_eq!(algo_digest_name(13), Some("sha256"));
+    }
+
+    #[test]
+    fn algo_digest_name_ed25519() {
+        assert_eq!(algo_digest_name(15), Some("null_hash"));
+    }
+
+    #[test]
+    fn algo_digest_name_rsa_md5_not_impl() {
+        assert_eq!(algo_digest_name(1), None);
+    }
+
+    #[test]
+    fn algo_digest_name_dsa_not_impl() {
+        assert_eq!(algo_digest_name(3), None);
+    }
+
+    // ── nsec3_digest_name ────────────────────────────────────────────────────
+
+    #[test]
+    fn nsec3_digest_name_sha1() {
+        assert_eq!(nsec3_digest_name(1), Some("sha1"));
+    }
+
+    #[test]
+    fn nsec3_digest_name_unknown() {
+        assert_eq!(nsec3_digest_name(0), None);
+        assert_eq!(nsec3_digest_name(2), None);
+    }
+
+    // ── algo_supported / ds_digest_supported ─────────────────────────────────
+
+    #[test]
+    fn algo_supported_checks() {
+        assert!(algo_supported(8));  // RSA/SHA-256
+        assert!(algo_supported(15)); // ED25519
+        assert!(!algo_supported(1)); // RSA/MD5 (not implemented)
+        assert!(!algo_supported(99));
+    }
+
+    #[test]
+    fn ds_digest_supported_checks() {
+        assert!(ds_digest_supported(1));  // SHA-1
+        assert!(ds_digest_supported(2));  // SHA-256
+        assert!(!ds_digest_supported(0));
+        assert!(!ds_digest_supported(99));
     }
 }

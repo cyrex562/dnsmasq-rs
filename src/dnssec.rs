@@ -591,6 +591,314 @@ fn rr_ttl(rrset: &[crate::rfc1035::DnsRr]) -> u32 {
     rrset.iter().map(|r| r.ttl).min().unwrap_or(u32::MAX)
 }
 
+// ─── Canonical DNS name comparison (ported from dnssec.c:1183-1244) ──────────
+
+/// Compare two DNS names in canonical (RFC 4034 §6.1) order.
+///
+/// Labels are compared right-to-left, case-insensitively.
+/// Returns `Ordering::Less`, `Equal`, or `Greater`.
+pub fn hostname_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let a_labels: Vec<&str> = a.trim_end_matches('.').split('.').collect();
+    let b_labels: Vec<&str> = b.trim_end_matches('.').split('.').collect();
+
+    let mut ai = a_labels.len();
+    let mut bi = b_labels.len();
+
+    loop {
+        if ai == 0 && bi == 0 {
+            return std::cmp::Ordering::Equal;
+        }
+        if ai == 0 {
+            return std::cmp::Ordering::Less;
+        }
+        if bi == 0 {
+            return std::cmp::Ordering::Greater;
+        }
+
+        ai -= 1;
+        bi -= 1;
+
+        let la = a_labels[ai].to_ascii_lowercase();
+        let lb = b_labels[bi].to_ascii_lowercase();
+
+        match la.cmp(&lb) {
+            std::cmp::Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+}
+
+// ─── Error flags to EDE mapping (ported from dnssec.c:2380-2409) ─────────────
+
+/// DNSSEC failure flag constants.
+pub const DNSSEC_FAIL_UPSTREAM:    u32 = 1 << 0;
+pub const DNSSEC_FAIL_NYV:        u32 = 1 << 1;
+pub const DNSSEC_FAIL_EXP:        u32 = 1 << 2;
+pub const DNSSEC_FAIL_NOKEYSUP:   u32 = 1 << 3;
+pub const DNSSEC_FAIL_NOZONE:     u32 = 1 << 4;
+pub const DNSSEC_FAIL_NOKEY:      u32 = 1 << 5;
+pub const DNSSEC_FAIL_NODSSUP:    u32 = 1 << 6;
+pub const DNSSEC_FAIL_NSEC3_ITERS: u32 = 1 << 7;
+pub const DNSSEC_FAIL_NONSEC:     u32 = 1 << 8;
+pub const DNSSEC_FAIL_INDET:      u32 = 1 << 9;
+pub const DNSSEC_FAIL_NOSIG:      u32 = 1 << 10;
+
+/// Extended DNS Error (EDE) codes.
+pub const EDE_UNSET:        u16 = 0;
+pub const EDE_US_SERVFAIL:  u16 = 23;
+pub const EDE_SIG_NYV:      u16 = 8;
+pub const EDE_SIG_EXP:      u16 = 7;
+pub const EDE_USUPDNSKEY:   u16 = 11;
+pub const EDE_NO_ZONEKEY:   u16 = 9;
+pub const EDE_NO_DNSKEY:    u16 = 10;
+pub const EDE_USUPDS:       u16 = 12;
+pub const EDE_UNS_NS3_ITER: u16 = 27;
+pub const EDE_NO_NSEC:      u16 = 14;
+pub const EDE_DNSSEC_IND:   u16 = 13;
+pub const EDE_NO_RRSIG:     u16 = 15;
+
+/// Map DNSSEC failure flags to the highest-priority EDE code.
+///
+/// When multiple flags are set, returns the most specific error.
+/// Port of `errflags_to_ede()` from dnssec.c:2380-2409.
+pub fn errflags_to_ede(status: u32) -> u16 {
+    if status & DNSSEC_FAIL_UPSTREAM != 0    { EDE_US_SERVFAIL }
+    else if status & DNSSEC_FAIL_NYV != 0    { EDE_SIG_NYV }
+    else if status & DNSSEC_FAIL_EXP != 0    { EDE_SIG_EXP }
+    else if status & DNSSEC_FAIL_NOKEYSUP != 0 { EDE_USUPDNSKEY }
+    else if status & DNSSEC_FAIL_NOZONE != 0 { EDE_NO_ZONEKEY }
+    else if status & DNSSEC_FAIL_NOKEY != 0  { EDE_NO_DNSKEY }
+    else if status & DNSSEC_FAIL_NODSSUP != 0 { EDE_USUPDS }
+    else if status & DNSSEC_FAIL_NSEC3_ITERS != 0 { EDE_UNS_NS3_ITER }
+    else if status & DNSSEC_FAIL_NONSEC != 0 { EDE_NO_NSEC }
+    else if status & DNSSEC_FAIL_INDET != 0  { EDE_DNSSEC_IND }
+    else if status & DNSSEC_FAIL_NOSIG != 0  { EDE_NO_RRSIG }
+    else { EDE_UNSET }
+}
+
+/// Compute the DNSKEY key tag per RFC 4034 Appendix B.
+///
+/// Algorithm 1 (RSAMD5) uses a special calculation; all others use the
+/// standard checksum. `alg`, `flags`, and `key` come from the DNSKEY RDATA.
+/// Port of `dnskey_keytag()` from dnssec.c:2332-2351.
+pub fn dnskey_keytag(alg: u8, flags: u16, key: &[u8]) -> u16 {
+    if alg == 1 {
+        // RSAMD5 special case
+        if key.len() >= 4 {
+            (key[key.len() - 4] as u16) * 256 + key[key.len() - 3] as u16
+        } else {
+            0
+        }
+    } else {
+        let mut ac: u32 = flags as u32 + 0x300 + alg as u32;
+        for (i, &b) in key.iter().enumerate() {
+            if i & 1 != 0 {
+                ac += b as u32;
+            } else {
+                ac += (b as u32) << 8;
+            }
+        }
+        ac += (ac >> 16) & 0xffff;
+        (ac & 0xffff) as u16
+    }
+}
+
+// ─── NSEC type bitmap checking (ported from dnssec.c NSEC handling) ──────────
+
+/// Check if `rr_type` is present in an NSEC/NSEC3 type bitmap.
+///
+/// The bitmap is a sequence of window blocks:
+///   window(1) | bitmap_len(1) | bitmap(bitmap_len)
+/// Each window covers 256 types starting at `window * 256`.
+/// Port of the type-bitmap checking logic used in `prove_non_existence_nsec`.
+pub fn type_in_bitmap(bitmap: &[u8], rr_type: u16) -> bool {
+    let window_wanted = (rr_type >> 8) as u8;
+    let offset = ((rr_type & 0xff) >> 3) as usize;
+    let mask = 0x80u8 >> (rr_type & 0x07);
+
+    let mut i = 0;
+    while i + 2 <= bitmap.len() {
+        let window = bitmap[i];
+        let bm_len = bitmap[i + 1] as usize;
+        if i + 2 + bm_len > bitmap.len() {
+            break;
+        }
+        if window == window_wanted {
+            if offset < bm_len {
+                return (bitmap[i + 2 + offset] & mask) != 0;
+            }
+            return false;
+        }
+        i += 2 + bm_len;
+    }
+    false
+}
+
+// ─── DNSSEC query builder (ported from dnssec.c:2353-2378) ───────────────────
+
+/// Build a DNS query packet for DNSSEC key retrieval (DNSKEY or DS).
+///
+/// Returns a complete DNS packet with RD set, a single question, and no
+/// additional records. The DO bit should be added separately via
+/// `edns0::add_do_bit`.
+/// Port of `dnssec_generate_query()` from dnssec.c:2353-2378.
+pub fn dnssec_generate_query(name: &str, qclass: u16, qtype: u16, id: u16) -> Vec<u8> {
+    let mut pkt = Vec::with_capacity(128);
+
+    // DNS header (12 bytes)
+    pkt.extend_from_slice(&id.to_be_bytes());       // ID
+    pkt.push(0x01); // hb3: RD=1
+    pkt.push(0x00); // hb4: 0 (or CD for debug)
+    pkt.extend_from_slice(&1u16.to_be_bytes());     // QDCOUNT=1
+    pkt.extend_from_slice(&0u16.to_be_bytes());     // ANCOUNT=0
+    pkt.extend_from_slice(&0u16.to_be_bytes());     // NSCOUNT=0
+    pkt.extend_from_slice(&0u16.to_be_bytes());     // ARCOUNT=0
+
+    // Question: encode name as wire-format labels
+    for label in name.trim_end_matches('.').split('.') {
+        if label.is_empty() {
+            continue;
+        }
+        pkt.push(label.len() as u8);
+        pkt.extend_from_slice(label.as_bytes());
+    }
+    pkt.push(0); // root label
+
+    pkt.extend_from_slice(&qtype.to_be_bytes());    // QTYPE
+    pkt.extend_from_slice(&qclass.to_be_bytes());   // QCLASS
+
+    pkt
+}
+
+// ─── DNSSEC timestamp validation (ported from dnssec.c:114-141) ──────────────
+
+/// Check if DNSSEC timestamp validation should be performed.
+///
+/// If a timestamp file is configured, timestamps are only checked after
+/// the system time has advanced past the timestamp file's mtime
+/// (indicating the clock is set correctly).
+/// Port of `is_check_date()` from dnssec.c:114-141.
+pub fn is_check_date(
+    has_timestamp_file: bool,
+    back_to_the_future: bool,
+    no_time_check: bool,
+) -> bool {
+    if has_timestamp_file {
+        back_to_the_future
+    } else {
+        !no_time_check
+    }
+}
+
+/// Check if a DNSSEC signature's time window is valid.
+///
+/// Returns true if `now` falls within `[inception, expiration]`.
+/// Handles serial-number arithmetic for wraparound.
+pub fn check_signature_time(inception: u32, expiration: u32, now: u32) -> bool {
+    // RFC 4034 §3.1.5: using serial number arithmetic
+    // sig_inception <= now <= sig_expiration
+    let now_after_inception = now.wrapping_sub(inception) < 0x80000000;
+    let now_before_expiry = expiration.wrapping_sub(now) < 0x80000000;
+    now_after_inception && now_before_expiry
+}
+
+// ─── RR data canonicalization (ported from dnssec.c:152-218) ─────────────────
+
+/// RR type descriptor for canonicalization.
+///
+/// Describes the structure of an RR's RDATA for DNSSEC signature verification.
+/// Each entry is either:
+/// - A positive value: number of plain data bytes
+/// - 0: a domain name (to be lowercased/canonicalized)
+/// - -1: remaining bytes to the end (terminal)
+#[derive(Debug, Clone)]
+pub struct RrDescriptor {
+    pub fields: Vec<i16>,
+}
+
+impl RrDescriptor {
+    /// Get the descriptor for common RR types.
+    ///
+    /// Returns field descriptions for canonicalization.
+    pub fn for_type(rr_type: u16) -> Self {
+        let fields = match rr_type {
+            // A: 4 bytes address
+            1 => vec![-1],
+            // NS, CNAME, PTR: domain name
+            2 | 5 | 12 => vec![0],
+            // SOA: mname, rname, 5*u32
+            6 => vec![0, 0, -1],
+            // MX: 2-byte preference + domain name
+            15 => vec![2, 0],
+            // AAAA: 16 bytes
+            28 => vec![-1],
+            // SRV: 6 bytes + domain name
+            33 => vec![6, 0],
+            // RRSIG: 18 bytes + signer name + signature
+            46 => vec![18, 0, -1],
+            // DNSKEY, DS, NSEC, NSEC3, TLSA, etc.: all plain bytes
+            _ => vec![-1],
+        };
+        Self { fields }
+    }
+}
+
+/// Canonicalize RDATA for DNSSEC signature verification.
+///
+/// Domain names in the RDATA are lowercased. Plain data bytes are left unchanged.
+/// Returns the canonicalized bytes, or `None` on malformed data.
+/// Port of `get_rdata()` iteration from dnssec.c:159-218.
+pub fn canonicalize_rdata(rdata: &[u8], rr_type: u16) -> Option<Vec<u8>> {
+    let desc = RrDescriptor::for_type(rr_type);
+    let mut result = Vec::with_capacity(rdata.len());
+    let mut pos = 0;
+
+    for &field in &desc.fields {
+        if field == -1 {
+            // Remaining bytes to end
+            result.extend_from_slice(&rdata[pos..]);
+            pos = rdata.len();
+            break;
+        } else if field == 0 {
+            // Domain name: read wire-format labels and lowercase
+            let start = pos;
+            loop {
+                if pos >= rdata.len() {
+                    return None;
+                }
+                let label_len = rdata[pos] as usize;
+                if label_len == 0 {
+                    result.push(0); // root label
+                    pos += 1;
+                    break;
+                }
+                if label_len >= 0xc0 {
+                    // Compression pointer — shouldn't appear in canonical form
+                    return None;
+                }
+                if pos + 1 + label_len > rdata.len() {
+                    return None;
+                }
+                result.push(label_len as u8);
+                for i in 0..label_len {
+                    result.push(rdata[pos + 1 + i].to_ascii_lowercase());
+                }
+                pos += 1 + label_len;
+            }
+        } else {
+            // Plain data bytes
+            let n = field as usize;
+            if pos + n > rdata.len() {
+                return None;
+            }
+            result.extend_from_slice(&rdata[pos..pos + n]);
+            pos += n;
+        }
+    }
+
+    Some(result)
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -993,5 +1301,280 @@ mod tests {
         );
         // expired → all sigs fail → Bogus
         assert!(matches!(result, RrsetValidation::Bogus(_)));
+    }
+
+    // ─── hostname_cmp ────────────────────────────────────────────────────────
+
+    #[test]
+    fn hostname_cmp_equal() {
+        assert_eq!(hostname_cmp("example.com", "example.com"), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn hostname_cmp_case_insensitive() {
+        assert_eq!(hostname_cmp("Example.COM", "example.com"), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn hostname_cmp_different_tld() {
+        // "com" < "org"
+        assert_eq!(hostname_cmp("a.com", "a.org"), std::cmp::Ordering::Less);
+        assert_eq!(hostname_cmp("a.org", "a.com"), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn hostname_cmp_subdomain_before_parent() {
+        // "a.example.com" < "b.example.com" (label 'a' < 'b')
+        assert_eq!(hostname_cmp("a.example.com", "b.example.com"), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn hostname_cmp_fewer_labels_is_less() {
+        // "com" < "example.com"
+        assert_eq!(hostname_cmp("com", "example.com"), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn hostname_cmp_trailing_dot() {
+        assert_eq!(hostname_cmp("example.com.", "example.com"), std::cmp::Ordering::Equal);
+    }
+
+    // ─── errflags_to_ede ─────────────────────────────────────────────────────
+
+    #[test]
+    fn errflags_to_ede_upstream() {
+        assert_eq!(errflags_to_ede(DNSSEC_FAIL_UPSTREAM), EDE_US_SERVFAIL);
+    }
+
+    #[test]
+    fn errflags_to_ede_expired() {
+        assert_eq!(errflags_to_ede(DNSSEC_FAIL_EXP), EDE_SIG_EXP);
+    }
+
+    #[test]
+    fn errflags_to_ede_nosig() {
+        assert_eq!(errflags_to_ede(DNSSEC_FAIL_NOSIG), EDE_NO_RRSIG);
+    }
+
+    #[test]
+    fn errflags_to_ede_zero() {
+        assert_eq!(errflags_to_ede(0), EDE_UNSET);
+    }
+
+    #[test]
+    fn errflags_to_ede_priority_upstream_wins() {
+        // Multiple flags: upstream should take priority
+        assert_eq!(
+            errflags_to_ede(DNSSEC_FAIL_UPSTREAM | DNSSEC_FAIL_NOSIG),
+            EDE_US_SERVFAIL
+        );
+    }
+
+    // ─── dnskey_keytag ───────────────────────────────────────────────────────
+
+    #[test]
+    fn dnskey_keytag_standard() {
+        // flags=256, alg=8 (RSASHA256), key=[0x03, 0x01, 0x00, 0x01, ...]
+        let key = vec![0x03, 0x01, 0x00, 0x01, 0xAB, 0xCD];
+        let tag = dnskey_keytag(8, 256, &key);
+        assert!(tag > 0);
+    }
+
+    #[test]
+    fn dnskey_keytag_rsamd5_special() {
+        // Algorithm 1 uses special calculation from last 4 bytes
+        let key = vec![0x00, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
+        let tag = dnskey_keytag(1, 256, &key);
+        // key[len-4]*256 + key[len-3] = 0xDE*256 + 0xAD = 57005
+        assert_eq!(tag, 0xDE * 256 + 0xAD);
+    }
+
+    #[test]
+    fn dnskey_keytag_empty_key() {
+        let tag = dnskey_keytag(8, 256, &[]);
+        assert!(tag > 0); // still produces a tag from flags+alg
+    }
+
+    // ─── type_in_bitmap ──────────────────────────────────────────────────────
+
+    #[test]
+    fn type_in_bitmap_a_record() {
+        // Window 0, bitmap length 4, bits for types 0-31
+        // Type A = 1, so byte offset = 1>>3 = 0, mask = 0x80 >> 1 = 0x40
+        let bitmap = vec![0u8, 4, 0x40, 0x00, 0x00, 0x00]; // A bit set
+        assert!(type_in_bitmap(&bitmap, 1)); // A
+        assert!(!type_in_bitmap(&bitmap, 2)); // NS not set
+    }
+
+    #[test]
+    fn type_in_bitmap_ns_and_soa() {
+        // Type NS=2: byte 0, mask 0x20
+        // Type SOA=6: byte 0, mask 0x02
+        let bitmap = vec![0u8, 1, 0x22]; // NS (0x20) + SOA (0x02)
+        assert!(type_in_bitmap(&bitmap, 2));  // NS
+        assert!(type_in_bitmap(&bitmap, 6));  // SOA
+        assert!(!type_in_bitmap(&bitmap, 1)); // A not set
+    }
+
+    #[test]
+    fn type_in_bitmap_high_type() {
+        // RRSIG = 46. Window 0, byte offset = 46>>3 = 5, mask = 0x80>>(46&7) = 0x80>>6 = 0x02
+        let mut bitmap = vec![0u8, 6, 0, 0, 0, 0, 0, 0x02];
+        assert!(type_in_bitmap(&bitmap, 46)); // RRSIG
+        assert!(!type_in_bitmap(&bitmap, 45));
+    }
+
+    #[test]
+    fn type_in_bitmap_empty() {
+        assert!(!type_in_bitmap(&[], 1));
+    }
+
+    #[test]
+    fn type_in_bitmap_type_not_in_any_window() {
+        // Only window 0, types 0-7
+        let bitmap = vec![0u8, 1, 0xFF]; // all types 0-7 set
+        assert!(!type_in_bitmap(&bitmap, 256)); // window 1 — not present
+    }
+
+    // ─── dnssec_generate_query ───────────────────────────────────────────────
+
+    #[test]
+    fn dnssec_generate_query_structure() {
+        let pkt = dnssec_generate_query("example.com", 1, 48, 0x1234); // DNSKEY=48, IN=1
+        // Header check
+        assert_eq!(pkt[0], 0x12); // ID high
+        assert_eq!(pkt[1], 0x34); // ID low
+        assert_eq!(pkt[2], 0x01); // RD=1
+        // QDCOUNT=1
+        assert_eq!(u16::from_be_bytes([pkt[4], pkt[5]]), 1);
+        // ANCOUNT, NSCOUNT, ARCOUNT = 0
+        assert_eq!(u16::from_be_bytes([pkt[6], pkt[7]]), 0);
+        assert_eq!(u16::from_be_bytes([pkt[8], pkt[9]]), 0);
+        assert_eq!(u16::from_be_bytes([pkt[10], pkt[11]]), 0);
+        // QNAME starts at offset 12
+        assert_eq!(pkt[12], 7); // "example" label length
+        assert_eq!(&pkt[13..20], b"example");
+        assert_eq!(pkt[20], 3); // "com" label length
+        assert_eq!(&pkt[21..24], b"com");
+        assert_eq!(pkt[24], 0); // root
+        // QTYPE=48 (DNSKEY)
+        assert_eq!(u16::from_be_bytes([pkt[25], pkt[26]]), 48);
+        // QCLASS=1 (IN)
+        assert_eq!(u16::from_be_bytes([pkt[27], pkt[28]]), 1);
+    }
+
+    #[test]
+    fn dnssec_generate_query_ds() {
+        let pkt = dnssec_generate_query("sub.example.com", 1, 43, 0xABCD); // DS=43
+        assert_eq!(u16::from_be_bytes([pkt[0], pkt[1]]), 0xABCD);
+        // Check label: "sub"(3) "example"(7) "com"(3)
+        assert_eq!(pkt[12], 3);
+        assert_eq!(&pkt[13..16], b"sub");
+    }
+
+    #[test]
+    fn dnssec_generate_query_trailing_dot() {
+        let pkt1 = dnssec_generate_query("example.com.", 1, 48, 1);
+        let pkt2 = dnssec_generate_query("example.com", 1, 48, 1);
+        assert_eq!(pkt1, pkt2);
+    }
+
+    // ─── is_check_date ───────────────────────────────────────────────────────
+
+    #[test]
+    fn is_check_date_no_timestamp_file() {
+        assert!(is_check_date(false, false, false));
+        assert!(!is_check_date(false, false, true)); // no_time_check → don't check
+    }
+
+    #[test]
+    fn is_check_date_with_timestamp_file() {
+        assert!(!is_check_date(true, false, false)); // not yet back_to_the_future
+        assert!(is_check_date(true, true, false)); // back_to_the_future → check
+    }
+
+    // ─── check_signature_time ────────────────────────────────────────────────
+
+    #[test]
+    fn check_signature_time_valid() {
+        assert!(check_signature_time(100, 200, 150));
+    }
+
+    #[test]
+    fn check_signature_time_at_boundaries() {
+        assert!(check_signature_time(100, 200, 100)); // at inception
+        assert!(check_signature_time(100, 200, 200)); // at expiry
+    }
+
+    #[test]
+    fn check_signature_time_expired() {
+        assert!(!check_signature_time(100, 200, 201));
+    }
+
+    #[test]
+    fn check_signature_time_not_yet_valid() {
+        assert!(!check_signature_time(100, 200, 99));
+    }
+
+    #[test]
+    fn check_signature_time_wraparound() {
+        // inception near max u32, expiry after wrap
+        assert!(check_signature_time(u32::MAX - 10, 10, u32::MAX));
+        assert!(check_signature_time(u32::MAX - 10, 10, 5));
+    }
+
+    // ─── RrDescriptor ────────────────────────────────────────────────────────
+
+    #[test]
+    fn rr_descriptor_a_record() {
+        let desc = RrDescriptor::for_type(1);
+        assert_eq!(desc.fields, vec![-1]); // all plain bytes
+    }
+
+    #[test]
+    fn rr_descriptor_mx() {
+        let desc = RrDescriptor::for_type(15);
+        assert_eq!(desc.fields, vec![2, 0]); // 2 bytes pref + domain
+    }
+
+    #[test]
+    fn rr_descriptor_soa() {
+        let desc = RrDescriptor::for_type(6);
+        assert_eq!(desc.fields, vec![0, 0, -1]); // mname, rname, rest
+    }
+
+    // ─── canonicalize_rdata ──────────────────────────────────────────────────
+
+    #[test]
+    fn canonicalize_rdata_a_record() {
+        let rdata = [1, 2, 3, 4];
+        let result = canonicalize_rdata(&rdata, 1).unwrap();
+        assert_eq!(result, rdata);
+    }
+
+    #[test]
+    fn canonicalize_rdata_ns_lowercases() {
+        // NS record: domain name "Example.COM" in wire format
+        let rdata = [7, b'E', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'C', b'O', b'M', 0];
+        let result = canonicalize_rdata(&rdata, 2).unwrap();
+        // Should be lowercased
+        let expected = [7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0];
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn canonicalize_rdata_mx() {
+        // MX: 2 bytes preference + domain name
+        let mut rdata = vec![0x00, 0x0A]; // preference = 10
+        rdata.extend_from_slice(&[4, b'M', b'A', b'I', b'L', 0]); // "MAIL."
+        let result = canonicalize_rdata(&rdata, 15).unwrap();
+        assert_eq!(&result[0..2], &[0x00, 0x0A]); // preference unchanged
+        assert_eq!(result[3], b'm'); // lowercased
+    }
+
+    #[test]
+    fn canonicalize_rdata_empty() {
+        let result = canonicalize_rdata(&[], 1).unwrap();
+        assert!(result.is_empty());
     }
 }

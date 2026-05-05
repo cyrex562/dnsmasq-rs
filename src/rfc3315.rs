@@ -423,6 +423,248 @@ pub fn log6_quiet(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// DHCPv6 reply dispatcher (ported from rfc3315.c:71-107)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Result of processing a DHCPv6 packet.
+#[cfg(feature = "dhcp6")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Dhcp6ReplyResult {
+    /// Reply should be sent back to client (port 546).
+    ClientReply(Vec<u8>),
+    /// Reply should be sent to relay (port 547).
+    RelayReply(Vec<u8>),
+    /// Packet was dropped (too short, non-multicast, or unknown type).
+    Drop,
+}
+
+/// Validate and dispatch an incoming DHCPv6 packet.
+///
+/// Returns `Drop` if the packet is too short, is non-relay and non-multicast
+/// (RFC 9115 §16), or has an unrecognized message type.
+/// Port of `dhcp6_reply()` from rfc3315.c:71-107.
+#[cfg(feature = "dhcp6")]
+pub fn dhcp6_reply_validate(data: &[u8], multicast_dest: bool) -> Result<Dhcp6MsgType, &'static str> {
+    if data.len() <= 4 {
+        return Err("packet too short");
+    }
+
+    let msg_type_byte = data[0];
+    let msg_type = Dhcp6MsgType::from_u8(msg_type_byte)
+        .ok_or("unknown message type")?;
+
+    // Non-relay client requests must be multicast (RFC 9115 §16)
+    if msg_type != Dhcp6MsgType::RelayForw && !multicast_dest {
+        return Err("non-relay request must be multicast");
+    }
+
+    Ok(msg_type)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Relay message handling (ported from rfc3315.c:2145-2325)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// DHCPv6 relay message header fields.
+#[cfg(feature = "dhcp6")]
+#[derive(Debug, Clone)]
+pub struct Dhcp6RelayMsg {
+    pub msg_type: u8,
+    pub hop_count: u8,
+    pub link_addr: Ipv6Addr,
+    pub peer_addr: Ipv6Addr,
+    pub options: Vec<u8>,
+}
+
+/// Parse a DHCPv6 Relay-Forward or Relay-Reply message.
+///
+/// Wire format: msg-type(1) | hop-count(1) | link-address(16) | peer-address(16) | options(...)
+/// Port of relay message parsing from rfc3315.c:2145+.
+#[cfg(feature = "dhcp6")]
+pub fn parse_relay_msg(data: &[u8]) -> Result<Dhcp6RelayMsg, Dhcp6Error> {
+    if data.len() < 34 {
+        return Err(Dhcp6Error::TooShort);
+    }
+    let msg_type = data[0];
+    let hop_count = data[1];
+    let link_addr = Ipv6Addr::from(<[u8; 16]>::try_from(&data[2..18]).unwrap());
+    let peer_addr = Ipv6Addr::from(<[u8; 16]>::try_from(&data[18..34]).unwrap());
+    let options = data[34..].to_vec();
+    Ok(Dhcp6RelayMsg { msg_type, hop_count, link_addr, peer_addr, options })
+}
+
+/// Build a DHCPv6 Relay-Reply message wrapping an inner reply.
+///
+/// Port of relay reply building from rfc3315.c:2247-2325.
+#[cfg(feature = "dhcp6")]
+pub fn build_relay_reply(
+    hop_count: u8,
+    link_addr: &Ipv6Addr,
+    peer_addr: &Ipv6Addr,
+    inner_reply: &[u8],
+) -> Vec<u8> {
+    use crate::dhcp6_protocol::OPTION6_RELAY_MSG;
+    let mut buf = Vec::with_capacity(34 + 4 + inner_reply.len());
+    buf.push(13); // RELAY_REPL
+    buf.push(hop_count);
+    buf.extend_from_slice(&link_addr.octets());
+    buf.extend_from_slice(&peer_addr.octets());
+    // Relay Message option (option 9)
+    buf.extend_from_slice(&OPTION6_RELAY_MSG.to_be_bytes());
+    buf.extend_from_slice(&(inner_reply.len() as u16).to_be_bytes());
+    buf.extend_from_slice(inner_reply);
+    buf
+}
+
+/// Extract the inner message from a Relay-Forward, finding the Relay Message option.
+///
+/// Returns the inner message bytes if found.
+#[cfg(feature = "dhcp6")]
+pub fn extract_relay_inner(relay: &Dhcp6RelayMsg) -> Option<Vec<u8>> {
+    use crate::dhcp6_protocol::OPTION6_RELAY_MSG;
+    // Scan options for OPTION_RELAY_MSG (9)
+    let opts = &relay.options;
+    let mut i = 0;
+    while i + 4 <= opts.len() {
+        let code = u16::from_be_bytes([opts[i], opts[i + 1]]);
+        let len = u16::from_be_bytes([opts[i + 2], opts[i + 3]]) as usize;
+        if i + 4 + len > opts.len() {
+            break;
+        }
+        if code == OPTION6_RELAY_MSG {
+            return Some(opts[i + 4..i + 4 + len].to_vec());
+        }
+        i += 4 + len;
+    }
+    None
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IA option helpers (ported from rfc3315.c:1579-1650)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// DHCPv6 IA (Identity Association) type constants.
+#[cfg(feature = "dhcp6")]
+pub const IA_NA: u8 = 3;  // Non-temporary Address
+#[cfg(feature = "dhcp6")]
+pub const IA_TA: u8 = 4;  // Temporary Address
+
+/// Validate an IA_NA or IA_TA option payload and extract the IAID.
+///
+/// Returns `Some((iaid, ia_type))` if the payload is well-formed, `None` otherwise.
+/// IA_NA must have at least 12 bytes (IAID + T1 + T2), IA_TA at least 4 (IAID).
+/// Port of `check_ia()` from rfc3315.c:1579-1606.
+#[cfg(feature = "dhcp6")]
+pub fn check_ia(ia_type: u8, opt_data: &[u8]) -> Option<(u32, u8)> {
+    match ia_type {
+        IA_NA => {
+            if opt_data.len() < 12 {
+                return None;
+            }
+            let iaid = u32::from_be_bytes([opt_data[0], opt_data[1], opt_data[2], opt_data[3]]);
+            Some((iaid, IA_NA))
+        }
+        IA_TA => {
+            if opt_data.len() < 4 {
+                return None;
+            }
+            let iaid = u32::from_be_bytes([opt_data[0], opt_data[1], opt_data[2], opt_data[3]]);
+            Some((iaid, IA_TA))
+        }
+        _ => None,
+    }
+}
+
+/// Build an IA_NA option payload: IAID(4) + T1(4) + T2(4).
+///
+/// Port of `build_ia()` from rfc3315.c:1609-1626.
+#[cfg(feature = "dhcp6")]
+pub fn build_ia(iaid: u32, t1: u32, t2: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(12);
+    buf.extend_from_slice(&iaid.to_be_bytes());
+    buf.extend_from_slice(&t1.to_be_bytes());
+    buf.extend_from_slice(&t2.to_be_bytes());
+    buf
+}
+
+/// Backfill T1/T2 values into an existing IA_NA payload.
+///
+/// `buf` must be at least 12 bytes. If `fuzz` is true, T1 and T2 are
+/// reduced by up to 1/20th to prevent all clients from renewing at once.
+/// Port of `end_ia()` from rfc3315.c:1628-1650.
+#[cfg(feature = "dhcp6")]
+pub fn end_ia(buf: &mut [u8], t1: u32, t2: u32, fuzz: bool) {
+    if buf.len() < 12 {
+        return;
+    }
+    let (t1_val, t2_val) = if fuzz && t1 > 20 && t2 > 20 {
+        // Reduce by up to 1/20th
+        let fuzz_t1 = t1 / 20;
+        let fuzz_t2 = t2 / 20;
+        (t1 - fuzz_t1, t2 - fuzz_t2)
+    } else {
+        (t1, t2)
+    };
+    buf[4..8].copy_from_slice(&t1_val.to_be_bytes());
+    buf[8..12].copy_from_slice(&t2_val.to_be_bytes());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lifetime calculation (ported from rfc3315.c:1823-1868)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Calculate DHCPv6 preferred/valid lifetimes and T1/T2 timers.
+///
+/// Per RFC 3315 §22.4:
+/// - T1 = 0.5 * preferred_lifetime (when to start RENEW)
+/// - T2 = 0.8 * preferred_lifetime (when to start REBIND)
+///
+/// `lease_time` is the configured lease duration in seconds.
+/// Returns `(preferred, valid, t1, t2)`.
+/// Port of `calculate_times()` from rfc3315.c:1823-1868.
+#[cfg(feature = "dhcp6")]
+pub fn calculate_times(lease_time: u32) -> (u32, u32, u32, u32) {
+    if lease_time == 0xFFFFFFFF {
+        // Infinite lease
+        return (0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF);
+    }
+    let preferred = lease_time;
+    let valid = lease_time;
+    let t1 = preferred / 2;       // 0.5 * preferred
+    let t2 = (preferred * 4) / 5; // 0.8 * preferred
+    (preferred, valid, t1, t2)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Status code option builder (ported from rfc3315.c option 13 handling)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// DHCPv6 status codes (RFC 3315 §24.4).
+#[cfg(feature = "dhcp6")]
+pub const STATUS_SUCCESS:        u16 = 0;
+#[cfg(feature = "dhcp6")]
+pub const STATUS_UNSPEC_FAIL:    u16 = 1;
+#[cfg(feature = "dhcp6")]
+pub const STATUS_NO_ADDRS_AVAIL: u16 = 2;
+#[cfg(feature = "dhcp6")]
+pub const STATUS_NO_BINDING:     u16 = 3;
+#[cfg(feature = "dhcp6")]
+pub const STATUS_NOT_ON_LINK:    u16 = 4;
+#[cfg(feature = "dhcp6")]
+pub const STATUS_USE_MULTICAST:  u16 = 5;
+
+/// Build a DHCPv6 Status Code option payload (option 13).
+///
+/// Wire format: status-code(2) + status-message(variable).
+#[cfg(feature = "dhcp6")]
+pub fn build_status_code(code: u16, message: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(2 + message.len());
+    buf.extend_from_slice(&code.to_be_bytes());
+    buf.extend_from_slice(message.as_bytes());
+    buf
+}
+
 #[cfg(all(test, feature = "dhcp6"))]
 mod tests {
     use super::*;
@@ -669,5 +911,285 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("status"));
         assert!(lines[0].contains('0'));
+    }
+
+    // ── check_ia ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn check_ia_valid_na() {
+        // IAID(4) + T1(4) + T2(4) = 12 bytes minimum
+        let mut data = Vec::new();
+        data.extend_from_slice(&42u32.to_be_bytes()); // IAID
+        data.extend_from_slice(&1800u32.to_be_bytes()); // T1
+        data.extend_from_slice(&2880u32.to_be_bytes()); // T2
+        let result = check_ia(IA_NA, &data);
+        assert_eq!(result, Some((42, IA_NA)));
+    }
+
+    #[test]
+    fn check_ia_valid_ta() {
+        let data = 99u32.to_be_bytes().to_vec();
+        let result = check_ia(IA_TA, &data);
+        assert_eq!(result, Some((99, IA_TA)));
+    }
+
+    #[test]
+    fn check_ia_na_too_short() {
+        assert!(check_ia(IA_NA, &[0; 11]).is_none());
+    }
+
+    #[test]
+    fn check_ia_ta_too_short() {
+        assert!(check_ia(IA_TA, &[0; 3]).is_none());
+    }
+
+    #[test]
+    fn check_ia_unknown_type() {
+        assert!(check_ia(99, &[0; 12]).is_none());
+    }
+
+    // ── build_ia ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn build_ia_roundtrip() {
+        let buf = build_ia(42, 1800, 2880);
+        assert_eq!(buf.len(), 12);
+        let (iaid, ia_type) = check_ia(IA_NA, &buf).unwrap();
+        assert_eq!(iaid, 42);
+        assert_eq!(ia_type, IA_NA);
+        let t1 = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let t2 = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        assert_eq!(t1, 1800);
+        assert_eq!(t2, 2880);
+    }
+
+    #[test]
+    fn build_ia_zero_timers() {
+        let buf = build_ia(1, 0, 0);
+        let t1 = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let t2 = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        assert_eq!(t1, 0);
+        assert_eq!(t2, 0);
+    }
+
+    // ── end_ia ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn end_ia_overwrites_t1_t2() {
+        let mut buf = build_ia(1, 0, 0);
+        end_ia(&mut buf, 900, 1440, false);
+        let t1 = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let t2 = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        assert_eq!(t1, 900);
+        assert_eq!(t2, 1440);
+    }
+
+    #[test]
+    fn end_ia_fuzz_reduces() {
+        let mut buf = build_ia(1, 0, 0);
+        end_ia(&mut buf, 1000, 2000, true);
+        let t1 = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let t2 = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        // 1000 - 1000/20 = 950, 2000 - 2000/20 = 1900
+        assert_eq!(t1, 950);
+        assert_eq!(t2, 1900);
+    }
+
+    #[test]
+    fn end_ia_fuzz_no_effect_when_small() {
+        let mut buf = build_ia(1, 0, 0);
+        end_ia(&mut buf, 10, 15, true);
+        let t1 = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let t2 = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        assert_eq!(t1, 10);
+        assert_eq!(t2, 15);
+    }
+
+    #[test]
+    fn end_ia_short_buf_noop() {
+        let mut buf = vec![0u8; 4]; // too short
+        end_ia(&mut buf, 100, 200, false);
+        assert_eq!(buf, vec![0; 4]); // unchanged
+    }
+
+    // ── calculate_times ──────────────────────────────────────────────────────
+
+    #[test]
+    fn calculate_times_standard() {
+        let (pref, valid, t1, t2) = calculate_times(3600);
+        assert_eq!(pref, 3600);
+        assert_eq!(valid, 3600);
+        assert_eq!(t1, 1800);  // 0.5 * 3600
+        assert_eq!(t2, 2880);  // 0.8 * 3600
+    }
+
+    #[test]
+    fn calculate_times_infinite() {
+        let (pref, valid, t1, t2) = calculate_times(0xFFFFFFFF);
+        assert_eq!(pref, 0xFFFFFFFF);
+        assert_eq!(valid, 0xFFFFFFFF);
+        assert_eq!(t1, 0xFFFFFFFF);
+        assert_eq!(t2, 0xFFFFFFFF);
+    }
+
+    #[test]
+    fn calculate_times_zero() {
+        let (pref, valid, t1, t2) = calculate_times(0);
+        assert_eq!(pref, 0);
+        assert_eq!(valid, 0);
+        assert_eq!(t1, 0);
+        assert_eq!(t2, 0);
+    }
+
+    #[test]
+    fn calculate_times_small() {
+        let (pref, valid, t1, t2) = calculate_times(100);
+        assert_eq!(pref, 100);
+        assert_eq!(valid, 100);
+        assert_eq!(t1, 50);
+        assert_eq!(t2, 80);
+    }
+
+    // ── build_status_code ────────────────────────────────────────────────────
+
+    #[test]
+    fn build_status_code_success() {
+        let buf = build_status_code(STATUS_SUCCESS, "success");
+        assert_eq!(buf[0], 0);
+        assert_eq!(buf[1], 0);
+        assert_eq!(&buf[2..], b"success");
+    }
+
+    #[test]
+    fn build_status_code_no_addrs() {
+        let buf = build_status_code(STATUS_NO_ADDRS_AVAIL, "no addresses available");
+        let code = u16::from_be_bytes([buf[0], buf[1]]);
+        assert_eq!(code, 2);
+        assert_eq!(&buf[2..], b"no addresses available");
+    }
+
+    #[test]
+    fn build_status_code_not_on_link() {
+        let buf = build_status_code(STATUS_NOT_ON_LINK, "");
+        let code = u16::from_be_bytes([buf[0], buf[1]]);
+        assert_eq!(code, 4);
+        assert_eq!(buf.len(), 2); // no message
+    }
+
+    // ── dhcp6_reply_validate ─────────────────────────────────────────────────
+
+    #[test]
+    fn dhcp6_reply_validate_too_short() {
+        assert!(dhcp6_reply_validate(&[1, 2, 3], true).is_err());
+    }
+
+    #[test]
+    fn dhcp6_reply_validate_solicit_multicast_ok() {
+        let mut data = vec![0u8; 10];
+        data[0] = Dhcp6MsgType::Solicit as u8;
+        let result = dhcp6_reply_validate(&data, true);
+        assert_eq!(result.unwrap(), Dhcp6MsgType::Solicit);
+    }
+
+    #[test]
+    fn dhcp6_reply_validate_solicit_unicast_rejected() {
+        let mut data = vec![0u8; 10];
+        data[0] = Dhcp6MsgType::Solicit as u8;
+        assert!(dhcp6_reply_validate(&data, false).is_err());
+    }
+
+    #[test]
+    fn dhcp6_reply_validate_relay_forw_unicast_ok() {
+        let mut data = vec![0u8; 10];
+        data[0] = Dhcp6MsgType::RelayForw as u8;
+        let result = dhcp6_reply_validate(&data, false);
+        assert_eq!(result.unwrap(), Dhcp6MsgType::RelayForw);
+    }
+
+    #[test]
+    fn dhcp6_reply_validate_unknown_type() {
+        let mut data = vec![0u8; 10];
+        data[0] = 255;
+        assert!(dhcp6_reply_validate(&data, true).is_err());
+    }
+
+    // ── parse_relay_msg ──────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_relay_msg_valid() {
+        let mut data = vec![0u8; 40];
+        data[0] = 12; // RELAY_FORW
+        data[1] = 3;  // hop count
+        // link_addr: 2001:db8::1 at bytes 2..18
+        let link: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        data[2..18].copy_from_slice(&link.octets());
+        // peer_addr at 18..34 stays zeros
+        // options at 34+
+        data.extend_from_slice(&[0, 9, 0, 2, 0xAA, 0xBB]); // option 9 (relay msg), len 2
+
+        let relay = parse_relay_msg(&data).unwrap();
+        assert_eq!(relay.msg_type, 12);
+        assert_eq!(relay.hop_count, 3);
+        assert_eq!(relay.link_addr, link);
+    }
+
+    #[test]
+    fn parse_relay_msg_too_short() {
+        assert!(parse_relay_msg(&[0u8; 10]).is_err());
+    }
+
+    // ── build_relay_reply ────────────────────────────────────────────────────
+
+    #[test]
+    fn build_relay_reply_structure() {
+        let link: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let peer: Ipv6Addr = "fe80::42".parse().unwrap();
+        let inner = vec![1, 0xAA, 0xBB, 0xCC]; // msg_type=Solicit, txn_id
+
+        let reply = build_relay_reply(2, &link, &peer, &inner);
+        assert_eq!(reply[0], 13); // RELAY_REPL
+        assert_eq!(reply[1], 2);  // hop count
+        // link addr at 2..18
+        assert_eq!(&reply[2..18], &link.octets());
+        // peer addr at 18..34
+        assert_eq!(&reply[18..34], &peer.octets());
+        // option code at 34..36 = 0x0009 (RELAY_MSG)
+        assert_eq!(u16::from_be_bytes([reply[34], reply[35]]), 9);
+        // option len at 36..38
+        assert_eq!(u16::from_be_bytes([reply[36], reply[37]]), 4);
+        // inner data at 38..42
+        assert_eq!(&reply[38..42], &inner);
+    }
+
+    // ── extract_relay_inner ──────────────────────────────────────────────────
+
+    #[test]
+    fn extract_relay_inner_found() {
+        use crate::dhcp6_protocol::OPTION6_RELAY_MSG;
+        let inner = vec![1, 0x11, 0x22, 0x33];
+        let mut opts = Vec::new();
+        opts.extend_from_slice(&OPTION6_RELAY_MSG.to_be_bytes());
+        opts.extend_from_slice(&(inner.len() as u16).to_be_bytes());
+        opts.extend_from_slice(&inner);
+
+        let relay = Dhcp6RelayMsg {
+            msg_type: 12, hop_count: 0,
+            link_addr: Ipv6Addr::UNSPECIFIED,
+            peer_addr: Ipv6Addr::UNSPECIFIED,
+            options: opts,
+        };
+        let extracted = extract_relay_inner(&relay).unwrap();
+        assert_eq!(extracted, inner);
+    }
+
+    #[test]
+    fn extract_relay_inner_not_found() {
+        let relay = Dhcp6RelayMsg {
+            msg_type: 12, hop_count: 0,
+            link_addr: Ipv6Addr::UNSPECIFIED,
+            peer_addr: Ipv6Addr::UNSPECIFIED,
+            options: vec![0, 1, 0, 2, 0xAA, 0xBB], // option 1, not relay msg
+        };
+        assert!(extract_relay_inner(&relay).is_none());
     }
 }

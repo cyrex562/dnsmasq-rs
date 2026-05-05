@@ -1,0 +1,9 @@
+# qname qtype
+host.test A
+host.test AAAA
+alias.test CNAME
+alias.test A
+txt.test TXT
+mail.test MX
+_sip._tcp.service.test SRV
+10.2.0.192.in-addr.arpa PTR

@@ -140,7 +140,7 @@ pub struct DhcpContext {
     pub end:        Ipv4Addr,
     pub flags:      u32,
     pub netid:      DhcpNetid,
-    pub filter:     Option<DhcpNetid>,
+    pub filter:     Vec<DhcpNetid>,
 
     #[cfg(feature = "dhcp6")]
     pub start6:       Ipv6Addr,
@@ -166,7 +166,7 @@ pub struct DhcpConfig {
     pub hostname:   Option<String>,
     pub domain:     Option<String>,
     pub netid:      Vec<DhcpNetid>,
-    pub filter:     Option<DhcpNetid>,
+    pub filter:     Vec<DhcpNetid>,
     pub addr:       Ipv4Addr,
     pub decline_time: Option<SystemTime>,
     pub lease_time: u32,
@@ -190,7 +190,7 @@ pub struct DhcpOpt {
     pub opt:   i32,
     pub flags: u32,
     pub val:   Option<Vec<u8>>,
-    pub netid: Option<DhcpNetid>,
+    pub netid: Vec<DhcpNetid>,
     pub encap: i32,
     pub vendor_class: Option<Vec<u8>>,
 }
@@ -202,7 +202,46 @@ pub struct DhcpBoot {
     pub sname:      Option<String>,
     pub tftp_sname: Option<String>,
     pub next_server: Ipv4Addr,
-    pub netid:       Option<DhcpNetid>,
+    pub netid:       Vec<DhcpNetid>,
+}
+
+/// DHCP classifier rule that assigns a tag when the vendor-class option matches.
+#[derive(Debug, Clone)]
+pub struct DhcpVendorRule {
+    pub netid:        DhcpNetid,
+    pub vendor_class: Vec<u8>,
+}
+
+/// DHCP classifier rule that assigns a tag when the user-class option matches.
+#[derive(Debug, Clone)]
+pub struct DhcpUserClassRule {
+    pub netid:      DhcpNetid,
+    pub user_class: Vec<u8>,
+}
+
+/// DHCP classifier rule that assigns a tag when the client MAC address matches.
+#[derive(Debug, Clone)]
+pub struct DhcpMacRule {
+    pub netid:         DhcpNetid,
+    pub hwaddr:        [u8; DHCP_CHADDR_MAX],
+    pub hwaddr_len:    i32,
+    pub hwaddr_type:   i32,
+    pub wildcard_mask: u32,
+}
+
+/// DHCP relay-agent classifier rule keyed by an option-82 suboption payload.
+#[derive(Debug, Clone)]
+pub struct DhcpRelayIdRule {
+    pub netid:   DhcpNetid,
+    pub subopt:  u8,
+    pub data:    Vec<u8>,
+}
+
+/// Delay policy for DHCP replies, optionally scoped to a matching tag.
+#[derive(Debug, Clone)]
+pub struct DhcpReplyDelay {
+    pub delay_secs: u32,
+    pub filter:     Vec<DhcpNetid>,
 }
 
 /// Router Advertisement interface parameters.

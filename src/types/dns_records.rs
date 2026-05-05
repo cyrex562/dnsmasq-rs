@@ -97,6 +97,9 @@ pub struct AuthNameEntry {
     pub flags: i32,
 }
 
+pub const AUTH6: i32 = 1;
+pub const AUTH4: i32 = 2;
+
 /// Host record — maps a set of names to IPv4/IPv6 addresses.
 #[derive(Debug, Clone)]
 pub struct HostRecord {
@@ -108,6 +111,11 @@ pub struct HostRecord {
 }
 
 /// Interface name → domain mapping.
+pub const IN4: i32 = 1;
+pub const IN6: i32 = 2;
+pub const INP4: i32 = 4;
+pub const INP6: i32 = 8;
+
 #[derive(Debug, Clone)]
 pub struct InterfaceName {
     pub name:   String,  // domain name

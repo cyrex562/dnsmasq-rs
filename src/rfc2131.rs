@@ -27,6 +27,10 @@ pub struct DhcpReply {
     pub siaddr: Ipv4Addr,
     /// Relay-agent IP address (`giaddr`).
     pub giaddr: Ipv4Addr,
+    /// Optional BOOTP server host name (`sname`).
+    pub sname: Option<String>,
+    /// Optional BOOTP boot file name (`file`).
+    pub file: Option<String>,
 }
 
 /// Encode a DHCP option-53 (message type) TLV.
@@ -49,7 +53,11 @@ fn pick_offer_addr(
     pool_start: Ipv4Addr,
     pool_end: Ipv4Addr,
     existing_lease: Option<&DhcpLease>,
+    static_addr: Option<Ipv4Addr>,
 ) -> Option<Ipv4Addr> {
+    if let Some(addr) = static_addr {
+        return Some(addr);
+    }
     if let Some(lease) = existing_lease {
         if in_pool(lease.addr, pool_start, pool_end) {
             return Some(lease.addr);
@@ -89,14 +97,17 @@ pub fn handle_discover(
     pool_end: Ipv4Addr,
     existing_lease: Option<&DhcpLease>,
     server_id: Ipv4Addr,
+    static_addr: Option<Ipv4Addr>,
 ) -> Option<DhcpReply> {
-    let yiaddr = pick_offer_addr(pool_start, pool_end, existing_lease)?;
+    let yiaddr = pick_offer_addr(pool_start, pool_end, existing_lease, static_addr)?;
     Some(DhcpReply {
         msg_type: DhcpMsgType::Offer,
         yiaddr,
         options: build_reply_options(DhcpMsgType::Offer, server_id),
         siaddr: server_id,
         giaddr: pkt.giaddr,
+        sname: None,
+        file: None,
     })
 }
 
@@ -110,17 +121,26 @@ pub fn handle_request(
     pool_start: Ipv4Addr,
     pool_end: Ipv4Addr,
     server_id: Ipv4Addr,
+    static_addr: Option<Ipv4Addr>,
 ) -> Option<DhcpReply> {
-    // Find the requested IP (option 50) in the packet options.
-    let requested = find_requested_ip(&pkt.options)?;
+    // Find the requested IP (option 50) in the packet options, falling back to
+    // ciaddr for the renewal/rebind path.
+    let requested = find_requested_ip(&pkt.options)
+        .or_else(|| (pkt.ciaddr != Ipv4Addr::UNSPECIFIED).then_some(pkt.ciaddr))?;
 
-    if in_pool(requested, pool_start, pool_end) {
+    let in_range = static_addr.map(|addr| requested == addr).unwrap_or_else(|| {
+        in_pool(requested, pool_start, pool_end)
+    });
+
+    if in_range {
         Some(DhcpReply {
             msg_type: DhcpMsgType::Ack,
-            yiaddr: requested,
+            yiaddr: static_addr.unwrap_or(requested),
             options: build_reply_options(DhcpMsgType::Ack, server_id),
             siaddr: server_id,
             giaddr: pkt.giaddr,
+            sname: None,
+            file: None,
         })
     } else {
         Some(DhcpReply {
@@ -129,6 +149,8 @@ pub fn handle_request(
             options: build_reply_options(DhcpMsgType::Nak, server_id),
             siaddr: Ipv4Addr::UNSPECIFIED,
             giaddr: pkt.giaddr,
+            sname: None,
+            file: None,
         })
     }
 }
@@ -160,6 +182,8 @@ pub fn handle_inform(pkt: &DhcpPacket, server_id: Ipv4Addr) -> Option<DhcpReply>
         options:  build_reply_options(DhcpMsgType::Ack, server_id),
         siaddr:   server_id,
         giaddr:   pkt.giaddr,
+        sname:    None,
+        file:     None,
     })
 }
 
@@ -789,13 +813,11 @@ pub fn prune_vendor_opts(
     let mut force = false;
     for opt in opts.iter_mut() {
         if (opt.flags & DHOPT_VENDOR_MATCH) != 0 {
-            let opt_netids: Vec<_> = opt.netid.iter().collect();
-            if !match_netid(netid, netid) {
+            if !match_netid(netid, &opt.netid) {
                 opt.flags &= !DHOPT_VENDOR_MATCH;
             } else if (opt.flags & DHOPT_FORCE) != 0 {
                 force = true;
             }
-            let _ = opt_netids; // suppress unused warning
         }
     }
     force
@@ -1061,6 +1083,161 @@ pub fn has_opt_raw(opts: &[u8], opt: u8) -> bool {
     false
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Lease time / server-id / sanitise (ported from rfc2131.c:1859-1906)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Calculate lease time: minimum of context default, config override, and client request.
+///
+/// `config_time` is the per-host config lease time (or `None` for default).
+/// `context_time` is the pool's default lease time.
+/// `requested` is the client-requested time from option 51 (or `None`).
+/// Returns the final lease duration in seconds.
+/// Port of `calc_time()` from rfc2131.c:1859-1873.
+#[cfg(feature = "dhcp")]
+pub fn calc_time(context_time: u32, config_time: Option<u32>, requested: Option<u32>) -> u32 {
+    let mut time = config_time.unwrap_or(context_time);
+
+    if let Some(mut req) = requested {
+        if req < 120 {
+            req = 120; // sanity minimum
+        }
+        if time == 0xFFFFFFFF || (req != 0xFFFFFFFF && req < time) {
+            time = req;
+        }
+    }
+
+    time
+}
+
+/// Determine the DHCP Server Identifier (option 54) address.
+///
+/// Priority: explicit override > context local address > fallback.
+/// Port of `server_id()` from rfc2131.c:1875-1883.
+#[cfg(feature = "dhcp")]
+pub fn server_id(
+    context_local: Option<Ipv4Addr>,
+    override_addr: Option<Ipv4Addr>,
+    fallback: Ipv4Addr,
+) -> Ipv4Addr {
+    if let Some(o) = override_addr {
+        if o != Ipv4Addr::UNSPECIFIED {
+            return o;
+        }
+    }
+    if let Some(l) = context_local {
+        if l != Ipv4Addr::UNSPECIFIED {
+            return l;
+        }
+    }
+    fallback
+}
+
+/// Sanitise a DHCP option value to a printable ASCII string.
+///
+/// Non-printable bytes are dropped. Used for logging client hostnames etc.
+/// Port of `sanitise()` from rfc2131.c:1885-1906.
+#[cfg(feature = "dhcp")]
+pub fn sanitise(data: &[u8]) -> String {
+    data.iter()
+        .filter(|&&b| b >= 0x20 && b < 0x7f)
+        .map(|&b| b as char)
+        .collect()
+}
+
+/// Format a DHCP log line for a packet event.
+///
+/// Port of `log_packet()` from rfc2131.c:1918-1960.
+#[cfg(feature = "dhcp")]
+pub fn log_packet(
+    msg_type: &str,
+    addr: Option<Ipv4Addr>,
+    mac: Option<&[u8]>,
+    interface: &str,
+    hostname: Option<&str>,
+    xid: u32,
+    log_opts: bool,
+) -> String {
+    let addr_str = match addr {
+        Some(a) if a != Ipv4Addr::UNSPECIFIED => a.to_string(),
+        _ => String::new(),
+    };
+
+    let mac_str = match mac {
+        Some(m) if !m.is_empty() => m.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":"),
+        _ => String::new(),
+    };
+
+    let host_str = hostname.unwrap_or("");
+
+    if log_opts {
+        format!("{xid:08x} {msg_type}({interface}) {addr_str} {mac_str} {host_str}").trim().to_string()
+    } else {
+        format!("{msg_type}({interface}) {addr_str} {mac_str} {host_str}").trim().to_string()
+    }
+}
+
+/// Select the best hardware address for a DHCP client.
+///
+/// Prefers the actual hwaddr if available; falls back to extracting
+/// the address from the client-id if the hardware address length is 0
+/// and the client-id starts with the hardware type byte.
+/// Port of `extended_hwaddr()` from rfc2131.c:1832-1857.
+#[cfg(feature = "dhcp")]
+pub fn extended_hwaddr<'a>(
+    hwtype: u8,
+    hwaddr: &'a [u8],
+    clid: Option<&'a [u8]>,
+) -> &'a [u8] {
+    if hwaddr.is_empty() {
+        if let Some(clid) = clid {
+            if clid.len() > 3 {
+                if clid[0] == hwtype {
+                    return &clid[1..];
+                }
+                // EUI-64 / IEEE 1394 fallback
+                if clid[0] == 27 && hwtype == 24 {
+                    return &clid[1..];
+                }
+                return clid;
+            }
+        }
+    }
+    hwaddr
+}
+
+/// Check if a DHCP option value looks like a PXE client identifier.
+///
+/// PXE clients send option 60 starting with "PXEClient".
+/// Port of `is_pxe_client()` from rfc2131.c:2582-2604.
+#[cfg(feature = "dhcp")]
+pub fn is_pxe_client(vendor_class: Option<&[u8]>) -> bool {
+    match vendor_class {
+        Some(vc) => vc.starts_with(b"PXEClient"),
+        None => false,
+    }
+}
+
+/// Find the boot server config matching a network tag.
+///
+/// Port of `find_boot()` from rfc2131.c:2565-2581.
+#[cfg(feature = "dhcp")]
+pub fn find_boot<'a>(
+    boot_configs: &'a [crate::types::dhcp::DhcpBoot],
+    netid: Option<&str>,
+) -> Option<&'a crate::types::dhcp::DhcpBoot> {
+    // First try to find one with a matching tag
+    if let Some(tag) = netid {
+        for b in boot_configs {
+            if b.netid.iter().any(|n| n.net == tag) {
+                return Some(b);
+            }
+        }
+    }
+    // Fall back to untagged entry
+    boot_configs.iter().find(|b| b.netid.is_empty())
+}
+
 #[cfg(all(test, feature = "dhcp"))]
 mod tests {
     use super::*;
@@ -1270,7 +1447,7 @@ mod tests {
         let start = Ipv4Addr::new(192, 168, 1, 10);
         let end = Ipv4Addr::new(192, 168, 1, 200);
         let server = Ipv4Addr::new(192, 168, 1, 1);
-        let reply = handle_discover(&pkt, start, end, None, server).unwrap();
+        let reply = handle_discover(&pkt, start, end, None, server, None).unwrap();
         assert_eq!(reply.msg_type, DhcpMsgType::Offer);
         assert!(in_pool(reply.yiaddr, start, end));
     }
@@ -1310,7 +1487,7 @@ mod tests {
             #[cfg(feature = "dhcp6")]
             vendorclass_count: 0,
         };
-        let reply = handle_discover(&pkt, start, end, Some(&lease), server).unwrap();
+        let reply = handle_discover(&pkt, start, end, Some(&lease), server, None).unwrap();
         assert_eq!(reply.yiaddr, lease_addr);
     }
 
@@ -1322,7 +1499,7 @@ mod tests {
         let requested = Ipv4Addr::new(192, 168, 1, 50);
         let mut pkt = base_packet();
         pkt.options = opts_with_requested_ip(requested);
-        let reply = handle_request(&pkt, start, end, server).unwrap();
+        let reply = handle_request(&pkt, start, end, server, None).unwrap();
         assert_eq!(reply.msg_type, DhcpMsgType::Ack);
         assert_eq!(reply.yiaddr, requested);
     }
@@ -1335,7 +1512,7 @@ mod tests {
         let out_of_pool = Ipv4Addr::new(10, 0, 0, 1);
         let mut pkt = base_packet();
         pkt.options = opts_with_requested_ip(out_of_pool);
-        let reply = handle_request(&pkt, start, end, server).unwrap();
+        let reply = handle_request(&pkt, start, end, server, None).unwrap();
         assert_eq!(reply.msg_type, DhcpMsgType::Nak);
     }
 
@@ -1461,7 +1638,7 @@ mod tests {
     fn do_opt_len_only() {
         use crate::types::dhcp::{DhcpOpt, DHOPT_STRING};
         let opt = DhcpOpt { opt: 15, flags: DHOPT_STRING, val: Some(b"hi".to_vec()),
-                            netid: None, encap: 0, vendor_class: None };
+                            netid: vec![], encap: 0, vendor_class: None };
         // null_term → len + 1
         assert_eq!(do_opt(&opt, None, None, true), 3);
         assert_eq!(do_opt(&opt, None, None, false), 2);
@@ -1471,7 +1648,7 @@ mod tests {
     fn do_opt_writes_data() {
         use crate::types::dhcp::{DhcpOpt, DHOPT_STRING};
         let opt = DhcpOpt { opt: 15, flags: DHOPT_STRING, val: Some(b"hi".to_vec()),
-                            netid: None, encap: 0, vendor_class: None };
+                            netid: vec![], encap: 0, vendor_class: None };
         let mut buf = vec![0u8; 2];
         let n = do_opt(&opt, Some(&mut buf), None, false);
         assert_eq!(n, 2);
@@ -1482,7 +1659,7 @@ mod tests {
     fn do_opt_null_terminator() {
         use crate::types::dhcp::{DhcpOpt, DHOPT_STRING};
         let opt = DhcpOpt { opt: 15, flags: DHOPT_STRING, val: Some(b"hi".to_vec()),
-                            netid: None, encap: 0, vendor_class: None };
+                            netid: vec![], encap: 0, vendor_class: None };
         let mut buf = vec![0u8; 3];
         do_opt(&opt, Some(&mut buf), None, true);
         assert_eq!(buf[2], 0, "null terminator should be appended");
@@ -1496,7 +1673,7 @@ mod tests {
         let mut opts = vec![DhcpOpt {
             opt: 43, flags: DHOPT_VENDOR,
             val: Some(b"v".to_vec()),
-            netid: None, encap: 0,
+            netid: vec![], encap: 0,
             vendor_class: Some(b"PXEClient".to_vec()),
         }];
         match_vendor_opts(Some(b"PXEClient:Arch:00000"), &mut opts);
@@ -1509,7 +1686,7 @@ mod tests {
         let mut opts = vec![DhcpOpt {
             opt: 43, flags: DHOPT_VENDOR,
             val: Some(b"v".to_vec()),
-            netid: None, encap: 0,
+            netid: vec![], encap: 0,
             vendor_class: Some(b"PXEClient".to_vec()),
         }];
         match_vendor_opts(Some(b"MSFT 5.0"), &mut opts);
@@ -1522,7 +1699,7 @@ mod tests {
         let mut opts = vec![DhcpOpt {
             opt: 43, flags: DHOPT_VENDOR | DHOPT_VENDOR_MATCH,
             val: Some(b"v".to_vec()),
-            netid: None, encap: 0,
+            netid: vec![], encap: 0,
             vendor_class: Some(b"PXEClient".to_vec()),
         }];
         // No vc_data → should clear VENDOR_MATCH.
@@ -1664,5 +1841,199 @@ mod tests {
         };
         do_options(&mut pkt, &mut cfg);
         assert!(has_opt_raw(&pkt.options, crate::dhcp_protocol::OPTION_VENDOR_ID));
+    }
+
+    // ── calc_time ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn calc_time_context_default() {
+        assert_eq!(calc_time(3600, None, None), 3600);
+    }
+
+    #[test]
+    fn calc_time_config_override() {
+        assert_eq!(calc_time(3600, Some(7200), None), 7200);
+    }
+
+    #[test]
+    fn calc_time_client_request_lower() {
+        assert_eq!(calc_time(3600, None, Some(1800)), 1800);
+    }
+
+    #[test]
+    fn calc_time_client_request_minimum_120() {
+        assert_eq!(calc_time(3600, None, Some(10)), 120);
+    }
+
+    #[test]
+    fn calc_time_infinite_context_uses_request() {
+        assert_eq!(calc_time(0xFFFFFFFF, None, Some(3600)), 3600);
+    }
+
+    #[test]
+    fn calc_time_infinite_request_keeps_context() {
+        assert_eq!(calc_time(3600, None, Some(0xFFFFFFFF)), 3600);
+    }
+
+    // ── server_id ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn server_id_override_wins() {
+        let o = Some(Ipv4Addr::new(10, 0, 0, 99));
+        let c = Some(Ipv4Addr::new(10, 0, 0, 1));
+        let f = Ipv4Addr::new(1, 2, 3, 4);
+        assert_eq!(server_id(c, o, f), Ipv4Addr::new(10, 0, 0, 99));
+    }
+
+    #[test]
+    fn server_id_context_local() {
+        let c = Some(Ipv4Addr::new(10, 0, 0, 1));
+        let f = Ipv4Addr::new(1, 2, 3, 4);
+        assert_eq!(server_id(c, None, f), Ipv4Addr::new(10, 0, 0, 1));
+    }
+
+    #[test]
+    fn server_id_fallback() {
+        let f = Ipv4Addr::new(1, 2, 3, 4);
+        assert_eq!(server_id(None, None, f), Ipv4Addr::new(1, 2, 3, 4));
+    }
+
+    // ── sanitise ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sanitise_printable() {
+        assert_eq!(sanitise(b"hello"), "hello");
+    }
+
+    #[test]
+    fn sanitise_strips_control() {
+        assert_eq!(sanitise(b"he\x01llo\x7f"), "hello");
+    }
+
+    #[test]
+    fn sanitise_empty() {
+        assert_eq!(sanitise(b""), "");
+    }
+
+    // ── log_packet ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn log_packet_basic() {
+        let s = log_packet("DHCPOFFER", Some(Ipv4Addr::new(10,0,0,5)), Some(&[0xaa,0xbb,0xcc]), "eth0", Some("host1"), 0x1234, false);
+        assert!(s.contains("DHCPOFFER(eth0)"));
+        assert!(s.contains("10.0.0.5"));
+        assert!(s.contains("aa:bb:cc"));
+        assert!(s.contains("host1"));
+    }
+
+    #[test]
+    fn log_packet_with_xid() {
+        let s = log_packet("DHCPACK", None, None, "eth0", None, 0xDEAD, true);
+        assert!(s.contains("0000dead"));
+        assert!(s.contains("DHCPACK(eth0)"));
+    }
+
+    #[test]
+    fn log_packet_no_addr_no_mac() {
+        let s = log_packet("DHCPNAK", None, None, "br0", None, 0, false);
+        assert!(s.contains("DHCPNAK(br0)"));
+    }
+
+    // ── extended_hwaddr ───────────────────────────────────────────────────────
+
+    #[test]
+    fn extended_hwaddr_uses_hwaddr_when_available() {
+        let hw = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let result = extended_hwaddr(1, &hw, Some(&[1, 0x11, 0x22, 0x33, 0x44]));
+        assert_eq!(result, &hw);
+    }
+
+    #[test]
+    fn extended_hwaddr_falls_back_to_clid_matching_type() {
+        // hwaddr empty, clid starts with hwtype=1
+        let clid = [1u8, 0xAA, 0xBB, 0xCC, 0xDD];
+        let result = extended_hwaddr(1, &[], Some(&clid));
+        assert_eq!(result, &[0xAA, 0xBB, 0xCC, 0xDD]); // skip type byte
+    }
+
+    #[test]
+    fn extended_hwaddr_falls_back_to_full_clid_mismatched_type() {
+        // hwaddr empty, clid type doesn't match
+        let clid = [2u8, 0xAA, 0xBB, 0xCC, 0xDD];
+        let result = extended_hwaddr(1, &[], Some(&clid));
+        assert_eq!(result, &clid[..]); // full clid
+    }
+
+    #[test]
+    fn extended_hwaddr_empty_hwaddr_no_clid() {
+        let result = extended_hwaddr(1, &[], None);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn extended_hwaddr_empty_hwaddr_short_clid() {
+        // clid too short (<=3), returns hwaddr (empty)
+        let result = extended_hwaddr(1, &[], Some(&[1, 2, 3]));
+        assert!(result.is_empty());
+    }
+
+    // ── is_pxe_client ────────────────────────────────────────────────────────
+
+    #[test]
+    fn is_pxe_client_yes() {
+        assert!(is_pxe_client(Some(b"PXEClient:Arch:00000")));
+    }
+
+    #[test]
+    fn is_pxe_client_no() {
+        assert!(!is_pxe_client(Some(b"MSFT 5.0")));
+    }
+
+    #[test]
+    fn is_pxe_client_none() {
+        assert!(!is_pxe_client(None));
+    }
+
+    // ── find_boot ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn find_boot_tagged() {
+        use crate::types::dhcp::{DhcpBoot, DhcpNetid};
+        let boots = vec![
+            DhcpBoot {
+                file: Some("default.img".into()),
+                sname: None, tftp_sname: None,
+                next_server: Ipv4Addr::UNSPECIFIED,
+                netid: vec![],
+            },
+            DhcpBoot {
+                file: Some("special.img".into()),
+                sname: None, tftp_sname: None,
+                next_server: Ipv4Addr::UNSPECIFIED,
+                netid: vec![DhcpNetid { net: "lab".into() }],
+            },
+        ];
+        let result = find_boot(&boots, Some("lab"));
+        assert_eq!(result.unwrap().file.as_deref(), Some("special.img"));
+    }
+
+    #[test]
+    fn find_boot_untagged_fallback() {
+        use crate::types::dhcp::DhcpBoot;
+        let boots = vec![
+            DhcpBoot {
+                file: Some("default.img".into()),
+                sname: None, tftp_sname: None,
+                next_server: Ipv4Addr::UNSPECIFIED,
+                netid: vec![],
+            },
+        ];
+        let result = find_boot(&boots, Some("nomatch"));
+        assert_eq!(result.unwrap().file.as_deref(), Some("default.img"));
+    }
+
+    #[test]
+    fn find_boot_empty() {
+        assert!(find_boot(&[], Some("x")).is_none());
     }
 }

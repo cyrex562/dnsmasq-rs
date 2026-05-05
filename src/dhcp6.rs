@@ -199,6 +199,142 @@ pub fn dhcp6_reply_dest(src: SocketAddr) -> SocketAddr {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// IPv6 address helpers (ported from dhcp6.c:575-615)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Extract the lower 64 bits of an IPv6 address (the host part).
+fn addr6part(addr: &Ipv6Addr) -> u64 {
+    let o = addr.octets();
+    u64::from_be_bytes(o[8..16].try_into().unwrap())
+}
+
+/// Check if two IPv6 addresses share the same prefix of `prefix_len` bits.
+pub fn is_same_net6(a: &Ipv6Addr, b: &Ipv6Addr, prefix_len: i32) -> bool {
+    let a_oct = a.octets();
+    let b_oct = b.octets();
+    let mut remaining = prefix_len as usize;
+    for i in 0..16 {
+        if remaining == 0 {
+            break;
+        }
+        if remaining >= 8 {
+            if a_oct[i] != b_oct[i] {
+                return false;
+            }
+            remaining -= 8;
+        } else {
+            let mask = 0xFF << (8 - remaining);
+            if (a_oct[i] & mask) != (b_oct[i] & mask) {
+                return false;
+            }
+            remaining = 0;
+        }
+    }
+    true
+}
+
+/// Check if `addr` can be dynamically allocated from one of the DHCPv6 contexts.
+///
+/// Returns `true` if addr falls within any non-static context range on the same prefix.
+/// Port of `address6_available()` from dhcp6.c:575-599.
+pub fn address6_available(contexts: &[crate::types::dhcp::DhcpContext], addr: &Ipv6Addr) -> bool {
+    let a = addr6part(addr);
+    for ctx in contexts {
+        #[cfg(feature = "dhcp6")]
+        {
+            use crate::types::dhcp::{CONTEXT_STATIC, CONTEXT_RA_STATELESS};
+            if ctx.flags & (CONTEXT_STATIC | CONTEXT_RA_STATELESS) != 0 {
+                continue;
+            }
+            if !is_same_net6(&ctx.start6, addr, ctx.prefix) {
+                continue;
+            }
+            let start = addr6part(&ctx.start6);
+            let end = addr6part(&ctx.end6);
+            if a >= start && a <= end {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Check if `addr` is valid for any configured DHCPv6 context (static or dynamic).
+///
+/// Returns `true` if addr is on the same prefix as any context.
+/// Port of `address6_valid()` from dhcp6.c:601-615.
+pub fn address6_valid(contexts: &[crate::types::dhcp::DhcpContext], addr: &Ipv6Addr) -> bool {
+    for ctx in contexts {
+        #[cfg(feature = "dhcp6")]
+        {
+            if is_same_net6(&ctx.start6, addr, ctx.prefix) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Find a static DHCPv6 host config matching an address.
+///
+/// Port of `config_find_by_address6()` from dhcp6.c:474-490.
+#[cfg(feature = "dhcp6")]
+pub fn config_find_by_address6(
+    configs: &[crate::types::dhcp::DhcpConfig],
+    addr: &Ipv6Addr,
+) -> bool {
+    use crate::types::addr::AllAddr;
+    use crate::types::dhcp::CONFIG_ADDR6;
+    for config in configs {
+        if config.flags & CONFIG_ADDR6 == 0 {
+            continue;
+        }
+        for a6 in &config.addr6 {
+            if let AllAddr::Addr6(ref v6) = a6.addr {
+                if is_same_net6(v6, addr, 128) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DHCPv6 SDBM hash and address allocation (ported from dhcp6.c:492-573)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Compute 64-bit SDBM hash of a client identifier for DHCPv6 address allocation.
+///
+/// Seeded with the IAID (Identity Association ID).
+/// Port of the hash in dhcp6.c:514-515.
+pub fn sdbm_hash64(clid: &[u8], iaid: u32) -> u64 {
+    let mut j: u64 = iaid as u64;
+    for &b in clid {
+        j = (b as u64)
+            .wrapping_add(j.wrapping_shl(6))
+            .wrapping_add(j.wrapping_shl(16))
+            .wrapping_sub(j);
+    }
+    j
+}
+
+/// Calculate the starting IPv6 host-part for allocation using hash-based seeding.
+///
+/// Maps the hash into the range [start6_low64, end6_low64] using modular arithmetic.
+/// Port of the address calculation in dhcp6.c:536-544.
+pub fn hash_to_addr6(hash: u64, epoch: u32, start_low: u64, end_low: u64) -> u64 {
+    let range = end_low.wrapping_sub(start_low).wrapping_add(1);
+    let offset = hash.wrapping_add(epoch as u64);
+    if range == 0 {
+        // Full 2^64 range — don't divide by zero
+        start_low.wrapping_add(offset)
+    } else {
+        start_low.wrapping_add(offset % range)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -290,5 +426,191 @@ mod tests {
         let relay = result.err().unwrap().unwrap();
         assert_eq!(relay.msg_type, Dhcp6MsgType::RelayForw);
         assert_eq!(relay.hop_count, 5);
+    }
+
+    // ── is_same_net6 ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn is_same_net6_same_prefix() {
+        let a: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let b: Ipv6Addr = "2001:db8::ffff".parse().unwrap();
+        assert!(is_same_net6(&a, &b, 64));
+    }
+
+    #[test]
+    fn is_same_net6_different_prefix() {
+        let a: Ipv6Addr = "2001:db8:1::1".parse().unwrap();
+        let b: Ipv6Addr = "2001:db8:2::1".parse().unwrap();
+        assert!(!is_same_net6(&a, &b, 48));
+    }
+
+    #[test]
+    fn is_same_net6_exact_match() {
+        let a: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let b: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        assert!(is_same_net6(&a, &b, 128));
+    }
+
+    #[test]
+    fn is_same_net6_exact_mismatch() {
+        let a: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let b: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        assert!(!is_same_net6(&a, &b, 128));
+    }
+
+    #[test]
+    fn is_same_net6_zero_prefix() {
+        let a: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let b: Ipv6Addr = "fe80::1".parse().unwrap();
+        assert!(is_same_net6(&a, &b, 0));
+    }
+
+    // ── addr6part ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn addr6part_extracts_low64() {
+        let a: Ipv6Addr = "2001:db8::42".parse().unwrap();
+        assert_eq!(addr6part(&a), 0x42);
+    }
+
+    #[test]
+    fn addr6part_max() {
+        let a: Ipv6Addr = "::ffff:ffff:ffff:ffff".parse().unwrap();
+        assert_eq!(addr6part(&a), u64::MAX);
+    }
+
+    // ── address6_available / address6_valid ───────────────────────────────────
+
+    #[cfg(feature = "dhcp6")]
+    fn make_v6_ctx(start6: Ipv6Addr, end6: Ipv6Addr, prefix: i32, flags: u32) -> crate::types::dhcp::DhcpContext {
+        use std::net::Ipv4Addr;
+        crate::types::dhcp::DhcpContext {
+            start: Ipv4Addr::UNSPECIFIED,
+            end: Ipv4Addr::UNSPECIFIED,
+            router: Ipv4Addr::UNSPECIFIED,
+            flags,
+            netmask: Ipv4Addr::new(0,0,0,0),
+            broadcast: Ipv4Addr::new(0,0,0,0),
+            local: Ipv4Addr::new(0,0,0,0),
+            lease_time: 3600,
+            addr_epoch: 0,
+            netid: crate::types::dhcp::DhcpNetid { net: String::new() },
+            filter: vec![],
+            start6,
+            end6,
+            local6: Ipv6Addr::UNSPECIFIED,
+            prefix,
+            if_index: 0,
+            valid: 0,
+            preferred: 0,
+        }
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn address6_available_in_range() {
+        let ctx = make_v6_ctx(
+            "2001:db8::100".parse().unwrap(),
+            "2001:db8::200".parse().unwrap(),
+            64, 0,
+        );
+        assert!(address6_available(&[ctx], &"2001:db8::150".parse().unwrap()));
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn address6_available_out_of_range() {
+        let ctx = make_v6_ctx(
+            "2001:db8::100".parse().unwrap(),
+            "2001:db8::200".parse().unwrap(),
+            64, 0,
+        );
+        assert!(!address6_available(&[ctx], &"2001:db8::50".parse().unwrap()));
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn address6_available_skips_static() {
+        use crate::types::dhcp::CONTEXT_STATIC;
+        let ctx = make_v6_ctx(
+            "2001:db8::100".parse().unwrap(),
+            "2001:db8::200".parse().unwrap(),
+            64, CONTEXT_STATIC,
+        );
+        assert!(!address6_available(&[ctx], &"2001:db8::150".parse().unwrap()));
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn address6_valid_on_prefix() {
+        let ctx = make_v6_ctx(
+            "2001:db8::100".parse().unwrap(),
+            "2001:db8::200".parse().unwrap(),
+            64, 0,
+        );
+        assert!(address6_valid(&[ctx], &"2001:db8::999".parse().unwrap()));
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn address6_valid_wrong_prefix() {
+        let ctx = make_v6_ctx(
+            "2001:db8:1::100".parse().unwrap(),
+            "2001:db8:1::200".parse().unwrap(),
+            48, 0,
+        );
+        assert!(!address6_valid(&[ctx], &"2001:db8:2::1".parse().unwrap()));
+    }
+
+    // ── sdbm_hash64 ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn sdbm_hash64_deterministic() {
+        let clid = [0x01, 0x02, 0x03, 0x04];
+        assert_eq!(sdbm_hash64(&clid, 1), sdbm_hash64(&clid, 1));
+    }
+
+    #[test]
+    fn sdbm_hash64_different_clids_differ() {
+        let h1 = sdbm_hash64(&[0x01, 0x02], 1);
+        let h2 = sdbm_hash64(&[0xAA, 0xBB], 1);
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn sdbm_hash64_different_iaids_differ() {
+        let clid = [0x01, 0x02, 0x03];
+        assert_ne!(sdbm_hash64(&clid, 1), sdbm_hash64(&clid, 2));
+    }
+
+    // ── hash_to_addr6 ────────────────────────────────────────────────────────
+
+    #[test]
+    fn hash_to_addr6_in_range() {
+        let start = 0x100u64;
+        let end = 0x200u64;
+        let result = hash_to_addr6(42, 0, start, end);
+        assert!(result >= start && result <= end);
+    }
+
+    #[test]
+    fn hash_to_addr6_single_address() {
+        let result = hash_to_addr6(999, 0, 0x42, 0x42);
+        assert_eq!(result, 0x42);
+    }
+
+    #[test]
+    fn hash_to_addr6_epoch_shifts() {
+        let a1 = hash_to_addr6(42, 0, 0x100, 0x200);
+        let a2 = hash_to_addr6(42, 1, 0x100, 0x200);
+        assert_ne!(a1, a2);
+    }
+
+    #[test]
+    fn hash_to_addr6_full_range() {
+        // Full 2^64 range should not panic
+        let result = hash_to_addr6(42, 0, 0, u64::MAX);
+        // Just verify it doesn't panic
+        let _ = result;
     }
 }

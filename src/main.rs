@@ -40,6 +40,8 @@ pub mod crypto;
 pub mod auth;
 
 #[cfg(feature = "dhcp")]
+pub mod dhcp;
+#[cfg(feature = "dhcp")]
 pub mod dhcp_common;
 #[cfg(feature = "dhcp")]
 pub mod rfc2131;
@@ -82,22 +84,6 @@ pub mod bpf;
 pub mod tables;
 
 /// Command-line arguments.
-#[derive(clap::Parser, Debug)]
-#[command(name = "dnsmasq-rs", version, about = "A Rust port of dnsmasq")]
-struct Args {
-    /// Path to the configuration file.
-    #[arg(long = "conf-file", value_name = "FILE")]
-    conf_file: Option<String>,
-
-    /// DNS port to listen on (overrides config file).
-    #[arg(long, value_name = "PORT")]
-    port: Option<u16>,
-
-    /// Print version and exit.
-    #[arg(long, action = clap::ArgAction::Version)]
-    version: (),
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use clap::Parser as _;
@@ -111,23 +97,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let args = Args::parse();
-
-    let daemon_handle = dnsmasq::init_daemon();
-
-    // Apply config file if given.
+    let args = option::CliArgs::parse();
+    let mut lines = Vec::new();
     if let Some(ref conf_path) = args.conf_file {
         let text = std::fs::read_to_string(conf_path)?;
-        let lines = option::parse_config_text(&text, conf_path)?;
-        let mut daemon = daemon_handle.write().await;
-        option::apply_config(&mut daemon, &lines)?;
+        lines.extend(option::parse_config_text(&text, conf_path)?);
         info!("loaded config from {conf_path}");
     }
+    lines.extend(option::config_lines_from_cli(&args));
 
-    // CLI port overrides config file.
-    if let Some(port) = args.port {
-        daemon_handle.write().await.port = port;
-    }
+    let resolved = option::resolve_config(&lines)?;
+    let daemon_handle = dnsmasq::init_daemon_with(resolved.into_daemon());
 
     {
         let daemon = daemon_handle.read().await;

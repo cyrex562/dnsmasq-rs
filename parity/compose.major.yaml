@@ -1,0 +1,33 @@
+services:
+  upstream:
+    build:
+      context: ..
+      dockerfile: parity/docker/upstream.Dockerfile
+    container_name: dnsmasq-parity-upstream
+    command:
+      - -k
+      - --conf-file=/fixtures/dns/${FIXTURE:-basic}/dnsmasq.conf
+      - --port=1053
+    ports:
+      - "127.0.0.1:${UPSTREAM_PORT:-2053}:1053/udp"
+      - "127.0.0.1:${UPSTREAM_PORT:-2053}:1053/tcp"
+    volumes:
+      - ./fixtures:/fixtures:ro
+
+  rust:
+    build:
+      context: ..
+      dockerfile: parity/docker/rust.Dockerfile
+    container_name: dnsmasq-parity-rust
+    command:
+      - --conf-file
+      - /fixtures/dns/${FIXTURE:-basic}/dnsmasq.conf
+      - --port
+      - "1053"
+    environment:
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:${CANDIDATE_PORT:-3053}:1053/udp"
+      - "127.0.0.1:${CANDIDATE_PORT:-3053}:1053/tcp"
+    volumes:
+      - ./fixtures:/fixtures:ro

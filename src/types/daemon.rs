@@ -5,7 +5,7 @@
 /// concurrent access from tokio tasks.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
-use crate::types::constants::OPTION_SIZE;
+use crate::types::constants::*;
 use crate::types::addr::MySockAddr;
 use crate::types::dns_records::*;
 use crate::types::network::*;
@@ -41,6 +41,7 @@ pub struct Daemon {
     pub int_names:     Vec<InterfaceName>,
     pub bogus_addr:    Vec<BogusAddr>,
     pub ignore_addr:   Vec<BogusAddr>,
+    pub leasequery_addr: Vec<BogusAddr>,
     pub doctors:       Vec<Doctor>,
     pub rrlist_cache:  Vec<RrList>,
     pub rrlist_filter: Vec<RrList>,
@@ -52,6 +53,7 @@ pub struct Daemon {
     pub if_except:     Vec<Iname>,
     pub dhcp_except:   Vec<Iname>,
     pub auth_peers:    Vec<Iname>,
+    pub auth_interfaces: Vec<Iname>,
     pub tftp_interfaces: Vec<Iname>,
     pub interface_addrs: Vec<Addrlist>,
     pub ipsets:        Vec<Ipsets>,
@@ -91,6 +93,7 @@ pub struct Daemon {
     pub luascript:       Option<String>,
     pub authserver:      Option<String>,
     pub hostmaster:      Option<String>,
+    pub secondary_forward_servers: Vec<String>,
     pub domain_suffix:   Option<String>,
     pub runfile:         Option<String>,
     pub lease_change_command: Option<String>,
@@ -100,6 +103,8 @@ pub struct Daemon {
     pub add_subnet4:     Option<MySubnet>,
     pub add_subnet6:     Option<MySubnet>,
     pub addn_hosts:      Vec<HostsFile>,
+    pub dhcp_hosts_file: Vec<HostsFile>,
+    pub dhcp_opts_file:  Vec<HostsFile>,
     pub dynamic_dirs:    Vec<DynDir>,
     pub soa_sn:          u32,
     pub soa_refresh:     u32,
@@ -112,6 +117,10 @@ pub struct Daemon {
     pub randport_limit:  i32,
     /// Incremented each time a config reload (SIGHUP) is processed.
     pub reload_count:    u32,
+    /// Set when DNS data has been modified and needs re-serving.
+    pub dns_dirty:       bool,
+    /// The next scheduled alarm time (if any).
+    pub next_alarm:      Option<std::time::Instant>,
 
     // ── DHCP state (feature-gated) ────────────────────────────────────────────
     #[cfg(feature = "dhcp")]
@@ -122,6 +131,16 @@ pub struct Daemon {
     pub dhcp_opts:       Vec<DhcpOpt>,
     #[cfg(feature = "dhcp")]
     pub dhcp_opts6:      Vec<DhcpOpt>,
+    #[cfg(feature = "dhcp")]
+    pub dhcp_vendors:    Vec<DhcpVendorRule>,
+    #[cfg(feature = "dhcp")]
+    pub dhcp_userclasses: Vec<DhcpUserClassRule>,
+    #[cfg(feature = "dhcp")]
+    pub dhcp_macs:      Vec<DhcpMacRule>,
+    #[cfg(feature = "dhcp")]
+    pub dhcp_relay_ids: Vec<DhcpRelayIdRule>,
+    #[cfg(feature = "dhcp")]
+    pub dhcp_reply_delays: Vec<DhcpReplyDelay>,
     #[cfg(feature = "dhcp")]
     pub boot_config:     Vec<DhcpBoot>,
     #[cfg(feature = "dhcp")]
@@ -153,6 +172,8 @@ pub struct Daemon {
     // ── DNSSEC (feature-gated) ────────────────────────────────────────────────
     #[cfg(feature = "dnssec")]
     pub ds:                 Vec<DsConfig>,
+    #[cfg(feature = "dnssec")]
+    pub dnssec_limits:      [i32; LIMIT_MAX],
     #[cfg(feature = "dnssec")]
     pub timestamp_file:     Option<String>,
     #[cfg(feature = "dnssec")]
@@ -190,19 +211,19 @@ pub struct Daemon {
 impl Daemon {
     /// Test whether an option bit is set.
     pub fn option_bool(&self, opt: usize) -> bool {
-        let bits = usize::BITS as usize;
+        let bits = u32::BITS as usize;
         self.options[opt / bits] & (1u32 << (opt % bits)) != 0
     }
 
     /// Set an option bit.
     pub fn set_option(&mut self, opt: usize) {
-        let bits = usize::BITS as usize;
+        let bits = u32::BITS as usize;
         self.options[opt / bits] |= 1u32 << (opt % bits);
     }
 
     /// Clear an option bit.
     pub fn clear_option(&mut self, opt: usize) {
-        let bits = usize::BITS as usize;
+        let bits = u32::BITS as usize;
         self.options[opt / bits] &= !(1u32 << (opt % bits));
     }
 }
@@ -227,6 +248,7 @@ impl Default for Daemon {
             int_names: vec![],
             bogus_addr: vec![],
             ignore_addr: vec![],
+            leasequery_addr: vec![],
             doctors: vec![],
             rrlist_cache: vec![],
             rrlist_filter: vec![],
@@ -236,6 +258,7 @@ impl Default for Daemon {
             if_except: vec![],
             dhcp_except: vec![],
             auth_peers: vec![],
+            auth_interfaces: vec![],
             tftp_interfaces: vec![],
             interface_addrs: vec![],
             ipsets: vec![],
@@ -250,9 +273,9 @@ impl Default for Daemon {
             max_ttl: 0,
             min_cache_ttl: 0,
             max_cache_ttl: 0,
-            auth_ttl: 0,
+            auth_ttl: 600,
             cachesize: 150,
-            ftabsize: 1000,
+            ftabsize: 150,
             cache_max_expiry: -1,
             fast_retry_time: 0,
             fast_retry_timeout: 0,
@@ -269,6 +292,7 @@ impl Default for Daemon {
             luascript: None,
             authserver: None,
             hostmaster: None,
+            secondary_forward_servers: vec![],
             domain_suffix: None,
             runfile: None,
             lease_change_command: None,
@@ -278,17 +302,21 @@ impl Default for Daemon {
             add_subnet4: None,
             add_subnet6: None,
             addn_hosts: vec![],
+            dhcp_hosts_file: vec![],
+            dhcp_opts_file: vec![],
             dynamic_dirs: vec![],
             soa_sn: 0,
-            soa_refresh: 0,
-            soa_retry: 0,
-            soa_expiry: 0,
+            soa_refresh: 1200,
+            soa_retry: 180,
+            soa_expiry: 1209600,
             osport: 0,
             host_index: 0,
             pipe_to_parent: -1,
             max_procs: 0,
             randport_limit: 0,
             reload_count: 0,
+            dns_dirty: false,
+            next_alarm: None,
 
             #[cfg(feature = "dhcp")]
             dhcp: vec![],
@@ -298,6 +326,16 @@ impl Default for Daemon {
             dhcp_opts: vec![],
             #[cfg(feature = "dhcp")]
             dhcp_opts6: vec![],
+            #[cfg(feature = "dhcp")]
+            dhcp_vendors: vec![],
+            #[cfg(feature = "dhcp")]
+            dhcp_userclasses: vec![],
+            #[cfg(feature = "dhcp")]
+            dhcp_macs: vec![],
+            #[cfg(feature = "dhcp")]
+            dhcp_relay_ids: vec![],
+            #[cfg(feature = "dhcp")]
+            dhcp_reply_delays: vec![],
             #[cfg(feature = "dhcp")]
             boot_config: vec![],
             #[cfg(feature = "dhcp")]
@@ -329,6 +367,13 @@ impl Default for Daemon {
             #[cfg(feature = "dnssec")]
             ds: vec![],
             #[cfg(feature = "dnssec")]
+            dnssec_limits: [
+                DNSSEC_LIMIT_SIG_FAIL,
+                DNSSEC_LIMIT_CRYPTO,
+                DNSSEC_LIMIT_WORK,
+                DNSSEC_LIMIT_NSEC3_ITERS,
+            ],
+            #[cfg(feature = "dnssec")]
             timestamp_file: None,
             #[cfg(feature = "dnssec")]
             dnssec_no_time_check: false,
@@ -349,7 +394,7 @@ impl Default for Daemon {
             #[cfg(feature = "dump")]
             dump_file: None,
             #[cfg(feature = "dump")]
-            dump_mask: 0,
+            dump_mask: -1,
 
             #[cfg(feature = "dbus")]
             dbus_name: None,
@@ -363,7 +408,7 @@ impl Default for Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::constants::{OPT_DEBUG, OPT_NO_POLL};
+    use crate::types::constants::{OPT_DEBUG, OPT_DNSSEC_VALID, OPT_NO_POLL};
 
     #[test]
     fn option_set_get_clear() {
@@ -385,6 +430,16 @@ mod tests {
         d.clear_option(OPT_DEBUG);
         assert!(!d.option_bool(OPT_DEBUG));
         assert!(d.option_bool(OPT_NO_POLL));
+    }
+
+    #[test]
+    fn high_option_bit_set_get_clear() {
+        let mut d = Daemon::default();
+        assert!(!d.option_bool(OPT_DNSSEC_VALID));
+        d.set_option(OPT_DNSSEC_VALID);
+        assert!(d.option_bool(OPT_DNSSEC_VALID));
+        d.clear_option(OPT_DNSSEC_VALID);
+        assert!(!d.option_bool(OPT_DNSSEC_VALID));
     }
 
     #[test]
