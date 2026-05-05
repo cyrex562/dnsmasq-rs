@@ -121,8 +121,20 @@ pub const OPT_LOG_ONLY_FAILED:  usize = 78;
 pub const OPT_LOG_MALLOC:       usize = 79;
 pub const OPT_LAST:             usize = 80;
 
-const OPTION_BITS: usize = usize::BITS as usize;
+const OPTION_BITS: usize = u32::BITS as usize;
 pub const OPTION_SIZE: usize = (OPT_LAST / OPTION_BITS) + ((OPT_LAST % OPTION_BITS != 0) as usize);
+
+/// DNSSEC validation resource limit indexes.
+pub const LIMIT_SIG_FAIL: usize = 0;
+pub const LIMIT_CRYPTO: usize = 1;
+pub const LIMIT_WORK: usize = 2;
+pub const LIMIT_NSEC3_ITERS: usize = 3;
+pub const LIMIT_MAX: usize = 4;
+
+pub const DNSSEC_LIMIT_SIG_FAIL: i32 = 20;
+pub const DNSSEC_LIMIT_CRYPTO: i32 = 200;
+pub const DNSSEC_LIMIT_WORK: i32 = 40;
+pub const DNSSEC_LIMIT_NSEC3_ITERS: i32 = 150;
 
 /// Cache record flags (F_* constants).
 pub const F_IMMORTAL:  u32 = 1 << 0;
@@ -241,7 +253,7 @@ mod tests {
 
     #[test]
     fn option_size_covers_all() {
-        assert!(OPTION_SIZE * usize::BITS as usize >= OPT_LAST);
+        assert!(OPTION_SIZE * u32::BITS as usize >= OPT_LAST);
     }
 
     #[test]

@@ -11,10 +11,12 @@ use crate::types::addr::MySockAddr;
 use crate::types::constants::*;
 use crate::types::daemon::Daemon;
 use crate::types::dns_records::{
-    Addrlist, AuthNameEntry, AuthZone, BogusAddr, Cname, Doctor, DsConfig, HostRecord,
-    MxSrvRecord, Naptr, PtrRecord, RrList, TxtRecord, ADDRLIST_IPV6, ADDRLIST_LITERAL,
+    Addrlist, AuthNameEntry, AuthZone, BogusAddr, Cname, Doctor, DsConfig, HostRecord, AUTH4,
+    AUTH6,
+    InterfaceName, MxSrvRecord, Naptr, PtrRecord, RrList, TxtRecord, ADDRLIST_IPV6,
+    ADDRLIST_LITERAL, IN4, IN6, INP4, INP6,
 };
-use crate::types::network::{HostsFile, Iname, Ipsets};
+use crate::types::network::{DynDir, HostsFile, Iname, Ipsets, MySubnet, AH_DHCP_HST, AH_DHCP_OPT, AH_HOSTS, INAME_4, INAME_6};
 use crate::types::server::{Server, SERV_4ADDR, SERV_6ADDR, SERV_LITERAL_ADDRESS};
 #[cfg(feature = "dhcp")]
 use crate::types::dhcp::{
@@ -514,7 +516,7 @@ pub fn apply_config(daemon: &mut Daemon, lines: &[ConfigLine]) -> Result<(), Con
     for cl in lines {
         apply_line(daemon, cl)?;
     }
-    normalize_config(daemon);
+    normalize_config(daemon)?;
 
     Ok(())
 }
@@ -526,8 +528,14 @@ pub fn resolve_config(lines: &[ConfigLine]) -> Result<ResolvedConfig, ConfigErro
     Ok(ResolvedConfig { daemon })
 }
 
-fn normalize_config(daemon: &mut Daemon) {
+fn normalize_config(daemon: &mut Daemon) -> Result<(), ConfigError> {
     apply_dnssec_fast_retry_defaults(daemon);
+    apply_local_ttl_defaults(daemon);
+    apply_mx_defaults(daemon)?;
+    apply_auth_defaults(daemon);
+    apply_local_service_defaults(daemon);
+    validate_auth_config(daemon)?;
+    Ok(())
 }
 
 fn apply_dnssec_fast_retry_defaults(daemon: &mut Daemon) {
@@ -537,6 +545,115 @@ fn apply_dnssec_fast_retry_defaults(daemon: &mut Daemon) {
         daemon.fast_retry_timeout = UPSTREAM_TIMEOUT_SECS;
         daemon.fast_retry_time = DEFAULT_FAST_RETRY_MS;
     }
+}
+
+fn apply_local_ttl_defaults(daemon: &mut Daemon) {
+    let local_ttl = daemon.local_ttl as i32;
+    for host_record in &mut daemon.host_records {
+        if host_record.ttl == -1 {
+            host_record.ttl = local_ttl;
+        }
+    }
+    for cname in &mut daemon.cnames {
+        if cname.ttl == -1 {
+            cname.ttl = local_ttl;
+        }
+    }
+}
+
+fn apply_mx_defaults(daemon: &mut Daemon) -> Result<(), ConfigError> {
+    if !daemon.option_bool(OPT_LOCALMX) && daemon.mxnames.is_empty() && daemon.mxtarget.is_none() {
+        return Ok(());
+    }
+
+    let hostname = local_hostname_for_mx().ok_or_else(|| {
+        ConfigError::InvalidValue(
+            String::new(),
+            "mx-target".to_string(),
+            "<runtime>".to_string(),
+            0,
+            "failed to determine local hostname".to_string(),
+        )
+    })?;
+
+    if (daemon.mxtarget.is_some() || daemon.option_bool(OPT_LOCALMX))
+        && !daemon.mxnames.iter().any(|mx| !mx.is_srv && mx.name.eq_ignore_ascii_case(&hostname))
+    {
+        daemon.mxnames.push(MxSrvRecord {
+            name: hostname.clone(),
+            target: String::new(),
+            is_srv: false,
+            srv_port: 0,
+            priority: 1,
+            weight: 0,
+            offset: 0,
+        });
+    }
+
+    if daemon.mxtarget.is_none() {
+        daemon.mxtarget = Some(hostname);
+    }
+
+    if let Some(target) = daemon.mxtarget.clone() {
+        for mx in &mut daemon.mxnames {
+            if !mx.is_srv && mx.target.is_empty() {
+                mx.target = target.clone();
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn local_hostname_for_mx() -> Option<String> {
+    let mut buf = [0i8; 256];
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    buf[buf.len() - 1] = 0;
+    let hostname = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy();
+    canonicalise_opt(hostname.as_ref()).filter(|name| !name.is_empty())
+}
+
+fn apply_auth_defaults(daemon: &mut Daemon) {
+    if daemon.hostmaster.is_none() {
+        if let Some(authserver) = daemon.authserver.as_ref() {
+            daemon.hostmaster = Some(format!("hostmaster.{authserver}"));
+        }
+    }
+}
+
+fn apply_local_service_defaults(daemon: &mut Daemon) {
+    if !daemon.if_names.is_empty()
+        || !daemon.if_except.is_empty()
+        || !daemon.if_addrs.is_empty()
+        || daemon.authserver.is_some()
+    {
+        daemon.clear_option(OPT_LOCAL_SERVICE);
+        daemon.clear_option(OPT_LOCALHOST_SERVICE);
+    } else if daemon.option_bool(OPT_LOCALHOST_SERVICE) && !daemon.option_bool(OPT_LOCAL_SERVICE) {
+        daemon.if_names.push(Iname {
+            name: None,
+            addr: None,
+            flags: 0,
+        });
+        daemon.set_option(OPT_NOWILD);
+    }
+}
+
+fn validate_auth_config(daemon: &Daemon) -> Result<(), ConfigError> {
+    if !daemon.auth_zones.is_empty() && daemon.authserver.is_none() {
+        return Err(ConfigError::InvalidValue(
+            String::new(),
+            "auth-server".to_string(),
+            "<runtime>".to_string(),
+            0,
+            "--auth-server required when an auth zone is defined".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Apply a single [`ConfigLine`] to the daemon state.
@@ -550,6 +667,19 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
         cl.value.as_deref().ok_or_else(|| {
             ConfigError::MissingValue(opt.to_string(), file.clone(), lineno)
         })
+    };
+
+    let require_no_value = |opt: &str| -> Result<(), ConfigError> {
+        if let Some(value) = cl.value.as_deref() {
+            return Err(ConfigError::InvalidValue(
+                value.to_string(),
+                opt.to_string(),
+                file.clone(),
+                lineno,
+                "unexpected value".to_string(),
+            ));
+        }
+        Ok(())
     };
 
     let invalid = |val: &str, reason: &str| -> ConfigError {
@@ -571,20 +701,37 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
         "expand-hosts" => daemon.set_option(OPT_EXPAND),
         "filterwin2k" | "filter-win2k" => daemon.set_option(OPT_FILTER),
         "localise-queries" | "localize-queries" => daemon.set_option(OPT_LOCALISE),
-        "log-queries" => daemon.set_option(OPT_LOG),
+        "log-queries" => {
+            daemon.set_option(OPT_LOG);
+            match cl.value.as_deref() {
+                Some("extra") => daemon.set_option(OPT_EXTRALOG),
+                Some("proto") => {
+                    daemon.set_option(OPT_EXTRALOG);
+                    daemon.set_option(OPT_LOG_PROTO);
+                }
+                Some("auth") => daemon.set_option(OPT_AUTH_LOG),
+                Some("only_failed") => daemon.set_option(OPT_LOG_ONLY_FAILED),
+                _ => {}
+            }
+        }
         "log-dhcp"    => daemon.set_option(OPT_LOG_OPTS),
         "no-negcache" => daemon.set_option(OPT_NO_NEG),
         "strict-order" => daemon.set_option(OPT_ORDER),
         "all-servers"  => daemon.set_option(OPT_ALL_SERVERS),
         "reload-acl"   => daemon.set_option(OPT_RELOAD),
-        "local-service" => daemon.set_option(OPT_LOCAL_SERVICE),
         "no-rebind"    => daemon.set_option(OPT_NO_REBIND),
         "no-daemon"    => daemon.set_option(OPT_NO_FORK),
         "bind-interfaces" => daemon.set_option(OPT_NOWILD),
         "selfmx"       => daemon.set_option(OPT_SELFMX),
         "localmx"      => daemon.set_option(OPT_LOCALMX),
         "authoritative" => daemon.set_option(OPT_AUTHORITATIVE),
+        "dhcp-authoritative" => daemon.set_option(OPT_AUTHORITATIVE),
+        "read-ethers" => daemon.set_option(OPT_ETHERS),
         "ra-param"     => {} // skip; DHCP6 only
+        "dhcp-no-override" => daemon.set_option(OPT_NO_OVERRIDE),
+        "dhcp-sequential-ip" => daemon.set_option(OPT_CONSEC_ADDR),
+        "dhcp-ignore-clid" => daemon.set_option(OPT_IGNORE_CLID),
+        "dhcp-client-update" => daemon.set_option(OPT_FQDN_UPDATE),
         "dhcp-fqdn"    => daemon.set_option(OPT_DHCP_FQDN),
         "enable-dbus"  => daemon.set_option(OPT_DBUS),
         "no-ping"      => daemon.set_option(OPT_NO_PING),
@@ -598,19 +745,46 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
         "dnssec-debug" => daemon.set_option(OPT_DNSSEC_DEBUG),
         "dnssec-no-timecheck" => daemon.set_option(OPT_DNSSEC_TIME),
         "enable-ra"    => daemon.set_option(OPT_RA),
-        "enable-tftp"  => daemon.set_option(OPT_TFTP),
+        "enable-tftp"  => {
+            daemon.set_option(OPT_TFTP);
+            if let Some(v) = cl.value.as_deref() {
+                daemon.tftp_interfaces.extend(parse_tftp_interfaces(v, cl)?);
+            }
+        }
         "tftp-secure"  => daemon.set_option(OPT_TFTP_SECURE),
+        "tftp-no-fail" => {
+            require_no_value("tftp-no-fail")?;
+            daemon.set_option(OPT_TFTP_NO_FAIL);
+        }
         "tftp-no-blocksize" => daemon.set_option(OPT_TFTP_NOBLOCK),
         "tftp-lowercase"    => daemon.set_option(OPT_TFTP_LC),
+        "tftp-single-port"  => {
+            require_no_value("tftp-single-port")?;
+            daemon.set_option(OPT_SINGLE_PORT);
+        }
         "client-subnet"     => daemon.set_option(OPT_CLIENT_SUBNET),
         "loop-detect"       => daemon.set_option(OPT_LOOP_DETECT),
         "script-arp"        => daemon.set_option(OPT_SCRIPT_ARP),
+        "script-on-renewal" => daemon.set_option(OPT_LEASE_RENEW),
         "rapid-commit"      => daemon.set_option(OPT_RAPID_COMMIT),
+        "log-debug"         => daemon.set_option(OPT_LOG_DEBUG),
+        "quiet-tftp"        => daemon.set_option(OPT_QUIET_TFTP),
+        "no-ident"          => daemon.set_option(OPT_NO_IDENT),
+        "no-0x20-encode"    => daemon.set_option(OPT_NO_0X20),
+        "do-0x20-encode"    => daemon.set_option(OPT_DO_0X20),
+        "log-malloc"        => daemon.set_option(OPT_LOG_MALLOC),
         "ubus"              => daemon.set_option(OPT_UBUS),
-        "add-mac"           => daemon.set_option(OPT_ADD_MAC),
         "local-ttl" if cl.value.is_none() => {} // value required; handled below
 
         // ── Numeric / string options ────────────────────────────────────────
+        "local-service" => {
+            match cl.value.as_deref() {
+                None | Some("net") => daemon.set_option(OPT_LOCAL_SERVICE),
+                Some("host") => daemon.set_option(OPT_LOCALHOST_SERVICE),
+                Some(v) => return Err(invalid_value_for(cl, "local-service", v, "expected net or host")),
+            }
+        }
+
         "port" => {
             let v = require_value("port")?;
             let p: u16 = v.parse().map_err(|_| invalid(v, "expected a valid port number (0-65535)"))?;
@@ -698,6 +872,54 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             daemon.max_cache_ttl = n;
         }
 
+        "auth-ttl" => {
+            let v = require_value("auth-ttl")?;
+            daemon.auth_ttl = parse_u32_token(v, "auth-ttl", cl, "authoritative TTL")?;
+        }
+
+        "dhcp-ttl" => {
+            let v = require_value("dhcp-ttl")?;
+            let ttl = parse_u32_token(v, "dhcp-ttl", cl, "DHCP TTL")?;
+            #[cfg(feature = "dhcp")]
+            {
+                daemon.dhcp_ttl = ttl;
+                daemon.use_dhcp_ttl = 1;
+            }
+            #[cfg(not(feature = "dhcp"))]
+            {
+                let _ = ttl;
+            }
+        }
+
+        "auth-soa" => {
+            let v = require_value("auth-soa")?;
+            parse_auth_soa(daemon, v, cl)?;
+        }
+
+        "dnssec-timestamp" => {
+            let v = require_value("dnssec-timestamp")?;
+            #[cfg(feature = "dnssec")]
+            {
+                daemon.timestamp_file = Some(v.to_string());
+            }
+            #[cfg(not(feature = "dnssec"))]
+            {
+                let _ = v;
+            }
+        }
+
+        "dnssec-limits" => {
+            let v = require_value("dnssec-limits")?;
+            #[cfg(feature = "dnssec")]
+            {
+                parse_dnssec_limits(v, cl, &mut daemon.dnssec_limits)?;
+            }
+            #[cfg(not(feature = "dnssec"))]
+            {
+                let _ = v;
+            }
+        }
+
         "use-stale-cache" => {
             let mut max_expiry = STALE_CACHE_EXPIRY_SECS;
             if let Some(v) = cl.value.as_deref() {
@@ -735,6 +957,21 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             daemon.groupname = Some(v.to_string());
         }
 
+        "dhcp-scriptuser" => {
+            let v = require_value("dhcp-scriptuser")?;
+            daemon.scriptuser = Some(v.to_string());
+        }
+
+        "dhcp-script" => {
+            let v = require_value("dhcp-script")?;
+            daemon.lease_change_command = Some(v.to_string());
+        }
+
+        "dhcp-luascript" => {
+            let v = require_value("dhcp-luascript")?;
+            daemon.luascript = Some(v.to_string());
+        }
+
         "pid-file" => {
             let v = require_value("pid-file")?;
             daemon.runfile = Some(v.to_string());
@@ -752,6 +989,68 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
                 .parse()
                 .map_err(|_| invalid(cl.value.as_deref().unwrap_or(""), "expected an integer"))?;
             daemon.max_logs = n;
+        }
+
+        "dumpfile" => {
+            let v = require_value("dumpfile")?;
+            #[cfg(feature = "dump")]
+            {
+                daemon.dump_file = Some(v.to_string());
+            }
+            #[cfg(not(feature = "dump"))]
+            {
+                let _ = v;
+            }
+        }
+
+        "dumpmask" => {
+            let v = require_value("dumpmask")?;
+            let mask = parse_i32_base0_token(v, "dumpmask", cl, "dump mask")?;
+            #[cfg(feature = "dump")]
+            {
+                daemon.dump_mask = mask;
+            }
+            #[cfg(not(feature = "dump"))]
+            {
+                let _ = mask;
+            }
+        }
+
+        "add-mac" => {
+            match cl.value.as_deref() {
+                None => daemon.set_option(OPT_ADD_MAC),
+                Some("base64") => daemon.set_option(OPT_MAC_B64),
+                Some("text") => daemon.set_option(OPT_MAC_HEX),
+                Some(v) => return Err(invalid_value_for(cl, "add-mac", v, "expected base64 or text")),
+            }
+        }
+
+        "strip-mac" => {
+            require_no_value("strip-mac")?;
+            daemon.set_option(OPT_STRIP_MAC);
+        }
+
+        "add-cpe-id" => {
+            let v = require_value("add-cpe-id")?;
+            daemon.dns_client_id = Some(v.to_string());
+        }
+
+        "add-subnet" => {
+            daemon.set_option(OPT_CLIENT_SUBNET);
+            if let Some(v) = cl.value.as_deref() {
+                if !v.trim().is_empty() {
+                    let (subnet4, subnet6) = parse_add_subnet(v, cl)?;
+                    daemon.add_subnet4 = Some(subnet4);
+                    if let Some(subnet6) = subnet6 {
+                        daemon.add_subnet6 = Some(subnet6);
+                    }
+                }
+            }
+        }
+
+        "strip-subnet" => {
+            require_no_value("strip-subnet")?;
+            daemon.set_option(OPT_STRIP_ECS);
         }
 
         "dhcp-alternate-port" => {
@@ -1013,6 +1312,11 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             daemon.mxnames.push(parse_mx_host(v, cl)?);
         }
 
+        "mx-target" => {
+            let v = require_value("mx-target")?;
+            daemon.mxtarget = Some(parse_domain_token(v, "mx-target", cl)?);
+        }
+
         "srv-host" => {
             let v = require_value("srv-host")?;
             daemon.mxnames.push(parse_srv_host(v, cl)?);
@@ -1033,14 +1337,35 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             daemon.host_records.push(parse_host_record(v, cl)?);
         }
 
+        "interface-name" => {
+            let v = require_value("interface-name")?;
+            daemon.int_names.push(parse_interface_name(v, cl, false)?);
+        }
+
+        "dynamic-host" => {
+            let v = require_value("dynamic-host")?;
+            daemon.int_names.push(parse_interface_name(v, cl, true)?);
+        }
+
         "cname" => {
             let v = require_value("cname")?;
-            daemon.cnames.push(parse_cname_record(v, cl)?);
+            let cnames = parse_cname_records(v, cl, &daemon.cnames)?;
+            daemon.cnames.extend(cnames);
         }
 
         "naptr-record" => {
             let v = require_value("naptr-record")?;
             daemon.naptr.push(parse_naptr_record(v, cl)?);
+        }
+
+        "dns-rr" => {
+            let v = require_value("dns-rr")?;
+            daemon.rr.push(parse_dns_rr(v, cl)?);
+        }
+
+        "caa-record" => {
+            let v = require_value("caa-record")?;
+            daemon.rr.push(parse_caa_record(v, cl)?);
         }
 
         "trust-anchor" => {
@@ -1056,9 +1381,37 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
         }
 
         // ── Additional hosts files ──────────────────────────────────────────
-        "addn-hosts" | "addn-hosts-dir" | "hosts-dir" => {
+        "addn-hosts" => {
+            let v = require_value("addn-hosts")?;
+            let file = make_hosts_file(daemon, v);
+            daemon.addn_hosts.push(file);
+        }
+
+        "dhcp-hostsfile" => {
+            let v = require_value("dhcp-hostsfile")?;
+            let file = make_hosts_file(daemon, v);
+            daemon.dhcp_hosts_file.push(file);
+        }
+
+        "dhcp-optsfile" => {
+            let v = require_value("dhcp-optsfile")?;
+            let file = make_hosts_file(daemon, v);
+            daemon.dhcp_opts_file.push(file);
+        }
+
+        "hostsdir" | "addn-hosts-dir" | "hosts-dir" => {
             let v = require_value(key)?;
-            daemon.addn_hosts.push(HostsFile { flags: 0, fname: v.to_string(), index: 0 });
+            daemon.dynamic_dirs.push(make_dynamic_dir(v, AH_HOSTS));
+        }
+
+        "dhcp-hostsdir" => {
+            let v = require_value("dhcp-hostsdir")?;
+            daemon.dynamic_dirs.push(make_dynamic_dir(v, AH_DHCP_HST));
+        }
+
+        "dhcp-optsdir" => {
+            let v = require_value("dhcp-optsdir")?;
+            daemon.dynamic_dirs.push(make_dynamic_dir(v, AH_DHCP_OPT));
         }
 
         // ── conf-dir (recursive config loading) ────────────────────────────
@@ -1073,10 +1426,32 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             daemon.ftabsize = parse_i32_token(v, "dns-forward-max", cl, "maximum concurrent DNS queries")?;
         }
 
+        "max-tcp-connections" => {
+            let v = require_value("max-tcp-connections")?;
+            daemon.max_procs = parse_i32_token(v, "max-tcp-connections", cl, "maximum TCP connections")?;
+        }
+
         // ── Auth zone ──────────────────────────────────────────────────────
         "auth-zone" => {
             let v = require_value("auth-zone")?;
             daemon.auth_zones.push(parse_auth_zone(v, cl)?);
+        }
+
+        "auth-server" => {
+            let v = require_value("auth-server")?;
+            let (authserver, interfaces) = parse_auth_server(v, cl)?;
+            daemon.authserver = Some(authserver);
+            daemon.auth_interfaces.extend(interfaces);
+        }
+
+        "auth-sec-servers" => {
+            let v = require_value("auth-sec-servers")?;
+            daemon.secondary_forward_servers.extend(parse_auth_sec_servers(v, cl)?);
+        }
+
+        "auth-peer" => {
+            let v = require_value("auth-peer")?;
+            daemon.auth_peers.extend(parse_auth_peers(v, cl)?);
         }
 
         // ── TFTP options ───────────────────────────────────────────────────
@@ -1097,8 +1472,39 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             { let _ = n; }
         }
 
+        "tftp-mtu" => {
+            let v = require_value("tftp-mtu")?;
+            let mtu = parse_i32_token(v, "tftp-mtu", cl, "TFTP MTU")?;
+            #[cfg(feature = "tftp")]
+            {
+                daemon.tftp_mtu = mtu;
+            }
+            #[cfg(not(feature = "tftp"))]
+            {
+                let _ = mtu;
+            }
+        }
+
+        "tftp-port-range" => {
+            let v = require_value("tftp-port-range")?;
+            let (start, end) = parse_tftp_port_range(v, cl)?;
+            #[cfg(feature = "tftp")]
+            {
+                daemon.start_tftp_port = i32::from(start);
+                daemon.end_tftp_port = i32::from(end);
+            }
+            #[cfg(not(feature = "tftp"))]
+            {
+                let _ = (start, end);
+            }
+        }
+
         "tftp-unique-root" => {
-            daemon.set_option(OPT_TFTP_APREF_IP);
+            match cl.value.as_deref() {
+                None | Some("ip") => daemon.set_option(OPT_TFTP_APREF_IP),
+                Some("mac") => daemon.set_option(OPT_TFTP_APREF_MAC),
+                Some(v) => return Err(invalid_value_for(cl, "tftp-unique-root", v, "expected ip or mac")),
+            }
         }
 
         // ── ipset / nftset ─────────────────────────────────────────────────
@@ -1121,7 +1527,19 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
         // ── bogus-nxdomain ────────────────────────────────────────────────
         "bogus-nxdomain" => {
             let v = require_value("bogus-nxdomain")?;
-            daemon.bogus_addr.push(parse_bogus_addr(v, cl)?);
+            daemon.bogus_addr.push(parse_bogus_addr(v, cl, "bogus-nxdomain")?);
+        }
+
+        "ignore-address" => {
+            let v = require_value("ignore-address")?;
+            daemon.ignore_addr.push(parse_bogus_addr(v, cl, "ignore-address")?);
+        }
+
+        "leasequery" => {
+            daemon.set_option(OPT_LEASEQUERY);
+            if let Some(v) = cl.value.as_deref() {
+                daemon.leasequery_addr.push(parse_bogus_addr(v, cl, "leasequery")?);
+            }
         }
 
         // ── log-rotate ────────────────────────────────────────────────────
@@ -1150,7 +1568,11 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
 
         // ── DNSSEC ────────────────────────────────────────────────────────
         "dnssec-check-unsigned" => {
-            daemon.set_option(OPT_DNSSEC_IGN_NS);
+            match cl.value.as_deref() {
+                None => {}
+                Some("no") => daemon.set_option(OPT_DNSSEC_IGN_NS),
+                Some(v) => return Err(invalid_value_for(cl, "dnssec-check-unsigned", v, "expected no")),
+            }
         }
 
         // ── Boolean flags not yet in the bool section ─────────────────────
@@ -1172,6 +1594,16 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
 
         "filter-AAAA" => {
             daemon.rrlist_filter.push(RrList { rr: 28 });
+        }
+
+        "cache-rr" => {
+            let v = require_value("cache-rr")?;
+            daemon.rrlist_cache.extend(parse_rrlist(v, cl, "cache-rr")?);
+        }
+
+        "filter-rr" => {
+            let v = require_value("filter-rr")?;
+            daemon.rrlist_filter.extend(parse_rrlist(v, cl, "filter-rr")?);
         }
 
         "port-limit" => {
@@ -1334,6 +1766,55 @@ fn split_csv(value: &str) -> Vec<&str> {
     value.split(',').map(str::trim).collect()
 }
 
+fn make_hosts_file(daemon: &mut Daemon, fname: &str) -> HostsFile {
+    let index = daemon.host_index as u32;
+    daemon.host_index += 1;
+    HostsFile {
+        flags: 0,
+        fname: fname.to_string(),
+        index,
+    }
+}
+
+fn make_dynamic_dir(dname: &str, flags: u32) -> DynDir {
+    DynDir {
+        files: Vec::new(),
+        flags,
+        dname: dname.to_string(),
+        #[cfg(feature = "inotify")]
+        wd: -1,
+    }
+}
+
+fn parse_tftp_interfaces(value: &str, cl: &ConfigLine) -> Result<Vec<Iname>, ConfigError> {
+    let mut interfaces = Vec::new();
+    for part in split_csv(value) {
+        if part.is_empty() {
+            return Err(invalid_value_for(cl, "enable-tftp", value, "expected interface name"));
+        }
+        interfaces.push(Iname {
+            name: Some(part.to_string()),
+            addr: None,
+            flags: INAME_4 | INAME_6,
+        });
+    }
+    Ok(interfaces)
+}
+
+fn parse_tftp_port_range(value: &str, cl: &ConfigLine) -> Result<(u16, u16), ConfigError> {
+    let parts = split_csv(value);
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return Err(invalid_value_for(cl, "tftp-port-range", value, "expected start,end"));
+    }
+
+    let mut start = parse_u16_token(parts[0], "tftp-port-range", cl, "TFTP port")?;
+    let mut end = parse_u16_token(parts[1], "tftp-port-range", cl, "TFTP port")?;
+    if start > end {
+        std::mem::swap(&mut start, &mut end);
+    }
+    Ok((start, end))
+}
+
 fn parse_domain_token(token: &str, key: &str, cl: &ConfigLine) -> Result<String, ConfigError> {
     canonicalise_opt(token).filter(|s| !s.is_empty()).ok_or_else(|| {
         invalid_value_for(cl, key, token, "expected a valid domain name")
@@ -1355,6 +1836,239 @@ fn parse_u32_token(token: &str, key: &str, cl: &ConfigLine, field: &str) -> Resu
 fn parse_i32_token(token: &str, key: &str, cl: &ConfigLine, field: &str) -> Result<i32, ConfigError> {
     token.parse::<i32>().map_err(|_| {
         invalid_value_for(cl, key, token, &format!("expected a valid {field}"))
+    })
+}
+
+fn parse_i32_base0_token(token: &str, key: &str, cl: &ConfigLine, field: &str) -> Result<i32, ConfigError> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(invalid_value_for(cl, key, token, &format!("expected a valid {field}")));
+    }
+
+    let (negative, unsigned) = token.strip_prefix('-').map_or((false, token), |rest| (true, rest));
+    let (radix, digits) = unsigned
+        .strip_prefix("0x")
+        .or_else(|| unsigned.strip_prefix("0X"))
+        .map_or((10, unsigned), |rest| (16, rest));
+
+    if digits.is_empty() {
+        return Err(invalid_value_for(cl, key, token, &format!("expected a valid {field}")));
+    }
+
+    let value = i64::from_str_radix(digits, radix).map_err(|_| {
+        invalid_value_for(cl, key, token, &format!("expected a valid {field}"))
+    })?;
+    let signed = if negative { -value } else { value };
+    i32::try_from(signed).map_err(|_| {
+        invalid_value_for(cl, key, token, &format!("{field} out of range"))
+    })
+}
+
+fn parse_auth_soa(daemon: &mut Daemon, value: &str, cl: &ConfigLine) -> Result<(), ConfigError> {
+    let parts = split_csv(value);
+    if parts.is_empty() || parts.len() > 5 || parts.iter().any(|p| p.is_empty()) {
+        return Err(invalid_value_for(
+            cl,
+            "auth-soa",
+            value,
+            "expected serial[,hostmaster[,refresh[,retry[,expiry]]]]",
+        ));
+    }
+
+    daemon.soa_sn = parse_u32_token(parts[0], "auth-soa", cl, "SOA serial")?;
+    if parts.len() >= 2 {
+        daemon.hostmaster = Some(parts[1].replace('@', "."));
+    }
+    if parts.len() >= 3 {
+        daemon.soa_refresh = parse_u32_token(parts[2], "auth-soa", cl, "SOA refresh")?;
+    }
+    if parts.len() >= 4 {
+        daemon.soa_retry = parse_u32_token(parts[3], "auth-soa", cl, "SOA retry")?;
+    }
+    if parts.len() == 5 {
+        daemon.soa_expiry = parse_u32_token(parts[4], "auth-soa", cl, "SOA expiry")?;
+    }
+
+    Ok(())
+}
+
+fn parse_auth_peers(value: &str, cl: &ConfigLine) -> Result<Vec<Iname>, ConfigError> {
+    let mut out = Vec::new();
+    for token in split_csv(value) {
+        if token.is_empty() {
+            return Err(invalid_value_for(cl, "auth-peer", value, "empty peer address"));
+        }
+        let addr = match token.parse::<IpAddr>() {
+            Ok(IpAddr::V4(ip4)) => MySockAddr::V4(SocketAddrV4::new(ip4, 0)),
+            Ok(IpAddr::V6(ip6)) => MySockAddr::V6(SocketAddrV6::new(ip6, 0, 0, 0)),
+            Err(_) => {
+                return Err(invalid_value_for(
+                    cl,
+                    "auth-peer",
+                    token,
+                    "expected an IPv4 or IPv6 address",
+                ));
+            }
+        };
+        out.push(Iname {
+            name: None,
+            addr: Some(addr),
+            flags: 0,
+        });
+    }
+
+    if out.is_empty() {
+        return Err(invalid_value_for(cl, "auth-peer", value, "expected at least one peer address"));
+    }
+    Ok(out)
+}
+
+fn parse_auth_server(value: &str, cl: &ConfigLine) -> Result<(String, Vec<Iname>), ConfigError> {
+    let parts = split_csv(value);
+    if parts.is_empty() || parts[0].is_empty() {
+        return Err(invalid_value_for(
+            cl,
+            "auth-server",
+            value,
+            "expected domain[,interface|ip-address...]",
+        ));
+    }
+
+    let authserver = parse_domain_token(parts[0], "auth-server", cl)?;
+    let mut interfaces = Vec::new();
+    for token in &parts[1..] {
+        if token.is_empty() {
+            return Err(invalid_value_for(cl, "auth-server", value, "empty auth-server field"));
+        }
+        interfaces.push(parse_auth_server_interface(token, cl)?);
+    }
+
+    Ok((authserver, interfaces))
+}
+
+fn parse_auth_server_interface(token: &str, cl: &ConfigLine) -> Result<Iname, ConfigError> {
+    if let Ok(ip) = token.parse::<IpAddr>() {
+        let addr = match ip {
+            IpAddr::V4(ip4) => MySockAddr::V4(SocketAddrV4::new(ip4, 0)),
+            IpAddr::V6(ip6) => MySockAddr::V6(SocketAddrV6::new(ip6, 0, 0, 0)),
+        };
+        return Ok(Iname {
+            name: None,
+            addr: Some(addr),
+            flags: 0,
+        });
+    }
+
+    let (name, family) = parse_interface_family(token, "auth-server", cl)?;
+    let mut flags = 0;
+    let addr = match family {
+        Some(4) => {
+            flags |= INAME_4;
+            Some(MySockAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
+        }
+        Some(6) => {
+            flags |= INAME_6;
+            Some(MySockAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)))
+        }
+        Some(_) => unreachable!(),
+        None => None,
+    };
+
+    Ok(Iname {
+        name: Some(name.to_string()),
+        addr,
+        flags,
+    })
+}
+
+fn parse_auth_sec_servers(value: &str, cl: &ConfigLine) -> Result<Vec<String>, ConfigError> {
+    let mut out = Vec::new();
+    for token in split_csv(value) {
+        if token.is_empty() {
+            return Err(invalid_value_for(cl, "auth-sec-servers", value, "empty secondary server"));
+        }
+        out.push(parse_domain_token(token, "auth-sec-servers", cl)?);
+    }
+
+    if out.is_empty() {
+        return Err(invalid_value_for(cl, "auth-sec-servers", value, "expected at least one domain"));
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "dnssec")]
+fn parse_dnssec_limits(value: &str, cl: &ConfigLine, limits: &mut [i32; LIMIT_MAX]) -> Result<(), ConfigError> {
+    let parts = split_csv(value);
+    if parts.is_empty() || parts.len() > LIMIT_MAX || parts.iter().any(|part| part.is_empty()) {
+        return Err(invalid_value_for(
+            cl,
+            "dnssec-limits",
+            value,
+            "expected up to four comma-separated DNSSEC limits",
+        ));
+    }
+
+    for (idx, part) in parts.iter().enumerate() {
+        let val = parse_i32_token(part, "dnssec-limits", cl, "DNSSEC limit")?;
+        if val != 0 {
+            limits[idx] = val;
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_add_subnet(value: &str, cl: &ConfigLine) -> Result<(MySubnet, Option<MySubnet>), ConfigError> {
+    let parts = split_csv(value);
+    if parts.is_empty() || parts.len() > 2 || parts.iter().any(|p| p.is_empty()) {
+        return Err(invalid_value_for(
+            cl,
+            "add-subnet",
+            value,
+            "expected [address/]IPv4-prefix[, [address/]IPv6-prefix]",
+        ));
+    }
+
+    let subnet4 = parse_add_subnet_part(parts[0], false, cl)?;
+    let subnet6 = if parts.len() == 2 {
+        Some(parse_add_subnet_part(parts[1], true, cl)?)
+    } else {
+        None
+    };
+    Ok((subnet4, subnet6))
+}
+
+fn parse_add_subnet_part(token: &str, ipv6_slot: bool, cl: &ConfigLine) -> Result<MySubnet, ConfigError> {
+    let (addr, mask_part) = if let Some((addr_part, mask_part)) = token.split_once('/') {
+        let parsed = parse_mysockaddr(addr_part.trim())
+            .map_err(|_| invalid_value_for(cl, "add-subnet", token, "expected a valid subnet address"))?;
+        (Some(MySockAddr::from(parsed)), mask_part.trim())
+    } else {
+        (None, token.trim())
+    };
+
+    let mask = parse_i32_token(mask_part, "add-subnet", cl, "subnet prefix length")?;
+    let max_mask = match addr.as_ref().map(MySockAddr::is_v6) {
+        Some(true) => 128,
+        Some(false) => 32,
+        None if ipv6_slot => 128,
+        None => 32,
+    };
+    if !(0..=max_mask).contains(&mask) {
+        return Err(invalid_value_for(cl, "add-subnet", token, "subnet prefix length out of range"));
+    }
+
+    let default_addr = if ipv6_slot {
+        MySockAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0))
+    } else {
+        MySockAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+    };
+
+    let addr_used = addr.is_some();
+    Ok(MySubnet {
+        addr: addr.unwrap_or(default_addr),
+        addr_used,
+        mask,
     })
 }
 
@@ -1381,11 +2095,15 @@ fn parse_hex_bytes(token: &str, key: &str, cl: &ConfigLine, field: &str) -> Resu
 
 fn parse_mx_host(value: &str, cl: &ConfigLine) -> Result<MxSrvRecord, ConfigError> {
     let parts = split_csv(value);
-    if parts.len() < 2 || parts.len() > 3 {
-        return Err(invalid_value_for(cl, "mx-host", value, "expected name,target[,priority]"));
+    if parts.is_empty() || parts.len() > 3 {
+        return Err(invalid_value_for(cl, "mx-host", value, "expected name[,target[,priority]]"));
     }
     let name = parse_domain_token(parts[0], "mx-host", cl)?;
-    let target = parse_domain_token(parts[1], "mx-host", cl)?;
+    let target = if parts.len() >= 2 {
+        parse_domain_token(parts[1], "mx-host", cl)?
+    } else {
+        String::new()
+    };
     let priority = if parts.len() == 3 {
         parse_u32_token(parts[2], "mx-host", cl, "MX priority")?
     } else {
@@ -1433,12 +2151,32 @@ fn parse_srv_host(value: &str, cl: &ConfigLine) -> Result<MxSrvRecord, ConfigErr
 
 fn parse_txt_record(value: &str, cl: &ConfigLine) -> Result<TxtRecord, ConfigError> {
     let parts = split_csv(value);
-    if parts.len() < 2 {
-        return Err(invalid_value_for(cl, "txt-record", value, "expected name,text"));
+    if parts.is_empty() || parts[0].is_empty() {
+        return Err(invalid_value_for(cl, "txt-record", value, "expected name[,text...]"));
     }
     let name = parse_domain_token(parts[0], "txt-record", cl)?;
-    let txt = parts[1..].join(",").into_bytes();
+    let txt = encode_txt_record_chunks(&parts[1..]);
     Ok(TxtRecord { name, txt, class: 1, stat: 0 })
+}
+
+fn encode_txt_record_chunks(chunks: &[&str]) -> Vec<u8> {
+    if chunks.is_empty() {
+        return vec![0];
+    }
+
+    let mut out = Vec::new();
+    for chunk in chunks {
+        let bytes = chunk.as_bytes();
+        if bytes.is_empty() {
+            out.push(0);
+            continue;
+        }
+        for piece in bytes.chunks(255) {
+            out.push(piece.len() as u8);
+            out.extend_from_slice(piece);
+        }
+    }
+    out
 }
 
 fn parse_ptr_record(value: &str, cl: &ConfigLine) -> Result<PtrRecord, ConfigError> {
@@ -1461,7 +2199,7 @@ fn parse_host_record(value: &str, cl: &ConfigLine) -> Result<HostRecord, ConfigE
     let mut names = Vec::new();
     let mut addr4 = None;
     let mut addr6 = None;
-    let mut ttl = 0i32;
+    let mut ttl = -1i32;
 
     for part in parts {
         if part.is_empty() {
@@ -1478,7 +2216,7 @@ fn parse_host_record(value: &str, cl: &ConfigLine) -> Result<HostRecord, ConfigE
             }
             addr6 = Some(ip6);
         } else if let Ok(parsed_ttl) = part.parse::<i32>() {
-            if ttl != 0 {
+            if ttl != -1 {
                 return Err(invalid_value_for(cl, "host-record", part, "duplicate TTL"));
             }
             ttl = parsed_ttl;
@@ -1497,19 +2235,147 @@ fn parse_host_record(value: &str, cl: &ConfigLine) -> Result<HostRecord, ConfigE
     Ok(HostRecord { ttl, flags: 0, names, addr4, addr6 })
 }
 
-fn parse_cname_record(value: &str, cl: &ConfigLine) -> Result<Cname, ConfigError> {
+fn parse_interface_name(
+    value: &str,
+    cl: &ConfigLine,
+    dynamic: bool,
+) -> Result<InterfaceName, ConfigError> {
+    let key = if dynamic { "dynamic-host" } else { "interface-name" };
     let parts = split_csv(value);
-    if parts.len() < 2 || parts.len() > 3 {
-        return Err(invalid_value_for(cl, "cname", value, "expected alias,target[,ttl]"));
+    if parts.len() < 2 || parts.iter().any(|p| p.is_empty()) {
+        return Err(invalid_value_for(
+            cl,
+            key,
+            value,
+            if dynamic {
+                "expected name,[IPv4],[IPv6],interface"
+            } else {
+                "expected name,interface[/4|/6]"
+            },
+        ));
     }
-    let alias = parse_domain_token(parts[0], "cname", cl)?;
-    let target = parse_domain_token(parts[1], "cname", cl)?;
-    let ttl = if parts.len() == 3 {
-        parse_i32_token(parts[2], "cname", cl, "TTL")?
+
+    let name = parse_domain_token(parts[0], key, cl)?;
+    let mut flags = IN4 | IN6;
+    let mut proto4 = None;
+    let mut proto6 = None;
+    let mut iface_idx = 1;
+
+    while iface_idx + 1 < parts.len() {
+        if let Ok(ip4) = parts[iface_idx].parse::<Ipv4Addr>() {
+            if proto4.is_some() {
+                return Err(invalid_value_for(cl, key, parts[iface_idx], "duplicate IPv4 address"));
+            }
+            proto4 = Some(ip4);
+            flags |= INP4;
+            iface_idx += 1;
+        } else if let Ok(ip6) = parts[iface_idx].parse::<Ipv6Addr>() {
+            if proto6.is_some() {
+                return Err(invalid_value_for(cl, key, parts[iface_idx], "duplicate IPv6 address"));
+            }
+            proto6 = Some(ip6);
+            flags |= INP6;
+            iface_idx += 1;
+        } else {
+            break;
+        }
+    }
+
+    if iface_idx != parts.len() - 1 {
+        return Err(invalid_value_for(cl, key, value, "unexpected field"));
+    }
+
+    let (intr, family) = parse_interface_family(parts[iface_idx], key, cl)?;
+    match family {
+        Some(4) => flags &= !IN6,
+        Some(6) => flags &= !IN4,
+        Some(_) => unreachable!(),
+        None => {}
+    }
+
+    if dynamic {
+        if flags & (INP4 | INP6) == 0 {
+            return Err(invalid_value_for(cl, key, value, "dynamic-host requires an IPv4 or IPv6 address"));
+        }
+        if family.is_some() {
+            return Err(invalid_value_for(cl, key, parts[iface_idx], "dynamic-host interface cannot use /4 or /6"));
+        }
+        flags &= !(IN4 | IN6);
+    } else if flags & (INP4 | INP6) != 0 {
+        return Err(invalid_value_for(cl, key, value, "interface-name does not accept address fields"));
+    }
+
+    Ok(InterfaceName {
+        name,
+        intr: intr.to_string(),
+        flags,
+        proto4,
+        proto6,
+        addrs: Vec::new(),
+    })
+}
+
+fn parse_interface_family<'a>(
+    token: &'a str,
+    key: &str,
+    cl: &ConfigLine,
+) -> Result<(&'a str, Option<i32>), ConfigError> {
+    if let Some((intr, family)) = token.rsplit_once('/') {
+        if intr.is_empty() {
+            return Err(invalid_value_for(cl, key, token, "expected an interface name"));
+        }
+        return match family {
+            "4" => Ok((intr, Some(4))),
+            "6" => Ok((intr, Some(6))),
+            _ => Err(invalid_value_for(cl, key, token, "expected interface suffix /4 or /6")),
+        };
+    }
+
+    Ok((token, None))
+}
+
+fn parse_cname_records(
+    value: &str,
+    cl: &ConfigLine,
+    existing: &[Cname],
+) -> Result<Vec<Cname>, ConfigError> {
+    let parts = split_csv(value);
+    if parts.len() < 2 {
+        return Err(invalid_value_for(cl, "cname", value, "expected alias[,alias...],target[,ttl]"));
+    }
+
+    let (target_idx, ttl) = if parts.len() >= 3 {
+        match parts.last().and_then(|last| last.parse::<i32>().ok()) {
+            Some(ttl) => (parts.len() - 2, ttl),
+            None => (parts.len() - 1, -1),
+        }
     } else {
-        0
+        (1, -1)
     };
-    Ok(Cname { ttl, flag: 0, alias, target })
+
+    if target_idx == 0 {
+        return Err(invalid_value_for(cl, "cname", value, "expected at least one alias and a target"));
+    }
+
+    let target = parse_domain_token(parts[target_idx], "cname", cl)?;
+    let mut out = Vec::with_capacity(target_idx);
+
+    for alias_part in &parts[..target_idx] {
+        let alias = parse_domain_token(alias_part, "cname", cl)?;
+        if existing.iter().any(|c| c.alias.eq_ignore_ascii_case(&alias))
+            || out.iter().any(|c: &Cname| c.alias.eq_ignore_ascii_case(&alias))
+        {
+            return Err(invalid_value_for(cl, "cname", alias_part, "duplicate CNAME"));
+        }
+        out.push(Cname {
+            ttl,
+            flag: 0,
+            alias,
+            target: target.clone(),
+        });
+    }
+
+    Ok(out)
 }
 
 fn parse_naptr_record(value: &str, cl: &ConfigLine) -> Result<Naptr, ConfigError> {
@@ -1528,6 +2394,92 @@ fn parse_naptr_record(value: &str, cl: &ConfigLine) -> Result<Naptr, ConfigError
     })
 }
 
+fn parse_dns_rr(value: &str, cl: &ConfigLine) -> Result<TxtRecord, ConfigError> {
+    let parts = split_csv(value);
+    if parts.len() < 2 || parts.len() > 3 {
+        return Err(invalid_value_for(cl, "dns-rr", value, "expected name,type[,hex-data]"));
+    }
+    let rrtype = parse_rr_type(parts[1], "dns-rr", cl)?;
+    let data = if parts.len() == 3 {
+        parse_hex_bytes(parts[2], "dns-rr", cl, "RDATA")?
+    } else {
+        Vec::new()
+    };
+    Ok(TxtRecord {
+        name: parse_domain_token(parts[0], "dns-rr", cl)?,
+        txt: data,
+        class: rrtype,
+        stat: 0,
+    })
+}
+
+fn parse_caa_record(value: &str, cl: &ConfigLine) -> Result<TxtRecord, ConfigError> {
+    let parts = split_csv(value);
+    if parts.len() != 4 {
+        return Err(invalid_value_for(cl, "caa-record", value, "expected name,flags,tag,value"));
+    }
+
+    let flags = parts[1].parse::<u8>().map_err(|_| {
+        invalid_value_for(cl, "caa-record", parts[1], "expected CAA flags in range 0-255")
+    })?;
+    let tag = parts[2].as_bytes();
+    if tag.is_empty() || tag.len() > u8::MAX as usize {
+        return Err(invalid_value_for(cl, "caa-record", parts[2], "CAA tag length must be 1-255"));
+    }
+
+    let mut data = Vec::with_capacity(2 + tag.len() + parts[3].len());
+    data.push(flags);
+    data.push(tag.len() as u8);
+    data.extend_from_slice(tag);
+    data.extend_from_slice(parts[3].as_bytes());
+
+    Ok(TxtRecord {
+        name: parse_domain_token(parts[0], "caa-record", cl)?,
+        txt: data,
+        class: crate::dns_protocol::RrType::CAA as u16,
+        stat: 0,
+    })
+}
+
+fn parse_rrlist(value: &str, cl: &ConfigLine, key: &str) -> Result<Vec<RrList>, ConfigError> {
+    let mut out = Vec::new();
+    for token in split_csv(value) {
+        if token.is_empty() {
+            return Err(invalid_value_for(cl, key, value, "empty RR type"));
+        }
+        out.push(RrList { rr: parse_rr_type(token, key, cl)? });
+    }
+    if out.is_empty() {
+        return Err(invalid_value_for(cl, key, value, "expected at least one RR type"));
+    }
+    Ok(out)
+}
+
+fn parse_rr_type(token: &str, key: &str, cl: &ConfigLine) -> Result<u16, ConfigError> {
+    if let Ok(rrtype) = token.parse::<u16>() {
+        return Ok(rrtype);
+    }
+
+    let rrtype = match token.to_ascii_uppercase().as_str() {
+        "A" => crate::dns_protocol::RrType::A as u16,
+        "NS" => crate::dns_protocol::RrType::NS as u16,
+        "CNAME" => crate::dns_protocol::RrType::CNAME as u16,
+        "SOA" => crate::dns_protocol::RrType::SOA as u16,
+        "PTR" => crate::dns_protocol::RrType::PTR as u16,
+        "MX" => crate::dns_protocol::RrType::MX as u16,
+        "TXT" => crate::dns_protocol::RrType::TXT as u16,
+        "AAAA" => crate::dns_protocol::RrType::AAAA as u16,
+        "SRV" => crate::dns_protocol::RrType::SRV as u16,
+        "NAPTR" => crate::dns_protocol::RrType::NAPTR as u16,
+        "DS" => crate::dns_protocol::RrType::DS as u16,
+        "DNSKEY" => crate::dns_protocol::RrType::DNSKEY as u16,
+        "CAA" => crate::dns_protocol::RrType::CAA as u16,
+        "ANY" => crate::dns_protocol::RrType::ANY as u16,
+        _ => return Err(invalid_value_for(cl, key, token, "unknown RR type")),
+    };
+    Ok(rrtype)
+}
+
 fn parse_trust_anchor(value: &str, cl: &ConfigLine) -> Result<DsConfig, ConfigError> {
     let parts = split_csv(value);
     if parts.len() != 5 {
@@ -1543,21 +2495,50 @@ fn parse_trust_anchor(value: &str, cl: &ConfigLine) -> Result<DsConfig, ConfigEr
     })
 }
 
-fn parse_bogus_addr(value: &str, cl: &ConfigLine) -> Result<BogusAddr, ConfigError> {
-    let ip: IpAddr = value.parse().map_err(|_| {
-        invalid_value_for(cl, "bogus-nxdomain", value, "expected an IP address")
+fn parse_bogus_addr(value: &str, cl: &ConfigLine, key: &str) -> Result<BogusAddr, ConfigError> {
+    let (addr_part, prefix_part) = if let Some((addr, prefix)) = value.split_once('/') {
+        (addr.trim(), Some(prefix.trim()))
+    } else {
+        (value.trim(), None)
+    };
+
+    if addr_part.is_empty() {
+        return Err(invalid_value_for(cl, key, value, "expected an IP address"));
+    }
+
+    let ip: IpAddr = addr_part.parse().map_err(|_| {
+        invalid_value_for(cl, key, value, "expected an IP address")
     })?;
+
     match ip {
-        IpAddr::V4(v4) => Ok(BogusAddr {
-            is6: false,
-            prefix: 32,
-            addr: AllAddr::Addr4(v4),
-        }),
-        IpAddr::V6(v6) => Ok(BogusAddr {
-            is6: true,
-            prefix: 128,
-            addr: AllAddr::Addr6(v6),
-        }),
+        IpAddr::V4(v4) => {
+            let prefix = match prefix_part {
+                Some(prefix) => parse_i32_token(prefix, key, cl, "IPv4 prefix length")?,
+                None => 32,
+            };
+            if !(0..=32).contains(&prefix) {
+                return Err(invalid_value_for(cl, key, value, "IPv4 prefix length must be 0-32"));
+            }
+            Ok(BogusAddr {
+                is6: false,
+                prefix,
+                addr: AllAddr::Addr4(v4),
+            })
+        }
+        IpAddr::V6(v6) => {
+            let prefix = match prefix_part {
+                Some(prefix) => parse_i32_token(prefix, key, cl, "IPv6 prefix length")?,
+                None => 128,
+            };
+            if !(0..=128).contains(&prefix) {
+                return Err(invalid_value_for(cl, key, value, "IPv6 prefix length must be 0-128"));
+            }
+            Ok(BogusAddr {
+                is6: true,
+                prefix,
+                addr: AllAddr::Addr6(v6),
+            })
+        }
     }
 }
 
@@ -1660,7 +2641,14 @@ fn parse_auth_zone_interface(token: &str, cl: &ConfigLine) -> Result<AuthNameEnt
     let (name, family_suffix) = if let Some((name, family)) = token.rsplit_once('/') {
         match family.trim() {
             "4" | "6" => (name.trim(), Some(family.trim())),
-            _ => (token.trim(), None),
+            _ => {
+                return Err(invalid_value_for(
+                    cl,
+                    "auth-zone",
+                    token,
+                    "interface family suffix must be /4 or /6",
+                ));
+            }
         }
     } else {
         (token.trim(), None)
@@ -1670,10 +2658,12 @@ fn parse_auth_zone_interface(token: &str, cl: &ConfigLine) -> Result<AuthNameEnt
         return Err(invalid_value_for(cl, "auth-zone", token, "expected an interface name"));
     }
 
-    let flags = match family_suffix {
-        Some("4") => 4,
-        Some("6") => 6,
-        _ => 0,
+    let mut flags = AUTH4 | AUTH6;
+    match family_suffix {
+        Some("4") => flags &= !AUTH6,
+        Some("6") => flags &= !AUTH4,
+        Some(_) => unreachable!(),
+        None => {}
     };
 
     Ok(AuthNameEntry {
@@ -3037,6 +4027,331 @@ mod tests {
         let lines = parse_config_text("log-queries", "test").unwrap();
         apply_config(&mut d, &lines).unwrap();
         assert!(d.option_bool(OPT_LOG));
+        assert!(!d.option_bool(OPT_EXTRALOG));
+        assert!(!d.option_bool(OPT_LOG_PROTO));
+        assert!(!d.option_bool(OPT_AUTH_LOG));
+        assert!(!d.option_bool(OPT_LOG_ONLY_FAILED));
+    }
+
+    #[test]
+    fn apply_log_queries_modes() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("log-queries=extra", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_LOG));
+        assert!(d.option_bool(OPT_EXTRALOG));
+        assert!(!d.option_bool(OPT_LOG_PROTO));
+
+        let mut d = Daemon::default();
+        let lines = parse_config_text("log-queries=proto", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_LOG));
+        assert!(d.option_bool(OPT_EXTRALOG));
+        assert!(d.option_bool(OPT_LOG_PROTO));
+
+        let mut d = Daemon::default();
+        let lines = parse_config_text("log-queries=auth", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_LOG));
+        assert!(d.option_bool(OPT_AUTH_LOG));
+
+        let mut d = Daemon::default();
+        let lines = parse_config_text("log-queries=only_failed", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_LOG));
+        assert!(d.option_bool(OPT_LOG_ONLY_FAILED));
+    }
+
+    #[test]
+    fn apply_log_queries_unknown_mode_matches_upstream_noop() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("log-queries=unknown", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_LOG));
+        assert!(!d.option_bool(OPT_EXTRALOG));
+        assert!(!d.option_bool(OPT_LOG_PROTO));
+        assert!(!d.option_bool(OPT_AUTH_LOG));
+        assert!(!d.option_bool(OPT_LOG_ONLY_FAILED));
+    }
+
+    #[test]
+    fn apply_remaining_simple_boolean_flags() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text(
+            "dhcp-no-override\n\
+             dhcp-sequential-ip\n\
+             dhcp-ignore-clid\n\
+             dhcp-client-update\n\
+             log-debug\n\
+             quiet-tftp\n\
+             no-ident\n\
+             no-0x20-encode\n\
+             do-0x20-encode\n\
+             log-malloc",
+            "test",
+        ).unwrap();
+        apply_config(&mut d, &lines).unwrap();
+
+        assert!(d.option_bool(OPT_NO_OVERRIDE));
+        assert!(d.option_bool(OPT_CONSEC_ADDR));
+        assert!(d.option_bool(OPT_IGNORE_CLID));
+        assert!(d.option_bool(OPT_FQDN_UPDATE));
+        assert!(d.option_bool(OPT_LOG_DEBUG));
+        assert!(d.option_bool(OPT_QUIET_TFTP));
+        assert!(d.option_bool(OPT_NO_IDENT));
+        assert!(d.option_bool(OPT_NO_0X20));
+        assert!(d.option_bool(OPT_DO_0X20));
+        assert!(d.option_bool(OPT_LOG_MALLOC));
+    }
+
+    #[test]
+    fn apply_dhcp_authoritative_and_read_ethers_flags() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-authoritative\nread-ethers", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_AUTHORITATIVE));
+        assert!(d.option_bool(OPT_ETHERS));
+    }
+
+    #[test]
+    fn apply_dhcp_script_paths_and_renewal_flag() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text(
+            "dhcp-script=/usr/lib/dnsmasq/dhcp-hook\n\
+             dhcp-luascript=/usr/lib/dnsmasq/dhcp-hook.lua\n\
+             script-on-renewal",
+            "test",
+        ).unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.lease_change_command, Some("/usr/lib/dnsmasq/dhcp-hook".to_string()));
+        assert_eq!(d.luascript, Some("/usr/lib/dnsmasq/dhcp-hook.lua".to_string()));
+        assert!(d.option_bool(OPT_LEASE_RENEW));
+    }
+
+    #[test]
+    fn apply_max_tcp_connections() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("max-tcp-connections=42", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.max_procs, 42);
+    }
+
+    #[test]
+    fn apply_max_tcp_connections_invalid_value_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("max-tcp-connections=lots", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "max-tcp-connections"));
+    }
+
+    #[test]
+    fn apply_tftp_flags_and_unique_root_modes() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text(
+            "tftp-no-fail\n\
+             tftp-single-port\n\
+             tftp-unique-root=mac",
+            "test",
+        ).unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_TFTP_NO_FAIL));
+        assert!(d.option_bool(OPT_SINGLE_PORT));
+        assert!(d.option_bool(OPT_TFTP_APREF_MAC));
+        assert!(!d.option_bool(OPT_TFTP_APREF_IP));
+
+        let mut d = Daemon::default();
+        let lines = parse_config_text("tftp-unique-root", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_TFTP_APREF_IP));
+    }
+
+    #[test]
+    fn apply_enable_tftp_with_interfaces() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("enable-tftp=eth0,br-lan", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_TFTP));
+        assert_eq!(d.tftp_interfaces.len(), 2);
+        assert_eq!(d.tftp_interfaces[0].name, Some("eth0".to_string()));
+        assert_eq!(d.tftp_interfaces[0].flags, INAME_4 | INAME_6);
+        assert_eq!(d.tftp_interfaces[1].name, Some("br-lan".to_string()));
+        assert_eq!(d.tftp_interfaces[1].flags, INAME_4 | INAME_6);
+    }
+
+    #[test]
+    fn apply_tftp_numeric_options() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("tftp-mtu=1400\ntftp-port-range=7000,6000", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        #[cfg(feature = "tftp")]
+        {
+            assert_eq!(d.tftp_mtu, 1400);
+            assert_eq!(d.start_tftp_port, 6000);
+            assert_eq!(d.end_tftp_port, 7000);
+        }
+    }
+
+    #[test]
+    fn apply_tftp_invalid_values_error() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("tftp-unique-root=host", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "tftp-unique-root"));
+
+        let mut d = Daemon::default();
+        let lines = parse_config_text("tftp-port-range=6000", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "tftp-port-range"));
+    }
+
+    #[test]
+    fn apply_local_service_default_and_net_mode() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("local-service", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_LOCAL_SERVICE));
+        assert!(!d.option_bool(OPT_LOCALHOST_SERVICE));
+
+        let mut d = Daemon::default();
+        let lines = parse_config_text("local-service=net", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_LOCAL_SERVICE));
+        assert!(!d.option_bool(OPT_LOCALHOST_SERVICE));
+    }
+
+    #[test]
+    fn apply_local_service_host_mode_adds_loopback_interface() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("local-service=host", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(!d.option_bool(OPT_LOCAL_SERVICE));
+        assert!(d.option_bool(OPT_LOCALHOST_SERVICE));
+        assert!(d.option_bool(OPT_NOWILD));
+        assert_eq!(d.if_names.len(), 1);
+        assert_eq!(d.if_names[0].name, None);
+    }
+
+    #[test]
+    fn apply_local_service_clears_when_access_control_is_explicit() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("local-service\ninterface=eth0", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(!d.option_bool(OPT_LOCAL_SERVICE));
+        assert!(!d.option_bool(OPT_LOCALHOST_SERVICE));
+
+        let mut d = Daemon::default();
+        let lines = parse_config_text("local-service=host\nlisten-address=127.0.0.1", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(!d.option_bool(OPT_LOCAL_SERVICE));
+        assert!(!d.option_bool(OPT_LOCALHOST_SERVICE));
+        assert_eq!(d.if_names.len(), 0);
+    }
+
+    #[test]
+    fn apply_local_service_invalid_mode_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("local-service=maybe", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "local-service"));
+    }
+
+    #[test]
+    fn apply_dumpfile_and_hex_dumpmask() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dumpfile=/tmp/dnsmasq.pcap\ndumpmask=0x1001", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        #[cfg(feature = "dump")]
+        {
+            assert_eq!(d.dump_file, Some("/tmp/dnsmasq.pcap".to_string()));
+            assert_eq!(d.dump_mask, 0x1001);
+        }
+    }
+
+    #[test]
+    fn apply_dumpmask_invalid_value_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dumpmask=not-a-mask", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "dumpmask"));
+    }
+
+    #[test]
+    fn daemon_default_dump_mask_matches_upstream() {
+        let d = Daemon::default();
+        #[cfg(feature = "dump")]
+        assert_eq!(d.dump_mask, -1);
+    }
+
+    #[test]
+    fn apply_add_mac_modes_and_strip_mac() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("add-mac\nstrip-mac", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_ADD_MAC));
+        assert!(d.option_bool(OPT_STRIP_MAC));
+
+        let mut d = Daemon::default();
+        let lines = parse_config_text("add-mac=base64", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_MAC_B64));
+
+        let mut d = Daemon::default();
+        let lines = parse_config_text("add-mac=text", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_MAC_HEX));
+    }
+
+    #[test]
+    fn apply_add_mac_invalid_mode_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("add-mac=binary", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "add-mac"));
+    }
+
+    #[test]
+    fn apply_add_cpe_id_and_strip_subnet() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("add-cpe-id=device-123\nstrip-subnet", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.dns_client_id, Some("device-123".to_string()));
+        assert!(d.option_bool(OPT_STRIP_ECS));
+    }
+
+    #[test]
+    fn apply_add_subnet_masks_and_constant_addresses() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("add-subnet=1.2.3.4/24,96", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_CLIENT_SUBNET));
+
+        let subnet4 = d.add_subnet4.as_ref().unwrap();
+        assert_eq!(subnet4.mask, 24);
+        assert!(subnet4.addr_used);
+        assert_eq!(subnet4.addr.ip(), IpAddr::V4("1.2.3.4".parse().unwrap()));
+
+        let subnet6 = d.add_subnet6.as_ref().unwrap();
+        assert_eq!(subnet6.mask, 96);
+        assert!(!subnet6.addr_used);
+        assert!(subnet6.addr.is_v6());
+    }
+
+    #[test]
+    fn apply_add_subnet_without_value_sets_option_only() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("add-subnet", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_CLIENT_SUBNET));
+        assert!(d.add_subnet4.is_none());
+        assert!(d.add_subnet6.is_none());
+    }
+
+    #[test]
+    fn apply_add_subnet_bad_prefix_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("add-subnet=33", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "add-subnet"));
     }
 
     #[test]
@@ -3198,6 +4513,28 @@ mod tests {
     }
 
     #[test]
+    fn apply_mx_host_without_target_uses_default_mx_target() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("mx-target=mail.example.com\nmx-host=example.com", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        let mx = d.mxnames.iter().find(|mx| mx.name == "example.com").unwrap();
+        assert_eq!(mx.target, "mail.example.com");
+        assert_eq!(mx.priority, 1);
+    }
+
+    #[test]
+    fn apply_mx_target_adds_local_hostname_mx_record() {
+        let hostname = local_hostname_for_mx().unwrap();
+        let mut d = Daemon::default();
+        let lines = parse_config_text("mx-target=mail.example.com", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.mxtarget, Some("mail.example.com".to_string()));
+        assert!(d.mxnames.iter().any(|mx| {
+            !mx.is_srv && mx.name == hostname && mx.target == "mail.example.com"
+        }));
+    }
+
+    #[test]
     fn apply_srv_host() {
         let mut d = Daemon::default();
         let lines = parse_config_text("srv-host=_sip._tcp.example.com,sip.example.com,5060,10,5", "test").unwrap();
@@ -3217,7 +4554,17 @@ mod tests {
         apply_config(&mut d, &lines).unwrap();
         assert_eq!(d.txt.len(), 1);
         assert_eq!(d.txt[0].name, "example.com");
-        assert_eq!(d.txt[0].txt, b"v=spf1,-all");
+        assert_eq!(d.txt[0].txt, b"\x06v=spf1\x04-all");
+    }
+
+    #[test]
+    fn apply_txt_record_without_text_creates_empty_txt_string() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("txt-record=empty.example.com", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.txt.len(), 1);
+        assert_eq!(d.txt[0].name, "empty.example.com");
+        assert_eq!(d.txt[0].txt, vec![0]);
     }
 
     #[test]
@@ -3247,6 +4594,53 @@ mod tests {
     }
 
     #[test]
+    fn apply_interface_name_with_family_suffix() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("interface-name=router.example.com,eth0/4", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.int_names.len(), 1);
+        let rec = &d.int_names[0];
+        assert_eq!(rec.name, "router.example.com");
+        assert_eq!(rec.intr, "eth0");
+        assert_eq!(rec.flags, IN4);
+        assert_eq!(rec.proto4, None);
+        assert_eq!(rec.proto6, None);
+    }
+
+    #[test]
+    fn apply_dynamic_host_with_prototype_addresses() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text(
+            "dynamic-host=dyn.example.com,0.0.0.8,::8,eth0",
+            "test",
+        ).unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.int_names.len(), 1);
+        let rec = &d.int_names[0];
+        assert_eq!(rec.name, "dyn.example.com");
+        assert_eq!(rec.intr, "eth0");
+        assert_eq!(rec.flags, INP4 | INP6);
+        assert_eq!(rec.proto4, Some("0.0.0.8".parse().unwrap()));
+        assert_eq!(rec.proto6, Some("::8".parse().unwrap()));
+    }
+
+    #[test]
+    fn apply_interface_name_rejects_address_fields() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("interface-name=router.example.com,192.0.2.1,eth0", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "interface-name"));
+    }
+
+    #[test]
+    fn apply_dynamic_host_requires_address() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dynamic-host=dyn.example.com,eth0", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "dynamic-host"));
+    }
+
+    #[test]
     fn apply_cname() {
         let mut d = Daemon::default();
         let lines = parse_config_text("cname=www.example.com,target.example.com,300", "test").unwrap();
@@ -3255,6 +4649,25 @@ mod tests {
         assert_eq!(d.cnames[0].alias, "www.example.com");
         assert_eq!(d.cnames[0].target, "target.example.com");
         assert_eq!(d.cnames[0].ttl, 300);
+    }
+
+    #[test]
+    fn apply_cname_multiple_aliases_share_target() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("cname=www.example.com,api.example.com,target.example.com,120", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.cnames.len(), 2);
+        assert_eq!(d.cnames[0].alias, "www.example.com");
+        assert_eq!(d.cnames[1].alias, "api.example.com");
+        assert!(d.cnames.iter().all(|c| c.target == "target.example.com" && c.ttl == 120));
+    }
+
+    #[test]
+    fn apply_cname_duplicate_alias_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("cname=www.example.com,target.example.com\ncname=www.example.com,other.example.com", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "cname"));
     }
 
     #[test]
@@ -3273,6 +4686,46 @@ mod tests {
         assert_eq!(rec.flags, "S");
         assert_eq!(rec.services, "SIP+D2U");
         assert_eq!(rec.replace, "_sip._udp.example.com");
+    }
+
+    #[test]
+    fn apply_dns_rr_numeric_type_and_hex_rdata() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dns-rr=example.com,65,00010002", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.rr.len(), 1);
+        assert_eq!(d.rr[0].name, "example.com");
+        assert_eq!(d.rr[0].class, 65);
+        assert_eq!(d.rr[0].txt, vec![0, 1, 0, 2]);
+    }
+
+    #[test]
+    fn apply_dns_rr_named_type_without_rdata() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dns-rr=example.com,CAA", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.rr.len(), 1);
+        assert_eq!(d.rr[0].class, crate::dns_protocol::RrType::CAA as u16);
+        assert!(d.rr[0].txt.is_empty());
+    }
+
+    #[test]
+    fn apply_caa_record() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("caa-record=example.com,0,issue,letsencrypt.org", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.rr.len(), 1);
+        assert_eq!(d.rr[0].name, "example.com");
+        assert_eq!(d.rr[0].class, crate::dns_protocol::RrType::CAA as u16);
+        assert_eq!(d.rr[0].txt, b"\x00\x05issueletsencrypt.org");
+    }
+
+    #[test]
+    fn apply_dns_rr_rejects_bad_hex() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dns-rr=example.com,65,001", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "dns-rr"));
     }
 
     #[test]
@@ -3296,6 +4749,187 @@ mod tests {
     }
 
     #[test]
+    fn apply_hosts_files_assigns_incrementing_indexes() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text(
+            "addn-hosts=/etc/hosts.extra\ndhcp-hostsfile=/etc/dhcp.hosts\ndhcp-optsfile=/etc/dhcp.opts",
+            "test",
+        ).unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.addn_hosts.len(), 1);
+        assert_eq!(d.dhcp_hosts_file.len(), 1);
+        assert_eq!(d.dhcp_opts_file.len(), 1);
+        assert_eq!(d.addn_hosts[0].fname, "/etc/hosts.extra");
+        assert_eq!(d.dhcp_hosts_file[0].fname, "/etc/dhcp.hosts");
+        assert_eq!(d.dhcp_opts_file[0].fname, "/etc/dhcp.opts");
+        assert_eq!(d.addn_hosts[0].index, 0);
+        assert_eq!(d.dhcp_hosts_file[0].index, 1);
+        assert_eq!(d.dhcp_opts_file[0].index, 2);
+        assert_eq!(d.host_index, 3);
+    }
+
+    #[test]
+    fn apply_hosts_dirs_sets_dynamic_dir_flags() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text(
+            "hostsdir=/etc/hosts.d\ndhcp-hostsdir=/etc/dhcp-hosts.d\ndhcp-optsdir=/etc/dhcp-opts.d",
+            "test",
+        ).unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.dynamic_dirs.len(), 3);
+        assert_eq!(d.dynamic_dirs[0].dname, "/etc/hosts.d");
+        assert_eq!(d.dynamic_dirs[0].flags, AH_HOSTS);
+        assert_eq!(d.dynamic_dirs[1].dname, "/etc/dhcp-hosts.d");
+        assert_eq!(d.dynamic_dirs[1].flags, AH_DHCP_HST);
+        assert_eq!(d.dynamic_dirs[2].dname, "/etc/dhcp-opts.d");
+        assert_eq!(d.dynamic_dirs[2].flags, AH_DHCP_OPT);
+    }
+
+    #[test]
+    fn daemon_auth_defaults_match_upstream() {
+        let d = Daemon::default();
+        assert_eq!(d.auth_ttl, 600);
+        assert_eq!(d.soa_refresh, 1200);
+        assert_eq!(d.soa_retry, 180);
+        assert_eq!(d.soa_expiry, 1209600);
+    }
+
+    #[test]
+    fn apply_auth_ttl() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("auth-ttl=1800", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.auth_ttl, 1800);
+    }
+
+    #[test]
+    fn apply_dhcp_ttl_sets_use_marker() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-ttl=120", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        #[cfg(feature = "dhcp")]
+        {
+            assert_eq!(d.dhcp_ttl, 120);
+            assert_eq!(d.use_dhcp_ttl, 1);
+        }
+    }
+
+    #[test]
+    fn apply_dhcp_ttl_invalid_value_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-ttl=not-a-ttl", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "dhcp-ttl"));
+    }
+
+    #[test]
+    fn apply_dhcp_scriptuser() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-scriptuser=nobody", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.scriptuser, Some("nobody".to_string()));
+    }
+
+    #[test]
+    fn apply_auth_server_domain_interfaces_and_default_hostmaster() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text(
+            "auth-server=ns.example.com,eth0/4,2001:db8::53",
+            "test",
+        ).unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.authserver, Some("ns.example.com".to_string()));
+        assert_eq!(d.hostmaster, Some("hostmaster.ns.example.com".to_string()));
+        assert_eq!(d.auth_interfaces.len(), 2);
+
+        assert_eq!(d.auth_interfaces[0].name, Some("eth0".to_string()));
+        assert_eq!(d.auth_interfaces[0].flags, INAME_4);
+        assert!(d.auth_interfaces[0].addr.as_ref().unwrap().is_v4());
+
+        assert_eq!(d.auth_interfaces[1].name, None);
+        assert_eq!(d.auth_interfaces[1].addr.as_ref().unwrap().ip(), IpAddr::V6("2001:db8::53".parse().unwrap()));
+    }
+
+    #[test]
+    fn apply_auth_server_preserves_explicit_hostmaster() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("auth-soa=1,admin@example.com\nauth-server=ns.example.com", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.authserver, Some("ns.example.com".to_string()));
+        assert_eq!(d.hostmaster, Some("admin.example.com".to_string()));
+    }
+
+    #[test]
+    fn apply_auth_sec_servers() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("auth-sec-servers=sec1.example.com,sec2.example.com", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(
+            d.secondary_forward_servers,
+            vec!["sec1.example.com".to_string(), "sec2.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn apply_auth_server_bad_interface_suffix_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("auth-server=ns.example.com,eth0/9", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "auth-server"));
+    }
+
+    #[test]
+    fn apply_auth_sec_servers_bad_name_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("auth-sec-servers=bad..example", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "auth-sec-servers"));
+    }
+
+    #[test]
+    fn apply_auth_soa_full_form() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("auth-soa=1234,hostmaster@example.com,3600,600,86400", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.soa_sn, 1234);
+        assert_eq!(d.hostmaster, Some("hostmaster.example.com".to_string()));
+        assert_eq!(d.soa_refresh, 3600);
+        assert_eq!(d.soa_retry, 600);
+        assert_eq!(d.soa_expiry, 86400);
+    }
+
+    #[test]
+    fn apply_auth_soa_serial_preserves_default_timers() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("auth-soa=42", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.soa_sn, 42);
+        assert_eq!(d.hostmaster, None);
+        assert_eq!(d.soa_refresh, 1200);
+        assert_eq!(d.soa_retry, 180);
+        assert_eq!(d.soa_expiry, 1209600);
+    }
+
+    #[test]
+    fn apply_auth_peer_ipv4_and_ipv6() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("auth-peer=192.0.2.53,2001:db8::53", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.auth_peers.len(), 2);
+        assert_eq!(d.auth_peers[0].addr.as_ref().unwrap().ip(), IpAddr::V4("192.0.2.53".parse().unwrap()));
+        assert_eq!(d.auth_peers[1].addr.as_ref().unwrap().ip(), IpAddr::V6("2001:db8::53".parse().unwrap()));
+        assert!(d.auth_peers.iter().all(|peer| peer.name.is_none() && peer.flags == 0));
+    }
+
+    #[test]
+    fn apply_auth_peer_rejects_non_ip() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("auth-peer=secondary.example.com", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "auth-peer"));
+    }
+
+    #[test]
     fn apply_bogus_nxdomain_ipv4() {
         let mut d = Daemon::default();
         let lines = parse_config_text("bogus-nxdomain=64.94.110.11", "test").unwrap();
@@ -3304,6 +4938,68 @@ mod tests {
         assert!(!d.bogus_addr[0].is6);
         assert_eq!(d.bogus_addr[0].prefix, 32);
         assert_eq!(d.bogus_addr[0].addr.as_ipv4(), Some("64.94.110.11".parse().unwrap()));
+    }
+
+    #[test]
+    fn apply_bogus_nxdomain_ipv4_prefix() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("bogus-nxdomain=64.94.110.0/24", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.bogus_addr.len(), 1);
+        assert!(!d.bogus_addr[0].is6);
+        assert_eq!(d.bogus_addr[0].prefix, 24);
+        assert_eq!(d.bogus_addr[0].addr.as_ipv4(), Some("64.94.110.0".parse().unwrap()));
+    }
+
+    #[test]
+    fn apply_ignore_address_ipv6_prefix() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("ignore-address=2001:db8::/32", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.ignore_addr.len(), 1);
+        assert!(d.ignore_addr[0].is6);
+        assert_eq!(d.ignore_addr[0].prefix, 32);
+        assert_eq!(d.ignore_addr[0].addr.as_ipv6(), Some("2001:db8::".parse().unwrap()));
+    }
+
+    #[test]
+    fn apply_ignore_address_bad_prefix_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("ignore-address=192.0.2.0/33", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "ignore-address"));
+    }
+
+    #[test]
+    fn apply_leasequery_enables_without_address_filter() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("leasequery", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_LEASEQUERY));
+        assert!(d.leasequery_addr.is_empty());
+    }
+
+    #[test]
+    fn apply_leasequery_address_filters() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("leasequery=192.0.2.0/24\nleasequery=2001:db8::/32", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_LEASEQUERY));
+        assert_eq!(d.leasequery_addr.len(), 2);
+        assert!(!d.leasequery_addr[0].is6);
+        assert_eq!(d.leasequery_addr[0].prefix, 24);
+        assert_eq!(d.leasequery_addr[0].addr.as_ipv4(), Some("192.0.2.0".parse().unwrap()));
+        assert!(d.leasequery_addr[1].is6);
+        assert_eq!(d.leasequery_addr[1].prefix, 32);
+        assert_eq!(d.leasequery_addr[1].addr.as_ipv6(), Some("2001:db8::".parse().unwrap()));
+    }
+
+    #[test]
+    fn apply_leasequery_bad_prefix_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("leasequery=192.0.2.0/33", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "leasequery"));
     }
 
     #[test]
@@ -3320,7 +5016,7 @@ mod tests {
     fn apply_auth_zone_with_subnets_and_interface() {
         let mut d = Daemon::default();
         let lines = parse_config_text(
-            "auth-zone=example.com,192.0.2.0/24,exclude:192.0.2.128/25,eth0/4",
+            "auth-server=ns.example.com\nauth-zone=example.com,192.0.2.0/24,exclude:192.0.2.128/25,eth0/4",
             "test",
         ).unwrap();
         apply_config(&mut d, &lines).unwrap();
@@ -3335,7 +5031,40 @@ mod tests {
         assert_eq!(zone.exclude[0].addr.as_ipv4(), Some("192.0.2.128".parse().unwrap()));
         assert_eq!(zone.exclude[0].prefixlen, 25);
         assert_eq!(zone.interface_names[0].name, "eth0");
-        assert_eq!(zone.interface_names[0].flags, 4);
+        assert_eq!(zone.interface_names[0].flags, AUTH4);
+    }
+
+    #[test]
+    fn apply_auth_zone_requires_auth_server() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("auth-zone=example.com,192.0.2.0/24", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "auth-server"));
+    }
+
+    #[test]
+    fn apply_auth_zone_interface_family_suffixes() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text(
+            "auth-server=ns.example.com\nauth-zone=example.com,eth0/4,eth1/6,eth2",
+            "test",
+        ).unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        let zone = &d.auth_zones[0];
+        assert_eq!(zone.interface_names[0].name, "eth0");
+        assert_eq!(zone.interface_names[0].flags, AUTH4);
+        assert_eq!(zone.interface_names[1].name, "eth1");
+        assert_eq!(zone.interface_names[1].flags, AUTH6);
+        assert_eq!(zone.interface_names[2].name, "eth2");
+        assert_eq!(zone.interface_names[2].flags, AUTH4 | AUTH6);
+    }
+
+    #[test]
+    fn apply_auth_zone_bad_interface_suffix_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("auth-server=ns.example.com\nauth-zone=example.com,eth0/9", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "auth-zone"));
     }
 
     #[test]
@@ -3369,6 +5098,23 @@ mod tests {
         apply_config(&mut d, &lines).unwrap();
         assert_eq!(d.randport_limit, 3);
         assert_eq!(d.rrlist_filter.iter().map(|rr| rr.rr).collect::<Vec<_>>(), vec![1, 28]);
+    }
+
+    #[test]
+    fn apply_cache_rr_and_filter_rr_accept_named_and_numeric_types() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("cache-rr=TXT,65\nfilter-rr=CAA,46", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.rrlist_cache.iter().map(|rr| rr.rr).collect::<Vec<_>>(), vec![16, 65]);
+        assert_eq!(d.rrlist_filter.iter().map(|rr| rr.rr).collect::<Vec<_>>(), vec![257, 46]);
+    }
+
+    #[test]
+    fn apply_filter_rr_unknown_type_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("filter-rr=NOTATYPE", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "filter-rr"));
     }
 
     #[test]
@@ -3824,6 +5570,76 @@ mod tests {
     }
 
     #[test]
+    fn apply_dnssec_check_unsigned_modes() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dnssec-check-unsigned", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(!d.option_bool(OPT_DNSSEC_IGN_NS));
+
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dnssec-check-unsigned=no", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_DNSSEC_IGN_NS));
+    }
+
+    #[test]
+    fn apply_dnssec_check_unsigned_bad_value_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dnssec-check-unsigned=yes", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "dnssec-check-unsigned"));
+    }
+
+    #[test]
+    fn apply_dnssec_timestamp() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dnssec-timestamp=/var/lib/dnsmasq/dnssec.timestamp", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        #[cfg(feature = "dnssec")]
+        assert_eq!(d.timestamp_file, Some("/var/lib/dnsmasq/dnssec.timestamp".to_string()));
+    }
+
+    #[test]
+    fn daemon_dnssec_limit_defaults_match_upstream() {
+        let d = Daemon::default();
+        #[cfg(feature = "dnssec")]
+        assert_eq!(
+            d.dnssec_limits,
+            [
+                DNSSEC_LIMIT_SIG_FAIL,
+                DNSSEC_LIMIT_CRYPTO,
+                DNSSEC_LIMIT_WORK,
+                DNSSEC_LIMIT_NSEC3_ITERS,
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_dnssec_limits_overrides_nonzero_values() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dnssec-limits=1,0,3,4", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        #[cfg(feature = "dnssec")]
+        assert_eq!(
+            d.dnssec_limits,
+            [
+                1,
+                DNSSEC_LIMIT_CRYPTO,
+                3,
+                4,
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_dnssec_limits_bad_value_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dnssec-limits=1,nope", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "dnssec-limits"));
+    }
+
+    #[test]
     fn cli_lines_emit_port_directive() {
         let args = CliArgs {
             conf_file: Some("dnsmasq.conf".into()),
@@ -4007,7 +5823,7 @@ mod tests {
         assert!(resolved.daemon.option_bool(OPT_ALL_SERVERS));
         assert!(resolved.daemon.option_bool(OPT_ORDER));
         assert!(resolved.daemon.option_bool(OPT_DNSSEC_VALID));
-        assert!(resolved.daemon.option_bool(OPT_LOCAL_SERVICE));
+        assert!(!resolved.daemon.option_bool(OPT_LOCAL_SERVICE));
         assert!(resolved.daemon.option_bool(OPT_NO_REBIND));
         assert!(resolved.daemon.option_bool(OPT_NO_FORK));
         assert!(resolved.daemon.option_bool(OPT_NOWILD));

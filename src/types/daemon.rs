@@ -5,7 +5,7 @@
 /// concurrent access from tokio tasks.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
-use crate::types::constants::OPTION_SIZE;
+use crate::types::constants::*;
 use crate::types::addr::MySockAddr;
 use crate::types::dns_records::*;
 use crate::types::network::*;
@@ -41,6 +41,7 @@ pub struct Daemon {
     pub int_names:     Vec<InterfaceName>,
     pub bogus_addr:    Vec<BogusAddr>,
     pub ignore_addr:   Vec<BogusAddr>,
+    pub leasequery_addr: Vec<BogusAddr>,
     pub doctors:       Vec<Doctor>,
     pub rrlist_cache:  Vec<RrList>,
     pub rrlist_filter: Vec<RrList>,
@@ -52,6 +53,7 @@ pub struct Daemon {
     pub if_except:     Vec<Iname>,
     pub dhcp_except:   Vec<Iname>,
     pub auth_peers:    Vec<Iname>,
+    pub auth_interfaces: Vec<Iname>,
     pub tftp_interfaces: Vec<Iname>,
     pub interface_addrs: Vec<Addrlist>,
     pub ipsets:        Vec<Ipsets>,
@@ -91,6 +93,7 @@ pub struct Daemon {
     pub luascript:       Option<String>,
     pub authserver:      Option<String>,
     pub hostmaster:      Option<String>,
+    pub secondary_forward_servers: Vec<String>,
     pub domain_suffix:   Option<String>,
     pub runfile:         Option<String>,
     pub lease_change_command: Option<String>,
@@ -100,6 +103,8 @@ pub struct Daemon {
     pub add_subnet4:     Option<MySubnet>,
     pub add_subnet6:     Option<MySubnet>,
     pub addn_hosts:      Vec<HostsFile>,
+    pub dhcp_hosts_file: Vec<HostsFile>,
+    pub dhcp_opts_file:  Vec<HostsFile>,
     pub dynamic_dirs:    Vec<DynDir>,
     pub soa_sn:          u32,
     pub soa_refresh:     u32,
@@ -167,6 +172,8 @@ pub struct Daemon {
     // ── DNSSEC (feature-gated) ────────────────────────────────────────────────
     #[cfg(feature = "dnssec")]
     pub ds:                 Vec<DsConfig>,
+    #[cfg(feature = "dnssec")]
+    pub dnssec_limits:      [i32; LIMIT_MAX],
     #[cfg(feature = "dnssec")]
     pub timestamp_file:     Option<String>,
     #[cfg(feature = "dnssec")]
@@ -241,6 +248,7 @@ impl Default for Daemon {
             int_names: vec![],
             bogus_addr: vec![],
             ignore_addr: vec![],
+            leasequery_addr: vec![],
             doctors: vec![],
             rrlist_cache: vec![],
             rrlist_filter: vec![],
@@ -250,6 +258,7 @@ impl Default for Daemon {
             if_except: vec![],
             dhcp_except: vec![],
             auth_peers: vec![],
+            auth_interfaces: vec![],
             tftp_interfaces: vec![],
             interface_addrs: vec![],
             ipsets: vec![],
@@ -264,7 +273,7 @@ impl Default for Daemon {
             max_ttl: 0,
             min_cache_ttl: 0,
             max_cache_ttl: 0,
-            auth_ttl: 0,
+            auth_ttl: 600,
             cachesize: 150,
             ftabsize: 150,
             cache_max_expiry: -1,
@@ -283,6 +292,7 @@ impl Default for Daemon {
             luascript: None,
             authserver: None,
             hostmaster: None,
+            secondary_forward_servers: vec![],
             domain_suffix: None,
             runfile: None,
             lease_change_command: None,
@@ -292,11 +302,13 @@ impl Default for Daemon {
             add_subnet4: None,
             add_subnet6: None,
             addn_hosts: vec![],
+            dhcp_hosts_file: vec![],
+            dhcp_opts_file: vec![],
             dynamic_dirs: vec![],
             soa_sn: 0,
-            soa_refresh: 0,
-            soa_retry: 0,
-            soa_expiry: 0,
+            soa_refresh: 1200,
+            soa_retry: 180,
+            soa_expiry: 1209600,
             osport: 0,
             host_index: 0,
             pipe_to_parent: -1,
@@ -355,6 +367,13 @@ impl Default for Daemon {
             #[cfg(feature = "dnssec")]
             ds: vec![],
             #[cfg(feature = "dnssec")]
+            dnssec_limits: [
+                DNSSEC_LIMIT_SIG_FAIL,
+                DNSSEC_LIMIT_CRYPTO,
+                DNSSEC_LIMIT_WORK,
+                DNSSEC_LIMIT_NSEC3_ITERS,
+            ],
+            #[cfg(feature = "dnssec")]
             timestamp_file: None,
             #[cfg(feature = "dnssec")]
             dnssec_no_time_check: false,
@@ -375,7 +394,7 @@ impl Default for Daemon {
             #[cfg(feature = "dump")]
             dump_file: None,
             #[cfg(feature = "dump")]
-            dump_mask: 0,
+            dump_mask: -1,
 
             #[cfg(feature = "dbus")]
             dbus_name: None,

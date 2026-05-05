@@ -2102,7 +2102,7 @@ mod tests {
         use crate::types::dns_records::TxtRecord;
         let txt = TxtRecord {
             name:  "example.com".into(),
-            txt:   b"v=spf1 ~all".to_vec(),
+            txt:   b"\x0bv=spf1 ~all".to_vec(),
             class: 1,
             stat:  0,
         };
@@ -2113,7 +2113,26 @@ mod tests {
             .expect("should answer TXT");
         assert_eq!(resp.answers.len(), 1);
         assert_eq!(resp.answers[0].rtype, 16);
-        assert_eq!(resp.answers[0].rdata, b"v=spf1 ~all".to_vec());
+        assert_eq!(resp.answers[0].rdata, b"\x0bv=spf1 ~all".to_vec());
+    }
+
+    #[test]
+    fn test_answer_request_arbitrary_rr() {
+        use crate::types::dns_records::TxtRecord;
+        let caa = TxtRecord {
+            name:  "example.com".into(),
+            txt:   b"\x00\x05issueletsencrypt.org".to_vec(),
+            class: crate::dns_protocol::RrType::CAA as u16,
+            stat:  0,
+        };
+        let cfg   = LocalConfig { rr_records: std::slice::from_ref(&caa), ..empty_config() };
+        let query = make_query("example.com", crate::dns_protocol::RrType::CAA as u16);
+        let mut cache = DnsCache::new(100);
+        let resp = answer_request(&query, &mut cache, Instant::now(), &cfg)
+            .expect("should answer arbitrary RR");
+        assert_eq!(resp.answers.len(), 1);
+        assert_eq!(resp.answers[0].rtype, crate::dns_protocol::RrType::CAA as u16);
+        assert_eq!(resp.answers[0].rdata, b"\x00\x05issueletsencrypt.org".to_vec());
     }
 
     // ── check helpers ─────────────────────────────────────────────────────────
@@ -2397,5 +2416,3 @@ mod tests {
         assert_eq!(ttl, 30);
     }
 }
-
-
