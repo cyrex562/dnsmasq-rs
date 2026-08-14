@@ -1,0 +1,42 @@
+{
+  "feature_sets": {
+    "default": {
+      "cargo_flags": [],
+      "tests": {
+        "passed": 3019,
+        "failed": 0,
+        "ignored": 1
+      },
+      "clippy_warnings": 198
+    },
+    "all-features": {
+      "cargo_flags": [
+        "--all-features"
+      ],
+      "tests": {
+        "passed": 3059,
+        "failed": 0,
+        "ignored": 1
+      },
+      "clippy_warnings": 200
+    },
+    "no-default-features": {
+      "cargo_flags": [
+        "--no-default-features"
+      ],
+      "tests": {
+        "passed": 1613,
+        "failed": 0,
+        "ignored": 0
+      },
+      "clippy_warnings": 145
+    }
+  },
+  "git_commit": "d498ae88705c059980b39d2d429779c2d6c13d3b",
+  "parity": {
+    "fixture": "dns/basic",
+    "cases_total": 8,
+    "cases_passing": 0,
+    "note": "candidate answers no query; local-data path not wired into run_main_loop"
+  }
+}
