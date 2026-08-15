@@ -18,6 +18,7 @@ class CycleRecord:
     verdict: str = ""
     objections: str = ""
     pr_url: str = ""
+    parked_branch: str = ""
     merged: bool = False
     reverted: bool = False
     outcome: str = "started"
