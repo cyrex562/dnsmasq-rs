@@ -121,9 +121,18 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   `capset` capability retention across the `setuid` (with `CAP_SETUID` dropped
   afterwards), `unlink` + `O_EXCL` symlink-race protection and `fchown` on the pid file,
   an `err_pipe` equivalent (`dnsmasq::StartupPipe`) so the invoking shell blocks until
-  startup finishes and sees fatal startup errors, and `username` defaulting to `CHUSER`
-  ("nobody") as upstream's `read_opts` does. Covered by
+  startup finishes and sees fatal startup errors, and `username`/`runfile` defaulting to
+  `CHUSER` ("nobody") and `RUNFILE` (`/var/run/dnsmasq.pid`) as upstream's `read_opts`
+  does (option.c:5976-5977). Those two are seeded *before* the config lines are applied,
+  not filled in afterwards, so `user=`/`pid-file=` with an empty value clears them the
+  way `opt_string_alloc` (option.c:677-691) does. Covered by
   `tests/daemon_startup_integration.rs` plus unit tests in `src/dnsmasq.rs`.
+
+  `log::log_start` is now called from `main.rs` too, before the `/dev/null` redirect, and
+  installs the `tracing` sink — so `log-facility=<file>` receives the daemon's ordinary
+  output and a backgrounded or `-k` daemon is not silent. `StartupPipe::fail` reports
+  through that sink as well, which is what upstream's `fatal_event` → `die` → syslog path
+  gives the `-k` case, where there is neither a pipe nor a usable stderr.
 
   Two flag-semantics fixes came with it: `--no-daemon`/`-d` now sets `OPT_DEBUG`
   (`option.c:428`), not `OPT_NO_FORK`, so it suppresses the pid file, the stdio redirect
@@ -144,15 +153,27 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     "process is missing required capability NET_ADMIN" (`dnsmasq.c:576-583`); here a
     capability that is not permitted surfaces later as a `capset` failure during the drop.
     Both are fatal, but the Rust diagnostic is worse.
-  - No syslog. After the stdio redirect the tracing subscriber writes to `/dev/null`, so
-    a backgrounded daemon logs nothing; upstream's `log_start()`/`my_syslog()` has no
-    port. `log-facility` is parsed into `Daemon::log_file` and still unused.
+  - No syslog *socket*. `src/log.rs` ports `log_start`/`log_reopen`/`my_syslog` and is now
+    wired into startup, but with no `log-facility` the fallback is stderr, not
+    `/dev/log` — so a backgrounded daemon with no `log-facility` still logs nowhere,
+    where upstream would reach syslog. Consequently `log-facility=<facility-name>`
+    (`daemon`, `local0`, …) and `log-facility=-` are treated as file paths rather than as
+    facility selectors, and `log_fac`/`log-async` queueing are parsed but inert.
+    `log_start` also does not `fchown` the log file to the run user (log.c), so a
+    root-created log file stays root-owned after the drop.
+  - `my_syslog` output now passes through the `tracing` `EnvFilter`, so `RUST_LOG` can
+    suppress records upstream would always write. Upstream filters only on `MS_DEBUG`.
   - Solaris `priv_set`/`setppriv` (`dnsmasq.c:775-795`) is deliberately out of scope; the
     capability path is Linux-only and other platforms just `setgroups`/`setgid`/`setuid`.
   - No helper process is forked before the privilege drop, so `dhcp-script`/`dhcp-luascript`
     (`create_helper`, `dnsmasq.c:740`) still cannot run as a separate uid.
   - The pid file is never removed on shutdown, and `PR_SET_DUMPABLE` (debug mode,
     `dnsmasq.c:823`) is not set.
+  - Acceptance evidence caveat: `user_and_group_change_the_running_ids_and_clear_supplementary_groups`
+    is root-gated and skips on an unprivileged runner, so the `setuid`/`setgid`/`setgroups`
+    and pid-file-`fchown` assertions only actually execute under root. Likewise the
+    parity lane needs Docker; `parity_compose_keeps_the_candidate_in_the_foreground`
+    guards the `-k` flag the candidate container depends on without needing it.
   - `StartupPipe::ready()` fires once the runtime is built, not once the forwarding task
     is actually serving, so a failure inside `run_main_loop` still escapes the invoking
     process's notice.

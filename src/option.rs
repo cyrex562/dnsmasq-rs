@@ -532,13 +532,29 @@ pub fn apply_config(daemon: &mut Daemon, lines: &[ConfigLine]) -> Result<(), Con
 /// Resolve raw config lines into a finalized configuration.
 pub fn resolve_config(lines: &[ConfigLine]) -> Result<ResolvedConfig, ConfigError> {
     let mut daemon = Daemon::default();
+    seed_startup_defaults(&mut daemon);
     apply_config(&mut daemon, lines)?;
     Ok(ResolvedConfig { daemon })
 }
 
+/// Seed the compiled-in defaults upstream installs *before* it parses anything
+/// (`read_opts`, option.c:5970-5990).
+///
+/// Seeding first rather than filling gaps afterwards is what makes `user=` and
+/// `pid-file=` with an empty value work: `opt_string_alloc` (option.c:677-691)
+/// maps the empty string to NULL, so those directives *clear* the default
+/// rather than being ignored.  A post-hoc "if None then default" pass would
+/// silently reinstate it.
+fn seed_startup_defaults(daemon: &mut Daemon) {
+    // "nobody" unless `user=` says otherwise, so an unconfigured daemon still
+    // drops root.  The group has no unconditional default — it is resolved at
+    // startup from CHGRP or the run user's primary group (dnsmasq.c:507-517).
+    daemon.username = Some(CHUSER.to_string());
+    daemon.runfile = Some(RUNFILE.to_string());
+}
+
 fn normalize_config(daemon: &mut Daemon) -> Result<(), ConfigError> {
     apply_dnssec_fast_retry_defaults(daemon);
-    apply_run_user_default(daemon);
     apply_local_ttl_defaults(daemon);
     apply_mx_defaults(daemon)?;
     apply_auth_defaults(daemon);
@@ -553,16 +569,6 @@ fn apply_dnssec_fast_retry_defaults(daemon: &mut Daemon) {
     if daemon.option_bool(OPT_DNSSEC_VALID) && daemon.fast_retry_time == 0 {
         daemon.fast_retry_timeout = UPSTREAM_TIMEOUT_SECS;
         daemon.fast_retry_time = DEFAULT_FAST_RETRY_MS;
-    }
-}
-
-/// Upstream seeds `daemon->username` with `CHUSER` before it parses anything
-/// (option.c:5976), so a config that never says `user=` still drops root to
-/// "nobody".  The group has no unconditional default — it is resolved at
-/// startup from `CHGRP` or the run user's primary group (dnsmasq.c:507-517).
-fn apply_run_user_default(daemon: &mut Daemon) {
-    if daemon.username.is_none() {
-        daemon.username = Some(CHUSER.to_string());
     }
 }
 
@@ -970,14 +976,17 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             daemon.domain_suffix = Some(name);
         }
 
+        // `daemon->username = opt_string_alloc(arg)` (option.c:2868,2872), and
+        // `opt_string_alloc` maps the empty string to NULL — so `user=` on its
+        // own clears the seeded CHUSER default and means "do not change uid".
         "user" => {
             let v = require_value("user")?;
-            daemon.username = Some(v.to_string());
+            daemon.username = if v.is_empty() { None } else { Some(v.to_string()) };
         }
 
         "group" => {
             let v = require_value("group")?;
-            daemon.groupname = Some(v.to_string());
+            daemon.groupname = if v.is_empty() { None } else { Some(v.to_string()) };
         }
 
         "dhcp-scriptuser" => {
@@ -997,7 +1006,9 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
 
         "pid-file" => {
             let v = require_value("pid-file")?;
-            daemon.runfile = Some(v.to_string());
+            // `opt_string_alloc` (option.c:677-691) returns NULL for the empty
+            // string, so `pid-file=` is upstream's way of asking for no pid file.
+            daemon.runfile = if v.is_empty() { None } else { Some(v.to_string()) };
         }
 
         "log-facility" => {
@@ -5848,6 +5859,33 @@ mod tests {
         let resolved =
             resolve_config(&parse_config_text("user=dnsmasq", "test.conf").unwrap()).unwrap();
         assert_eq!(resolved.daemon.username.as_deref(), Some("dnsmasq"));
+    }
+
+    // ── pid-file default (option.c:5977) ──────────────────────────────────────
+
+    /// `daemon->runfile = RUNFILE` is seeded next to `daemon->username = CHUSER`,
+    /// so a config that never says `pid-file=` still writes `/var/run/dnsmasq.pid`.
+    #[test]
+    fn run_file_defaults_to_runfile() {
+        let resolved = resolve_config(&[]).unwrap();
+        assert_eq!(resolved.daemon.runfile.as_deref(), Some(RUNFILE));
+    }
+
+    #[test]
+    fn explicit_pid_file_overrides_the_default() {
+        let resolved =
+            resolve_config(&parse_config_text("pid-file=/run/x.pid", "test.conf").unwrap()).unwrap();
+        assert_eq!(resolved.daemon.runfile.as_deref(), Some("/run/x.pid"));
+    }
+
+    /// `pid-file=` with an empty value is upstream's way of asking for *no* pid
+    /// file at all: `opt_string_alloc` (option.c:677-691) returns NULL for it,
+    /// and the write at dnsmasq.c:659 is guarded on `daemon->runfile`.
+    #[test]
+    fn empty_pid_file_disables_the_pid_file() {
+        let resolved =
+            resolve_config(&parse_config_text("pid-file=", "test.conf").unwrap()).unwrap();
+        assert_eq!(resolved.daemon.runfile, None);
     }
 
     #[test]

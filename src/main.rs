@@ -119,24 +119,38 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
     use clap::Parser as _;
     use tracing::info;
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let args = option::CliArgs::parse();
     let mut lines = Vec::new();
-    if let Some(ref conf_path) = args.conf_file {
-        let text = std::fs::read_to_string(conf_path)?;
-        lines.extend(option::parse_config_text(&text, conf_path)?);
-        info!("loaded config from {conf_path}");
-    }
+    let conf_loaded = match args.conf_file {
+        Some(ref conf_path) => {
+            let text = std::fs::read_to_string(conf_path)?;
+            lines.extend(option::parse_config_text(&text, conf_path)?);
+            Some(conf_path.clone())
+        }
+        None => None,
+    };
     lines.extend(option::config_lines_from_cli(&args));
 
     let daemon = option::resolve_config(&lines)?.into_daemon();
     let debug = daemon.option_bool(OPT_DEBUG);
+
+    // Open the log before anything worth logging happens.  Upstream calls
+    // `log_start()` later — dnsmasq.c:717, after the fork — but it can afford
+    // to, because everything before that point reports through `die()` on a
+    // terminal that still exists.  Opening it here costs nothing (the fd is
+    // inherited across the fork) and means bind failures are logged too.
+    //
+    // `echo_stderr` follows `option_bool(OPT_DEBUG)` (log.c), so `-d` keeps
+    // talking to the terminal even when `log-facility` points at a file.
+    let log_path = daemon.log_file.as_deref().map(std::path::Path::new);
+    let log_debug = daemon.option_bool(types::constants::OPT_LOG_DEBUG);
+    if let Err(e) = log::log_start(log_path, None, debug, log_debug) {
+        let target = daemon.log_file.as_deref().unwrap_or("");
+        return Err(format!("failed to open log file {target}: {e}").into());
+    }
+    if let Some(conf_path) = conf_loaded {
+        info!("loaded config from {conf_path}");
+    }
 
     // Resolve names to ids first: an unknown user is fatal, and we want to say
     // so on the terminal rather than into /dev/null after the fork.
@@ -196,8 +210,14 @@ fn write_pid_file_if_configured(
     };
 
     let root = nix::unistd::getuid().is_root();
-    // "if (getuid() == 0 && ent_pw && ent_pw->pw_uid != 0)" — dnsmasq.c:697.
-    let owner = match (root, run_as.uid, run_as.gid) {
+    // "if (getuid() == 0 && ent_pw && ent_pw->pw_uid != 0 &&
+    //      fchown(fd, ent_pw->pw_uid, ent_pw->pw_gid) == -1)" — dnsmasq.c:697.
+    //
+    // Note `pw_gid`, the run *user's* primary group, not the group the daemon
+    // will run under: with `user=dnsmasq group=dip` the pid file is owned
+    // `dnsmasq:dnsmasq`, because systemd matches it against the containing
+    // directory's owner rather than against the daemon's runtime gid.
+    let owner = match (root, run_as.uid, run_as.user_gid) {
         (true, Some(uid), Some(gid)) if uid != 0 => Some((uid, gid)),
         _ => None,
     };

@@ -4,6 +4,7 @@
 
 use tracing::{debug, error, info, warn};
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 // ── Syslog priority constants ─────────────────────────────────────────────────
@@ -90,6 +91,48 @@ fn log_state() -> &'static Mutex<LogConfig> {
     LOG_STATE.get_or_init(|| Mutex::new(LogConfig::default()))
 }
 
+/// Set once [`log_start`] has successfully installed [`LogSink`] as the global
+/// `tracing` writer.  Sticky: a subscriber cannot be replaced once installed.
+static SINK_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Whether `tracing` output is being routed through the log backend.
+///
+/// When this is true, an ordinary `info!`/`warn!` from anywhere in the daemon
+/// reaches the `log-facility` file, and code that must be heard after the
+/// daemon's stdio has gone to `/dev/null` can rely on `tracing` alone.
+pub fn sink_installed() -> bool {
+    SINK_INSTALLED.load(Ordering::Relaxed)
+}
+
+/// The `tracing` output sink: the configured log file if there is one, else
+/// stderr.
+///
+/// The target is resolved per write rather than captured at install time, so
+/// [`log_reopen`] (SIGHUP log rotation) redirects `tracing` too.  Upstream gets
+/// this for free by having exactly one `log_fd`.
+struct LogSink;
+
+impl Write for LogSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Ok(mut cfg) = log_state().lock() {
+            if let Some(ref mut file) = cfg.log_file {
+                file.write_all(buf)?;
+                return Ok(buf.len());
+            }
+        }
+        std::io::stderr().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Ok(mut cfg) = log_state().lock() {
+            if let Some(ref mut file) = cfg.log_file {
+                return file.flush();
+            }
+        }
+        std::io::stderr().flush()
+    }
+}
+
 // ── Initialisation ────────────────────────────────────────────────────────────
 
 /// Initialise the logging subsystem.
@@ -109,17 +152,9 @@ pub fn log_start(
     echo_stderr: bool,
     log_debug:   bool,
 ) -> std::io::Result<()> {
-    // Set up the tracing subscriber (for console / test output).
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| {
-                    let level = if log_debug { "debug" } else { "info" };
-                    tracing_subscriber::EnvFilter::new(level)
-                }),
-        )
-        .try_init();
-
+    // Open the file *before* installing the subscriber, so that a bad
+    // `log-facility` path is reported to the caller instead of being swallowed
+    // by the first log line.
     let file = match log_file {
         Some(p) => {
             let f = std::fs::OpenOptions::new()
@@ -141,6 +176,28 @@ pub fn log_start(
         cfg.log_debug   = log_debug;
         cfg.entries_lost = 0;
     }
+
+    // Route `tracing` at the log backend rather than at stdout.  Upstream calls
+    // `log_start()` from the middle of the daemonization sequence (dnsmasq.c:717)
+    // — after the fork, before stdio goes to /dev/null — for exactly this
+    // reason: past that point the process has no terminal, and anything still
+    // writing to stdout is talking to nobody.
+    let installed = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| {
+                    let level = if log_debug { "debug" } else { "info" };
+                    tracing_subscriber::EnvFilter::new(level)
+                }),
+        )
+        .with_ansi(false)
+        .with_writer(|| LogSink)
+        .try_init()
+        .is_ok();
+    if installed {
+        SINK_INSTALLED.store(true, Ordering::Relaxed);
+    }
+
     Ok(())
 }
 
@@ -197,7 +254,12 @@ pub fn log_priority(priority: u32) -> u32 {
 /// - `LOG_WARNING` (4) → `tracing::warn!`
 /// - `LOG_ERR` (3) and below → `tracing::error!`
 ///
-/// If a log file is configured the message is also written there (one line per entry).
+/// If a log file is configured the message is also written there (one line per
+/// entry) — either directly, or, once [`log_start`] has installed the `tracing`
+/// sink, through `tracing`, which means the process-wide `RUST_LOG` filter
+/// applies.  That is the one deviation from upstream, whose `my_syslog` filters
+/// only on `MS_DEBUG`; it keeps `my_syslog` and the rest of the daemon's output
+/// under a single, consistent level control.
 pub fn my_syslog(priority: u32, message: &str) {
     let fac   = priority & LOG_FACMASK;
     let level = priority & LOG_PRIMASK;
@@ -230,14 +292,21 @@ pub fn my_syslog(priority: u32, message: &str) {
         _                                  => error!("{}", line),
     }
 
-    // Also write to log file if configured
+    // Also write to the log file — unless the tracing sink is already writing
+    // there, in which case the record above has been delivered and a second
+    // copy would duplicate every line.
     let state = log_state();
     if let Ok(mut cfg) = state.lock() {
-        if cfg.echo_stderr {
+        // With no log file the sink is stderr, so the record above already
+        // landed there and echoing would print every line twice.
+        let sink_is_stderr = sink_installed() && cfg.log_file.is_none();
+        if cfg.echo_stderr && !sink_is_stderr {
             eprintln!("dnsmasq{}: {}", tag, message);
         }
-        if let Some(ref mut file) = cfg.log_file {
-            let _ = writeln!(file, "dnsmasq{}: {}", tag, message);
+        if !sink_installed() {
+            if let Some(ref mut file) = cfg.log_file {
+                let _ = writeln!(file, "dnsmasq{}: {}", tag, message);
+            }
         }
     }
 }

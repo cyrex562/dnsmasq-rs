@@ -75,6 +75,10 @@ pub struct RunAs {
     /// upstream substitutes into `daemon->groupname` for its error messages.
     pub groupname: Option<String>,
     pub gid:       Option<u32>,
+    /// The run user's *primary* group (`ent_pw->pw_gid`), which is not
+    /// necessarily [`gid`](Self::gid): the daemon runs under `group=`/`CHGRP`,
+    /// but upstream chowns the pid file to `pw_uid:pw_gid` (dnsmasq.c:697).
+    pub user_gid:  Option<u32>,
 }
 
 /// Resolve `user=`/`group=` into numeric ids, mirroring dnsmasq.c:499-517.
@@ -97,6 +101,7 @@ pub fn resolve_run_as(daemon: &Daemon) -> Result<RunAs, DnsmasqError> {
                 .ok_or_else(|| unknown(name))?;
             run_as.username = Some(name.to_string());
             run_as.uid = Some(pw.uid.as_raw());
+            run_as.user_gid = Some(pw.gid.as_raw());
             Some(pw)
         }
         None => None,
@@ -239,11 +244,16 @@ pub fn drop_privileges_with(run_as: &RunAs, caps: NeededCaps) -> Result<(), Dnsm
     let current_uid = nix::unistd::getuid();
     let current_gid = nix::unistd::getgid();
 
-    // Already exactly this identity: nothing to do — and nothing we would be
-    // allowed to do, since setgroups(2) needs CAP_SETGID.
-    if run_as.uid.is_none_or(|u| current_uid == Uid::from_raw(u))
-        && run_as.gid.is_none_or(|g| current_gid == Gid::from_raw(g))
-    {
+    // Upstream only reaches this code as root (dnsmasq.c:747).  When we are
+    // not, asking for the identity we already have is a no-op — setgroups(2)
+    // would only fail with EPERM, and there is nothing to strip that we could
+    // not simply re-acquire.  Note the guard is deliberately *not* applied when
+    // we are root: `--user root --group root` must still clear the
+    // supplementary groups inherited from the invoking shell, exactly as
+    // upstream's unconditional `setgroups(0, &dummy)` does.
+    let already_there = run_as.uid.is_none_or(|u| current_uid == Uid::from_raw(u))
+        && run_as.gid.is_none_or(|g| current_gid == Gid::from_raw(g));
+    if already_there && !current_uid.is_root() {
         return Ok(());
     }
 
@@ -386,7 +396,13 @@ impl StartupPipe {
     ///
     /// Never returns.  Upstream's equivalent (`send_event` then `_exit`) is
     /// likewise terminal: past the fork there is nobody left to unwind to.
+    ///
+    /// The message always goes to the log as well.  By the time this can fire,
+    /// stderr may already be `/dev/null` — that is true of the `-k` path, which
+    /// never forks and so has no pipe either — and upstream does not lose the
+    /// diagnostic there: `fatal_event` reaches `die`, which reaches syslog.
     pub fn fail(self, msg: &str) -> ! {
+        crate::log::my_syslog(crate::log::LOG_CRIT, msg);
         match self.write_fd {
             Some(fd) => {
                 use std::io::Write as _;
@@ -394,7 +410,9 @@ impl StartupPipe {
                 let _ = f.write_all(msg.as_bytes());
                 let _ = f.flush();
             }
-            None => eprintln!("dnsmasq-rs: {msg}"),
+            // Without a log sink the record above went nowhere; say it plainly.
+            None if !crate::log::sink_installed() => eprintln!("dnsmasq-rs: {msg}"),
+            None => {}
         }
         std::process::exit(1);
     }
@@ -1168,10 +1186,12 @@ mod tests {
     }
 
     #[test]
-    fn drop_privileges_noop_for_current_user() {
+    fn drop_privileges_succeeds_for_the_current_user() {
         let uid = nix::unistd::getuid().as_raw();
         let gid = nix::unistd::getgid().as_raw();
-        // Should succeed without any syscall since uid/gid already match.
+        // Unprivileged: a pure no-op, since there is nothing to drop to.  As
+        // root it really does run setgroups(0)/setgid, which is upstream's
+        // behavior for `--user root` and must still succeed.
         drop_privileges(uid, gid).expect("drop_privileges failed for current user");
     }
 
@@ -1225,9 +1245,14 @@ mod tests {
         let path = dir.path().join("dnsmasq.pid");
         write_pid_file(path.to_str().unwrap(), 1).expect("write_pid_file failed");
 
-        // S_IWUSR|S_IRUSR|S_IRGRP|S_IROTH (dnsmasq.c:684).
+        // S_IWUSR|S_IRUSR|S_IRGRP|S_IROTH (dnsmasq.c:684).  The umask still
+        // applies — it does to upstream's `open()` too — so assert on what the
+        // umask cannot add rather than on the exact 0644: the owner must be
+        // able to read and write it, and nobody may gain write or execute.
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o644, "unexpected pid file mode {mode:o}");
+        assert_eq!(mode & 0o600, 0o600, "owner needs rw on the pid file, got {mode:o}");
+        assert_eq!(mode & 0o133, 0, "pid file must not be executable or group/other-writable, got {mode:o}");
+        assert_eq!(mode & !0o644, 0, "pid file mode must be a subset of 0644, got {mode:o}");
     }
 
     #[test]

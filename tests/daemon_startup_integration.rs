@@ -242,6 +242,174 @@ fn keep_in_foreground_writes_the_pid_file_without_forking() {
     let _ = child.wait();
 }
 
+// ── the default pid file must not be fatal when unprivileged ─────────────────
+
+/// `pid-file=` defaults to `RUNFILE` (option.c:5977), which an ordinary user
+/// cannot write.  Upstream "silently ignores failure to write the pid-file"
+/// when it was not started as root (dnsmasq.c:679-683), and so must we — a
+/// hard failure here would break every unprivileged run.
+#[test]
+fn the_default_pid_file_does_not_stop_an_unprivileged_start() {
+    if nix::unistd::getuid().is_root() {
+        // Deliberately not run as root: it would write the machine's real
+        // /var/run/dnsmasq.pid and could stomp on a running dnsmasq.
+        eprintln!("skipping: would write the real /var/run/dnsmasq.pid");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let port = free_udp_port();
+    let conf = write_conf(dir.path(), port);
+
+    let mut child = Command::new(bin())
+        .args(["--keep-in-foreground", "--conf-file", conf.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn dnsmasq-rs");
+
+    let reply = ask_host_test(port)
+        .expect("an unwritable default pid file must not stop the daemon serving");
+    assert_eq!(reply.answers.len(), 1, "expected the configured host-record");
+    assert!(
+        child.try_wait().expect("try_wait").is_none(),
+        "the daemon should still be running"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+// ── log-facility survives the /dev/null redirect ─────────────────────────────
+
+/// Upstream calls `log_start()` (dnsmasq.c:717) *before* pointing stdio at
+/// `/dev/null`, precisely so that a daemon which no longer has a terminal still
+/// has somewhere to talk.  Without that, `-k` and the forking default are both
+/// silent and `log-facility=<file>` is a no-op — which the porting rules forbid.
+#[test]
+fn log_facility_captures_output_after_the_stdio_redirect() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pid_path = dir.path().join("dnsmasq.pid");
+    let log_path = dir.path().join("dnsmasq.log");
+    let port = free_udp_port();
+
+    let mut child = Command::new(bin())
+        .args([
+            "--keep-in-foreground",
+            "--port",
+            &port.to_string(),
+            "--pid-file",
+            pid_path.to_str().unwrap(),
+            "--log-facility",
+            log_path.to_str().unwrap(),
+            "--no-resolv",
+            "--no-hosts",
+        ])
+        // Both are /dev/null inside the daemon anyway under -k; null them here
+        // too so a regression cannot pass by leaking onto the test's stderr.
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn dnsmasq-rs");
+
+    wait_for_pid_file(&pid_path, Duration::from_secs(10));
+
+    // Two records, on purpose.  "starting on port" is emitted before the
+    // redirect and proves `log-facility` is wired up at all; "listening for DNS
+    // queries" comes from inside the tokio runtime, i.e. after stdio has become
+    // /dev/null and after the privilege drop, and is the one that proves the
+    // sink actually survives daemonization.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let log = loop {
+        let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if text.contains("listening for DNS queries") {
+            break text;
+        }
+        if Instant::now() >= deadline {
+            panic!("log-facility file never received the daemon's output, got: {text:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        log.contains("starting on port"),
+        "the pre-fork startup banner should be in the log too, got: {log}"
+    );
+    assert!(
+        log.contains(&port.to_string()),
+        "the log lines should name the port the daemon bound, got: {log}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+// ── the parity harness must not be daemonized out from under itself ──────────
+
+/// `parity/docker/rust.Dockerfile` makes the binary the container's PID 1, so
+/// the default double-fork would exit PID 1 the moment the daemon signalled
+/// readiness and Docker would tear the container down.  The `upstream` service
+/// already passes `-k` for exactly this reason.
+///
+/// Checked here rather than in a container run because the parity lane needs
+/// Docker and this invariant does not: if it ever breaks, the failure mode is a
+/// parity suite that reports "candidate unavailable" rather than a test failure.
+#[test]
+fn parity_compose_keeps_the_candidate_in_the_foreground() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("parity/compose.major.yaml");
+    let text = std::fs::read_to_string(&path).expect("read parity/compose.major.yaml");
+
+    let rust_service = text
+        .split_once("\n  rust:")
+        .expect("compose file should define a `rust` service")
+        .1;
+    // Only the `rust:` service body — it is the last one in the file today, but
+    // stop at the next top-level service key if that changes.
+    let rust_service = rust_service
+        .split("\n  ")
+        .take_while(|chunk| !chunk.starts_with("upstream:"))
+        .collect::<Vec<_>>()
+        .join("\n  ");
+
+    assert!(
+        rust_service.lines().any(|l| l.trim() == "- -k" || l.trim() == "- --keep-in-foreground"),
+        "the parity candidate must run with -k or it forks and kills its own container:\n{rust_service}"
+    );
+}
+
+/// An unopenable `log-facility` is fatal and says so on the terminal.  It has
+/// to be caught here, before the fork: upstream's `log_start` failure path
+/// (log.c) can only `send_event(EVENT_LOG_ERR)` and `_exit`, because by then
+/// the terminal is gone.
+#[test]
+fn an_unopenable_log_facility_is_a_fatal_startup_error() {
+    let port = free_udp_port();
+
+    let mut child = Command::new(bin())
+        .args([
+            "--no-daemon",
+            "--port",
+            &port.to_string(),
+            "--log-facility",
+            "/proc/dnsmasq-rs-no-such-dir/dnsmasq.log",
+            "--no-resolv",
+            "--no-hosts",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn dnsmasq-rs");
+
+    let status = wait_with_timeout(&mut child, Duration::from_secs(10));
+    let mut stderr = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut stderr).ok();
+
+    assert!(!status.success(), "an unopenable log file must not start the daemon");
+    assert!(
+        stderr.contains("failed to open log file"),
+        "expected a log-file diagnostic, got: {stderr}"
+    );
+}
+
 // ── user/group resolution ────────────────────────────────────────────────────
 
 #[test]
@@ -360,6 +528,13 @@ fn user_and_group_change_the_running_ids_and_clear_supplementary_groups() {
     let meta = std::fs::metadata(&pid_path).expect("stat pid file");
     use std::os::unix::fs::MetadataExt as _;
     assert_eq!(meta.uid(), target.uid.as_raw(), "pid file should be chowned to the run user");
+    // `fchown(fd, ent_pw->pw_uid, ent_pw->pw_gid)` — the run user's *primary*
+    // group, which need not be the `--group` the daemon itself runs under.
+    assert_eq!(
+        meta.gid(),
+        target.gid.as_raw(),
+        "pid file group should be the run user's primary group, not --group"
+    );
 
     let _ = child.kill();
     let _ = child.wait();
