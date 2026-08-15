@@ -228,14 +228,22 @@ def run_cycle(meta, dry_run=False):
                 _merge_and_verify(meta, record, worktree, branch, judgement, review)
                 break
 
-            log(f"  retrying with objections ({judge_attempt + 1}/{MAX_JUDGE_RETRIES})")
+            if judge_attempt < MAX_JUDGE_RETRIES:
+                log(f"  retrying with objections ({judge_attempt + 1}/{MAX_JUDGE_RETRIES})")
         else:
             record.outcome = "judge-exhausted"
 
         if record.outcome in ("judge-exhausted", "gate-exhausted"):
+            # Push the abandoned work before the worktree is destroyed. Several
+            # rounds of converging effort are worth more to whoever picks the
+            # issue up than a clean branch list is.
+            pushed = gitops.push_branch(worktree, branch)
+            record.parked_branch = branch if pushed else ""
             _park(meta, f"Harness gave up after retries ({record.outcome}).\n\n"
-                        f"Last judge objections:\n{record.objections or 'none'}\n\n"
-                        f"Last gate failures:\n" + ("\n".join(record.gate_failures) or "none"))
+                        + (f"Work so far is pushed to `{branch}`.\n\n" if pushed else "")
+                        + f"Last judge objections:\n{record.objections or 'none'}\n\n"
+                        + "Last gate failures:\n"
+                        + ("\n".join(record.gate_failures) or "none"))
     except Exception as e:  # noqa: BLE001
         record.outcome = f"error: {e}"
         log(f"  ERROR {e}")

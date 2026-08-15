@@ -85,6 +85,18 @@ def squash_merge(worktree, pr_url):
     return state
 
 
+def push_branch(worktree, branch):
+    """Push a branch without opening a PR. Returns True on success.
+
+    Used to preserve abandoned work when an issue is parked: several rounds of
+    converging effort are worth more to whoever picks the issue up than a tidy
+    branch list is. Best-effort — failing to preserve work must not turn a park
+    into an error.
+    """
+    proc = _run(worktree, "git", "push", "-u", "origin", branch, check=False)
+    return proc.returncode == 0
+
+
 def delete_remote_branch(repo, branch):
     """Best-effort cleanup. Never raises: a leftover branch is untidy, not unsafe."""
     _run(repo, "git", "push", "origin", "--delete", branch, check=False)
