@@ -1,5 +1,8 @@
 use std::net::{Ipv4Addr, Ipv6Addr, IpAddr};
 
+/// `IFF_LOOPBACK` — the one interface flag this module needs from `SIOCGIFFLAGS`.
+pub const IFACE_LOOPBACK: u32 = 0x8;
+
 /// Information about a network interface.
 #[derive(Debug, Clone)]
 pub struct IfaceInfo {
@@ -8,6 +11,13 @@ pub struct IfaceInfo {
     pub addr:    IpAddr,
     pub netmask: Option<IpAddr>,
     pub flags:   u32,
+}
+
+impl IfaceInfo {
+    /// True when this address belongs to a loopback interface.
+    pub fn is_loopback(&self) -> bool {
+        self.flags & IFACE_LOOPBACK != 0
+    }
 }
 
 /// Check if `addr` is on the same subnet as `iface_addr` with given `netmask`.
@@ -47,10 +57,27 @@ pub fn is_ula_v6(addr: Ipv6Addr) -> bool {
 // Interface enumeration
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Look up an interface index by name (`if_nametoindex(3)`).
+///
+/// Returns `0` when the name is unknown, matching the C function.
+#[cfg(unix)]
+pub fn nametoindex(name: &str) -> u32 {
+    match std::ffi::CString::new(name) {
+        Ok(c) => unsafe { libc::if_nametoindex(c.as_ptr()) },
+        Err(_) => 0,
+    }
+}
+
+/// Non-Unix stub.
+#[cfg(not(unix))]
+pub fn nametoindex(_name: &str) -> u32 { 0 }
+
 /// Enumerate all network interfaces and return their addresses.
 ///
 /// Uses the `if-addrs` crate which wraps `getifaddrs(3)` on Linux/macOS and
-/// `GetAdaptersAddresses` on Windows.
+/// `GetAdaptersAddresses` on Windows.  The interface index and the loopback
+/// flag are filled in afterwards — `iface_allowed_*` and the per-packet arrival
+/// check both need them, and `if-addrs` exposes neither directly.
 ///
 /// Returns an empty `Vec` (not an error) when no interfaces are present.
 pub fn enumerate_interfaces() -> std::io::Result<Vec<IfaceInfo>> {
@@ -58,6 +85,7 @@ pub fn enumerate_interfaces() -> std::io::Result<Vec<IfaceInfo>> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
     let result = ifaces.into_iter().map(|i| {
+        let loopback = i.is_loopback();
         let (addr, netmask) = match &i.addr {
             if_addrs::IfAddr::V4(v4) => (
                 IpAddr::V4(v4.ip),
@@ -65,15 +93,15 @@ pub fn enumerate_interfaces() -> std::io::Result<Vec<IfaceInfo>> {
             ),
             if_addrs::IfAddr::V6(v6) => (
                 IpAddr::V6(v6.ip),
-                None, // IPv6 doesn't have a simple netmask
+                Some(IpAddr::V6(v6.netmask)),
             ),
         };
         IfaceInfo {
+            index:   nametoindex(&i.name),
             name:    i.name,
-            index:   0, // if-addrs doesn't expose the ifindex; netlink can provide it
             addr,
             netmask,
-            flags:   0,
+            flags:   if loopback { IFACE_LOOPBACK } else { 0 },
         }
     }).collect();
 
@@ -171,42 +199,146 @@ pub async fn create_tcp_listener(
 // Interface check / filtering
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Configuration for interface filtering.
+/// Configuration for interface filtering — the Rust form of the
+/// `--interface` / `--except-interface` / `--listen-address` triple that
+/// upstream's `iface_check()` consults (`daemon->if_names`, `if_except`,
+/// `if_addrs`).
 #[derive(Debug, Clone, Default)]
 pub struct IfaceCheckConfig {
-    /// If non-empty, only interfaces whose name matches one of these patterns
-    /// are accepted (supports `*` suffix wildcard).
+    /// `--interface` name patterns (supports a `*` wildcard).
     pub allow: Vec<String>,
-    /// Interfaces matching any of these patterns are always rejected.
+    /// `--except-interface` name patterns.
     pub deny:  Vec<String>,
+    /// `--listen-address` addresses.  An arrival/interface address matching one
+    /// of these is accepted regardless of `allow`, and — as upstream's
+    /// `match_addr` does — it also overrides `deny`.
+    pub addrs: Vec<IpAddr>,
+    /// Set when `--interface` was given with no name, upstream's NULL-named
+    /// `struct iname` (pushed by `--local-service=host`, `option.c:6312`).  It
+    /// restricts the served set without naming an interface, so it has to be
+    /// tracked separately from `allow` being non-empty.
+    pub unnamed_iface: bool,
 }
 
-/// Return `true` if `iface` is allowed by the filter configuration.
+impl IfaceCheckConfig {
+    /// True when any access control at all is configured — upstream's
+    /// `if (daemon->if_names || daemon->if_addrs)` test.
+    pub fn restricted(&self) -> bool {
+        self.has_if_names() || !self.addrs.is_empty()
+    }
+
+    /// True when `--interface` was given at all, named or not — upstream's
+    /// `daemon->if_names` being non-NULL.
+    ///
+    /// This is deliberately narrower than [`restricted`](Self::restricted):
+    /// the loopback-always-served rule keys off `if_names` alone, so
+    /// `--listen-address` on its own does *not* pull loopback into the set.
+    pub fn has_if_names(&self) -> bool {
+        self.unnamed_iface || !self.allow.is_empty()
+    }
+}
+
+/// Which `--interface` / `--listen-address` entries a check matched.
 ///
-/// Rules (evaluated in order):
-/// 1. If `deny` is non-empty and the name matches any deny pattern → reject.
-/// 2. If `allow` is non-empty and the name matches any allow pattern → accept.
-/// 3. If `allow` is empty → accept (deny-only mode).
-/// 4. Otherwise → reject.
+/// Mirrors upstream's `INAME_USED` flag, which drives both the "unknown
+/// interface %s" startup error (`dnsmasq.c:396-398`) and the extra listeners
+/// created for `--listen-address` values no interface carries
+/// (`network.c:1219-1233`).
+#[derive(Debug, Clone, Default)]
+pub struct IfaceCheckUsed {
+    /// Parallel to `IfaceCheckConfig::allow`.
+    pub names: Vec<bool>,
+    /// Parallel to `IfaceCheckConfig::addrs`.
+    pub addrs: Vec<bool>,
+}
+
+impl IfaceCheckUsed {
+    /// An all-unused record sized for `config`.
+    pub fn for_config(config: &IfaceCheckConfig) -> Self {
+        Self {
+            names: vec![false; config.allow.len()],
+            addrs: vec![false; config.addrs.len()],
+        }
+    }
+}
+
+/// Return `true` if `iface` is allowed by the filter configuration, recording
+/// which config entries matched in `used`.
+///
+/// Direct port of `iface_check()` (`network.c:112-181`), minus the auth-DNS
+/// output parameter:
+///
+/// 1. With no `--interface`/`--listen-address` config at all, everything is
+///    accepted and only `--except-interface` can reject.
+/// 2. Otherwise the default is reject, and either a name match against
+///    `allow` or an address match against `addrs` accepts.
+/// 3. `--except-interface` then rejects — unless the accept came from an
+///    address match (upstream's `match_addr`), because an explicitly named
+///    listen address outranks an interface exclusion.
+///
+/// Note that, like upstream, every list is walked in full even after the answer
+/// is known: the `used` flags have to be set for entries that matched.
+pub fn iface_check_used(
+    iface:  &IfaceInfo,
+    config: &IfaceCheckConfig,
+    used:   &mut IfaceCheckUsed,
+) -> bool {
+    used.names.resize(config.allow.len(), false);
+    used.addrs.resize(config.addrs.len(), false);
+
+    let mut ret = true;
+    let mut match_addr = false;
+
+    if config.restricted() {
+        ret = false;
+
+        for (i, pattern) in config.allow.iter().enumerate() {
+            if iface_name_matches(&iface.name, pattern) {
+                used.names[i] = true;
+                ret = true;
+            }
+        }
+
+        for (i, addr) in config.addrs.iter().enumerate() {
+            if *addr == iface.addr {
+                used.addrs[i] = true;
+                ret = true;
+                match_addr = true;
+            }
+        }
+    }
+
+    if !match_addr && config.deny.iter().any(|p| iface_name_matches(&iface.name, p)) {
+        ret = false;
+    }
+
+    ret
+}
+
+/// [`iface_check_used`] without the `used` bookkeeping.
 pub fn iface_check(iface: &IfaceInfo, config: &IfaceCheckConfig) -> bool {
-    // Check deny list first.
-    if config.deny.iter().any(|p| iface_name_matches(&iface.name, p)) {
-        return false;
-    }
-    // If allow list is empty, accept everything not denied.
-    if config.allow.is_empty() {
-        return true;
-    }
-    // Otherwise accept only if in allow list.
-    config.allow.iter().any(|p| iface_name_matches(&iface.name, p))
+    let mut used = IfaceCheckUsed::for_config(config);
+    iface_check_used(iface, config, &mut used)
 }
 
-/// Returns `true` if the address is a loopback address.
+/// Accept a datagram that arrived via a loopback interface addressed to an
+/// address we do serve.
 ///
-/// Wraps `IpAddr::is_loopback()` — provided as a named function to mirror
-/// dnsmasq's `loopback_exception()` helper.
-pub fn loopback_exception(addr: IpAddr) -> bool {
-    addr.is_loopback()
+/// The kernel sometimes reports the loopback interface as the arrival interface
+/// for locally-originated packets even when they were sent to the address of
+/// another interface.  Upstream works around that by accepting any packet whose
+/// arrival interface is a loopback one, as long as its destination address is
+/// one of the addresses we know about.
+///
+/// Port of `loopback_exception()` (`network.c:185-206`).  `arrival_is_loopback`
+/// stands in for the `SIOCGIFFLAGS`/`IFF_LOOPBACK` test upstream does on the
+/// arrival interface name.
+pub fn loopback_exception(
+    arrival_is_loopback: bool,
+    addr:                IpAddr,
+    ifaces:              &[IfaceRecord],
+) -> bool {
+    arrival_is_loopback && ifaces.iter().any(|iface| iface.addr == addr)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -455,6 +587,144 @@ pub fn indextoname(_index: u32) -> Option<String> {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Receiving with destination metadata (forward.c:1700-1780)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// One received datagram plus the arrival metadata a wildcard listener needs.
+#[derive(Debug, Clone)]
+pub struct RecvMeta {
+    /// Number of bytes written into the caller's buffer.
+    pub len: usize,
+    /// Source address of the datagram.
+    pub src: std::net::SocketAddr,
+    /// Destination address, from `IP_PKTINFO` / `IPV6_PKTINFO`.  `None` when
+    /// the socket was bound to a specific address (no control message is
+    /// requested) or the kernel did not supply one.
+    pub dest: Option<IpAddr>,
+    /// Arrival interface index, or 0 when unknown.
+    pub if_index: u32,
+}
+
+/// `recvmsg(2)` a datagram, extracting the destination address and arrival
+/// interface index from the `IP_PKTINFO` / `IPV6_PKTINFO` control message.
+///
+/// Upstream reads exactly this metadata in `udp_request()` before calling
+/// `iface_check()`, which is how `--interface` and `--listen-address` are
+/// enforced on a wildcard socket.  Sockets created with `nowild = true` never
+/// carry the control message, and the fields come back as `None` / `0`.
+#[cfg(unix)]
+pub fn recv_with_dest(
+    fd:  std::os::unix::io::RawFd,
+    buf: &mut [u8],
+) -> std::io::Result<RecvMeta> {
+    use std::mem;
+
+    let mut name: libc::sockaddr_storage = unsafe { mem::zeroed() };
+    let mut ctrl = [0u8; 256];
+    let iov = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len:  buf.len(),
+    };
+    let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+    msg.msg_name       = &mut name as *mut _ as *mut libc::c_void;
+    msg.msg_namelen    = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    msg.msg_iov        = &iov as *const libc::iovec as *mut libc::iovec;
+    msg.msg_iovlen     = 1;
+    msg.msg_control    = ctrl.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = ctrl.len() as _;
+
+    let rc = unsafe { libc::recvmsg(fd, &mut msg, 0) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let src = sockaddr_storage_to_socket_addr(&name)
+        .ok_or_else(|| std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "recvmsg returned an unsupported source address family",
+        ))?;
+
+    let (dest, if_index) = parse_pktinfo(&msg);
+    Ok(RecvMeta { len: rc as usize, src, dest, if_index })
+}
+
+/// Walk a received `msghdr`'s control messages for `IP_PKTINFO` /
+/// `IPV6_PKTINFO`.
+#[cfg(unix)]
+fn parse_pktinfo(msg: &libc::msghdr) -> (Option<IpAddr>, u32) {
+    use std::mem;
+
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(msg) };
+    while !cmsg.is_null() {
+        let (level, ctype, clen) = unsafe {
+            ((*cmsg).cmsg_level, (*cmsg).cmsg_type, (*cmsg).cmsg_len as usize)
+        };
+        let payload = unsafe { libc::CMSG_DATA(cmsg) };
+        let hdr_len = unsafe { libc::CMSG_LEN(0) as usize };
+
+        #[cfg(target_os = "linux")]
+        if level == libc::IPPROTO_IP
+            && ctype == libc::IP_PKTINFO
+            && clen >= hdr_len + mem::size_of::<libc::in_pktinfo>()
+        {
+            let pi: libc::in_pktinfo =
+                unsafe { std::ptr::read_unaligned(payload as *const libc::in_pktinfo) };
+            let addr = Ipv4Addr::from(u32::from_be(u32::from_ne_bytes(
+                pi.ipi_addr.s_addr.to_ne_bytes(),
+            )));
+            return (Some(IpAddr::V4(addr)), pi.ipi_ifindex as u32);
+        }
+
+        if level == libc::IPPROTO_IPV6
+            && ctype == libc::IPV6_PKTINFO
+            && clen >= hdr_len + mem::size_of::<libc::in6_pktinfo>()
+        {
+            let pi: libc::in6_pktinfo =
+                unsafe { std::ptr::read_unaligned(payload as *const libc::in6_pktinfo) };
+            return (
+                Some(IpAddr::V6(Ipv6Addr::from(pi.ipi6_addr.s6_addr))),
+                pi.ipi6_ifindex,
+            );
+        }
+
+        let _ = (payload, hdr_len, clen);
+        cmsg = unsafe { libc::CMSG_NXTHDR(msg, cmsg) };
+    }
+    (None, 0)
+}
+
+/// Convert a filled `sockaddr_storage` into a `SocketAddr`.
+#[cfg(unix)]
+fn sockaddr_storage_to_socket_addr(
+    storage: &libc::sockaddr_storage,
+) -> Option<std::net::SocketAddr> {
+    match storage.ss_family as libc::c_int {
+        libc::AF_INET => {
+            let sin = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
+            let ip = Ipv4Addr::from(u32::from_be(u32::from_ne_bytes(
+                sin.sin_addr.s_addr.to_ne_bytes(),
+            )));
+            Some(std::net::SocketAddr::new(IpAddr::V4(ip), u16::from_be(sin.sin_port)))
+        }
+        libc::AF_INET6 => {
+            let sin6 = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
+            let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+            Some(std::net::SocketAddr::new(IpAddr::V6(ip), u16::from_be(sin6.sin6_port)))
+        }
+        _ => None,
+    }
+}
+
+/// Non-Unix stub.
+#[cfg(not(unix))]
+pub fn recv_with_dest(_fd: i32, _buf: &mut [u8]) -> std::io::Result<RecvMeta> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "recv_with_dest not supported on this platform",
+    ))
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Low-level listener socket helpers
 // (ported from network.c: make_sock, create_listeners,
 //  create_wildcard_listeners, find_listener, release_listener,
@@ -512,11 +782,18 @@ pub enum SockType { Udp, Tcp }
 /// * Sets `SO_REUSEADDR`.
 /// * Sets `O_NONBLOCK` via `fix_fd`.
 /// * For IPv6 sockets: sets `IPV6_V6ONLY`.
-/// * For **UDP IPv4** wildcard (not `nowild`): enables `IP_PKTINFO` (Linux) or
+/// * For **UDP IPv4**, unless `nowild`: enables `IP_PKTINFO` (Linux) or
 ///   `IP_RECVDSTADDR` + `IP_RECVIF` (BSD) so the kernel reports the
 ///   destination address on each received datagram.
-/// * For **UDP IPv6**: calls `set_ipv6pktinfo`.
+/// * For **UDP IPv6**: always calls `set_ipv6pktinfo` — the arrival interface
+///   is part of the standard IPv6 API, so upstream never opts out of it.
 /// * For **TCP**: calls `listen(128)` and optionally enables `TCP_FASTOPEN`.
+///
+/// `nowild` is upstream's global `option_bool(OPT_NOWILD)` (`--bind-interfaces`),
+/// which is what `network.c:962` actually tests — *not* "this socket is bound to
+/// one address".  `--bind-dynamic` binds per address but leaves `OPT_NOWILD`
+/// clear, and so keeps `IP_PKTINFO`; that is precisely how it manages to check
+/// the arrival interface where `--bind-interfaces` cannot.
 ///
 /// Returns the raw file descriptor, or `Err` on failure.
 ///
@@ -537,10 +814,18 @@ pub fn make_sock(
         SockType::Tcp => (Type::STREAM,  Some(Protocol::TCP)),
     };
 
+    // "No error if the kernel just doesn't support this IP flavour"
+    // (`network.c:900-905`).  Upstream grants that exemption to the `socket()`
+    // call *only*: every later failure reaches `goto err` and dies.  Tag the
+    // error here so callers can tell the two apart — a `bind()` that quietly
+    // did not happen is exactly the bug this module exists to prevent.
     let sock = Socket::new(domain, sock_type, proto).map_err(|e| {
-        // Silently ignore "kernel doesn't support this protocol family".
-        if matches!(e.kind(), io::ErrorKind::Unsupported) {
-            io::Error::new(io::ErrorKind::Unsupported, e)
+        if matches!(
+            e.raw_os_error(),
+            Some(libc::EPROTONOSUPPORT) | Some(libc::EAFNOSUPPORT) | Some(libc::EINVAL)
+        ) || matches!(e.kind(), io::ErrorKind::Unsupported)
+        {
+            io::Error::new(io::ErrorKind::Unsupported, FamilyUnsupported(e))
         } else {
             e
         }
@@ -630,23 +915,51 @@ pub fn make_sock(
     ))
 }
 
-/// Create a `Listener` (UDP + TCP socket pair) bound to `addr`.
+/// Which sockets a `Listener` should own.
 ///
-/// When `do_tftp` is true a third UDP socket is created for TFTP on port 69.
-/// When `nowild` is true `IP_PKTINFO` is not requested (the socket is already
-/// bound to a specific interface address).
+/// Upstream always creates the UDP/TCP pair.  This port serves DNS over UDP
+/// only, so the caller says what it can actually read — binding a TCP socket
+/// nothing ever `accept()`s would open a port that silently swallows
+/// connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListenerKinds {
+    pub udp:  bool,
+    pub tcp:  bool,
+    pub tftp: bool,
+}
+
+impl Default for ListenerKinds {
+    fn default() -> Self {
+        Self { udp: true, tcp: true, tftp: false }
+    }
+}
+
+impl ListenerKinds {
+    /// UDP only — what the current DNS runtime can serve.
+    pub const UDP_ONLY: Self = Self { udp: true, tcp: false, tftp: false };
+}
+
+/// Create a `Listener` bound to `addr`.
+///
+/// `kinds` selects which sockets are created; the TFTP socket is bound on
+/// port 69.  `nowild` is `--bind-interfaces` — see [`make_sock`] for why it is
+/// not the same question as "is this socket address-bound".
 ///
 /// Mirrors `create_listeners()` in `network.c`.
 #[cfg(unix)]
 pub fn create_listeners(
     addr: std::net::SocketAddr,
-    do_tftp: bool,
+    kinds: ListenerKinds,
     nowild: bool,
 ) -> Option<Listener> {
-    let udp_fd  = make_sock(addr, SockType::Udp, nowild).unwrap_or(-1);
-    let tcp_fd  = make_sock(addr, SockType::Tcp, nowild).unwrap_or(-1);
+    let udp_fd = if kinds.udp {
+        make_sock(addr, SockType::Udp, nowild).unwrap_or(-1)
+    } else { -1 };
+    let tcp_fd = if kinds.tcp {
+        make_sock(addr, SockType::Tcp, nowild).unwrap_or(-1)
+    } else { -1 };
 
-    let tftp_fd = if do_tftp {
+    let tftp_fd = if kinds.tftp {
         let mut tftp_addr = addr;
         tftp_addr.set_port(69); // TFTP_PORT
         make_sock(tftp_addr, SockType::Udp, nowild).unwrap_or(-1)
@@ -672,18 +985,131 @@ pub fn create_listeners(
 #[cfg(not(unix))]
 pub fn create_listeners(
     _addr: std::net::SocketAddr,
-    _do_tftp: bool,
+    _kinds: ListenerKinds,
     _nowild: bool,
 ) -> Option<Listener> {
     None
+}
+
+/// Marker attached by [`make_sock`] to a `socket()` failure that upstream skips
+/// silently (`network.c:900-905`).
+#[cfg(unix)]
+#[derive(Debug)]
+struct FamilyUnsupported(std::io::Error);
+
+#[cfg(unix)]
+impl std::fmt::Display for FamilyUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "address family not supported: {}", self.0)
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for FamilyUnsupported {}
+
+/// True only for a `socket()` call that failed because the kernel does not
+/// support the address family.
+///
+/// Deliberately *not* an errno test: `EINVAL` is on upstream's exempt list, but
+/// only where upstream applies it.  `bind()` also returns `EINVAL` — binding a
+/// link-local address with no scope id, say — and upstream dies on that.
+#[cfg(unix)]
+fn family_unsupported(e: &std::io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<FamilyUnsupported>())
+}
+
+/// True when the address does not exist on any interface.  Under
+/// `--bind-dynamic` this is not an error: the address may appear later
+/// (`network.c:929-936`).
+#[cfg(unix)]
+fn addr_not_available(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::EADDRNOTAVAIL)
+}
+
+/// [`create_listeners`], but reporting *why* a socket could not be created.
+///
+/// `Ok(None)` means the address family is not supported and upstream would move
+/// on quietly.  Any other failure is returned as `Err`, because upstream dies on
+/// it at startup (`make_sock`'s `dienow` path) — a bind that silently does not
+/// happen is exactly the class of bug this module exists to prevent.
+///
+/// `cleverbind` suppresses `EADDRNOTAVAIL`, as `--bind-dynamic` does.
+#[cfg(unix)]
+pub fn create_listeners_checked(
+    addr:       std::net::SocketAddr,
+    kinds:      ListenerKinds,
+    nowild:     bool,
+    cleverbind: bool,
+) -> std::io::Result<Option<Listener>> {
+    let sock = |addr: std::net::SocketAddr, kind: SockType, want: bool| {
+        if !want {
+            return Ok(-1);
+        }
+        match make_sock(addr, kind, nowild) {
+            Ok(fd) => Ok(fd),
+            Err(e) if family_unsupported(&e) => Ok(-1),
+            Err(e) if cleverbind && addr_not_available(&e) => Ok(-1),
+            Err(e) => Err(e),
+        }
+    };
+
+    let udp_fd = sock(addr, SockType::Udp, kinds.udp)?;
+    let tcp_fd = sock(addr, SockType::Tcp, kinds.tcp)?;
+    let tftp_fd = {
+        let mut tftp_addr = addr;
+        tftp_addr.set_port(69); // TFTP_PORT
+        sock(tftp_addr, SockType::Udp, kinds.tftp)?
+    };
+
+    if udp_fd < 0 && tcp_fd < 0 && tftp_fd < 0 {
+        // Every requested socket was skipped, or none was requested at all.
+        return Ok(None);
+    }
+
+    Ok(Some(Listener {
+        addr,
+        udp_fd,
+        tcp_fd,
+        tftp_fd,
+        used:  1,
+        iface: None,
+    }))
+}
+
+/// Non-Unix stub.
+#[cfg(not(unix))]
+pub fn create_listeners_checked(
+    _addr: std::net::SocketAddr,
+    _kinds: ListenerKinds,
+    _nowild: bool,
+    _cleverbind: bool,
+) -> std::io::Result<Option<Listener>> {
+    Ok(None)
 }
 
 /// Create wildcard (`0.0.0.0` and `::`) listeners for `port`.
 ///
 /// Returns up to two `Listener`s — one for IPv4, one for IPv6.
 ///
-/// Mirrors `create_wildcard_listeners()` in `network.c`.
-pub fn create_wildcard_listeners(port: u16, do_tftp: bool) -> Vec<Listener> {
+/// Mirrors `create_wildcard_listeners()` in `network.c`.  Note that these are
+/// created with `nowild = false`, so the kernel reports the destination address
+/// and arrival interface of every datagram — which is what lets
+/// `--interface`/`--listen-address` still be enforced without a per-address
+/// bind (see [`ArrivalFilter`]).
+pub fn create_wildcard_listeners(port: u16, kinds: ListenerKinds) -> Vec<Listener> {
+    create_wildcard_listeners_checked(port, kinds).unwrap_or_default()
+}
+
+/// [`create_wildcard_listeners`], failing loudly when a wildcard address could
+/// not be bound for a reason other than "no support for this family".
+///
+/// Upstream dies here (`make_sock`'s `dienow` path), and it matters: a daemon
+/// that quietly came up with only the IPv6 wildcard socket because the IPv4
+/// port was taken would look healthy and answer nothing.
+pub fn create_wildcard_listeners_checked(
+    port: u16,
+    kinds: ListenerKinds,
+) -> std::io::Result<Vec<Listener>> {
     let mut out = Vec::new();
     let addrs: &[std::net::SocketAddr] = &[
         std::net::SocketAddr::new(
@@ -692,11 +1118,13 @@ pub fn create_wildcard_listeners(port: u16, do_tftp: bool) -> Vec<Listener> {
             std::net::IpAddr::V6(Ipv6Addr::UNSPECIFIED), port),
     ];
     for &addr in addrs {
-        if let Some(l) = create_listeners(addr, do_tftp, /*nowild=*/false) {
+        if let Some(l) =
+            create_listeners_checked(addr, kinds, /*nowild=*/false, /*cleverbind=*/false)?
+        {
             out.push(l);
         }
     }
-    out
+    Ok(out)
 }
 
 /// Find a listener whose bound address equals `addr`.
@@ -714,8 +1142,7 @@ pub fn find_listener<'a>(
 /// For each `(addr, iface_name)` pair:
 /// - If a listener already exists for that address, increment its `used`
 ///   counter.
-/// - Otherwise, create a new `Listener` (with `nowild = true`) and push it
-///   onto the list.
+/// - Otherwise, create a new `Listener` and push it onto the list.
 ///
 /// Returns the number of new listeners created.
 ///
@@ -723,8 +1150,31 @@ pub fn find_listener<'a>(
 pub fn create_bound_listeners(
     listeners: &mut Vec<Listener>,
     iface_addrs: &[(std::net::SocketAddr, String)],
-    do_tftp: bool,
+    kinds: ListenerKinds,
+    nowild: bool,
 ) -> usize {
+    create_bound_listeners_checked(
+        listeners, iface_addrs, kinds, nowild, /*cleverbind=*/true,
+    )
+    .unwrap_or(0)
+}
+
+/// [`create_bound_listeners`], reporting a bind failure instead of skipping the
+/// address.
+///
+/// `nowild` is `--bind-interfaces`, and it is *not* implied by "this socket is
+/// address-bound": `--bind-dynamic` binds per address too but leaves `OPT_NOWILD`
+/// clear, so its sockets still request `IP_PKTINFO` and get arrival-checked.
+///
+/// `cleverbind` is `--bind-dynamic`: an address that does not exist yet is
+/// tolerated, because netlink will bring it up later (`network.c:929-936`).
+pub fn create_bound_listeners_checked(
+    listeners: &mut Vec<Listener>,
+    iface_addrs: &[(std::net::SocketAddr, String)],
+    kinds: ListenerKinds,
+    nowild: bool,
+    cleverbind: bool,
+) -> std::io::Result<usize> {
     let mut created = 0;
     for &(addr, ref name) in iface_addrs {
         // Check if a listener already covers this address.
@@ -732,13 +1182,13 @@ pub fn create_bound_listeners(
             existing.used += 1;
             continue;
         }
-        if let Some(mut l) = create_listeners(addr, do_tftp, /*nowild=*/true) {
+        if let Some(mut l) = create_listeners_checked(addr, kinds, nowild, cleverbind)? {
             l.iface = Some(name.clone());
             listeners.push(l);
             created += 1;
         }
     }
-    created
+    Ok(created)
 }
 
 // ─── Interface allowed / filtering ───────────────────────────────────────────
@@ -774,6 +1224,25 @@ pub struct IfaceRecord {
     /// Whether this address is a label (secondary alias) rather than the
     /// primary address of the interface.
     pub is_label:   bool,
+}
+
+impl IfaceRecord {
+    /// The address a listener for this interface binds to.
+    ///
+    /// `iface_allowed_v6()` copies the interface index into `sin6_scope_id` for
+    /// link-local addresses and zeroes it otherwise — "FreeBSD insists this is
+    /// zero for non-linklocal addresses" (`network.c:617-620`).  The scope is
+    /// not cosmetic: Linux rejects a `bind()` of a link-local address with no
+    /// scope (`EINVAL`), because the address alone does not identify a link.
+    pub fn listen_addr(&self, port: u16) -> std::net::SocketAddr {
+        match self.addr {
+            IpAddr::V4(a) => std::net::SocketAddr::new(IpAddr::V4(a), port),
+            IpAddr::V6(a) => {
+                let scope = if is_link_local_v6(a) { self.index } else { 0 };
+                std::net::SocketAddr::V6(std::net::SocketAddrV6::new(a, port, 0, scope))
+            }
+        }
+    }
 }
 
 impl Default for IfaceRecord {
@@ -844,6 +1313,7 @@ pub fn iface_allowed_v4(
     loopback:   bool,
     config:     &IfaceAllowedConfig,
     iface_check_cfg: &IfaceCheckConfig,
+    used:       &mut IfaceCheckUsed,
 ) -> Option<IfaceRecord> {
     let effective_name = label.unwrap_or(name);
     let is_label = label.map(|l| l != name).unwrap_or(false);
@@ -854,9 +1324,9 @@ pub fn iface_allowed_v4(
         index,
         addr:    IpAddr::V4(addr),
         netmask: Some(IpAddr::V4(netmask)),
-        flags:   if loopback { 0x8 } else { 0 },
+        flags:   if loopback { IFACE_LOOPBACK } else { 0 },
     };
-    if !iface_check(&dummy, iface_check_cfg) {
+    if !iface_check_used(&dummy, iface_check_cfg, used) {
         return None;
     }
 
@@ -914,15 +1384,16 @@ pub fn iface_allowed_v6(
     loopback:   bool,
     config:     &IfaceAllowedConfig,
     iface_check_cfg: &IfaceCheckConfig,
+    used:       &mut IfaceCheckUsed,
 ) -> Option<IfaceRecord> {
     let dummy = IfaceInfo {
         name:    name.to_string(),
         index,
         addr:    IpAddr::V6(addr),
         netmask: None,
-        flags:   if loopback { 0x8 } else { 0 },
+        flags:   if loopback { IFACE_LOOPBACK } else { 0 },
     };
-    if !iface_check(&dummy, iface_check_cfg) {
+    if !iface_check_used(&dummy, iface_check_cfg, used) {
         return None;
     }
 
@@ -955,6 +1426,219 @@ pub fn iface_allowed_v6(
         found:      true,
         is_label:   false,
     })
+}
+
+/// The result of one interface-enumeration pass.
+///
+/// Mirrors what `enumerate_interfaces()` leaves behind in `daemon->interfaces`
+/// plus the `INAME_USED` flags it sets on `daemon->if_names` / `if_addrs`.
+#[derive(Debug, Clone, Default)]
+pub struct EnumeratedInterfaces {
+    /// Addresses the daemon is willing to serve, after filtering.
+    pub interfaces: Vec<IfaceRecord>,
+    /// Which `--interface` / `--listen-address` entries were matched.
+    pub used: IfaceCheckUsed,
+}
+
+impl EnumeratedInterfaces {
+    /// `--interface` patterns that matched no live interface.
+    pub fn unmatched_names<'a>(&self, config: &'a IfaceCheckConfig) -> Vec<&'a str> {
+        config
+            .allow
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !self.used.names.get(*i).copied().unwrap_or(false))
+            .map(|(_, name)| name.as_str())
+            .collect()
+    }
+
+    /// `--listen-address` values no live interface carries.  Upstream still
+    /// binds these (`network.c:1219-1233`): it is legal to listen on 127.0.1.1
+    /// when the loopback interface only advertises 127.0.0.1.
+    pub fn unmatched_addrs(&self, config: &IfaceCheckConfig) -> Vec<IpAddr> {
+        config
+            .addrs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !self.used.addrs.get(*i).copied().unwrap_or(false))
+            .map(|(_, addr)| *addr)
+            .collect()
+    }
+}
+
+/// Walk the live interface list and keep the addresses the config allows.
+///
+/// Port of `enumerate_interfaces()` (`network.c:722-...`) as far as the DNS
+/// listener set is concerned: each address from `getifaddrs(3)` is offered to
+/// [`iface_allowed_v4`] / [`iface_allowed_v6`], which apply `check` and record
+/// the per-interface DHCP/TFTP permissions.
+///
+/// `check` is taken by `&mut` because upstream mutates `daemon->if_names` here:
+/// when the interface set is restricted at all, loopback interfaces are added
+/// to it so that a `--interface=eth0` config still serves 127.0.0.1
+/// (`network.c:500-519`).
+pub fn enumerate_allowed_interfaces(
+    check:   &mut IfaceCheckConfig,
+    allowed: &IfaceAllowedConfig,
+) -> std::io::Result<EnumeratedInterfaces> {
+    let live = enumerate_interfaces()?;
+    let mut out = EnumeratedInterfaces {
+        interfaces: Vec::new(),
+        used: IfaceCheckUsed::for_config(check),
+    };
+
+    for info in &live {
+        // "If we are restricting the set of interfaces to use, make sure that
+        // loopback interfaces are in that set" (network.c:500-519).  The
+        // synthesised entry is marked used so it never triggers the "unknown
+        // interface" error.  Note the condition is `if_names`, not
+        // `if_names || if_addrs`: a bare --listen-address does not pull
+        // loopback in.
+        if check.has_if_names()
+            && info.is_loopback()
+            && !check.allow.iter().any(|n| n == &info.name)
+        {
+            check.allow.push(info.name.clone());
+            out.used.names.push(true);
+        }
+
+        // "check whether the interface IP has been added already" (network.c:489)
+        if out
+            .interfaces
+            .iter()
+            .any(|r| r.addr == info.addr && r.index == info.index)
+        {
+            continue;
+        }
+
+        let record = match (info.addr, info.netmask) {
+            (IpAddr::V4(addr), netmask) => {
+                let mask = match netmask {
+                    Some(IpAddr::V4(m)) => m,
+                    _ => Ipv4Addr::UNSPECIFIED,
+                };
+                iface_allowed_v4(
+                    &info.name, None, info.index, addr, mask,
+                    info.is_loopback(), allowed, check, &mut out.used,
+                )
+            }
+            (IpAddr::V6(addr), netmask) => {
+                let prefix_len = match netmask {
+                    Some(IpAddr::V6(m)) => m.octets().iter().map(|b| b.count_ones()).sum::<u32>() as u8,
+                    _ => 0,
+                };
+                iface_allowed_v6(
+                    &info.name, info.index, addr, prefix_len,
+                    info.is_loopback(), allowed, check, &mut out.used,
+                )
+            }
+        };
+
+        if let Some(record) = record {
+            out.interfaces.push(record);
+        }
+    }
+
+    Ok(out)
+}
+
+/// Per-datagram arrival check — upstream's `check_dst` path in `udp_request()`
+/// (`forward.c:1771-1780`).
+///
+/// A wildcard socket receives datagrams addressed to *every* local address, so
+/// `--interface` / `--except-interface` / `--listen-address` can only be
+/// honoured by re-checking each datagram's arrival interface and destination
+/// address, read from the `IP_PKTINFO` / `IPV6_PKTINFO` control message.
+///
+/// Address-bound sockets need it too, and for a sharper reason: binding an
+/// address does not stop a query for that address arriving via a *different*
+/// interface.  `forward.c:1612` computes
+/// `check_dst = !option_bool(OPT_NOWILD) || family == AF_INET6`, so the check
+/// runs for every listener except IPv4 under plain `--bind-interfaces` — the one
+/// case where the platform may not report the arrival interface at all, and the
+/// reason `network.c:1240-1250` tells you to use `--bind-dynamic` instead.
+#[derive(Debug, Clone)]
+pub struct ArrivalFilter {
+    check:      IfaceCheckConfig,
+    allowed:    IfaceAllowedConfig,
+    interfaces: Vec<IfaceRecord>,
+    /// `--bind-dynamic`: upstream skips the re-enumeration retry in this mode
+    /// because netlink already keeps the interface list current.
+    cleverbind: bool,
+}
+
+impl ArrivalFilter {
+    /// Build a filter from a config and an enumeration that has already run.
+    pub fn new(
+        check:      IfaceCheckConfig,
+        allowed:    IfaceAllowedConfig,
+        interfaces: Vec<IfaceRecord>,
+        cleverbind: bool,
+    ) -> Self {
+        Self { check, allowed, interfaces, cleverbind }
+    }
+
+    /// True when no filtering is configured, so every datagram is accepted and
+    /// the caller can skip reading control messages entirely.
+    pub fn is_unrestricted(&self) -> bool {
+        !self.check.restricted() && self.check.deny.is_empty()
+    }
+
+    /// The addresses currently considered local, for `loopback_exception`.
+    pub fn interfaces(&self) -> &[IfaceRecord] {
+        &self.interfaces
+    }
+
+    /// Re-run interface enumeration, as upstream's `enumerate_interfaces(0)`
+    /// retry does.  Failures leave the previous list in place.
+    pub fn refresh(&mut self) {
+        if let Ok(fresh) = enumerate_allowed_interfaces(&mut self.check, &self.allowed) {
+            self.interfaces = fresh.interfaces;
+        }
+    }
+
+    /// Decide whether a datagram that arrived on interface index `if_index`,
+    /// addressed to `dest`, may be answered.
+    ///
+    /// `if_index == 0` or an unresolvable index means the kernel gave us no
+    /// arrival interface; upstream drops such packets (`forward.c:1771-1772`)
+    /// rather than guessing.
+    pub fn accepts(&mut self, if_index: u32, dest: Option<IpAddr>) -> bool {
+        if self.is_unrestricted() {
+            return true;
+        }
+        let Some(name) = indextoname(if_index) else { return false };
+        let Some(dest) = dest else { return false };
+
+        let info = IfaceInfo {
+            index:   if_index,
+            addr:    dest,
+            netmask: None,
+            flags:   0,
+            name,
+        };
+        if iface_check(&info, &self.check) {
+            return true;
+        }
+
+        // Upstream refreshes the interface list before falling back to the
+        // exceptions, so an interface that came up since startup is seen.
+        if !self.cleverbind {
+            self.refresh();
+        }
+
+        let arrival_is_loopback = self
+            .interfaces
+            .iter()
+            .any(|r| r.index == if_index && r.loopback);
+        if loopback_exception(arrival_is_loopback, dest, &self.interfaces) {
+            return true;
+        }
+        match dest {
+            IpAddr::V4(v4) => label_exception(if_index, v4, &self.interfaces),
+            IpAddr::V6(_) => false, // labels are IPv4-only (network.c:212-214)
+        }
+    }
 }
 
 /// Remove stale `IfaceRecord` entries from the interface list.
@@ -1142,7 +1826,7 @@ mod tests {
     fn test_iface_check_allow_list() {
         let cfg = IfaceCheckConfig {
             allow: vec!["eth*".to_string()],
-            deny:  vec![],
+            ..Default::default()
         };
         assert!(iface_check(&make_iface("eth0"), &cfg));
         assert!(iface_check(&make_iface("eth1"), &cfg));
@@ -1154,16 +1838,102 @@ mod tests {
         let cfg = IfaceCheckConfig {
             allow: vec!["eth*".to_string()],
             deny:  vec!["eth0".to_string()],
+            ..Default::default()
         };
         assert!(!iface_check(&make_iface("eth0"), &cfg));
         assert!(iface_check(&make_iface("eth1"), &cfg));
     }
 
+    // ── iface_check: --listen-address (network.c:130-148) ────────────────────
+
+    fn make_iface_at(name: &str, addr: IpAddr) -> IfaceInfo {
+        IfaceInfo { name: name.to_string(), index: 0, addr, netmask: None, flags: 0 }
+    }
+
+    /// `--listen-address` alone restricts the served set: an interface whose
+    /// address is not listed is rejected even though no `--interface` was given.
     #[test]
-    fn test_loopback_exception() {
-        assert!(loopback_exception(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
-        assert!(loopback_exception(IpAddr::V6("::1".parse().unwrap())));
-        assert!(!loopback_exception(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+    fn iface_check_listen_address_restricts_by_address() {
+        let cfg = IfaceCheckConfig {
+            addrs: vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))],
+            ..Default::default()
+        };
+        assert!(iface_check(&make_iface_at("lo", IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))), &cfg));
+        assert!(!iface_check(&make_iface_at("lo", IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))), &cfg));
+        assert!(!iface_check(&make_iface_at("eth0", IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))), &cfg));
+    }
+
+    /// An explicit `--listen-address` match outranks `--except-interface`
+    /// (upstream's `match_addr` short-circuit).
+    #[test]
+    fn iface_check_listen_address_beats_except_interface() {
+        let cfg = IfaceCheckConfig {
+            deny:  vec!["lo".to_string()],
+            addrs: vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))],
+            ..Default::default()
+        };
+        assert!(iface_check(&make_iface_at("lo", IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))), &cfg));
+        assert!(!iface_check(&make_iface_at("lo", IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))), &cfg));
+    }
+
+    /// `--except-interface` still wins over a plain `--interface` name match.
+    #[test]
+    fn iface_check_except_interface_beats_name_match() {
+        let cfg = IfaceCheckConfig {
+            allow: vec!["lo".to_string()],
+            deny:  vec!["lo".to_string()],
+            ..Default::default()
+        };
+        assert!(!iface_check(&make_iface_at("lo", IpAddr::V4(Ipv4Addr::LOCALHOST)), &cfg));
+    }
+
+    /// A NULL-named `--interface` (upstream's `--local-service=host`) restricts
+    /// everything without naming anything.
+    #[test]
+    fn iface_check_unnamed_iface_restricts_everything() {
+        let cfg = IfaceCheckConfig { unnamed_iface: true, ..Default::default() };
+        assert!(cfg.restricted());
+        assert!(!iface_check(&make_iface("eth0"), &cfg));
+    }
+
+    #[test]
+    fn iface_check_records_used_entries() {
+        let cfg = IfaceCheckConfig {
+            allow: vec!["eth*".to_string(), "wlan0".to_string()],
+            addrs: vec![
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            ],
+            ..Default::default()
+        };
+        let mut used = IfaceCheckUsed::for_config(&cfg);
+        assert!(iface_check_used(
+            &make_iface_at("eth0", IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+            &cfg,
+            &mut used,
+        ));
+        assert_eq!(used.names, vec![true, false], "only eth* matched");
+        assert_eq!(used.addrs, vec![true, false], "only 127.0.0.1 matched");
+    }
+
+    // ── loopback_exception (network.c:185-206) ───────────────────────────────
+
+    #[test]
+    fn loopback_exception_accepts_known_address_via_loopback() {
+        let ifaces = vec![make_iface_rec(1, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)))];
+        assert!(loopback_exception(true, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), &ifaces));
+    }
+
+    #[test]
+    fn loopback_exception_rejects_unknown_address() {
+        let ifaces = vec![make_iface_rec(1, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)))];
+        assert!(!loopback_exception(true, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), &ifaces));
+    }
+
+    #[test]
+    fn loopback_exception_rejects_non_loopback_arrival() {
+        let ifaces = vec![make_iface_rec(1, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)))];
+        assert!(!loopback_exception(false, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), &ifaces));
     }
 
     // ── enumerate_interfaces smoke test ──────────────────────────────────────
@@ -1176,8 +1946,149 @@ mod tests {
         assert!(result.is_ok(), "enumerate_interfaces failed: {:?}", result.err());
         let ifaces = result.unwrap();
         assert!(!ifaces.is_empty(), "no interfaces found");
-        let has_lo = ifaces.iter().any(|i| loopback_exception(i.addr));
+        let has_lo = ifaces.iter().any(|i| i.addr.is_loopback());
         assert!(has_lo, "no loopback address found");
+    }
+
+    /// The loopback interface must come back flagged and with a real index —
+    /// `iface_allowed_*` and the per-datagram arrival check both depend on it,
+    /// and `if-addrs` supplies neither.
+    #[test]
+    fn enumerate_interfaces_fills_index_and_loopback_flag() {
+        let ifaces = enumerate_interfaces().expect("enumeration must succeed");
+        let Some(lo) = ifaces.iter().find(|i| i.addr.is_loopback()) else { return };
+        assert!(lo.is_loopback(), "loopback address must carry IFACE_LOOPBACK");
+        assert_ne!(lo.index, 0, "interface index must be resolved");
+    }
+
+    // ── enumerate_allowed_interfaces ─────────────────────────────────────────
+
+    /// `--interface=nosuchif0` matches nothing, and the unmatched name is
+    /// reported so the caller can raise upstream's "unknown interface" error.
+    #[test]
+    fn enumerate_allowed_reports_unmatched_interface_name() {
+        let mut check = IfaceCheckConfig {
+            allow: vec!["nosuchif0".to_string()],
+            ..Default::default()
+        };
+        let out = enumerate_allowed_interfaces(&mut check, &IfaceAllowedConfig::default())
+            .expect("enumeration must succeed");
+        assert!(
+            out.unmatched_names(&check).contains(&"nosuchif0"),
+            "nosuchif0 matched no live interface, so it must be reported unused"
+        );
+    }
+
+    /// A restricted interface set still keeps loopback, because upstream adds
+    /// loopback interfaces to `if_names` during enumeration (network.c:500-519).
+    #[test]
+    fn enumerate_allowed_keeps_loopback_in_a_restricted_set() {
+        let mut check = IfaceCheckConfig {
+            allow: vec!["nosuchif0".to_string()],
+            ..Default::default()
+        };
+        let out = enumerate_allowed_interfaces(&mut check, &IfaceAllowedConfig::default())
+            .expect("enumeration must succeed");
+        let has_loopback = enumerate_interfaces()
+            .map(|live| live.iter().any(|i| i.addr.is_loopback()))
+            .unwrap_or(false);
+        if !has_loopback {
+            return; // no loopback address visible here
+        }
+        assert!(
+            out.interfaces.iter().any(|i| i.addr.is_loopback()),
+            "loopback must survive a restricted --interface set"
+        );
+    }
+
+    /// A bare `--listen-address` must *not* pull loopback into the served set:
+    /// upstream keys that rule off `daemon->if_names` alone, so listening on one
+    /// address does not quietly start serving 127.0.0.1 as well.
+    #[test]
+    fn enumerate_allowed_listen_address_alone_does_not_add_loopback() {
+        let unusual = IpAddr::V4(Ipv4Addr::new(127, 199, 199, 199));
+        let mut check = IfaceCheckConfig { addrs: vec![unusual], ..Default::default() };
+        assert!(check.restricted() && !check.has_if_names());
+        let out = enumerate_allowed_interfaces(&mut check, &IfaceAllowedConfig::default())
+            .expect("enumeration must succeed");
+        assert!(
+            check.allow.is_empty(),
+            "--listen-address must not synthesise an --interface entry: {:?}",
+            check.allow
+        );
+        assert!(
+            out.interfaces.is_empty(),
+            "no live interface carries {unusual}, so nothing may be served"
+        );
+    }
+
+    /// `--listen-address` for an address no interface carries is still reported,
+    /// so bound mode can bind it explicitly (network.c:1219-1233).
+    #[test]
+    fn enumerate_allowed_reports_unmatched_listen_address() {
+        let unusual = IpAddr::V4(Ipv4Addr::new(127, 199, 199, 199));
+        let mut check = IfaceCheckConfig { addrs: vec![unusual], ..Default::default() };
+        let out = enumerate_allowed_interfaces(&mut check, &IfaceAllowedConfig::default())
+            .expect("enumeration must succeed");
+        assert_eq!(out.unmatched_addrs(&check), vec![unusual]);
+    }
+
+    // ── ArrivalFilter ───────────────────────────────────────────────────────
+
+    #[test]
+    fn wildcard_filter_unrestricted_accepts_without_metadata() {
+        let mut filter = ArrivalFilter::new(
+            IfaceCheckConfig::default(),
+            IfaceAllowedConfig::default(),
+            Vec::new(),
+            false,
+        );
+        assert!(filter.is_unrestricted());
+        assert!(filter.accepts(0, None), "an unfiltered daemon answers everything");
+    }
+
+    /// With `--listen-address` set, a datagram whose destination is a different
+    /// local address must be dropped — the wildcard-socket half of the fix.
+    #[test]
+    fn wildcard_filter_drops_other_destination_addresses() {
+        let check = IfaceCheckConfig {
+            addrs: vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))],
+            ..Default::default()
+        };
+        let lo_index = nametoindex("lo");
+        if lo_index == 0 {
+            return; // no interface named "lo" here
+        }
+        let mut filter = ArrivalFilter::new(
+            check,
+            IfaceAllowedConfig::default(),
+            Vec::new(),
+            /*cleverbind=*/true, // no re-enumeration, so the test is deterministic
+        );
+        assert!(!filter.is_unrestricted());
+        assert!(
+            filter.accepts(lo_index, Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))),
+            "the configured listen address must be served"
+        );
+        assert!(
+            !filter.accepts(lo_index, Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)))),
+            "127.0.0.2 is not the configured listen address"
+        );
+    }
+
+    /// No arrival metadata means the packet cannot be checked, and upstream
+    /// drops it rather than guessing.
+    #[test]
+    fn wildcard_filter_drops_packets_with_no_arrival_metadata() {
+        let check = IfaceCheckConfig {
+            allow: vec!["eth0".to_string()],
+            ..Default::default()
+        };
+        let mut filter = ArrivalFilter::new(
+            check, IfaceAllowedConfig::default(), Vec::new(), true,
+        );
+        assert!(!filter.accepts(0, None));
+        assert!(!filter.accepts(0, Some(IpAddr::V4(Ipv4Addr::LOCALHOST))));
     }
 
     // ── listener socket creation ──────────────────────────────────────────────
@@ -1319,7 +2230,7 @@ mod tests {
     #[test]
     fn create_listeners_returns_some() {
         let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let l = create_listeners(addr, false, true).expect("should create listener");
+        let l = create_listeners(addr, ListenerKinds::default(), true).expect("should create listener");
         // At least one of UDP/TCP must be valid.
         assert!(l.udp_fd >= 0 || l.tcp_fd >= 0);
         // Manual cleanup.
@@ -1333,7 +2244,7 @@ mod tests {
     #[test]
     fn create_wildcard_listeners_produces_entries() {
         // Port 0 lets the OS pick a free port; should always succeed.
-        let listeners = create_wildcard_listeners(0, false);
+        let listeners = create_wildcard_listeners(0, ListenerKinds::default());
         // At least the IPv4 wildcard listener must be created.
         assert!(!listeners.is_empty(), "wildcard listeners should not be empty");
         #[cfg(unix)]
@@ -1343,6 +2254,101 @@ mod tests {
                 if l.tcp_fd >= 0 { libc::close(l.tcp_fd); }
             }
         }
+    }
+
+    /// `make_sock`'s third argument is upstream's *global* `OPT_NOWILD`, not
+    /// "is this socket address-bound": `network.c:964` requests `IP_PKTINFO`
+    /// whenever `--bind-interfaces` is off, so `--bind-dynamic`'s bound sockets
+    /// get it too and can be arrival-checked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn make_sock_requests_ip_pktinfo_unless_nowild() {
+        use std::os::unix::io::RawFd;
+
+        fn pktinfo_enabled(fd: RawFd) -> i32 {
+            let mut val: libc::c_int = -1;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            let rc = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::IPPROTO_IP,
+                    libc::IP_PKTINFO,
+                    &mut val as *mut _ as *mut libc::c_void,
+                    &mut len,
+                )
+            };
+            assert_eq!(rc, 0, "getsockopt(IP_PKTINFO) failed");
+            val
+        }
+
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let Ok(wild) = make_sock(addr, SockType::Udp, /*nowild=*/false) else { return };
+        assert_ne!(
+            pktinfo_enabled(wild), 0,
+            "IP_PKTINFO must be requested when --bind-interfaces is not set"
+        );
+        unsafe { libc::close(wild) };
+
+        let Ok(bound) = make_sock(addr, SockType::Udp, /*nowild=*/true) else { return };
+        assert_eq!(
+            pktinfo_enabled(bound), 0,
+            "--bind-interfaces suppresses IP_PKTINFO (network.c:962-966)"
+        );
+        unsafe { libc::close(bound) };
+    }
+
+    /// `network.c:900-905` exempts `EPROTONOSUPPORT`/`EAFNOSUPPORT`/`EINVAL`
+    /// only for the `socket()` call.  Every later failure — `bind()` included —
+    /// falls through to `die()`, so a bind that did not happen must never be
+    /// reported as success.
+    #[test]
+    fn create_listeners_checked_reports_a_bind_failure() {
+        // Gate: no usable IPv6 here means `socket()` itself fails, which *is*
+        // the exempt case.
+        if std::net::UdpSocket::bind("[::1]:0").is_err() {
+            return;
+        }
+        // A link-local address with no scope id: `socket()` succeeds, `bind()`
+        // returns EINVAL because the kernel cannot tell which link it means.
+        let addr = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1".parse().unwrap(), 0, 0, /*scope_id=*/0,
+        ));
+        let result = create_listeners_checked(
+            addr, ListenerKinds::UDP_ONLY, /*nowild=*/true, /*cleverbind=*/false,
+        );
+        match result {
+            Err(_) => {}
+            Ok(Some(l)) => {
+                unsafe { if l.udp_fd >= 0 { libc::close(l.udp_fd); } }
+                panic!("binding {addr} unexpectedly succeeded");
+            }
+            Ok(None) => panic!("a bind() failure was silently swallowed as Ok(None)"),
+        }
+    }
+
+    /// Upstream copies the interface index into `sin6_scope_id`, but only for
+    /// link-local addresses — "FreeBSD insists this is zero for non-linklocal"
+    /// (`network.c:617-620`).  Without it the link-local listener cannot bind.
+    #[test]
+    fn iface_record_listen_addr_scopes_link_local_only() {
+        let record = |addr: IpAddr| IfaceRecord {
+            name: "eth0".into(), index: 7, addr, ..IfaceRecord::default()
+        };
+
+        let link_local = record(IpAddr::V6("fe80::1".parse().unwrap())).listen_addr(53);
+        match link_local {
+            std::net::SocketAddr::V6(a) => assert_eq!(a.scope_id(), 7),
+            other => panic!("expected an IPv6 address, got {other}"),
+        }
+
+        let global = record(IpAddr::V6("2001:db8::1".parse().unwrap())).listen_addr(53);
+        match global {
+            std::net::SocketAddr::V6(a) => assert_eq!(a.scope_id(), 0),
+            other => panic!("expected an IPv6 address, got {other}"),
+        }
+
+        let v4 = record(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))).listen_addr(53);
+        assert_eq!(v4, "192.0.2.1:53".parse::<std::net::SocketAddr>().unwrap());
     }
 
     #[test]
@@ -1397,7 +2403,7 @@ mod tests {
             Listener { addr, udp_fd: -1, tcp_fd: -1, tftp_fd: -1, used: 1, iface: None },
         ];
         let ifaces = vec![(addr, "lo".to_string())];
-        let created = create_bound_listeners(&mut listeners, &ifaces, false);
+        let created = create_bound_listeners(&mut listeners, &ifaces, ListenerKinds::default(), /*nowild=*/true);
         assert_eq!(created, 0, "no new listener should be created for existing addr");
         assert_eq!(listeners[0].used, 2, "used counter should be incremented");
     }
@@ -1408,7 +2414,7 @@ mod tests {
         let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
         let mut listeners: Vec<Listener> = vec![];
         let ifaces = vec![(addr, "lo".to_string())];
-        let created = create_bound_listeners(&mut listeners, &ifaces, false);
+        let created = create_bound_listeners(&mut listeners, &ifaces, ListenerKinds::default(), /*nowild=*/true);
         assert_eq!(created, 1);
         assert_eq!(listeners.len(), 1);
         assert_eq!(listeners[0].iface.as_deref(), Some("lo"));
@@ -1460,7 +2466,7 @@ mod tests {
             Ipv4Addr::new(192, 168, 1, 1),
             Ipv4Addr::new(255, 255, 255, 0),
             false,
-            &default_allowed_cfg(), &default_check_cfg(),
+            &default_allowed_cfg(), &default_check_cfg(), &mut IfaceCheckUsed::default(),
         );
         assert!(rec.is_some());
         let rec = rec.unwrap();
@@ -1475,7 +2481,7 @@ mod tests {
             Ipv4Addr::new(127, 0, 0, 1),
             Ipv4Addr::new(255, 0, 0, 0),
             true,
-            &default_allowed_cfg(), &default_check_cfg(),
+            &default_allowed_cfg(), &default_check_cfg(), &mut IfaceCheckUsed::default(),
         ).unwrap();
         assert!(!rec.dhcp4_ok, "loopback should have dhcp4 disabled");
         assert!(!rec.tftp_ok,  "loopback should have tftp disabled");
@@ -1492,7 +2498,7 @@ mod tests {
             Ipv4Addr::new(192, 168, 1, 1),
             Ipv4Addr::new(255, 255, 255, 0),
             false,
-            &cfg, &default_check_cfg(),
+            &cfg, &default_check_cfg(), &mut IfaceCheckUsed::default(),
         ).unwrap();
         assert!(!rec.dhcp4_ok, "dhcp_except should disable dhcp");
     }
@@ -1508,7 +2514,7 @@ mod tests {
             Ipv4Addr::new(172, 17, 0, 1),
             Ipv4Addr::new(255, 255, 0, 0),
             false,
-            &default_allowed_cfg(), &check_cfg,
+            &default_allowed_cfg(), &check_cfg, &mut IfaceCheckUsed::default(),
         );
         assert!(rec.is_none(), "docker0 should be denied by check_cfg deny list");
     }
@@ -1520,7 +2526,7 @@ mod tests {
         let addr = "2001:db8::1".parse::<Ipv6Addr>().unwrap();
         let rec = iface_allowed_v6(
             "eth0", 2, addr, 64, false,
-            &default_allowed_cfg(), &default_check_cfg(),
+            &default_allowed_cfg(), &default_check_cfg(), &mut IfaceCheckUsed::default(),
         );
         assert!(rec.is_some());
         let rec = rec.unwrap();
@@ -1533,7 +2539,7 @@ mod tests {
         let addr = "::1".parse::<Ipv6Addr>().unwrap();
         let rec = iface_allowed_v6(
             "lo", 1, addr, 128, true,
-            &default_allowed_cfg(), &default_check_cfg(),
+            &default_allowed_cfg(), &default_check_cfg(), &mut IfaceCheckUsed::default(),
         ).unwrap();
         assert!(!rec.dhcp6_ok);
         assert!(!rec.tftp_ok);
