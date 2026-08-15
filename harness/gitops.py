@@ -19,9 +19,17 @@ def branch_name(key, attempt=0):
 
 
 def make_worktree(repo, branch):
+    """Create a throwaway worktree for one cycle, branched fresh from master.
+
+    Uses `-B`, not `-b`: re-running an issue that was parked or interrupted
+    would otherwise collide with the branch its previous attempt left behind
+    and fail before doing any work. Resetting is safe because a cycle always
+    starts from master anyway, and parked work is preserved on the remote by
+    push_branch before the worktree is destroyed.
+    """
     path = tempfile.mkdtemp(prefix="harness-wt-")
     os.rmdir(path)  # `git worktree add` wants a non-existent path
-    _run(repo, "git", "worktree", "add", "-b", branch, path, BASE_BRANCH)
+    _run(repo, "git", "worktree", "add", "-B", branch, path, BASE_BRANCH)
     return path
 
 
