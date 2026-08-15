@@ -131,12 +131,25 @@ async fn interface_lo_includes_loopback() {
 /// `--except-interface=lo` excludes it again, even when `--interface=lo` also
 /// names it (upstream `network.c:150-152`: the except list wins unless the
 /// destination address itself was an explicit `--listen-address`).
+///
+/// The assertion is a negative, so it needs a liveness control: a daemon that
+/// died for an unrelated reason also fails to answer.  A second daemon with the
+/// same config minus `--except-interface` has to answer first, otherwise the
+/// environment is simply not usable and the test skips.
 #[tokio::test]
 async fn except_interface_lo_excludes_loopback() {
+    // Control: the same config without the exclusion must answer.
+    let Some((live_port, live)) = spawn("interface=lo\n").await else { return };
+    let control = probe(([127, 0, 0, 1], live_port).into()).await;
+    live.abort();
+    let Ok(Some(_)) = control else { return }; // can't serve loopback here at all
+
     let Some((port, task)) = spawn("interface=lo\nexcept-interface=lo\n").await else { return };
     let reply = probe(([127, 0, 0, 1], port).into()).await;
+    let alive = !task.is_finished();
     task.abort();
 
+    assert!(alive, "the daemon exited instead of running with --except-interface=lo");
     let Ok(reply) = reply else { return };
     assert!(
         reply.is_none(),
@@ -276,5 +289,137 @@ async fn bind_interfaces_binds_explicit_listen_address() {
     assert!(
         !addrs.iter().any(|a| a.ip().is_unspecified()),
         "bound mode must not fall back to the wildcard address: {addrs:?}"
+    );
+}
+
+// ── arrival-interface checking (upstream `check_dst`) ────────────────────────
+//
+// `forward.c:1612`: `check_dst = !option_bool(OPT_NOWILD) || family == AF_INET6`.
+// Binding to an address is not by itself access control — a query addressed to
+// an internal interface can still arrive via an external one.  Upstream only
+// skips the per-datagram check for IPv4 under plain `--bind-interfaces`.
+
+/// `--bind-dynamic` sets `OPT_CLEVERBIND`, not `OPT_NOWILD`, so every listener
+/// it creates still checks the arrival interface.  That is the whole point of
+/// the option (`network.c:1240-1250`: "The fix is to use --bind-dynamic, which
+/// actually checks the arrival interface too").
+#[tokio::test]
+async fn bind_dynamic_listeners_check_the_arrival_interface() {
+    let Some(port) = free_port().await else { return };
+    let mut daemon = daemon_from("bind-dynamic\ninterface=lo\n");
+    daemon.port = port;
+
+    let Ok(listeners) = bind_listeners(&daemon) else { return };
+    let checks = listeners.dns_arrival_checks();
+    assert!(!checks.is_empty(), "loopback must be bound");
+    for (addr, checked) in &checks {
+        assert!(
+            *checked,
+            "--bind-dynamic listener on {addr} must check the arrival interface"
+        );
+    }
+}
+
+/// Plain `--bind-interfaces` sets `OPT_NOWILD`, which turns the check off for
+/// IPv4 only.  IPv6 always reports the arrival interface, so upstream always
+/// checks it.
+#[tokio::test]
+async fn bind_interfaces_checks_arrival_for_ipv6_only() {
+    let Some(port) = free_port().await else { return };
+    let mut daemon = daemon_from("bind-interfaces\ninterface=lo\n");
+    daemon.port = port;
+
+    let Ok(listeners) = bind_listeners(&daemon) else { return };
+    let checks = listeners.dns_arrival_checks();
+    assert!(!checks.is_empty(), "loopback must be bound");
+    for (addr, checked) in &checks {
+        assert_eq!(
+            *checked,
+            addr.is_ipv6(),
+            "--bind-interfaces listener on {addr}: check_dst should be {} \
+             (upstream forward.c:1612)",
+            addr.is_ipv6()
+        );
+    }
+}
+
+/// The default (wildcard) mode checks both families.
+#[tokio::test]
+async fn wildcard_listeners_check_both_families() {
+    let Some(port) = free_port().await else { return };
+    let mut daemon = daemon_from("interface=lo\n");
+    daemon.port = port;
+
+    let Ok(listeners) = bind_listeners(&daemon) else { return };
+    let checks = listeners.dns_arrival_checks();
+    assert!(!checks.is_empty(), "the wildcard addresses must be bound");
+    for (addr, checked) in &checks {
+        assert!(*checked, "wildcard listener on {addr} must check the arrival interface");
+    }
+}
+
+/// `enumerate_interfaces()` does not report IPv6 link-local addresses (the
+/// `if_addrs` crate drops them), so no link-local listener is ever created and
+/// the scope-id handling in `IfaceRecord::listen_addr` cannot be exercised end
+/// to end.  This test pins the gap so it is visible rather than assumed: if
+/// enumeration starts reporting them, it fails and the coverage above becomes
+/// reachable.  See `tasks.md`.
+#[test]
+fn enumeration_omits_ipv6_link_local_addresses() {
+    use std::net::IpAddr;
+
+    let Ok(live) = dnsmasq_rs::network::enumerate_interfaces() else { return };
+    let link_local: Vec<_> = live
+        .iter()
+        .filter(|i| match i.addr {
+            IpAddr::V6(a) => dnsmasq_rs::network::is_link_local_v6(a),
+            IpAddr::V4(_) => false,
+        })
+        .map(|i| (i.name.clone(), i.addr))
+        .collect();
+
+    assert!(
+        link_local.is_empty(),
+        "enumerate_interfaces() now reports link-local addresses {link_local:?} — \
+         drop this test and re-enable end-to-end coverage of the sin6_scope_id \
+         handling in IfaceRecord::listen_addr"
+    );
+}
+
+/// `--bind-interfaces` turns the arrival check off for IPv4 but *not* for IPv6,
+/// so an IPv6 bound listener now runs a code path IPv4 never reaches: it must
+/// still find the destination address in the `IPV6_PKTINFO` control message and
+/// accept the datagram.  A listener that lost `set_ipv6pktinfo` would report no
+/// destination and silently drop every query.
+#[tokio::test]
+async fn bind_interfaces_still_answers_on_ipv6_loopback() {
+    if tokio::net::UdpSocket::bind("[::1]:0").await.is_err() {
+        return; // no IPv6 loopback in this sandbox
+    }
+    let Some((port, task)) = spawn("bind-interfaces\ninterface=lo\n").await else { return };
+    let server: SocketAddr = ("::1".parse::<std::net::IpAddr>().unwrap(), port).into();
+    let reply = probe(server).await;
+    task.abort();
+
+    let Ok(reply) = reply else { return };
+    assert!(
+        reply.is_some(),
+        "--bind-interfaces --interface=lo must answer on [::1]; the IPv6 arrival \
+         check (forward.c:1612) rejected a query on the interface it allows"
+    );
+}
+
+/// Turning the arrival check on for bound listeners must not break the case it
+/// is supposed to allow: a query arriving on the interface that *is* configured.
+#[tokio::test]
+async fn bind_dynamic_still_answers_on_the_allowed_interface() {
+    let Some((port, task)) = spawn("bind-dynamic\ninterface=lo\n").await else { return };
+    let reply = probe(([127, 0, 0, 1], port).into()).await;
+    task.abort();
+
+    let Ok(reply) = reply else { return };
+    assert!(
+        reply.is_some(),
+        "--bind-dynamic --interface=lo must still answer queries arriving on lo"
     );
 }

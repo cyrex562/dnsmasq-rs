@@ -782,11 +782,18 @@ pub enum SockType { Udp, Tcp }
 /// * Sets `SO_REUSEADDR`.
 /// * Sets `O_NONBLOCK` via `fix_fd`.
 /// * For IPv6 sockets: sets `IPV6_V6ONLY`.
-/// * For **UDP IPv4** wildcard (not `nowild`): enables `IP_PKTINFO` (Linux) or
+/// * For **UDP IPv4**, unless `nowild`: enables `IP_PKTINFO` (Linux) or
 ///   `IP_RECVDSTADDR` + `IP_RECVIF` (BSD) so the kernel reports the
 ///   destination address on each received datagram.
-/// * For **UDP IPv6**: calls `set_ipv6pktinfo`.
+/// * For **UDP IPv6**: always calls `set_ipv6pktinfo` — the arrival interface
+///   is part of the standard IPv6 API, so upstream never opts out of it.
 /// * For **TCP**: calls `listen(128)` and optionally enables `TCP_FASTOPEN`.
+///
+/// `nowild` is upstream's global `option_bool(OPT_NOWILD)` (`--bind-interfaces`),
+/// which is what `network.c:962` actually tests — *not* "this socket is bound to
+/// one address".  `--bind-dynamic` binds per address but leaves `OPT_NOWILD`
+/// clear, and so keeps `IP_PKTINFO`; that is precisely how it manages to check
+/// the arrival interface where `--bind-interfaces` cannot.
 ///
 /// Returns the raw file descriptor, or `Err` on failure.
 ///
@@ -807,10 +814,18 @@ pub fn make_sock(
         SockType::Tcp => (Type::STREAM,  Some(Protocol::TCP)),
     };
 
+    // "No error if the kernel just doesn't support this IP flavour"
+    // (`network.c:900-905`).  Upstream grants that exemption to the `socket()`
+    // call *only*: every later failure reaches `goto err` and dies.  Tag the
+    // error here so callers can tell the two apart — a `bind()` that quietly
+    // did not happen is exactly the bug this module exists to prevent.
     let sock = Socket::new(domain, sock_type, proto).map_err(|e| {
-        // Silently ignore "kernel doesn't support this protocol family".
-        if matches!(e.kind(), io::ErrorKind::Unsupported) {
-            io::Error::new(io::ErrorKind::Unsupported, e)
+        if matches!(
+            e.raw_os_error(),
+            Some(libc::EPROTONOSUPPORT) | Some(libc::EAFNOSUPPORT) | Some(libc::EINVAL)
+        ) || matches!(e.kind(), io::ErrorKind::Unsupported)
+        {
+            io::Error::new(io::ErrorKind::Unsupported, FamilyUnsupported(e))
         } else {
             e
         }
@@ -927,8 +942,8 @@ impl ListenerKinds {
 /// Create a `Listener` bound to `addr`.
 ///
 /// `kinds` selects which sockets are created; the TFTP socket is bound on
-/// port 69.  When `nowild` is true `IP_PKTINFO` is not requested (the socket is
-/// already bound to a specific interface address).
+/// port 69.  `nowild` is `--bind-interfaces` — see [`make_sock`] for why it is
+/// not the same question as "is this socket address-bound".
 ///
 /// Mirrors `create_listeners()` in `network.c`.
 #[cfg(unix)]
@@ -976,14 +991,31 @@ pub fn create_listeners(
     None
 }
 
-/// True for the errnos upstream treats as "the kernel just doesn't support this
-/// IP flavour" and skips silently (`network.c:905-909`).
+/// Marker attached by [`make_sock`] to a `socket()` failure that upstream skips
+/// silently (`network.c:900-905`).
+#[cfg(unix)]
+#[derive(Debug)]
+struct FamilyUnsupported(std::io::Error);
+
+#[cfg(unix)]
+impl std::fmt::Display for FamilyUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "address family not supported: {}", self.0)
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for FamilyUnsupported {}
+
+/// True only for a `socket()` call that failed because the kernel does not
+/// support the address family.
+///
+/// Deliberately *not* an errno test: `EINVAL` is on upstream's exempt list, but
+/// only where upstream applies it.  `bind()` also returns `EINVAL` — binding a
+/// link-local address with no scope id, say — and upstream dies on that.
 #[cfg(unix)]
 fn family_unsupported(e: &std::io::Error) -> bool {
-    matches!(
-        e.raw_os_error(),
-        Some(libc::EPROTONOSUPPORT) | Some(libc::EAFNOSUPPORT) | Some(libc::EINVAL)
-    )
+    e.get_ref().is_some_and(|inner| inner.is::<FamilyUnsupported>())
 }
 
 /// True when the address does not exist on any interface.  Under
@@ -1063,7 +1095,7 @@ pub fn create_listeners_checked(
 /// created with `nowild = false`, so the kernel reports the destination address
 /// and arrival interface of every datagram — which is what lets
 /// `--interface`/`--listen-address` still be enforced without a per-address
-/// bind (see [`WildcardFilter`]).
+/// bind (see [`ArrivalFilter`]).
 pub fn create_wildcard_listeners(port: u16, kinds: ListenerKinds) -> Vec<Listener> {
     create_wildcard_listeners_checked(port, kinds).unwrap_or_default()
 }
@@ -1110,8 +1142,7 @@ pub fn find_listener<'a>(
 /// For each `(addr, iface_name)` pair:
 /// - If a listener already exists for that address, increment its `used`
 ///   counter.
-/// - Otherwise, create a new `Listener` (with `nowild = true`) and push it
-///   onto the list.
+/// - Otherwise, create a new `Listener` and push it onto the list.
 ///
 /// Returns the number of new listeners created.
 ///
@@ -1120,13 +1151,20 @@ pub fn create_bound_listeners(
     listeners: &mut Vec<Listener>,
     iface_addrs: &[(std::net::SocketAddr, String)],
     kinds: ListenerKinds,
+    nowild: bool,
 ) -> usize {
-    create_bound_listeners_checked(listeners, iface_addrs, kinds, /*cleverbind=*/true)
-        .unwrap_or(0)
+    create_bound_listeners_checked(
+        listeners, iface_addrs, kinds, nowild, /*cleverbind=*/true,
+    )
+    .unwrap_or(0)
 }
 
 /// [`create_bound_listeners`], reporting a bind failure instead of skipping the
 /// address.
+///
+/// `nowild` is `--bind-interfaces`, and it is *not* implied by "this socket is
+/// address-bound": `--bind-dynamic` binds per address too but leaves `OPT_NOWILD`
+/// clear, so its sockets still request `IP_PKTINFO` and get arrival-checked.
 ///
 /// `cleverbind` is `--bind-dynamic`: an address that does not exist yet is
 /// tolerated, because netlink will bring it up later (`network.c:929-936`).
@@ -1134,6 +1172,7 @@ pub fn create_bound_listeners_checked(
     listeners: &mut Vec<Listener>,
     iface_addrs: &[(std::net::SocketAddr, String)],
     kinds: ListenerKinds,
+    nowild: bool,
     cleverbind: bool,
 ) -> std::io::Result<usize> {
     let mut created = 0;
@@ -1143,7 +1182,7 @@ pub fn create_bound_listeners_checked(
             existing.used += 1;
             continue;
         }
-        if let Some(mut l) = create_listeners_checked(addr, kinds, /*nowild=*/true, cleverbind)? {
+        if let Some(mut l) = create_listeners_checked(addr, kinds, nowild, cleverbind)? {
             l.iface = Some(name.clone());
             listeners.push(l);
             created += 1;
@@ -1185,6 +1224,25 @@ pub struct IfaceRecord {
     /// Whether this address is a label (secondary alias) rather than the
     /// primary address of the interface.
     pub is_label:   bool,
+}
+
+impl IfaceRecord {
+    /// The address a listener for this interface binds to.
+    ///
+    /// `iface_allowed_v6()` copies the interface index into `sin6_scope_id` for
+    /// link-local addresses and zeroes it otherwise — "FreeBSD insists this is
+    /// zero for non-linklocal addresses" (`network.c:617-620`).  The scope is
+    /// not cosmetic: Linux rejects a `bind()` of a link-local address with no
+    /// scope (`EINVAL`), because the address alone does not identify a link.
+    pub fn listen_addr(&self, port: u16) -> std::net::SocketAddr {
+        match self.addr {
+            IpAddr::V4(a) => std::net::SocketAddr::new(IpAddr::V4(a), port),
+            IpAddr::V6(a) => {
+                let scope = if is_link_local_v6(a) { self.index } else { 0 };
+                std::net::SocketAddr::V6(std::net::SocketAddrV6::new(a, port, 0, scope))
+            }
+        }
+    }
 }
 
 impl Default for IfaceRecord {
@@ -1484,17 +1542,23 @@ pub fn enumerate_allowed_interfaces(
     Ok(out)
 }
 
-/// Per-packet arrival check for wildcard-bound listeners.
+/// Per-datagram arrival check — upstream's `check_dst` path in `udp_request()`
+/// (`forward.c:1771-1780`).
 ///
 /// A wildcard socket receives datagrams addressed to *every* local address, so
 /// `--interface` / `--except-interface` / `--listen-address` can only be
 /// honoured by re-checking each datagram's arrival interface and destination
-/// address.  That is what upstream does in `udp_request()`
-/// (`forward.c:1771-1780`) using the `IP_PKTINFO` / `IPV6_PKTINFO` control
-/// message, and it is why wildcard sockets are the only ones created with
-/// `nowild = false`.
+/// address, read from the `IP_PKTINFO` / `IPV6_PKTINFO` control message.
+///
+/// Address-bound sockets need it too, and for a sharper reason: binding an
+/// address does not stop a query for that address arriving via a *different*
+/// interface.  `forward.c:1612` computes
+/// `check_dst = !option_bool(OPT_NOWILD) || family == AF_INET6`, so the check
+/// runs for every listener except IPv4 under plain `--bind-interfaces` — the one
+/// case where the platform may not report the arrival interface at all, and the
+/// reason `network.c:1240-1250` tells you to use `--bind-dynamic` instead.
 #[derive(Debug, Clone)]
-pub struct WildcardFilter {
+pub struct ArrivalFilter {
     check:      IfaceCheckConfig,
     allowed:    IfaceAllowedConfig,
     interfaces: Vec<IfaceRecord>,
@@ -1503,7 +1567,7 @@ pub struct WildcardFilter {
     cleverbind: bool,
 }
 
-impl WildcardFilter {
+impl ArrivalFilter {
     /// Build a filter from a config and an enumeration that has already run.
     pub fn new(
         check:      IfaceCheckConfig,
@@ -1969,11 +2033,11 @@ mod tests {
         assert_eq!(out.unmatched_addrs(&check), vec![unusual]);
     }
 
-    // ── WildcardFilter ───────────────────────────────────────────────────────
+    // ── ArrivalFilter ───────────────────────────────────────────────────────
 
     #[test]
     fn wildcard_filter_unrestricted_accepts_without_metadata() {
-        let mut filter = WildcardFilter::new(
+        let mut filter = ArrivalFilter::new(
             IfaceCheckConfig::default(),
             IfaceAllowedConfig::default(),
             Vec::new(),
@@ -1995,7 +2059,7 @@ mod tests {
         if lo_index == 0 {
             return; // no interface named "lo" here
         }
-        let mut filter = WildcardFilter::new(
+        let mut filter = ArrivalFilter::new(
             check,
             IfaceAllowedConfig::default(),
             Vec::new(),
@@ -2020,7 +2084,7 @@ mod tests {
             allow: vec!["eth0".to_string()],
             ..Default::default()
         };
-        let mut filter = WildcardFilter::new(
+        let mut filter = ArrivalFilter::new(
             check, IfaceAllowedConfig::default(), Vec::new(), true,
         );
         assert!(!filter.accepts(0, None));
@@ -2192,6 +2256,101 @@ mod tests {
         }
     }
 
+    /// `make_sock`'s third argument is upstream's *global* `OPT_NOWILD`, not
+    /// "is this socket address-bound": `network.c:964` requests `IP_PKTINFO`
+    /// whenever `--bind-interfaces` is off, so `--bind-dynamic`'s bound sockets
+    /// get it too and can be arrival-checked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn make_sock_requests_ip_pktinfo_unless_nowild() {
+        use std::os::unix::io::RawFd;
+
+        fn pktinfo_enabled(fd: RawFd) -> i32 {
+            let mut val: libc::c_int = -1;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            let rc = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::IPPROTO_IP,
+                    libc::IP_PKTINFO,
+                    &mut val as *mut _ as *mut libc::c_void,
+                    &mut len,
+                )
+            };
+            assert_eq!(rc, 0, "getsockopt(IP_PKTINFO) failed");
+            val
+        }
+
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let Ok(wild) = make_sock(addr, SockType::Udp, /*nowild=*/false) else { return };
+        assert_ne!(
+            pktinfo_enabled(wild), 0,
+            "IP_PKTINFO must be requested when --bind-interfaces is not set"
+        );
+        unsafe { libc::close(wild) };
+
+        let Ok(bound) = make_sock(addr, SockType::Udp, /*nowild=*/true) else { return };
+        assert_eq!(
+            pktinfo_enabled(bound), 0,
+            "--bind-interfaces suppresses IP_PKTINFO (network.c:962-966)"
+        );
+        unsafe { libc::close(bound) };
+    }
+
+    /// `network.c:900-905` exempts `EPROTONOSUPPORT`/`EAFNOSUPPORT`/`EINVAL`
+    /// only for the `socket()` call.  Every later failure — `bind()` included —
+    /// falls through to `die()`, so a bind that did not happen must never be
+    /// reported as success.
+    #[test]
+    fn create_listeners_checked_reports_a_bind_failure() {
+        // Gate: no usable IPv6 here means `socket()` itself fails, which *is*
+        // the exempt case.
+        if std::net::UdpSocket::bind("[::1]:0").is_err() {
+            return;
+        }
+        // A link-local address with no scope id: `socket()` succeeds, `bind()`
+        // returns EINVAL because the kernel cannot tell which link it means.
+        let addr = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1".parse().unwrap(), 0, 0, /*scope_id=*/0,
+        ));
+        let result = create_listeners_checked(
+            addr, ListenerKinds::UDP_ONLY, /*nowild=*/true, /*cleverbind=*/false,
+        );
+        match result {
+            Err(_) => {}
+            Ok(Some(l)) => {
+                unsafe { if l.udp_fd >= 0 { libc::close(l.udp_fd); } }
+                panic!("binding {addr} unexpectedly succeeded");
+            }
+            Ok(None) => panic!("a bind() failure was silently swallowed as Ok(None)"),
+        }
+    }
+
+    /// Upstream copies the interface index into `sin6_scope_id`, but only for
+    /// link-local addresses — "FreeBSD insists this is zero for non-linklocal"
+    /// (`network.c:617-620`).  Without it the link-local listener cannot bind.
+    #[test]
+    fn iface_record_listen_addr_scopes_link_local_only() {
+        let record = |addr: IpAddr| IfaceRecord {
+            name: "eth0".into(), index: 7, addr, ..IfaceRecord::default()
+        };
+
+        let link_local = record(IpAddr::V6("fe80::1".parse().unwrap())).listen_addr(53);
+        match link_local {
+            std::net::SocketAddr::V6(a) => assert_eq!(a.scope_id(), 7),
+            other => panic!("expected an IPv6 address, got {other}"),
+        }
+
+        let global = record(IpAddr::V6("2001:db8::1".parse().unwrap())).listen_addr(53);
+        match global {
+            std::net::SocketAddr::V6(a) => assert_eq!(a.scope_id(), 0),
+            other => panic!("expected an IPv6 address, got {other}"),
+        }
+
+        let v4 = record(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))).listen_addr(53);
+        assert_eq!(v4, "192.0.2.1:53".parse::<std::net::SocketAddr>().unwrap());
+    }
+
     #[test]
     fn find_listener_finds_matching_addr() {
         // Fabricate two fake listeners (fds -1 to avoid real sockets).
@@ -2244,7 +2403,7 @@ mod tests {
             Listener { addr, udp_fd: -1, tcp_fd: -1, tftp_fd: -1, used: 1, iface: None },
         ];
         let ifaces = vec![(addr, "lo".to_string())];
-        let created = create_bound_listeners(&mut listeners, &ifaces, ListenerKinds::default());
+        let created = create_bound_listeners(&mut listeners, &ifaces, ListenerKinds::default(), /*nowild=*/true);
         assert_eq!(created, 0, "no new listener should be created for existing addr");
         assert_eq!(listeners[0].used, 2, "used counter should be incremented");
     }
@@ -2255,7 +2414,7 @@ mod tests {
         let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
         let mut listeners: Vec<Listener> = vec![];
         let ifaces = vec![(addr, "lo".to_string())];
-        let created = create_bound_listeners(&mut listeners, &ifaces, ListenerKinds::default());
+        let created = create_bound_listeners(&mut listeners, &ifaces, ListenerKinds::default(), /*nowild=*/true);
         assert_eq!(created, 1);
         assert_eq!(listeners.len(), 1);
         assert_eq!(listeners[0].iface.as_deref(), Some("lo"));

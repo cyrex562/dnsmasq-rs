@@ -615,9 +615,8 @@ fn daemon_dhcp_runtime(daemon: &Daemon) -> Option<DhcpDaemonRuntime> {
 #[derive(Debug)]
 pub struct Listeners {
     dns: Vec<BoundDnsSocket>,
-    /// Per-datagram arrival check for the wildcard listeners, `None` when the
-    /// sockets are address-bound and the bind is the access control.
-    wildcard_filter: Option<crate::network::WildcardFilter>,
+    /// Per-datagram arrival check, `None` only when no listener needs one.
+    arrival_filter: Option<crate::network::ArrivalFilter>,
     #[cfg(feature = "dhcp")]
     dhcp: Option<std::net::UdpSocket>,
 }
@@ -628,15 +627,25 @@ pub struct Listeners {
 struct BoundDnsSocket {
     sock: std::net::UdpSocket,
     addr: SocketAddr,
-    /// Bound to `0.0.0.0` / `::`, so arriving datagrams must be re-checked
-    /// against the interface config.
-    wildcard: bool,
+    /// Upstream's `check_dst` (`forward.c:1612`): re-check the arrival
+    /// interface of every datagram against the interface config.
+    check_dst: bool,
 }
 
 impl Listeners {
     /// Addresses the DNS listeners are bound to, in creation order.
     pub fn dns_addrs(&self) -> Vec<SocketAddr> {
         self.dns.iter().map(|l| l.addr).collect()
+    }
+
+    /// `(address, checks-arrival-interface)` per DNS listener, in creation
+    /// order.
+    ///
+    /// Upstream's `check_dst = !option_bool(OPT_NOWILD) || family == AF_INET6`
+    /// (`forward.c:1612`): binding an address is not by itself access control,
+    /// so only IPv4 under plain `--bind-interfaces` skips the check.
+    pub fn dns_arrival_checks(&self) -> Vec<(SocketAddr, bool)> {
+        self.dns.iter().map(|l| (l.addr, l.check_dst)).collect()
     }
 }
 
@@ -686,9 +695,12 @@ fn iface_allowed_config(daemon: &Daemon) -> crate::network::IfaceAllowedConfig {
 ///
 /// The TCP and TFTP descriptors are not requested (see
 /// [`crate::network::ListenerKinds`]), so only the UDP one is ever present.
+///
+/// `nowild` is `--bind-interfaces`; it decides `check_dst` per socket exactly as
+/// `forward.c:1612` does.
 fn adopt_dns_listeners(
     listeners: Vec<crate::network::Listener>,
-    wildcard: bool,
+    nowild: bool,
 ) -> Result<Vec<BoundDnsSocket>, DnsmasqError> {
     use std::os::unix::io::FromRawFd;
 
@@ -711,7 +723,10 @@ fn adopt_dns_listeners(
         // Report what the kernel actually gave us, which differs from the
         // requested address whenever port 0 was asked for.
         let addr = sock.local_addr().unwrap_or(l.addr);
-        out.push(BoundDnsSocket { sock, addr, wildcard });
+        // forward.c:1612 — the arrival interface is always available for IPv6,
+        // so only IPv4 under --bind-interfaces goes unchecked.
+        let check_dst = !nowild || addr.is_ipv6();
+        out.push(BoundDnsSocket { sock, addr, check_dst });
     }
     Ok(out)
 }
@@ -723,12 +738,17 @@ fn adopt_dns_listeners(
 ///   filter them through `iface_allowed_v4`/`_v6`, and bind one socket per
 ///   allowed address plus one per `--listen-address` no interface carries.
 ///   Under plain `--bind-interfaces` an unmatched `--interface` is fatal.
-/// * Everything else binds the two wildcard sockets and returns a
-///   [`crate::network::WildcardFilter`] so the query loop can apply the same
-///   config per datagram.
+/// * Everything else binds the two wildcard sockets.
+///
+/// Either way it returns a [`crate::network::ArrivalFilter`], because binding an
+/// address is not by itself access control: a query addressed to an internal
+/// interface can still arrive via an external one.  Upstream re-checks the
+/// arrival interface of every datagram unless `--bind-interfaces` is set, and
+/// even then for IPv6 (`forward.c:1612`).  Which listeners consult the filter is
+/// recorded per socket as `check_dst`.
 fn bind_dns_listeners(
     daemon: &Daemon,
-) -> Result<(Vec<BoundDnsSocket>, Option<crate::network::WildcardFilter>), DnsmasqError> {
+) -> Result<(Vec<BoundDnsSocket>, Option<crate::network::ArrivalFilter>), DnsmasqError> {
     use crate::network::{self, ListenerKinds};
     use crate::types::constants::{OPT_CLEVERBIND, OPT_NOWILD};
 
@@ -759,22 +779,27 @@ fn bind_dns_listeners(
                 "could not create any wildcard listener".to_string(),
             ));
         }
-        let filter = network::WildcardFilter::new(
+        let filter = network::ArrivalFilter::new(
             check, allowed_cfg, enumerated.interfaces, cleverbind,
         );
-        return Ok((adopt_dns_listeners(listeners, true)?, Some(filter)));
+        return Ok((adopt_dns_listeners(listeners, nowild)?, Some(filter)));
     }
 
     // ── --bind-interfaces / --bind-dynamic ───────────────────────────────────
+    // `listen_addr` carries the interface index into `sin6_scope_id` for
+    // link-local addresses; without it the bind fails with EINVAL
+    // (`network.c:617-620`).
     let iface_addrs: Vec<(SocketAddr, String)> = enumerated
         .interfaces
         .iter()
-        .map(|i| (SocketAddr::new(i.addr, port), i.name.clone()))
+        .map(|i| (i.listen_addr(port), i.name.clone()))
         .collect();
 
     let mut listeners = Vec::new();
-    network::create_bound_listeners_checked(&mut listeners, &iface_addrs, kinds, cleverbind)
-        .map_err(|e| DnsmasqError::Bind(format!("port {port}"), e.to_string()))?;
+    network::create_bound_listeners_checked(
+        &mut listeners, &iface_addrs, kinds, nowild, cleverbind,
+    )
+    .map_err(|e| DnsmasqError::Bind(format!("port {port}"), e.to_string()))?;
 
     // --listen-address values no interface carries are still bound: it is legal
     // to listen on 127.0.1.1 when loopback only advertises 127.0.0.1
@@ -785,7 +810,7 @@ fn bind_dns_listeners(
         if network::find_listener(&mut listeners, sock_addr).is_some() {
             continue;
         }
-        match network::create_listeners_checked(sock_addr, kinds, /*nowild=*/true, cleverbind) {
+        match network::create_listeners_checked(sock_addr, kinds, nowild, cleverbind) {
             Ok(Some(l)) => listeners.push(l),
             Ok(None) if cleverbind => {
                 tracing::warn!("cannot bind {sock_addr} yet; --bind-dynamic will retry");
@@ -808,13 +833,19 @@ fn bind_dns_listeners(
         }
     }
 
-    Ok((adopt_dns_listeners(listeners, false)?, None))
+    // Bound listeners are arrival-checked too, except IPv4 under plain
+    // --bind-interfaces (`forward.c:1612`).  Under --bind-dynamic that check is
+    // the entire point of the option (`network.c:1240-1250`).
+    let filter = network::ArrivalFilter::new(
+        check, allowed_cfg, enumerated.interfaces, cleverbind,
+    );
+    Ok((adopt_dns_listeners(listeners, nowild)?, Some(filter)))
 }
 
 /// Bind every socket the daemon serves from, before forking and before the
 /// privilege drop.
 pub fn bind_listeners(daemon: &Daemon) -> Result<Listeners, DnsmasqError> {
-    let (dns, wildcard_filter) = bind_dns_listeners(daemon)?;
+    let (dns, arrival_filter) = bind_dns_listeners(daemon)?;
 
     #[cfg(feature = "dhcp")]
     let dhcp = match daemon_dhcp_runtime(daemon) {
@@ -834,7 +865,7 @@ pub fn bind_listeners(daemon: &Daemon) -> Result<Listeners, DnsmasqError> {
 
     Ok(Listeners {
         dns,
-        wildcard_filter,
+        arrival_filter,
         #[cfg(feature = "dhcp")]
         dhcp,
     })
@@ -955,7 +986,7 @@ pub async fn run_main_loop_with(
     #[cfg(feature = "dhcp")]
     let prebound_dhcp = listeners.dhcp.take();
     let bound_dns = std::mem::take(&mut listeners.dns);
-    let wildcard_filter = listeners.wildcard_filter.take();
+    let arrival_filter = listeners.arrival_filter.take();
 
     let mut dns_listeners = Vec::with_capacity(bound_dns.len());
     for bound in bound_dns {
@@ -968,7 +999,7 @@ pub async fn run_main_loop_with(
             }
         };
         info!("listening for DNS queries on {addr}");
-        dns_listeners.push(DnsListener { sock: Arc::new(sock), wildcard: bound.wildcard });
+        dns_listeners.push(DnsListener { sock: Arc::new(sock), check_dst: bound.check_dst });
     }
     if dns_listeners.is_empty() {
         error!("no DNS listening sockets were bound; check --interface/--listen-address");
@@ -983,7 +1014,7 @@ pub async fn run_main_loop_with(
         ..Default::default()
     };
     let fwd_task = tokio::spawn(async move {
-        if let Err(e) = run_forward_loop_on(dns_listeners, wildcard_filter, fwd_config).await {
+        if let Err(e) = run_forward_loop_on(dns_listeners, arrival_filter, fwd_config).await {
             error!("forward loop exited: {e}");
         }
     });

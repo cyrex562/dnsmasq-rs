@@ -1331,7 +1331,7 @@ pub async fn run_forward_loop(
     config: ForwardConfig,
 ) -> std::io::Result<()> {
     run_forward_loop_on(
-        vec![DnsListener { sock: client_sock, wildcard: false }],
+        vec![DnsListener { sock: client_sock, check_dst: false }],
         None,
         config,
     )
@@ -1342,14 +1342,19 @@ pub async fn run_forward_loop(
 ///
 /// `--bind-interfaces` / `--bind-dynamic` produce one of these per allowed
 /// interface address; the default wildcard mode produces one per address
-/// family.  Only wildcard sockets need the per-datagram arrival check, because
-/// a socket bound to a single address is already restricted by the bind.
+/// family.
 pub struct DnsListener {
     /// The bound UDP socket.
     pub sock: Arc<tokio::net::UdpSocket>,
-    /// True when the socket is bound to `0.0.0.0` / `::` and therefore receives
-    /// datagrams addressed to every local address.
-    pub wildcard: bool,
+    /// Upstream's `check_dst` (`forward.c:1612`):
+    /// `!option_bool(OPT_NOWILD) || family == AF_INET6`.
+    ///
+    /// A wildcard socket obviously needs it — it receives datagrams for every
+    /// local address.  An address-bound socket needs it too, because a query
+    /// addressed to an internal interface can still arrive via an external one;
+    /// only IPv4 under plain `--bind-interfaces` gives that up, which is why
+    /// `network.c:1240-1250` recommends `--bind-dynamic` instead.
+    pub check_dst: bool,
 }
 
 /// Wait until one of `listeners` has a datagram ready, returning its index.
@@ -1398,14 +1403,15 @@ fn recv_datagram(
 
 /// Run the DNS UDP forwarding event loop over a set of bound listeners.
 ///
-/// `filter` is consulted for datagrams arriving on wildcard listeners, which is
-/// where `--interface` / `--except-interface` / `--listen-address` are enforced
-/// in the default (non-`--bind-interfaces`) mode — upstream's
-/// `iface_check()` call in `udp_request()` (`forward.c:1771-1780`).  Bound
-/// listeners skip it: the bind is already the access control.
+/// `filter` is consulted for datagrams arriving on any listener whose
+/// `check_dst` is set, which is where `--interface` / `--except-interface` /
+/// `--listen-address` are enforced — upstream's `iface_check()` call in
+/// `udp_request()` (`forward.c:1771-1780`).  Only IPv4 listeners under plain
+/// `--bind-interfaces` skip it, and there the bind is the only access control
+/// available (`forward.c:1612`).
 pub async fn run_forward_loop_on(
     listeners: Vec<DnsListener>,
-    filter:    Option<crate::network::WildcardFilter>,
+    filter:    Option<crate::network::ArrivalFilter>,
     config:    ForwardConfig,
 ) -> std::io::Result<()> {
     if listeners.is_empty() {
@@ -1444,9 +1450,10 @@ pub async fn run_forward_loop_on(
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
                     Err(e) => return Err(e),
                 };
-                // A wildcard socket sees datagrams for every local address, so
-                // the config has to be re-applied per datagram.
-                if listener.wildcard {
+                // Re-apply the interface config per datagram: the address a
+                // socket is bound to does not constrain which interface a
+                // datagram for it arrived on.
+                if listener.check_dst {
                     if let Some(f) = filter.as_mut() {
                         if !f.accepts(meta.if_index, meta.dest) {
                             continue;

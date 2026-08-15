@@ -197,12 +197,35 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     via `create_bound_listeners`, plus one per `--listen-address` that no interface carries
     (`network.c:1219-1233`). Under plain `--bind-interfaces` an unmatched `--interface` is
     fatal with "unknown interface %s" (`dnsmasq.c:396-398`); `--bind-dynamic` tolerates it.
-  - Default mode binds the two wildcard sockets via `create_wildcard_listeners` and hands
-    the query loop a `network::WildcardFilter`. `run_forward_loop_on` now reads each
-    datagram with `recvmsg` + `IP_PKTINFO`/`IPV6_PKTINFO` (`network::recv_with_dest`) and
-    re-applies `iface_check`, with the `loopback_exception` and `label_exception` fallbacks,
-    exactly as `udp_request()` does at `forward.c:1771-1780`. Without this half,
-    `--listen-address` could not work at all in the mode that is actually the default.
+  - Default mode binds the two wildcard sockets via `create_wildcard_listeners`.
+  - **Every mode hands the query loop a `network::ArrivalFilter`**, because binding an
+    address is not by itself access control: a query addressed to an internal interface can
+    still arrive via an external one. `run_forward_loop_on` reads each datagram with
+    `recvmsg` + `IP_PKTINFO`/`IPV6_PKTINFO` (`network::recv_with_dest`) and re-applies
+    `iface_check`, with the `loopback_exception` and `label_exception` fallbacks, exactly as
+    `udp_request()` does at `forward.c:1771-1780`. Which listeners consult it is upstream's
+    `check_dst = !option_bool(OPT_NOWILD) || family == AF_INET6` (`forward.c:1612`), carried
+    per socket as `BoundDnsSocket::check_dst` / `DnsListener::check_dst`:
+      - default (wildcard) mode — both families checked;
+      - `--bind-dynamic` (`OPT_CLEVERBIND`, *not* `OPT_NOWILD`) — both families checked.
+        This is the whole point of the option: `network.c:1240-1250` says so in as many
+        words ("The fix is to use `--bind-dynamic`, which actually checks the arrival
+        interface too");
+      - `--bind-interfaces` (`OPT_NOWILD`) — IPv6 checked, IPv4 not. IPv4 is the only case
+        where upstream gives the check up, and `warn_bound_listeners` exists precisely to
+        shout about it.
+
+    `make_sock`'s `nowild` argument is therefore the *global* `OPT_NOWILD`, matching
+    `network.c:962`, and not "is this socket address-bound": `--bind-dynamic`'s per-address
+    sockets still request `IP_PKTINFO`, which is what makes their arrival check possible.
+    Without all of this, `--listen-address` could not work in the default mode, and
+    `--bind-dynamic` would be indistinguishable from `--bind-interfaces`.
+  - A `bind()` failure is never silently swallowed. `network.c:900-905` exempts
+    `EPROTONOSUPPORT`/`EAFNOSUPPORT`/`EINVAL` for the `socket()` call only; everything after
+    it reaches `goto err` and `die()`. `make_sock` tags the socket-creation error so
+    `create_listeners_checked` can apply the exemption where upstream does and nowhere else
+    — an errno-only test would swallow, for instance, the `EINVAL` from binding a link-local
+    address with no scope id.
 
   `iface_check` itself was previously name-only; it now implements the full
   `network.c:112-181` algorithm including address matching and the `match_addr` rule that
@@ -229,14 +252,23 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     (`forward.c` `send_from`); here the kernel picks the source by route lookup, which can
     differ on a multi-homed host. `forward::send_from` exists and is tested but has no
     caller.
-  - **`--bind-dynamic` does not actually re-bind.** It currently behaves as
-    `--bind-interfaces` that tolerates missing addresses at startup; there is no netlink
-    listener re-running `create_bound_listeners` when an interface appears, and no
+  - **`--bind-dynamic` does not actually re-bind.** Its arrival check is wired up (see
+    above), but the dynamic half is not: there is no netlink listener re-running
+    `create_bound_listeners` when an interface appears, and no
     `RTM_NEWADDR`/`RTM_DELADDR` handling. `is_dad_listeners`/DAD-tentative deferral
     (`network.c:1300`) is absent too, so an IPv6 address still in DAD is bound or skipped
     by whatever `getifaddrs` reports rather than retried.
+  - **IPv6 link-local addresses are never enumerated, so no link-local listener is bound.**
+    `enumerate_interfaces()` goes through `if_addrs::get_if_addrs()`, which drops
+    `fe80::/10` addresses; upstream's `iface_enumerate` reports them and
+    `create_bound_listeners` binds one per interface. `IfaceRecord::listen_addr` already
+    carries the interface index into `sin6_scope_id` for link-local addresses as
+    `iface_allowed_v6` does (`network.c:617-620`) — without it Linux rejects the bind with
+    `EINVAL` — so only the enumeration source has to change. Pinned by
+    `enumeration_omits_ipv6_link_local_addresses` in
+    `tests/listener_binding_integration.rs`, which fails once enumeration reports them.
   - **The interface set is never garbage-collected.** `clean_interfaces` has no caller;
-    `WildcardFilter::refresh` re-enumerates on a failed check (matching upstream's
+    `ArrivalFilter::refresh` re-enumerates on a failed check (matching upstream's
     `enumerate_interfaces(0)` retry) but nothing releases listeners for addresses that went
     away (`release_listener`).
   - **`--local-service` (net) is not enforced.** `--local-service=host` works, because
