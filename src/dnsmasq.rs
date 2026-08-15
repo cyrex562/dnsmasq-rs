@@ -179,6 +179,36 @@ struct DhcpDaemonRuntime {
     loop_opts: crate::dhcp::DhcpLoopOptions,
 }
 
+/// Snapshot the locally-configured DNS data out of [`Daemon`] so the query loop
+/// can answer from it without holding the daemon lock.
+///
+/// Mirrors the config data upstream's `answer_request()` walks: `daemon->txt`,
+/// `daemon->rr`, `daemon->mxnames`, `daemon->ptr`, `daemon->naptr`, the
+/// `host-record` list and the configured CNAMEs.
+pub fn daemon_local_data(daemon: &Daemon) -> crate::forward::LocalData {
+    crate::forward::LocalData {
+        local_ttl:     daemon.local_ttl,
+        txt_records:   daemon.txt.clone(),
+        rr_records:    daemon.rr.clone(),
+        mx_records:    daemon.mxnames.clone(),
+        ptr_records:   daemon.ptr.clone(),
+        host_records:  daemon.host_records.clone(),
+        cnames:        daemon.cnames.clone(),
+        naptr_records: daemon.naptr.clone(),
+    }
+}
+
+/// Resolve the answer-cache size from `cache-size`.  Upstream treats a negative
+/// or absent value as "use the default" and `0` as "caching disabled"; the Rust
+/// cache has no disabled mode yet, so `0` collapses to the smallest cache.
+pub fn daemon_cache_size(daemon: &Daemon) -> usize {
+    if daemon.cachesize < 0 {
+        crate::forward::DEFAULT_CACHE_SIZE
+    } else {
+        daemon.cachesize as usize
+    }
+}
+
 #[cfg(feature = "dhcp")]
 fn first_ipv4_listen_addr(addrs: &[crate::types::network::Iname]) -> Option<Ipv4Addr> {
     addrs.iter().find_map(|iname| match iname.addr.as_ref() {
@@ -261,25 +291,30 @@ pub async fn run_main_loop(
     #[cfg(feature = "dhcp")]
     use tokio::sync::watch;
     use tokio::signal::unix::{signal, SignalKind};
-    use tracing::{error, info, warn};
+    use tracing::{error, info};
+    // `warn!` is only reached from the DHCP socket-bind path below.
+    #[cfg(feature = "dhcp")]
+    use tracing::warn;
 
     use crate::forward::{ForwardConfig, ForwardEngine, run_forward_loop};
     #[cfg(feature = "dhcp")]
     use crate::dhcp::{DhcpLoopOptions, run_dhcp_loop};
 
     // ── Resolve configuration ────────────────────────────────────────────────
-    let (port, upstreams, dhcp_runtime) = {
+    let (port, upstreams, local_data, cache_size, dhcp_runtime) = {
         let d = daemon_handle.read().await;
         let ups: Vec<_> = d
             .servers
             .iter()
             .map(|s| SocketAddr::from(s.addr.clone()))
             .collect();
+        let local_data = daemon_local_data(&d);
+        let cache_size = daemon_cache_size(&d);
         #[cfg(feature = "dhcp")]
         let dhcp_runtime = daemon_dhcp_runtime(&d);
         #[cfg(not(feature = "dhcp"))]
         let dhcp_runtime = ();
-        (d.port, ups, dhcp_runtime)
+        (d.port, ups, local_data, cache_size, dhcp_runtime)
     };
 
     // ── Bind the DNS listening socket ────────────────────────────────────────
@@ -296,6 +331,8 @@ pub async fn run_main_loop(
     // ── Spawn the forwarding engine ──────────────────────────────────────────
     let fwd_config = ForwardConfig {
         upstreams,
+        local: local_data,
+        cache_size,
         ..Default::default()
     };
     let fwd_sock = Arc::clone(&client_sock);
@@ -662,6 +699,68 @@ mod tests {
         let gid = nix::unistd::getgid().as_raw();
         // Should succeed without any syscall since uid/gid already match.
         drop_privileges(uid, gid).expect("drop_privileges failed for current user");
+    }
+
+    // ── local-data snapshot ───────────────────────────────────────────────────
+
+    #[test]
+    fn daemon_local_data_carries_every_record_kind() {
+        use crate::types::dns_records::{Cname, HostRecord, MxSrvRecord, Naptr, PtrRecord, TxtRecord};
+
+        let mut daemon = Daemon { local_ttl: 60, ..Default::default() };
+        daemon.host_records.push(HostRecord {
+            ttl: 60,
+            flags: 0,
+            names: vec!["host.test".into()],
+            addr4: Some(Ipv4Addr::new(192, 0, 2, 10)),
+            addr6: None,
+        });
+        daemon.cnames.push(Cname {
+            ttl: 60, flag: 0, alias: "alias.test".into(), target: "host.test".into(),
+        });
+        daemon.txt.push(TxtRecord {
+            name: "txt.test".into(), txt: b"\x05hello".to_vec(), class: 1, stat: 0,
+        });
+        daemon.rr.push(TxtRecord {
+            name: "rr.test".into(), txt: vec![0xde, 0xad], class: 99, stat: 0,
+        });
+        daemon.mxnames.push(MxSrvRecord {
+            name: "mail.test".into(), target: "sink.test".into(),
+            is_srv: false, srv_port: 0, priority: 10, weight: 0, offset: 0,
+        });
+        daemon.ptr.push(PtrRecord {
+            name: "10.2.0.192.in-addr.arpa".into(), ptr: "host.test".into(),
+        });
+        daemon.naptr.push(Naptr {
+            name: "naptr.test".into(), replace: "r.test".into(), regexp: String::new(),
+            services: "SIP+D2U".into(), flags: "s".into(), order: 1, pref: 2,
+        });
+
+        let local = daemon_local_data(&daemon);
+        assert_eq!(local.local_ttl, 60);
+        assert_eq!(local.host_records.len(), 1);
+        assert_eq!(local.cnames.len(), 1);
+        assert_eq!(local.txt_records.len(), 1);
+        assert_eq!(local.rr_records.len(), 1);
+        assert_eq!(local.mx_records.len(), 1);
+        assert_eq!(local.ptr_records.len(), 1);
+        assert_eq!(local.naptr_records.len(), 1);
+        assert!(!local.is_empty());
+    }
+
+    #[test]
+    fn daemon_local_data_empty_by_default() {
+        assert!(daemon_local_data(&Daemon::default()).is_empty());
+    }
+
+    #[test]
+    fn daemon_cache_size_defaults_and_clamps() {
+        let mut daemon = Daemon::default();
+        assert_eq!(daemon_cache_size(&daemon), daemon.cachesize as usize);
+        daemon.cachesize = -1;
+        assert_eq!(daemon_cache_size(&daemon), crate::forward::DEFAULT_CACHE_SIZE);
+        daemon.cachesize = 0;
+        assert_eq!(daemon_cache_size(&daemon), 0);
     }
 
     #[cfg(feature = "dhcp")]

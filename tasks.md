@@ -57,6 +57,53 @@ Both are reference-only. Do not treat either tree as code to edit in place.
 
 ## P1 Runtime And Integration Gaps
 
+- [x] Wire local-data answering into the live query path.
+  `run_forward_loop` now calls `rfc1035::answer_request` (via `try_local_answer`) before
+  `forward_query`, matching the order `udp_request()` uses in upstream `forward.c`, and
+  `run_main_loop` snapshots the `Daemon` local-data lists into `ForwardConfig::local`
+  (`dnsmasq::daemon_local_data`) plus the answer cache size (`dnsmasq::daemon_cache_size`).
+  A purely local config with zero upstreams now answers instead of timing out.
+  Covered by `tests/local_answer_integration.rs` and `tests/parity_dns_basic_local.rs`.
+
+  Explicitly **not** covered by that wiring — upstream behavior still missing:
+
+  - EDNS0 pseudo-header round-tripping. Upstream `udp_request()` calls
+    `add_edns0_config()` before `answer_request()` and re-attaches an OPT RR (plus any
+    EDE option) with `add_pseudoheader()` afterwards. The Rust `answer_request` drops the
+    query's additional section entirely, so a locally-answered EDNS query comes back
+    without an OPT RR and never carries an EDE code.
+  - `stale`/`filtered` answer signalling. Upstream threads `int *stale, int *filtered`
+    out of `answer_request()` to pick `METRIC_DNS_STALE_ANSWERED` and set
+    `EDE_STALE`/`EDE_FILTERED`. The Rust signature has no equivalent, so
+    `Metric::DnsStaleAnswered` is never incremented from this path.
+  - Response truncation. Upstream sets TC and empties the answer sections when a reply
+    exceeds the client's advertised UDP size; the Rust path always writes the full reply.
+  - MX/SRV additional-section glue. Upstream appends cached A/AAAA records for MX and SRV
+    targets (`rec->offset` loop at the end of `answer_request()`); the Rust port emits an
+    empty additional section. Harmless for `parity/fixtures/dns/basic` because no target
+    there resolves, but wrong once a fixture configures one.
+  - `qtype == T_CNAME` chain termination. Upstream stops after the first CNAME when the
+    query type is CNAME; the Rust port follows the whole chain, so a multi-hop alias
+    answers with every CNAME in the chain instead of one.
+  - `no-cache`/`do-bit`/`CD` handling, and the auth (`--auth-zone`) and conntrack
+    allowlist branches of `udp_request()`, which have no Rust call site at all.
+  - TCP DNS service. Only the UDP listener consults local data; there is no TCP listener.
+  - Answer-cache population. `run_forward_loop` builds a `DnsCache` and passes it to
+    `answer_request`, but nothing ever inserts forwarded upstream replies into it —
+    `ForwardEngine::process_reply` has no cache write. The cache therefore only ever
+    serves what `answer_request` itself stores, so the cache-hit branches of
+    `answer_request` (cached CNAME, cached NXDOMAIN, MX/SRV glue) are unreachable in the
+    live path. Upstream caches every forwarded reply in `cache_insert()`.
+  - `cache-size=0`. Upstream treats `0` as "caching disabled"; `DnsCache` has no disabled
+    mode, so `run_forward_loop` clamps the size to 1 entry (`cache_size.max(1)`) instead
+    of bypassing the cache.
+  - Reload staleness. `run_main_loop` snapshots the local data once at startup and moves
+    the clone into the forward task, so the query loop keeps answering from the
+    startup-time config forever. Upstream re-reads `daemon->` config data on every query,
+    so a SIGHUP reload takes effect immediately. Whoever implements real SIGHUP reload
+    (`dnsmasq::on_sighup` / `clear_cache_and_reload`) must also republish the snapshot —
+    a shared `ArcSwap`/`watch` channel rather than a moved clone.
+
 - [ ] Split pure logic tests from capability-dependent socket tests.
   Source of truth: current failing tests in `network.rs`, `forward.rs`, and `dhcp_common.rs`.
   Required tests: deterministic unit coverage for pure logic, gated or capability-aware integration coverage for privileged paths.

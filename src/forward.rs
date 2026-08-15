@@ -12,10 +12,12 @@ use std::time::{Duration, Instant};
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use crate::cache::DnsCache;
 use crate::hash_questions::hash_questions;
 use crate::metrics::{inc_metric, Metric};
-use crate::rfc1035::{private_net, private_net6, DnsPacket};
+use crate::rfc1035::{answer_request, private_net, private_net6, DnsPacket, LocalConfig};
 use crate::types::constants::{F_IPV4, F_IPV6, F_SERVER};
+use crate::types::dns_records::{Cname, HostRecord, MxSrvRecord, Naptr, PtrRecord, TxtRecord};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Types
@@ -715,6 +717,59 @@ pub const MAX_PACKET_SIZE: usize = 65535;
 /// Default query timeout before a forwarded query is abandoned.
 pub const QUERY_TIMEOUT_SECS: u64 = 10;
 
+/// Default number of cached answers, matching upstream's `CACHESIZ`.
+pub const DEFAULT_CACHE_SIZE: usize = 150;
+
+/// Owned snapshot of the locally-configured DNS data (`host-record`, `cname`,
+/// `txt-record`, `mx-host`, `srv-host`, `ptr-record`, `naptr-record`, …) that
+/// the query loop answers from before forwarding.
+///
+/// [`LocalConfig`] borrows its record slices, so it cannot be held across the
+/// loop's `.await` points; this owned form lives in [`ForwardConfig`] and a
+/// borrowed [`LocalConfig`] is rebuilt per query via [`LocalData::as_config`].
+#[derive(Debug, Clone, Default)]
+pub struct LocalData {
+    /// TTL applied to answers synthesised from config data (`local-ttl`).
+    pub local_ttl:     u32,
+    pub txt_records:   Vec<TxtRecord>,
+    /// Arbitrary configured RR types (`dns-rr`); `class` holds the RR type.
+    pub rr_records:    Vec<TxtRecord>,
+    /// `mx-host` and `srv-host` entries (discriminated by `is_srv`).
+    pub mx_records:    Vec<MxSrvRecord>,
+    pub ptr_records:   Vec<PtrRecord>,
+    pub host_records:  Vec<HostRecord>,
+    pub cnames:        Vec<Cname>,
+    pub naptr_records: Vec<Naptr>,
+}
+
+impl LocalData {
+    /// Borrow this snapshot as the [`LocalConfig`] view `answer_request` takes.
+    pub fn as_config(&self) -> LocalConfig<'_> {
+        LocalConfig {
+            local_ttl:     self.local_ttl,
+            txt_records:   &self.txt_records,
+            rr_records:    &self.rr_records,
+            mx_records:    &self.mx_records,
+            ptr_records:   &self.ptr_records,
+            host_records:  &self.host_records,
+            cnames:        &self.cnames,
+            naptr_records: &self.naptr_records,
+        }
+    }
+
+    /// `true` when no local data at all is configured, in which case
+    /// `answer_request` could still answer from the cache.
+    pub fn is_empty(&self) -> bool {
+        self.txt_records.is_empty()
+            && self.rr_records.is_empty()
+            && self.mx_records.is_empty()
+            && self.ptr_records.is_empty()
+            && self.host_records.is_empty()
+            && self.cnames.is_empty()
+            && self.naptr_records.is_empty()
+    }
+}
+
 /// Configuration for the forwarding engine.
 #[derive(Debug, Clone)]
 pub struct ForwardConfig {
@@ -724,6 +779,10 @@ pub struct ForwardConfig {
     pub timeout: Duration,
     /// Maximum number of retries per query.
     pub max_retries: u8,
+    /// Locally-configured DNS data consulted before forwarding.
+    pub local: LocalData,
+    /// Maximum number of entries in the answer cache (`cache-size`).
+    pub cache_size: usize,
 }
 
 impl Default for ForwardConfig {
@@ -732,6 +791,8 @@ impl Default for ForwardConfig {
             upstreams:   Vec::new(),
             timeout:     Duration::from_secs(QUERY_TIMEOUT_SECS),
             max_retries: 2,
+            local:       LocalData::default(),
+            cache_size:  DEFAULT_CACHE_SIZE,
         }
     }
 }
@@ -1214,10 +1275,40 @@ pub async fn tcp_fallback(
     Some(resp)
 }
 
+/// Try to satisfy `pkt` from local config data and the cache, mirroring the
+/// `answer_request()` call `udp_request()` makes before deciding to forward
+/// (`forward.c`).
+///
+/// Returns `true` when a reply was sent to `src`, in which case the query must
+/// *not* be forwarded.  A packet that fails to parse is left to the forwarding
+/// path, matching upstream's behaviour of forwarding whatever `answer_request`
+/// declines to answer.
+async fn try_local_answer(
+    client_sock: &tokio::net::UdpSocket,
+    pkt:         &[u8],
+    src:         SocketAddr,
+    cache:       &mut DnsCache,
+    local:       &LocalData,
+) -> bool {
+    let Ok(query) = DnsPacket::parse(pkt) else { return false };
+    let Some(reply) = answer_request(&query, cache, Instant::now(), &local.as_config()) else {
+        return false;
+    };
+    let wire = reply.write();
+    let _ = client_sock.send_to(&wire, src).await;
+    inc_metric(Metric::DnsLocalAnswered);
+    true
+}
+
 /// Run the DNS UDP forwarding event loop.
 ///
 /// * `client_sock` — bound UDP socket facing DNS clients.
-/// * `config`      — forwarding configuration (upstreams, timeout).
+/// * `config`      — forwarding configuration (upstreams, timeout, local data).
+///
+/// Each client query is first offered to [`answer_request`] via
+/// [`try_local_answer`]; only queries it declines are forwarded upstream.  This
+/// is the ordering upstream's `udp_request()` uses, and it is what lets a
+/// purely local configuration (no upstream servers at all) answer queries.
 ///
 /// Runs until an unrecoverable I/O error occurs.  Logs are omitted for
 /// simplicity; callers should wrap this in a task and handle the error.
@@ -1228,6 +1319,10 @@ pub async fn run_forward_loop(
     // Ephemeral socket for upstream communication.
     let upstream_sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
 
+    // Local data and cache are owned by the loop; `LocalConfig` borrows from
+    // `local` and is rebuilt per query.
+    let local            = config.local.clone();
+    let mut cache        = DnsCache::new(config.cache_size.max(1));
     let mut engine       = ForwardEngine::new(config);
     let mut client_buf   = vec![0u8; MAX_PACKET_SIZE];
     let mut upstream_buf = vec![0u8; MAX_PACKET_SIZE];
@@ -1241,7 +1336,10 @@ pub async fn run_forward_loop(
                 let pkt = &client_buf[..len];
                 // Only forward DNS queries (QR bit == 0).
                 if pkt.len() >= 12 && pkt[2] & 0x80 == 0 {
-                    engine.forward_query(pkt, src, &upstream_sock).await;
+                    // Local data and cache first — exactly as upstream does.
+                    if !try_local_answer(&client_sock, pkt, src, &mut cache, &local).await {
+                        engine.forward_query(pkt, src, &upstream_sock).await;
+                    }
                 }
             }
             // ── Upstream reply ────────────────────────────────────────────────
