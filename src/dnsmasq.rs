@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::RwLock;
 
 use crate::error::DnsmasqError;
+use crate::types::constants::CHGRP;
 use crate::types::daemon::Daemon;
 #[cfg(feature = "dhcp")]
 use crate::dhcp::DhcpServerConfig;
@@ -53,41 +54,283 @@ pub fn init_daemon_with(daemon: Daemon) -> DaemonHandle {
     Arc::new(RwLock::new(daemon))
 }
 
-/// Drop process privileges to the given `uid`/`gid`.
+// ──────────────────────────────────────────────────────────────────────────────
+// Run-as identity (dnsmasq.c:499-517)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// The uid/gid the daemon will run as once it has dropped root — upstream's
+/// `ent_pw` and `gp` locals, resolved from `user=`/`group=` before the fork so
+/// that an unknown name is still reportable on the invoking terminal.
 ///
-/// This is a best-effort implementation: on Linux it uses the `caps` and `nix`
-/// crates to set the real/effective/saved UIDs and GIDs.  Passing the current
-/// process's own uid/gid is always a no-op and succeeds.
+/// Either half may be absent: `uid` is `None` when no run user is configured at
+/// all, and `gid` is `None` when neither `group=`, `CHGRP` nor the run user's
+/// primary group could be resolved.  Upstream tolerates both and simply skips
+/// the corresponding `setuid`/`setgid`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RunAs {
+    /// The name `uid` was resolved from, for diagnostics.
+    pub username:  Option<String>,
+    pub uid:       Option<u32>,
+    /// The name `gid` was resolved from — either `group=` or the default that
+    /// upstream substitutes into `daemon->groupname` for its error messages.
+    pub groupname: Option<String>,
+    pub gid:       Option<u32>,
+    /// The run user's *primary* group (`ent_pw->pw_gid`), which is not
+    /// necessarily [`gid`](Self::gid): the daemon runs under `group=`/`CHGRP`,
+    /// but upstream chowns the pid file to `pw_uid:pw_gid` (dnsmasq.c:697).
+    pub user_gid:  Option<u32>,
+}
+
+/// Resolve `user=`/`group=` into numeric ids, mirroring dnsmasq.c:499-517.
+///
+/// An unrecognised name is fatal (`die(_("unknown user or group: %s"))`) — it
+/// is not silently ignored, because that would leave the daemon running as root.
+/// The group default follows upstream exactly: when `group=` is absent, try
+/// [`CHGRP`], and failing that the run user's primary group.
+pub fn resolve_run_as(daemon: &Daemon) -> Result<RunAs, DnsmasqError> {
+    use nix::unistd::{Group, User};
+
+    let unknown = |name: &str| DnsmasqError::PrivilegeDrop(format!("unknown user or group: {name}"));
+
+    let mut run_as = RunAs::default();
+
+    let pw = match daemon.username.as_deref() {
+        Some(name) => {
+            let pw = User::from_name(name)
+                .map_err(|e| DnsmasqError::PrivilegeDrop(format!("getpwnam({name}): {e}")))?
+                .ok_or_else(|| unknown(name))?;
+            run_as.username = Some(name.to_string());
+            run_as.uid = Some(pw.uid.as_raw());
+            run_as.user_gid = Some(pw.gid.as_raw());
+            Some(pw)
+        }
+        None => None,
+    };
+
+    match daemon.groupname.as_deref() {
+        Some(name) => {
+            let gr = Group::from_name(name)
+                .map_err(|e| DnsmasqError::PrivilegeDrop(format!("getgrnam({name}): {e}")))?
+                .ok_or_else(|| unknown(name))?;
+            run_as.groupname = Some(name.to_string());
+            run_as.gid = Some(gr.gid.as_raw());
+        }
+        // "implement group defaults, CHGRP if available, or group associated
+        // with uid" — a missing default group is not an error upstream.
+        None => {
+            if let Ok(Some(gr)) = Group::from_name(CHGRP) {
+                run_as.groupname = Some(gr.name);
+                run_as.gid = Some(gr.gid.as_raw());
+            } else if let Some(pw) = pw.as_ref() {
+                if let Ok(Some(gr)) = Group::from_gid(pw.gid) {
+                    run_as.groupname = Some(gr.name);
+                }
+                run_as.gid = Some(pw.gid.as_raw());
+            }
+        }
+    }
+
+    Ok(run_as)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Capability retention (dnsmasq.c:519-597, 747-819)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// The Linux capabilities upstream keeps across the `setuid()` so that the
+/// unprivileged daemon can still do the privileged things it needs to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NeededCaps {
+    /// `CAP_NET_ADMIN` — injecting ARP cache entries for DHCP replies.
+    pub net_admin: bool,
+    /// `CAP_NET_RAW` — the ICMP ping used for DHCP address-conflict detection,
+    /// and `SO_BINDTODEVICE` on per-interface upstream servers.
+    pub net_raw: bool,
+    /// `CAP_NET_BIND_SERVICE` — binding privileged ports after the drop.
+    pub net_bind_service: bool,
+}
+
+impl NeededCaps {
+    /// True when no capability at all has to survive the `setuid()`.
+    pub fn is_empty(&self) -> bool {
+        !self.net_admin && !self.net_raw && !self.net_bind_service
+    }
+}
+
+/// Work out which capabilities must survive the privilege drop.
+///
+/// Mirrors dnsmasq.c:326-333 (DHCP needs `NET_RAW` for the conflict-detection
+/// ping unless `--no-ping`, and `NET_ADMIN` for ARP injection) and dnsmasq.c:539
+/// (an upstream server pinned to an interface re-issues `SO_BINDTODEVICE` per
+/// TCP connection).  `CAP_NET_BIND_SERVICE` is *not* requested for the ordinary
+/// listening sockets: those are bound before the drop, exactly as upstream does.
+pub fn needed_capabilities(daemon: &Daemon) -> NeededCaps {
+    let mut caps = NeededCaps::default();
+
+    #[cfg(feature = "dhcp")]
+    if !daemon.dhcp.is_empty() {
+        if !daemon.option_bool(crate::types::constants::OPT_NO_PING) {
+            caps.net_raw = true;
+        }
+        caps.net_admin = true;
+    }
+
+    if daemon.servers.iter().any(|s| !s.interface.is_empty()) {
+        caps.net_raw = true;
+    }
+
+    caps
+}
+
+/// Restrict the process's permitted and effective capability sets to `caps`
+/// (plus `CAP_SETUID` while the `setuid()` is still pending).
+///
+/// The two sets are narrowed effective-first: the kernel requires the effective
+/// set to stay a subset of the permitted set, and the `caps` crate issues one
+/// `capset(2)` per set rather than upstream's single combined call.
+#[cfg(target_os = "linux")]
+fn apply_capabilities(wanted: NeededCaps, keep_setuid: bool) -> Result<(), DnsmasqError> {
+    use caps::{CapSet, Capability, CapsHashSet};
+
+    let mut set = CapsHashSet::new();
+    if wanted.net_admin {
+        set.insert(Capability::CAP_NET_ADMIN);
+    }
+    if wanted.net_raw {
+        set.insert(Capability::CAP_NET_RAW);
+    }
+    if wanted.net_bind_service {
+        set.insert(Capability::CAP_NET_BIND_SERVICE);
+    }
+    if keep_setuid {
+        set.insert(Capability::CAP_SETUID);
+    }
+
+    for which in [CapSet::Effective, CapSet::Permitted] {
+        caps::set(None, which, &set)
+            .map_err(|e| DnsmasqError::PrivilegeDrop(format!("capset({which:?}): {e}")))?;
+    }
+    Ok(())
+}
+
+/// Drop process privileges to the given `uid`/`gid`, keeping no capabilities.
+///
+/// Passing the current process's own uid/gid is always a no-op and succeeds.
+/// See [`drop_privileges_with`] for the full upstream sequence.
 pub fn drop_privileges(uid: u32, gid: u32) -> Result<(), DnsmasqError> {
+    drop_privileges_with(&RunAs {
+        uid: Some(uid),
+        gid: Some(gid),
+        ..Default::default()
+    }, NeededCaps::default())
+}
+
+/// Drop to `run_as`, retaining `caps` across the `setuid()`.
+///
+/// Follows dnsmasq.c:747-819 step for step:
+/// 1. `setgroups(0, …)` — strip every supplementary group, so a group the
+///    invoking root shell happened to be in cannot be used afterwards.
+/// 2. `setgid()`.
+/// 3. `capset()` + `prctl(PR_SET_KEEPCAPS, 1)` — ask the kernel not to clear
+///    the permitted set when the euid stops being 0.
+/// 4. `setuid()`.
+/// 5. `capset()` again, now without `CAP_SETUID`, so root cannot be regained.
+///
+/// Steps 3 and 5 are Linux-only; elsewhere this is just setgroups/setgid/setuid.
+/// Upstream skips the uid half entirely when the target uid is 0.
+pub fn drop_privileges_with(run_as: &RunAs, caps: NeededCaps) -> Result<(), DnsmasqError> {
     use nix::unistd::{Gid, Uid};
 
     let current_uid = nix::unistd::getuid();
     let current_gid = nix::unistd::getgid();
 
-    // No-op when already running as the target uid/gid.
-    if current_uid == Uid::from_raw(uid) && current_gid == Gid::from_raw(gid) {
+    // Upstream only reaches this code as root (dnsmasq.c:747).  When we are
+    // not, asking for the identity we already have is a no-op — setgroups(2)
+    // would only fail with EPERM, and there is nothing to strip that we could
+    // not simply re-acquire.  Note the guard is deliberately *not* applied when
+    // we are root: `--user root --group root` must still clear the
+    // supplementary groups inherited from the invoking shell, exactly as
+    // upstream's unconditional `setgroups(0, &dummy)` does.
+    let already_there = run_as.uid.is_none_or(|u| current_uid == Uid::from_raw(u))
+        && run_as.gid.is_none_or(|g| current_gid == Gid::from_raw(g));
+    if already_there && !current_uid.is_root() {
         return Ok(());
     }
 
-    // Set GID first (must be done before dropping root).
-    nix::unistd::setgid(Gid::from_raw(gid))
-        .map_err(|e| DnsmasqError::PrivilegeDrop(format!("setgid({gid}): {e}")))?;
+    if let Some(gid) = run_as.gid {
+        nix::unistd::setgroups(&[])
+            .map_err(|e| DnsmasqError::PrivilegeDrop(format!("setgroups(0): {e}")))?;
+        nix::unistd::setgid(Gid::from_raw(gid))
+            .map_err(|e| DnsmasqError::PrivilegeDrop(format!("setgid({gid}): {e}")))?;
+    }
+
+    // "if (ent_pw && ent_pw->pw_uid != 0)" — dropping to root is not a drop.
+    let Some(uid) = run_as.uid.filter(|u| *u != 0) else {
+        return Ok(());
+    };
+
+    #[cfg(target_os = "linux")]
+    {
+        apply_capabilities(caps, true)?;
+        if unsafe { libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) } == -1 {
+            return Err(DnsmasqError::PrivilegeDrop(format!(
+                "prctl(PR_SET_KEEPCAPS): {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
 
     nix::unistd::setuid(Uid::from_raw(uid))
         .map_err(|e| DnsmasqError::PrivilegeDrop(format!("setuid({uid}): {e}")))?;
 
+    #[cfg(target_os = "linux")]
+    apply_capabilities(caps, false)?;
+
     Ok(())
 }
 
-/// Write the current process PID to `path`.
-pub fn write_pid_file(path: &str, pid: u32) -> Result<(), DnsmasqError> {
+/// Write `pid` to `path`, mirroring the pid-file handling at dnsmasq.c:658-717.
+///
+/// `owner` is the `(uid, gid)` the file is `fchown`ed to while we are still
+/// root, so that systemd sees a pid file owned by the same user as the daemon.
+///
+/// The file is `unlink`ed and then created with `O_EXCL`: if an attacker with
+/// the run user's privileges replaced the pid file with a symlink, the open
+/// fails rather than truncating the symlink's target as root.
+pub fn write_pid_file_as(path: &str, pid: u32, owner: Option<(u32, u32)>) -> Result<(), DnsmasqError> {
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::io::AsRawFd as _;
 
-    let mut f = std::fs::File::create(path)
+    let _ = std::fs::remove_file(path);
+
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(path)
         .map_err(|e| DnsmasqError::PidFile(format!("create {path}: {e}")))?;
+
+    if let Some((uid, gid)) = owner {
+        // Best effort, exactly as upstream: a failed fchown is warned about,
+        // not fatal (dnsmasq.c:698 sets chown_warn).
+        if let Err(e) = nix::unistd::fchown(
+            f.as_raw_fd(),
+            Some(nix::unistd::Uid::from_raw(uid)),
+            Some(nix::unistd::Gid::from_raw(gid)),
+        ) {
+            tracing::warn!("cannot chown pid file {path} to {uid}:{gid}: {e}");
+        }
+    }
+
     writeln!(f, "{pid}")
         .map_err(|e| DnsmasqError::PidFile(format!("write {path}: {e}")))?;
     Ok(())
+}
+
+/// Write the current process PID to `path`, leaving its ownership alone.
+pub fn write_pid_file(path: &str, pid: u32) -> Result<(), DnsmasqError> {
+    write_pid_file_as(path, pid, None)
 }
 
 /// Read a PID from the file at `path`.
@@ -103,44 +346,16 @@ pub fn read_pid_file(path: &str) -> Result<u32, DnsmasqError> {
 // Process daemonization
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Daemonize the current process (double-fork, new session, redirect std fds).
-///
-/// This implements the standard Unix daemon idiom:
-/// 1. First `fork()` — the parent exits.
-/// 2. `setsid()` — become a session leader, detach from the controlling terminal.
-/// 3. Second `fork()` — ensure we are not a session leader (cannot reacquire tty).
-/// 4. Redirect stdin/stdout/stderr to `/dev/null`.
-/// 5. Change working directory to `/`.
-///
-/// **Must be called before any tokio runtime is started** (tokio is not
-/// fork-safe).
-///
-/// Returns `Ok(())` in the grandchild (the actual daemon).
-/// The intermediate parent and original parent both exit cleanly.
-#[cfg(unix)]
-pub fn daemonize() -> Result<(), DnsmasqError> {
-    use nix::unistd::{dup2, fork, setsid, ForkResult};
+/// Change the working directory to `/` so the daemon does not pin a mount
+/// point (dnsmasq.c:615).
+pub fn chdir_root() -> Result<(), DnsmasqError> {
+    std::env::set_current_dir("/").map_err(|e| DnsmasqError::Daemonize(e.to_string()))
+}
 
-    // First fork.
-    match unsafe { fork() }.map_err(|e| DnsmasqError::Daemonize(e.to_string()))? {
-        ForkResult::Parent { .. } => std::process::exit(0),
-        ForkResult::Child => {}
-    }
+/// Point stdin/stdout/stderr at `/dev/null` (dnsmasq.c:724-733).
+pub fn redirect_stdio_to_devnull() -> Result<(), DnsmasqError> {
+    use nix::unistd::dup2;
 
-    // Create new session.
-    setsid().map_err(|e| DnsmasqError::Daemonize(e.to_string()))?;
-
-    // Second fork (prevents re-acquiring a controlling terminal).
-    match unsafe { fork() }.map_err(|e| DnsmasqError::Daemonize(e.to_string()))? {
-        ForkResult::Parent { .. } => std::process::exit(0),
-        ForkResult::Child => {}
-    }
-
-    // Change to root directory so we don't hold a mount point.
-    std::env::set_current_dir("/")
-        .map_err(|e| DnsmasqError::Daemonize(e.to_string()))?;
-
-    // Redirect stdin/stdout/stderr to /dev/null using libc directly.
     let devnull = unsafe {
         libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDWR)
     };
@@ -153,7 +368,124 @@ pub fn daemonize() -> Result<(), DnsmasqError> {
     if devnull > 2 {
         unsafe { libc::close(devnull) };
     }
+    Ok(())
+}
 
+/// The write end of upstream's `err_pipe` (dnsmasq.c:625-641).
+///
+/// After the fork the process the user invoked is still alive, blocked reading
+/// the other end.  It stays blocked — so `dnsmasq &&  something-else` and
+/// systemd's `Type=forking` both see startup as complete only when it really
+/// is — until the daemon either calls [`ready`](StartupPipe::ready) or reports
+/// a fatal error through [`fail`](StartupPipe::fail).
+///
+/// A [`disabled`](StartupPipe::disabled) pipe is the `-d`/`-k` case, where
+/// there was no fork and stderr still belongs to the user.
+#[derive(Debug)]
+pub struct StartupPipe {
+    write_fd: Option<std::os::fd::OwnedFd>,
+}
+
+impl StartupPipe {
+    /// A pipe for a process that never forked: errors go straight to stderr.
+    pub fn disabled() -> Self {
+        Self { write_fd: None }
+    }
+
+    /// Report a fatal startup error to the invoking process and exit.
+    ///
+    /// Never returns.  Upstream's equivalent (`send_event` then `_exit`) is
+    /// likewise terminal: past the fork there is nobody left to unwind to.
+    ///
+    /// The message always goes to the log as well.  By the time this can fire,
+    /// stderr may already be `/dev/null` — that is true of the `-k` path, which
+    /// never forks and so has no pipe either — and upstream does not lose the
+    /// diagnostic there: `fatal_event` reaches `die`, which reaches syslog.
+    pub fn fail(self, msg: &str) -> ! {
+        crate::log::my_syslog(crate::log::LOG_CRIT, msg);
+        match self.write_fd {
+            Some(fd) => {
+                use std::io::Write as _;
+                let mut f = std::fs::File::from(fd);
+                let _ = f.write_all(msg.as_bytes());
+                let _ = f.flush();
+            }
+            // Without a log sink the record above went nowhere; say it plainly.
+            None if !crate::log::sink_installed() => eprintln!("dnsmasq-rs: {msg}"),
+            None => {}
+        }
+        std::process::exit(1);
+    }
+
+    /// Startup finished: release the invoking process with a success status.
+    pub fn ready(self) {
+        drop(self.write_fd);
+    }
+}
+
+/// Fork into the background: `fork` → `setsid` → `fork` (dnsmasq.c:617-655).
+///
+/// Only the grandchild returns; it gets the [`StartupPipe`] that keeps the
+/// original process waiting.  The two ancestors exit — the first once the
+/// grandchild signals it is up, the second immediately.
+///
+/// **Must be called before any tokio runtime is started**: `fork()` gives the
+/// child only the calling thread, so a forked reactor would deadlock.
+#[cfg(unix)]
+pub fn fork_into_background() -> Result<StartupPipe, DnsmasqError> {
+    use nix::unistd::{fork, pipe, setsid, ForkResult};
+    use std::io::Read as _;
+
+    let (read_fd, write_fd) =
+        pipe().map_err(|e| DnsmasqError::Daemonize(format!("pipe: {e}")))?;
+
+    match unsafe { fork() }.map_err(|e| DnsmasqError::Daemonize(e.to_string()))? {
+        ForkResult::Parent { .. } => {
+            drop(write_fd);
+            let mut msg = String::new();
+            let _ = std::fs::File::from(read_fd).read_to_string(&mut msg);
+            if msg.is_empty() {
+                std::process::exit(0);
+            }
+            eprintln!("dnsmasq-rs: {}", msg.trim_end());
+            std::process::exit(1);
+        }
+        ForkResult::Child => {}
+    }
+    drop(read_fd);
+
+    setsid().map_err(|e| DnsmasqError::Daemonize(e.to_string()))?;
+
+    // Second fork: the daemon must not be a session leader, or it could
+    // reacquire a controlling terminal.
+    match unsafe { fork() }.map_err(|e| DnsmasqError::Daemonize(e.to_string()))? {
+        // The intermediate parent must not run any cleanup the grandchild
+        // still owns — `_exit` skips atexit handlers and stdio flushing.
+        ForkResult::Parent { .. } => unsafe { libc::_exit(0) },
+        ForkResult::Child => {}
+    }
+
+    Ok(StartupPipe { write_fd: Some(write_fd) })
+}
+
+/// Daemonize the current process (double-fork, new session, `chdir("/")`,
+/// redirect std fds) and release the invoking process immediately.
+///
+/// This is the whole-sequence convenience form.  `src/main.rs` drives the
+/// individual steps instead, because upstream interleaves the pid-file write
+/// between the fork and the stdio redirect.
+///
+/// **Must be called before any tokio runtime is started** (tokio is not
+/// fork-safe).
+///
+/// Returns `Ok(())` in the grandchild (the actual daemon).
+#[cfg(unix)]
+pub fn daemonize() -> Result<(), DnsmasqError> {
+    // chdir first, as upstream does (dnsmasq.c:615) — the fork inherits it.
+    chdir_root()?;
+    let startup = fork_into_background()?;
+    redirect_stdio_to_devnull()?;
+    startup.ready();
     Ok(())
 }
 
@@ -270,7 +602,86 @@ fn daemon_dhcp_runtime(daemon: &Daemon) -> Option<DhcpDaemonRuntime> {
     })
 }
 
-/// Run the main daemon event loop.
+/// Sockets bound up-front by [`bind_listeners`].
+///
+/// Upstream creates its listeners (dnsmasq.c:393-409) and DHCP sockets
+/// (dnsmasq.c:325) long before it forks or drops root, so that privileged
+/// ports are claimed while it is still root and a bind failure can still be
+/// reported on the invoking terminal.  Holding them in a plain value lets
+/// `main` do the same and hand them to [`run_main_loop_with`] afterwards.
+///
+/// The sockets are `std` rather than `tokio` types on purpose: they are bound
+/// before the runtime exists, and they have to survive a `fork()`.
+#[derive(Debug)]
+pub struct Listeners {
+    dns: std::net::UdpSocket,
+    #[cfg(feature = "dhcp")]
+    dhcp: Option<std::net::UdpSocket>,
+}
+
+/// Bind every socket the daemon serves from, before forking and before the
+/// privilege drop.
+pub fn bind_listeners(daemon: &Daemon) -> Result<Listeners, DnsmasqError> {
+    let bind_addr = format!("0.0.0.0:{}", daemon.port);
+    let dns = std::net::UdpSocket::bind(&bind_addr)
+        .map_err(|e| DnsmasqError::Bind(bind_addr.clone(), e.to_string()))?;
+    dns.set_nonblocking(true)?;
+
+    #[cfg(feature = "dhcp")]
+    let dhcp = match daemon_dhcp_runtime(daemon) {
+        Some(runtime) => {
+            let addr = runtime.bind_addr;
+            let sock = std::net::UdpSocket::bind(addr)
+                .map_err(|e| DnsmasqError::Bind(addr.to_string(), e.to_string()))?;
+            sock.set_nonblocking(true)?;
+            #[cfg(target_os = "linux")]
+            if let Some(device) = runtime.bind_interface.as_deref() {
+                bind_dhcp_socket_to_device(&sock, device)?;
+            }
+            Some(sock)
+        }
+        None => None,
+    };
+
+    Ok(Listeners {
+        dns,
+        #[cfg(feature = "dhcp")]
+        dhcp,
+    })
+}
+
+/// Adopt a socket that was bound before the runtime existed, or bind one now.
+async fn adopt_or_bind(
+    prebound: Option<std::net::UdpSocket>,
+    bind_addr: &str,
+) -> std::io::Result<tokio::net::UdpSocket> {
+    match prebound {
+        Some(sock) => tokio::net::UdpSocket::from_std(sock),
+        None => tokio::net::UdpSocket::bind(bind_addr).await,
+    }
+}
+
+#[cfg(all(feature = "dhcp", target_os = "linux"))]
+fn bind_dhcp_socket_to_device(
+    sock: &impl std::os::unix::io::AsRawFd,
+    device: &str,
+) -> Result<(), DnsmasqError> {
+    use tracing::{info, warn};
+
+    match crate::dhcp_common::bindtodevice(device, sock.as_raw_fd()) {
+        Ok(true) => info!("bound DHCP socket to interface {device}"),
+        Ok(false) => warn!("permission denied binding DHCP socket to interface {device}; continuing"),
+        Err(e) => {
+            return Err(DnsmasqError::Bind(
+                format!("interface {device}"),
+                e.to_string(),
+            ))
+        }
+    }
+    Ok(())
+}
+
+/// Run the main daemon event loop, binding its own sockets.
 ///
 /// This function:
 /// 1. Binds a UDP DNS socket on `0.0.0.0:{port}`.
@@ -286,15 +697,24 @@ pub async fn run_main_loop(
     daemon_handle: DaemonHandle,
     sighup_tx: Option<tokio::sync::mpsc::Sender<()>>,
 ) -> RunResult {
+    run_main_loop_with(daemon_handle, sighup_tx, None).await
+}
+
+/// Run the main daemon event loop over sockets that were bound earlier.
+///
+/// `listeners` is `Some` when `main` bound them before forking and dropping
+/// root (the upstream order); `None` makes this bind them itself, which is what
+/// [`run_main_loop`] and the in-process tests do.
+pub async fn run_main_loop_with(
+    daemon_handle: DaemonHandle,
+    sighup_tx: Option<tokio::sync::mpsc::Sender<()>>,
+    listeners: Option<Listeners>,
+) -> RunResult {
     use std::sync::Arc;
-    use tokio::net::UdpSocket;
     #[cfg(feature = "dhcp")]
     use tokio::sync::watch;
     use tokio::signal::unix::{signal, SignalKind};
     use tracing::{error, info};
-    // `warn!` is only reached from the DHCP socket-bind path below.
-    #[cfg(feature = "dhcp")]
-    use tracing::warn;
 
     use crate::forward::{ForwardConfig, ForwardEngine, run_forward_loop};
     #[cfg(feature = "dhcp")]
@@ -317,9 +737,17 @@ pub async fn run_main_loop(
         (d.port, ups, local_data, cache_size, dhcp_runtime)
     };
 
-    // ── Bind the DNS listening socket ────────────────────────────────────────
+    // ── Adopt or bind the DNS listening socket ───────────────────────────────
+    #[cfg(feature = "dhcp")]
+    let (prebound_dns, prebound_dhcp) = match listeners {
+        Some(l) => (Some(l.dns), l.dhcp),
+        None => (None, None),
+    };
+    #[cfg(not(feature = "dhcp"))]
+    let prebound_dns = listeners.map(|l| l.dns);
+
     let bind_addr = format!("0.0.0.0:{port}");
-    let client_sock = match UdpSocket::bind(&bind_addr).await {
+    let client_sock = match adopt_or_bind(prebound_dns, &bind_addr).await {
         Ok(s) => Arc::new(s),
         Err(e) => {
             error!("failed to bind UDP socket on {bind_addr}: {e}");
@@ -345,7 +773,9 @@ pub async fn run_main_loop(
     #[cfg(feature = "dhcp")]
     let (dhcp_task, dhcp_shutdown_tx) = if let Some(dhcp_runtime) = dhcp_runtime {
         let bind_addr = dhcp_runtime.bind_addr;
-        let dhcp_sock = match UdpSocket::bind(bind_addr).await {
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+        let already_bound = prebound_dhcp.is_some();
+        let dhcp_sock = match adopt_or_bind(prebound_dhcp, &bind_addr.to_string()).await {
             Ok(s) => Arc::new(s),
             Err(e) => {
                 error!("failed to bind DHCP socket on {bind_addr}: {e}");
@@ -354,13 +784,12 @@ pub async fn run_main_loop(
             }
         };
         info!("listening for DHCP packets on {bind_addr}");
-        #[cfg(all(unix, target_os = "linux"))]
-        if let Some(device) = dhcp_runtime.bind_interface.as_deref() {
-            use std::os::unix::io::AsRawFd;
-            match crate::dhcp_common::bindtodevice(device, dhcp_sock.as_raw_fd()) {
-                Ok(true) => info!("bound DHCP socket to interface {device}"),
-                Ok(false) => warn!("permission denied binding DHCP socket to interface {device}; continuing"),
-                Err(e) => {
+        // A pre-bound socket already went through `bind_listeners`, which does
+        // the SO_BINDTODEVICE while the process is still privileged.
+        #[cfg(target_os = "linux")]
+        if !already_bound {
+            if let Some(device) = dhcp_runtime.bind_interface.as_deref() {
+                if let Err(e) = bind_dhcp_socket_to_device(dhcp_sock.as_ref(), device) {
                     error!("failed to bind DHCP socket to interface {device}: {e}");
                     fwd_task.abort();
                     return RunResult::IoError;
@@ -663,6 +1092,69 @@ impl IcmpPinger {
 mod tests {
     use super::*;
 
+    /// A minimal upstream server entry; `Server` has no `Default`.
+    fn test_server(interface: &str) -> crate::types::server::Server {
+        use crate::types::addr::MySockAddr;
+        use crate::types::server::Server;
+
+        let addr = MySockAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53));
+        Server {
+            flags: 0,
+            domain: String::new(),
+            source_addr: addr.clone(),
+            addr,
+            interface: interface.to_string(),
+            ifindex: 0,
+            queries: 0,
+            failed_queries: 0,
+            nxdomain_replies: 0,
+            retrys: 0,
+            query_latency: 0,
+            mma_latency: 0,
+            forwardtime: None,
+            forwardcount: 0,
+            tcpfd: -1,
+            serial: 0,
+            arrayposn: -1,
+            last_server: 0,
+            #[cfg(feature = "loop")]
+            uid: 0,
+        }
+    }
+
+    #[cfg(feature = "dhcp")]
+    fn test_dhcp_context() -> crate::types::dhcp::DhcpContext {
+        use crate::types::dhcp::{DhcpContext, DhcpNetid, CONTEXT_DHCP};
+
+        DhcpContext {
+            lease_time: 3600,
+            addr_epoch: 0,
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::new(10, 0, 0, 255),
+            local: Ipv4Addr::UNSPECIFIED,
+            router: Ipv4Addr::new(10, 0, 0, 1),
+            start: Ipv4Addr::new(10, 0, 0, 100),
+            end: Ipv4Addr::new(10, 0, 0, 150),
+            flags: CONTEXT_DHCP,
+            netid: DhcpNetid { net: "default".into() },
+            filter: vec![],
+            #[cfg(feature = "dhcp6")]
+            start6: std::net::Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            end6: std::net::Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            local6: std::net::Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            prefix: 0,
+            #[cfg(feature = "dhcp6")]
+            if_index: 0,
+            #[cfg(feature = "dhcp6")]
+            valid: 0,
+            #[cfg(feature = "dhcp6")]
+            preferred: 0,
+        }
+    }
+
     #[test]
     fn init_daemon_returns_handle() {
         let handle = init_daemon();
@@ -694,11 +1186,236 @@ mod tests {
     }
 
     #[test]
-    fn drop_privileges_noop_for_current_user() {
+    fn drop_privileges_succeeds_for_the_current_user() {
         let uid = nix::unistd::getuid().as_raw();
         let gid = nix::unistd::getgid().as_raw();
-        // Should succeed without any syscall since uid/gid already match.
+        // Unprivileged: a pure no-op, since there is nothing to drop to.  As
+        // root it really does run setgroups(0)/setgid, which is upstream's
+        // behavior for `--user root` and must still succeed.
         drop_privileges(uid, gid).expect("drop_privileges failed for current user");
+    }
+
+    #[test]
+    fn drop_privileges_with_empty_run_as_is_a_noop() {
+        // Nothing configured — upstream skips both setgid and setuid.
+        drop_privileges_with(&RunAs::default(), NeededCaps::default())
+            .expect("an empty RunAs should not attempt any syscall");
+    }
+
+    // ── pid file ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn write_pid_file_replaces_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dnsmasq.pid");
+        let path_str = path.to_str().unwrap();
+
+        std::fs::write(&path, "99999\n").unwrap();
+        write_pid_file(path_str, 4242).expect("write_pid_file failed");
+        assert_eq!(read_pid_file(path_str).unwrap(), 4242);
+    }
+
+    /// dnsmasq.c:680-694 — the pid file is unlinked and reopened with `O_EXCL`
+    /// so that a symlink planted by the (unprivileged) run user cannot be
+    /// followed and have its target overwritten as root.
+    #[test]
+    fn write_pid_file_does_not_follow_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        let link = dir.path().join("dnsmasq.pid");
+        std::fs::write(&victim, "precious\n").unwrap();
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        write_pid_file(link.to_str().unwrap(), 4242).expect("write_pid_file failed");
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "precious\n",
+            "the symlink target must not have been written through"
+        );
+        assert_eq!(read_pid_file(link.to_str().unwrap()).unwrap(), 4242);
+        assert!(!std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn write_pid_file_is_world_readable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dnsmasq.pid");
+        write_pid_file(path.to_str().unwrap(), 1).expect("write_pid_file failed");
+
+        // S_IWUSR|S_IRUSR|S_IRGRP|S_IROTH (dnsmasq.c:684).  The umask still
+        // applies — it does to upstream's `open()` too — so assert on what the
+        // umask cannot add rather than on the exact 0644: the owner must be
+        // able to read and write it, and nobody may gain write or execute.
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode & 0o600, 0o600, "owner needs rw on the pid file, got {mode:o}");
+        assert_eq!(mode & 0o133, 0, "pid file must not be executable or group/other-writable, got {mode:o}");
+        assert_eq!(mode & !0o644, 0, "pid file mode must be a subset of 0644, got {mode:o}");
+    }
+
+    #[test]
+    fn write_pid_file_reports_an_unwritable_directory() {
+        let err = write_pid_file("/proc/dnsmasq_rs_no_such_dir/pid", 1).unwrap_err();
+        assert!(matches!(err, DnsmasqError::PidFile(_)));
+    }
+
+    // ── run-as resolution (dnsmasq.c:499-517) ────────────────────────────────
+
+    #[test]
+    fn resolve_run_as_rejects_an_unknown_user() {
+        let daemon = Daemon {
+            username: Some("dnsmasq-rs-definitely-no-such-user".into()),
+            ..Default::default()
+        };
+        let err = resolve_run_as(&daemon).unwrap_err().to_string();
+        assert!(err.contains("unknown user or group"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn resolve_run_as_rejects_an_unknown_group() {
+        let daemon = Daemon {
+            username: None,
+            groupname: Some("dnsmasq-rs-definitely-no-such-group".into()),
+            ..Default::default()
+        };
+        let err = resolve_run_as(&daemon).unwrap_err().to_string();
+        assert!(err.contains("unknown user or group"), "unexpected message: {err}");
+    }
+
+    /// With no `user=` there is no uid to drop to, and no primary group to fall
+    /// back to either — but upstream still looks `CHGRP` up unconditionally, so
+    /// a gid may or may not come out depending on whether the host has it.
+    #[test]
+    fn resolve_run_as_without_a_user_resolves_no_uid() {
+        let run_as = resolve_run_as(&Daemon::default()).expect("no user is not an error");
+        assert_eq!(run_as.uid, None);
+        assert_eq!(run_as.username, None);
+        match nix::unistd::Group::from_name(CHGRP).ok().flatten() {
+            Some(gr) => assert_eq!(run_as.gid, Some(gr.gid.as_raw()), "expected the {CHGRP} group"),
+            None => assert_eq!(run_as.gid, None, "no {CHGRP} and no user: nothing to fall back to"),
+        }
+    }
+
+    /// "root" is the one account guaranteed to exist, so it is what we can pin
+    /// the happy path against without depending on the host's user database.
+    #[test]
+    fn resolve_run_as_resolves_a_known_user_and_defaults_the_group() {
+        let daemon = Daemon { username: Some("root".into()), ..Default::default() };
+        let run_as = resolve_run_as(&daemon).expect("root should resolve");
+        assert_eq!(run_as.uid, Some(0));
+        assert_eq!(run_as.username.as_deref(), Some("root"));
+        // Either CHGRP exists, or we fall back to root's primary group; both
+        // yield a gid.  Which one it is depends on the host.
+        assert!(run_as.gid.is_some(), "the group should have been defaulted");
+        if nix::unistd::Group::from_name(CHGRP).ok().flatten().is_none() {
+            assert_eq!(run_as.gid, Some(0), "no {CHGRP} group: expected root's primary group");
+        }
+    }
+
+    #[test]
+    fn resolve_run_as_prefers_an_explicit_group_over_the_default() {
+        let Ok(Some(root_group)) = nix::unistd::Group::from_gid(nix::unistd::Gid::from_raw(0))
+        else {
+            eprintln!("skipping: gid 0 has no name on this system");
+            return;
+        };
+        let daemon = Daemon {
+            username: Some("root".into()),
+            groupname: Some(root_group.name.clone()),
+            ..Default::default()
+        };
+        let run_as = resolve_run_as(&daemon).expect("root group should resolve");
+        assert_eq!(run_as.gid, Some(0));
+        assert_eq!(run_as.groupname.as_deref(), Some(root_group.name.as_str()));
+    }
+
+    // ── capability requirements (dnsmasq.c:326-333, 537-540) ─────────────────
+
+    #[test]
+    fn needed_capabilities_empty_for_a_plain_resolver() {
+        assert!(needed_capabilities(&Daemon::default()).is_empty());
+    }
+
+    #[test]
+    fn needed_capabilities_wants_net_raw_for_an_interface_bound_server() {
+        let mut daemon = Daemon::default();
+        daemon.servers.push(test_server(""));
+        assert!(needed_capabilities(&daemon).is_empty(), "a plain server needs nothing");
+
+        daemon.servers.push(test_server("eth0"));
+        let caps = needed_capabilities(&daemon);
+        assert!(caps.net_raw, "SO_BINDTODEVICE per TCP connection needs CAP_NET_RAW");
+        assert!(!caps.net_admin);
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn needed_capabilities_for_dhcp_follows_no_ping() {
+        use crate::types::constants::OPT_NO_PING;
+
+        let mut daemon = Daemon::default();
+        daemon.dhcp.push(test_dhcp_context());
+
+        let caps = needed_capabilities(&daemon);
+        assert!(caps.net_admin, "ARP injection needs CAP_NET_ADMIN");
+        assert!(caps.net_raw, "the conflict-detection ping needs CAP_NET_RAW");
+
+        daemon.set_option(OPT_NO_PING);
+        let caps = needed_capabilities(&daemon);
+        assert!(caps.net_admin);
+        assert!(!caps.net_raw, "--no-ping removes the only CAP_NET_RAW user");
+    }
+
+    // ── pre-bound listeners ──────────────────────────────────────────────────
+
+    /// Binding is what `main` does before the fork and before `setuid`.  Port 0
+    /// keeps this runnable without privileges.
+    #[test]
+    fn bind_listeners_binds_the_dns_socket_before_the_runtime_exists() {
+        let daemon = Daemon { port: 0, ..Default::default() };
+        let listeners = bind_listeners(&daemon).expect("binding port 0 should always work");
+        let addr = listeners.dns.local_addr().expect("local_addr");
+        assert_ne!(addr.port(), 0, "the kernel should have assigned a port");
+    }
+
+    #[test]
+    fn bind_listeners_reports_a_port_already_in_use() {
+        let held = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+
+        let daemon = Daemon { port, ..Default::default() };
+        let err = bind_listeners(&daemon).unwrap_err();
+        assert!(matches!(err, DnsmasqError::Bind(..)), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn run_main_loop_serves_on_a_pre_bound_socket() {
+        let listeners = bind_listeners(&Daemon { port: 0, ..Default::default() }).unwrap();
+        let port = listeners.dns.local_addr().unwrap().port();
+
+        let daemon = Daemon { port, ..Default::default() };
+        let task = tokio::spawn(run_main_loop_with(
+            init_daemon_with(daemon),
+            None,
+            Some(listeners),
+        ));
+
+        // If the pre-bound socket were dropped and rebound, this would race or
+        // fail; if it is adopted, the port stays claimed for the whole run.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!task.is_finished(), "the loop should still be serving");
+        assert!(
+            std::net::UdpSocket::bind(("0.0.0.0", port)).is_err(),
+            "port {port} should still be held by the adopted socket"
+        );
+        task.abort();
+    }
+
+    #[test]
+    fn startup_pipe_disabled_has_no_write_end() {
+        assert!(StartupPipe::disabled().write_fd.is_none());
     }
 
     // ── local-data snapshot ───────────────────────────────────────────────────

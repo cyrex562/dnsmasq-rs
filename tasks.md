@@ -104,6 +104,80 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     (`dnsmasq::on_sighup` / `clear_cache_and_reload`) must also republish the snapshot —
     a shared `ArcSwap`/`watch` channel rather than a moved clone.
 
+- [x] Wire daemonization, pid-file writing and privilege dropping into `src/main.rs`.
+  `main` is no longer `#[tokio::main]`: it runs the upstream startup sequence
+  (`dnsmasq.c:499-820`) synchronously and only then builds the tokio runtime, because
+  `fork()` is unsound once the reactor and its worker threads exist. The order is
+  upstream's — resolve `user=`/`group=` → bind listeners → `chdir("/")` → double-fork +
+  `setsid` → write the pid file → stdio to `/dev/null` → drop privileges → main loop.
+
+  Listeners are now bound by `dnsmasq::bind_listeners` *before* the fork and the drop
+  (upstream does the same at `dnsmasq.c:325-409`), so port 53 is claimed while the
+  process is still root and a bind failure is still reportable on the invoking terminal.
+  `run_main_loop_with` adopts those sockets; `run_main_loop` still binds its own, which
+  is what the in-process tests use.
+
+  Also landed: `setgroups(0, ...)` supplementary-group clearing, `PR_SET_KEEPCAPS` +
+  `capset` capability retention across the `setuid` (with `CAP_SETUID` dropped
+  afterwards), `unlink` + `O_EXCL` symlink-race protection and `fchown` on the pid file,
+  an `err_pipe` equivalent (`dnsmasq::StartupPipe`) so the invoking shell blocks until
+  startup finishes and sees fatal startup errors, and `username`/`runfile` defaulting to
+  `CHUSER` ("nobody") and `RUNFILE` (`/var/run/dnsmasq.pid`) as upstream's `read_opts`
+  does (option.c:5976-5977). Those two are seeded *before* the config lines are applied,
+  not filled in afterwards, so `user=`/`pid-file=` with an empty value clears them the
+  way `opt_string_alloc` (option.c:677-691) does. Covered by
+  `tests/daemon_startup_integration.rs` plus unit tests in `src/dnsmasq.rs`.
+
+  `log::log_start` is now called from `main.rs` too, before the `/dev/null` redirect, and
+  installs the `tracing` sink — so `log-facility=<file>` receives the daemon's ordinary
+  output and a backgrounded or `-k` daemon is not silent. `StartupPipe::fail` reports
+  through that sink as well, which is what upstream's `fatal_event` → `die` → syslog path
+  gives the `-k` case, where there is neither a pipe nor a usable stderr.
+
+  Two flag-semantics fixes came with it: `--no-daemon`/`-d` now sets `OPT_DEBUG`
+  (`option.c:428`), not `OPT_NO_FORK`, so it suppresses the pid file, the stdio redirect
+  and the privilege drop as well as the fork; `-k`/`--keep-in-foreground` was added for
+  `OPT_NO_FORK` (`option.c:456`) and was previously missing entirely.
+
+  Explicitly **not** covered — upstream behavior still missing:
+
+  - `need_cap_net_admin`/`need_cap_net_raw` are approximated: a DHCP context implies
+    `NET_ADMIN` and (unless `--no-ping`) `NET_RAW`, ignoring the `force_broadcast` list
+    (`dnsmasq.c:332`), and the DHCPv6/RA, ipset, nftset, DBus and UBus contributors have
+    no Rust equivalent yet. `CAP_NET_BIND_SERVICE` is never requested, because nothing
+    binds after the drop — once `bind-dynamic`/DAD deferred binds exist it must be.
+  - `server=<addr>@<interface>` is not parsed at all, so `Server::interface` is always
+    empty and the `NET_RAW`-for-`SO_BINDTODEVICE` rule (`dnsmasq.c:537-540`) is only
+    reachable from unit tests.
+  - No `capget` pre-flight. Upstream checks the permitted set up front and dies with
+    "process is missing required capability NET_ADMIN" (`dnsmasq.c:576-583`); here a
+    capability that is not permitted surfaces later as a `capset` failure during the drop.
+    Both are fatal, but the Rust diagnostic is worse.
+  - No syslog *socket*. `src/log.rs` ports `log_start`/`log_reopen`/`my_syslog` and is now
+    wired into startup, but with no `log-facility` the fallback is stderr, not
+    `/dev/log` — so a backgrounded daemon with no `log-facility` still logs nowhere,
+    where upstream would reach syslog. Consequently `log-facility=<facility-name>`
+    (`daemon`, `local0`, …) and `log-facility=-` are treated as file paths rather than as
+    facility selectors, and `log_fac`/`log-async` queueing are parsed but inert.
+    `log_start` also does not `fchown` the log file to the run user (log.c), so a
+    root-created log file stays root-owned after the drop.
+  - `my_syslog` output now passes through the `tracing` `EnvFilter`, so `RUST_LOG` can
+    suppress records upstream would always write. Upstream filters only on `MS_DEBUG`.
+  - Solaris `priv_set`/`setppriv` (`dnsmasq.c:775-795`) is deliberately out of scope; the
+    capability path is Linux-only and other platforms just `setgroups`/`setgid`/`setuid`.
+  - No helper process is forked before the privilege drop, so `dhcp-script`/`dhcp-luascript`
+    (`create_helper`, `dnsmasq.c:740`) still cannot run as a separate uid.
+  - The pid file is never removed on shutdown, and `PR_SET_DUMPABLE` (debug mode,
+    `dnsmasq.c:823`) is not set.
+  - Acceptance evidence caveat: `user_and_group_change_the_running_ids_and_clear_supplementary_groups`
+    is root-gated and skips on an unprivileged runner, so the `setuid`/`setgid`/`setgroups`
+    and pid-file-`fchown` assertions only actually execute under root. Likewise the
+    parity lane needs Docker; `parity_compose_keeps_the_candidate_in_the_foreground`
+    guards the `-k` flag the candidate container depends on without needing it.
+  - `StartupPipe::ready()` fires once the runtime is built, not once the forwarding task
+    is actually serving, so a failure inside `run_main_loop` still escapes the invoking
+    process's notice.
+
 - [ ] Split pure logic tests from capability-dependent socket tests.
   Source of truth: current failing tests in `network.rs`, `forward.rs`, and `dhcp_common.rs`.
   Required tests: deterministic unit coverage for pure logic, gated or capability-aware integration coverage for privileged paths.

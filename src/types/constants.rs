@@ -1,6 +1,17 @@
 /// Global constants and option bit definitions.
 /// Ported from `dnsmasq.h`.
 
+// ── Compiled-in defaults (config.h) ───────────────────────────────────────────
+/// User the daemon changes to after startup unless `user=` says otherwise
+/// (`CHUSER`, config.h:53).
+pub const CHUSER: &str = "nobody";
+/// Group the daemon prefers when `group=` is not given (`CHGRP`, config.h:54).
+/// If it does not exist, upstream falls back to the run user's primary group.
+pub const CHGRP: &str = "dip";
+/// Pid file written when `pid-file=` is not given (`RUNFILE`, config.h:243).
+/// An explicit empty `pid-file=` suppresses the file entirely.
+pub const RUNFILE: &str = "/var/run/dnsmasq.pid";
+
 // ── Exit codes ────────────────────────────────────────────────────────────────
 pub const EC_GOOD:        i32 = 0;
 pub const EC_BADCONF:     i32 = 1;

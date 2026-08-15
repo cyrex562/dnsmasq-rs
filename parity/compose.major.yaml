@@ -20,6 +20,10 @@ services:
       dockerfile: parity/docker/rust.Dockerfile
     container_name: dnsmasq-parity-rust
     command:
+      # As with `upstream` above: the binary is the container's PID 1, so it
+      # must stay in the foreground.  Without this it double-forks, PID 1 exits
+      # once the daemon signals readiness, and the container is torn down.
+      - -k
       - --conf-file
       - /fixtures/dns/${FIXTURE:-basic}/dnsmasq.conf
       - --port
