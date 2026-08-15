@@ -6,7 +6,23 @@ COMPOSE_FILE="$ROOT_DIR/parity/compose.major.yaml"
 FIXTURE="${FIXTURE:-basic}"
 UPSTREAM_PORT="${UPSTREAM_PORT:-2053}"
 CANDIDATE_PORT="${CANDIDATE_PORT:-3053}"
-PARITY_STARTUP_WAIT_SECS="${PARITY_STARTUP_WAIT_SECS:-3}"
+# 3s was not enough after a cold container build: upstream had not finished
+# starting, so every case failed as "upstream query failed" and the run looked
+# like a total parity failure rather than a not-ready one.
+PARITY_STARTUP_WAIT_SECS="${PARITY_STARTUP_WAIT_SECS:-10}"
+
+# In --json mode stdout carries ONLY the probe's JSON document, so every
+# progress message goes to stderr. The harness gate parses stdout directly.
+JSON_MODE=0
+[[ "${1:-}" == "--json" ]] && JSON_MODE=1
+
+say() {
+  if [[ "$JSON_MODE" -eq 1 ]]; then
+    echo "$@" >&2
+  else
+    echo "$@"
+  fi
+}
 
 cleanup() {
   if [[ "${KEEP_CONTAINERS:-0}" == "1" ]]; then
@@ -19,18 +35,35 @@ trap cleanup EXIT
 
 cd "$ROOT_DIR"
 
-echo "==> building parity containers"
-docker compose -f "$COMPOSE_FILE" build upstream rust
+say "==> building parity containers"
+if [[ "$JSON_MODE" -eq 1 ]]; then
+  docker compose -f "$COMPOSE_FILE" build upstream rust >&2
+else
+  docker compose -f "$COMPOSE_FILE" build upstream rust
+fi
 
-echo "==> starting upstream and candidate services"
-docker compose -f "$COMPOSE_FILE" up -d upstream rust
+say "==> starting upstream and candidate services"
+docker compose -f "$COMPOSE_FILE" up -d upstream rust >&2
 
-echo "==> waiting ${PARITY_STARTUP_WAIT_SECS}s for services to start"
+say "==> waiting ${PARITY_STARTUP_WAIT_SECS}s for services to start"
 sleep "$PARITY_STARTUP_WAIT_SECS"
 
 QUERY_FILE="$ROOT_DIR/parity/fixtures/dns/${FIXTURE}/queries.txt"
 
-echo "==> probing DNS parity using fixture '${FIXTURE}'"
+say "==> probing DNS parity using fixture '${FIXTURE}'"
+
+if [[ "$JSON_MODE" -eq 1 ]]; then
+  # --json always exits 0; the caller compares the per-case results against
+  # its recorded baseline rather than treating any mismatch as fatal.
+  cargo run --quiet --bin parity_probe -- \
+    --queries "$QUERY_FILE" \
+    --upstream "127.0.0.1:${UPSTREAM_PORT}" \
+    --candidate "127.0.0.1:${CANDIDATE_PORT}" \
+    --json 2>/dev/null
+  say "==> parity probe complete for fixture '${FIXTURE}'"
+  exit 0
+fi
+
 if ! cargo run --quiet --bin parity_probe -- \
   --queries "$QUERY_FILE" \
   --upstream "127.0.0.1:${UPSTREAM_PORT}" \

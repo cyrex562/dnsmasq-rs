@@ -13,6 +13,7 @@ struct Config {
     upstream: SocketAddr,
     candidate: SocketAddr,
     timeout_ms: u64,
+    json: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -39,24 +40,81 @@ struct NormalizedRr {
     data: String,
 }
 
+/// Minimal JSON string escaping — enough for names, qtypes, and error text.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = parse_args(env::args().skip(1).collect())?;
     let cases = load_queries(&config.queries)?;
 
+    // (status, detail) per case. A failure never aborts the run: the ratchet
+    // needs a verdict for every case, not just the ones before the first error.
+    let mut results: Vec<(String, String)> = Vec::with_capacity(cases.len());
     let mut mismatches = 0usize;
 
     for case in &cases {
-        let upstream = query_server(config.upstream, case, config.timeout_ms)?;
-        let candidate = query_server(config.candidate, case, config.timeout_ms)?;
+        let up = query_server(config.upstream, case, config.timeout_ms);
+        let cand = query_server(config.candidate, case, config.timeout_ms);
 
-        if upstream != candidate {
+        let (status, detail) = match (up, cand) {
+            (Ok(u), Ok(c)) if u == c => ("ok".to_string(), String::new()),
+            (Ok(u), Ok(c)) => (
+                "mismatch".to_string(),
+                format!("upstream={u:?} candidate={c:?}"),
+            ),
+            (Err(e), _) => ("error".to_string(), format!("upstream query failed: {e}")),
+            (_, Err(e)) => ("error".to_string(), format!("candidate query failed: {e}")),
+        };
+
+        if status != "ok" {
             mismatches += 1;
-            eprintln!("mismatch for {} {}", case.name, case.qtype_name);
-            eprintln!("  upstream : {upstream:#?}");
-            eprintln!("  candidate: {candidate:#?}");
-        } else {
-            println!("ok {} {}", case.name, case.qtype_name);
         }
+
+        if !config.json {
+            if status == "ok" {
+                println!("ok {} {}", case.name, case.qtype_name);
+            } else {
+                eprintln!("{status} for {} {}: {detail}", case.name, case.qtype_name);
+            }
+        }
+
+        results.push((status, detail));
+    }
+
+    if config.json {
+        let passing = results.iter().filter(|(s, _)| s == "ok").count();
+        let mut out = String::from("{\n");
+        out.push_str(&format!("  \"total\": {},\n", results.len()));
+        out.push_str(&format!("  \"passing\": {passing},\n"));
+        out.push_str("  \"cases\": [\n");
+        for (i, (case, (status, detail))) in cases.iter().zip(results.iter()).enumerate() {
+            out.push_str(&format!(
+                "    {{\"name\": \"{}\", \"qtype\": \"{}\", \"status\": \"{}\", \"detail\": \"{}\"}}{}\n",
+                json_escape(&case.name),
+                json_escape(&case.qtype_name),
+                json_escape(status),
+                json_escape(detail),
+                if i + 1 == results.len() { "" } else { "," }
+            ));
+        }
+        out.push_str("  ]\n}");
+        println!("{out}");
+        // Always exit 0 in JSON mode; the caller compares against baseline.
+        return Ok(());
     }
 
     if mismatches > 0 {
@@ -71,6 +129,7 @@ fn parse_args(args: Vec<String>) -> Result<Config, Box<dyn std::error::Error>> {
     let mut upstream = None;
     let mut candidate = None;
     let mut timeout_ms = 2000u64;
+    let mut json = false;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -94,6 +153,9 @@ fn parse_args(args: Vec<String>) -> Result<Config, Box<dyn std::error::Error>> {
                     .ok_or("missing value for --timeout-ms")?
                     .parse()?;
             }
+            "--json" => {
+                json = true;
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -110,11 +172,12 @@ fn parse_args(args: Vec<String>) -> Result<Config, Box<dyn std::error::Error>> {
         upstream: upstream.ok_or("missing --upstream")?,
         candidate: candidate.ok_or("missing --candidate")?,
         timeout_ms,
+        json,
     })
 }
 
 fn print_help() {
-    println!("parity_probe --queries FILE --upstream HOST:PORT --candidate HOST:PORT [--timeout-ms N]");
+    println!("parity_probe --queries FILE --upstream HOST:PORT --candidate HOST:PORT [--timeout-ms N] [--json]");
 }
 
 fn load_queries(path: &str) -> Result<Vec<QueryCase>, Box<dyn std::error::Error>> {
@@ -286,4 +349,37 @@ fn hex_encode(bytes: &[u8]) -> String {
         let _ = write!(&mut s, "{b:02x}");
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_args_accepts_json_flag() {
+        let cfg = parse_args(vec![
+            "--queries".into(), "q.txt".into(),
+            "--upstream".into(), "127.0.0.1:1".into(),
+            "--candidate".into(), "127.0.0.1:2".into(),
+            "--json".into(),
+        ])
+        .unwrap();
+        assert!(cfg.json);
+    }
+
+    #[test]
+    fn parse_args_defaults_json_off() {
+        let cfg = parse_args(vec![
+            "--queries".into(), "q.txt".into(),
+            "--upstream".into(), "127.0.0.1:1".into(),
+            "--candidate".into(), "127.0.0.1:2".into(),
+        ])
+        .unwrap();
+        assert!(!cfg.json);
+    }
+
+    #[test]
+    fn json_escape_handles_quotes_and_backslashes() {
+        assert_eq!(json_escape(r#"a"b\c"#), r#"a\"b\\c"#);
+    }
 }

@@ -1054,9 +1054,16 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
         }
 
         "dhcp-alternate-port" => {
-            let (server_port, client_port) = parse_dhcp_alternate_port(cl)?;
-            daemon.dhcp_server_port = i32::from(server_port);
-            daemon.dhcp_client_port = i32::from(client_port);
+            #[cfg(feature = "dhcp")]
+            {
+                let (server_port, client_port) = parse_dhcp_alternate_port(cl)?;
+                daemon.dhcp_server_port = i32::from(server_port);
+                daemon.dhcp_client_port = i32::from(client_port);
+            }
+            #[cfg(not(feature = "dhcp"))]
+            {
+                let _ = cl;
+            }
         }
 
         "resolv-file" => {
@@ -4407,6 +4414,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dhcp")]
     fn apply_dhcp_alternate_port_defaults_to_unprivileged_pair() {
         let mut d = Daemon::default();
         let lines = parse_config_text("dhcp-alternate-port", "test").unwrap();
@@ -4416,6 +4424,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dhcp")]
     fn apply_dhcp_alternate_port_single_value_derives_client_port() {
         let mut d = Daemon::default();
         let lines = parse_config_text("dhcp-alternate-port=2000", "test").unwrap();
@@ -4425,6 +4434,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dhcp")]
     fn apply_dhcp_alternate_port_pair_sets_both_ports() {
         let mut d = Daemon::default();
         let lines = parse_config_text("dhcp-alternate-port=2000,3000", "test").unwrap();
@@ -4433,7 +4443,10 @@ mod tests {
         assert_eq!(d.dhcp_client_port, 3000);
     }
 
+    // Without the `dhcp` feature the directive is accepted and ignored, matching the
+    // other DHCP directives, so there is no error to assert.
     #[test]
+    #[cfg(feature = "dhcp")]
     fn apply_dhcp_alternate_port_invalid_value_errors() {
         let mut d = Daemon::default();
         let lines = parse_config_text("dhcp-alternate-port=abc", "test").unwrap();
@@ -5272,6 +5285,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dhcp")]
     fn apply_dhcp_host_multiple_names_error() {
         let mut d = Daemon::default();
         let lines = parse_config_text("dhcp-host=host1,host2", "test").unwrap();
@@ -5478,6 +5492,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dhcp")]
     fn apply_dhcp_option_unknown_name_errors() {
         let mut d = Daemon::default();
         let lines = parse_config_text("dhcp-option=option:not-real,1", "test").unwrap();
@@ -5486,6 +5501,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dhcp")]
     fn apply_dhcp_range_without_two_ips_errors() {
         let mut d = Daemon::default();
         let lines = parse_config_text("dhcp-range=192.168.0.10", "test").unwrap();
@@ -5494,6 +5510,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dhcp")]
     fn apply_dhcp_option_vi_encap_is_explicitly_unsupported() {
         let mut d = Daemon::default();
         let lines = parse_config_text("dhcp-option=vi-encap:2,10,text", "test").unwrap();
@@ -5502,6 +5519,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dhcp")]
     fn apply_dhcp_option_option6_is_explicitly_unsupported() {
         let mut d = Daemon::default();
         let lines = parse_config_text("dhcp-option=option6:dns-server,[2001:db8::1]", "test").unwrap();
@@ -5510,6 +5528,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dhcp")]
     fn apply_dhcp_option_vendor_and_encap_together_errors() {
         let mut d = Daemon::default();
         let lines = parse_config_text("dhcp-option=vendor:PXEClient,encap:175,190,text", "test").unwrap();
@@ -5632,6 +5651,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dnssec")]
     fn apply_dnssec_limits_bad_value_errors() {
         let mut d = Daemon::default();
         let lines = parse_config_text("dnssec-limits=1,nope", "test").unwrap();
@@ -5847,8 +5867,11 @@ mod tests {
         assert_eq!(resolved.daemon.servers_file.as_deref(), Some("/tmp/servers.conf"));
         assert_eq!(resolved.daemon.lease_file.as_deref(), Some("/tmp/dnsmasq.leases"));
         assert_eq!(resolved.daemon.ftabsize, 150);
-        assert_eq!(resolved.daemon.dhcp_server_port, 2000);
-        assert_eq!(resolved.daemon.dhcp_client_port, 3000);
+        #[cfg(feature = "dhcp")]
+        {
+            assert_eq!(resolved.daemon.dhcp_server_port, 2000);
+            assert_eq!(resolved.daemon.dhcp_client_port, 3000);
+        }
         assert_eq!(resolved.daemon.resolv_files.len(), 1);
         assert_eq!(resolved.daemon.if_names.len(), 1);
         assert_eq!(resolved.daemon.if_except.len(), 1);
@@ -5926,6 +5949,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dhcp")]
     fn apply_dhcp_ignore_unsupported_selector_errors() {
         let mut d = Daemon::default();
         let lines = parse_config_text("dhcp-ignore=enterprise:1", "test").unwrap();
@@ -5960,6 +5984,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dhcp")]
     fn apply_dhcp_userclass_missing_match_string_errors() {
         let mut d = Daemon::default();
         let lines = parse_config_text("dhcp-userclass=set:accounts", "test").unwrap();
@@ -5999,6 +6024,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dhcp")]
     fn apply_dhcp_mac_invalid_pattern_errors() {
         let mut d = Daemon::default();
         let lines = parse_config_text("dhcp-mac=set:printer,00:60:8C:**", "test").unwrap();
@@ -6165,6 +6191,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dhcp")]
     fn apply_dhcp_reply_delay_invalid_selector_errors() {
         let mut d = Daemon::default();
         let lines = parse_config_text("dhcp-reply-delay=set:pxe,2", "test").unwrap();
@@ -6173,6 +6200,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dhcp")]
     fn apply_dhcp_reply_delay_invalid_seconds_errors() {
         let mut d = Daemon::default();
         let lines = parse_config_text("dhcp-reply-delay=tag:pxe,soon", "test").unwrap();
@@ -6282,6 +6310,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dhcp")]
     fn reread_dhcp_increments_reload_count() {
         let mut d = Daemon::default();
         assert_eq!(d.reload_count, 0);

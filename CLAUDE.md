@@ -1,152 +1,161 @@
 # CLAUDE.md
 
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 ## Overview
 
 `dnsmasq-rs` is an in-progress Rust port of the upstream `dnsmasq` binary. The target is behavioral parity for the supported feature set, with safe Rust internals and strong regression coverage.
 
-This repository already contains broad module coverage and substantial tests, but it should not yet be described as feature-complete or upstream-equivalent.
+The repository has broad module coverage and substantial tests, but it is not yet feature-complete or upstream-equivalent. Module presence is not parity. Passing unit tests are not executable equivalence.
 
 Primary references:
 
-- Upstream C source: `original_dnsmasq_src/dnsmasq-master/src/`
-- Earlier Rust attempt: `old/`
-- Current execution tracker: `tasks.md`
+- Upstream C source: `original_dnsmasq_src/dnsmasq-master/src/` — read-only reference
+- Earlier Rust attempt: `old/` — read-only reference
+- Execution tracker: `tasks.md`
+- Sibling agent guidance: `agents.md` (roles/process), `.github/copilot-instructions.md`
 
-The upstream tree and `old/` tree are reference-only.
+Note that `tasks.md` and `agents.md` describe some blockers that have since been resolved (see "Build and test reality"). Verify a claimed blocker before treating it as current.
 
-## What Matters Most
-
-Current top priorities:
-
-1. Complete `src/option.rs` enough to support realistic config parity fixtures.
-2. Close the behavioral gap in `src/dnsmasq.rs` and `src/main.rs` for startup, reload, and runtime control flow.
-3. Separate or harden permission-sensitive runtime tests so restricted environments do not produce misleading failures.
-4. Build functional parity tests that compare `dnsmasq-rs` against the original dnsmasq binary under identical fixtures.
-
-Module presence is not the same as parity. Passing unit tests are not the same as executable equivalence.
-
-## Build And Test Reality
-
-Useful commands:
+## Build and test reality
 
 ```bash
-cargo test -- --list
-cargo test
-cargo test --test dns_roundtrip
-cargo test proptest
-cargo build
-cargo build --no-default-features
-cargo check
+cargo build                       # default features
+cargo check --all-features        # clean
+cargo check --no-default-features # BROKEN — see below
+cargo test                        # full suite, ~3019 tests, currently clean
+cargo test -- --list              # enumerate tests
+cargo test <substring>            # single test by name
+cargo test --test dns_roundtrip   # one integration target
+cargo test proptest               # property suites
+RUST_LOG=debug cargo run          # logging via tracing EnvFilter
 ```
 
-Current state observed in this environment:
+Verified state in this environment:
 
-- `cargo test -- --list` reports about `1306` unit and integration tests plus the existing property-based suites.
-- Full `cargo test` is not clean in this sandbox.
-  Observed result: `1287` passed, `19` failed.
-  Failure class: permission-sensitive socket or interface tests in `network`, `forward`, and `dhcp_common`.
-- `cargo check --all-features` was not confirmed in this session because dependency unpacking hit a read-only cargo registry path in the sandbox.
+- Full `cargo test` passes: 1500 (lib) + 1472 (bin) unit tests + 5/5/6 integration + 31 proptests, **0 failures**. Earlier docs claiming ~1306 tests with 19 permission-related failures are stale.
+- `cargo check --all-features` compiles clean (warnings only).
+- `cargo check --no-default-features` **fails to compile** with 3 errors in `src/option.rs`: `parse_dhcp_alternate_port` not in scope, and `dhcp_server_port` / `dhcp_client_port` missing from `Daemon`. These are `dhcp`-gated items referenced from ungated code. Fixing this gate leakage is real outstanding work — do not treat the command as merely unsupported.
 
-Interpretation:
+Before claiming a build or test state, run the command and read the output. The prior version of this file over-reported failures and under-reported progress in both directions.
 
-- Core logic coverage is already substantial.
-- Runtime and environment-sensitive behavior still needs work.
-- The repository does not yet have the upstream parity harness required to prove binary-equivalent behavior.
+## Parity harness
 
-## Architecture Notes
+The container-backed parity harness exists at `parity/` (earlier docs said it was missing).
 
-Central state:
+```bash
+./parity/run-major.sh                                    # build, start both, probe, diff
+FIXTURE=basic UPSTREAM_PORT=2053 CANDIDATE_PORT=3053 ./parity/run-major.sh
+KEEP_CONTAINERS=1 ./parity/run-major.sh                  # leave containers up for inspection
+cargo run --bin parity_probe -- --queries <file> --upstream <addr> --candidate <addr>
+```
 
-- `DaemonHandle = Arc<RwLock<Daemon>>` in `src/types/daemon.rs`
+How it works: `compose.major.yaml` builds an upstream `dnsmasq` image from the vendored C tree and a `dnsmasq-rs` image from this repo, mounts the same fixture read-only into both, and binds them to isolated loopback ports. `src/bin/parity_probe.rs` (host-side, no Python or extra container) sends identical queries to both, normalizes each reply into a `NormalizedPacket` (rcode, TC bit, sorted answer/authority/additional RRs) and fails on any difference.
 
-Important modules:
+Scope today is DNS only, fixture `parity/fixtures/dns/basic/`. DHCP, DHCPv6, RA, and interface-sensitive behavior are out of scope for this harness version and would need `NET_ADMIN`/`NET_RAW`. The current codebase is not expected to pass every future parity suite.
 
-- `src/option.rs`
-  Config parsing and application. This is one of the main parity blockers because many directives are still partial or stubbed.
+## Architecture
 
-- `src/dnsmasq.rs` and `src/main.rs`
-  Startup, daemon control flow, signal handling, and reload path. Present, but simplified relative to upstream.
+### Central state
 
-- `src/rfc1035.rs`, `src/cache.rs`, `src/forward.rs`
-  Core DNS packet, cache, and forwarding logic. Broadly implemented with strong internal coverage, but still need parity validation.
+`Daemon` (`src/types/daemon.rs`, ~450 lines) is a direct port of C's global `struct daemon` from `dnsmasq.h` — the single source of truth for runtime configuration and state. It is always shared as:
 
-- `src/rfc2131.rs`, `src/dhcp.rs`, `src/rfc3315.rs`, `src/dhcp6.rs`, `src/radv.rs`
-  DHCPv4, DHCPv6, and RA behavior. Useful internal coverage exists, but config-driven and executable-level parity is still incomplete.
+```rust
+pub type DaemonHandle = Arc<RwLock<Daemon>>;   // defined in src/dnsmasq.rs:18
+```
 
-- `src/network.rs`, `src/dhcp_common.rs`
-  Runtime socket and interface behavior. Important because current failures cluster here in restricted environments.
+`DaemonHandle` lives in `src/dnsmasq.rs`, not in `src/types/daemon.rs` — other docs in this repo get this wrong. Async tasks take a clone of the handle; never store a bare `Daemon`.
 
-## Porting Rules
+### Config pipeline
 
-- Preserve observable upstream behavior first.
-- Prefer safe Rust types and ownership-based design, but do not invent new semantics accidentally.
+This is the parity-critical path and spans several files:
+
+```
+CliArgs (clap, src/option.rs)  ─┐
+                                ├─> Vec<ConfigLine>  ─> resolve_config ─> ResolvedConfig
+conf-file text ─> parse_config_text ─┘                      │                    │
+                  (recursive conf-file, depth 10)           │              .into_daemon()
+                                                            │                    ▼
+                                          apply_line per directive        init_daemon_with
+                                          then normalize_config                 ▼
+                                                                            DaemonHandle
+```
+
+- `ConfigLine` is the single raw directive form. CLI flags are converted to `ConfigLine`s by `config_lines_from_cli` and appended **after** file-derived lines, so CLI overrides win by application order.
+- `normalize_config` holds post-processing that upstream does implicitly: DNSSEC fast-retry defaults, local-TTL fill-in for host records and CNAMEs, MX/auth defaults, `local-service` handling, and auth validation. Put new cross-directive defaulting here, in a named helper — not in the tail of `apply_config`.
+- `src/option.rs` is ~6600 lines and the largest parity surface. A directive is not done until it parses valid forms, rejects invalid forms clearly, mutates `Daemon` correctly, affects runtime behavior, and has directive-level plus fixture-level tests. Never accept a directive as a silent no-op; if a no-op is deliberate, document it and track it in `tasks.md`.
+
+### Runtime flow
+
+`main.rs` reads the config, resolves it once, calls `dnsmasq::init_daemon_with`, installs SIGTERM/SIGHUP handlers, and enters `dnsmasq::run_main_loop`. `run_main_loop` snapshots port/upstreams/DHCP runtime from the handle, binds the DNS UDP socket, and spawns `forward::run_forward_loop` (plus `dhcp::run_dhcp_loop` under the `dhcp` feature).
+
+This path is deliberately simpler than upstream `dnsmasq.c`. SIGHUP reload in `main.rs` is still a logging stub; `dnsmasq::on_sighup` / `clear_cache_and_reload` are the real hooks to grow. Startup, reload, and listener lifecycle parity is open work.
+
+Daemonization (`dnsmasq::daemonize`) must happen **before** the tokio runtime starts — `fork` is not tokio-safe.
+
+### The lib/bin duplication gotcha
+
+`src/main.rs` re-declares the entire module tree with `pub mod ...` instead of importing the `dnsmasq_rs` library crate. Consequences you will hit:
+
+- Every module is compiled twice and its unit tests run twice (hence 1500 lib + 1472 bin test counts).
+- The two module lists have already drifted: `pub mod dhcp6;` is in `lib.rs` but missing from `main.rs`.
+- Adding a module means editing **both** `src/lib.rs` and `src/main.rs`, with matching `#[cfg(feature = ...)]` gates, or the binary silently loses it.
+
+Integration tests in `tests/` import through the library (`dnsmasq_rs::*`), so they only see `lib.rs`'s view.
+
+### Module map
+
+| Path | Purpose |
+|---|---|
+| `src/types/` | Structs/enums ported from `dnsmasq.h` (daemon, addr, cache, dhcp, server, network, dns_records, constants) |
+| `src/dns_protocol/`, `src/dhcp_protocol/`, `src/dhcp6_protocol/`, `src/radv_protocol/` | Wire-format constants (opcodes, rcodes, RR types, flag bitmasks) |
+| `src/rfc1035.rs` | DNS packet parser/encoder — port of `rfc1035.c` |
+| `src/cache.rs` | Bounded LRU DNS cache keyed by `(name, type-flags)` |
+| `src/forward.rs` | DNS query forwarding engine |
+| `src/option.rs` | Config parsing and application — port of `option.c` |
+| `src/dnsmasq.rs`, `src/main.rs` | Daemon init, privilege drop, daemonization, signals, main loop |
+| `src/rfc2131.rs`, `src/dhcp.rs`, `src/lease.rs`, `src/helper.rs` | DHCPv4 |
+| `src/rfc3315.rs`, `src/dhcp6.rs`, `src/radv.rs`, `src/slaac.rs` | DHCPv6 and RA |
+| `src/network.rs`, `src/netlink.rs`, `src/dhcp_common.rs`, `src/arp.rs` | Runtime socket and interface behavior |
+| `src/dnssec.rs`, `src/crypto.rs` | DNSSEC validation |
+| `src/error.rs` | Central `DnsmasqError` (`thiserror`) |
+| `src/bin/parity_probe.rs` | Host-side parity comparison tool |
+
+### Feature flags
+
+Cargo features mirror upstream's compile-time `HAVE_*` defines. Defaults: `dhcp dhcp6 dnssec auth tftp loop inotify dump bpf`. `dhcp6` implies `dhcp`. Non-default: `conntrack`, `dbus` (pulls `zbus`), `ubus`, `ipset`, `nftset`.
+
+Gates apply both to `pub mod` declarations (in *both* `lib.rs` and `main.rs`) and inside modules. Gate leakage is a live bug class — see the `--no-default-features` failure above.
+
+### Conventions
+
+- C `union all_addr` → Rust `enum AllAddr`; C null pointer → `Option<T>`; C globals → explicit shared state that invents no new semantics; C `#ifdef HAVE_X` → `#[cfg(feature = "x")]`; C allocation patterns → ownership-based types.
+- `F_*` flag bits (`F_IPV4`, `F_NEG`, `F_DNSSEC`, ...) are `const u32` in `src/types/constants.rs`. Use `cache::type_flags(flags)` to extract only the type bits when building a `CacheKey`.
+- Module-local errors (`DnsError` in `rfc1035`, `ConfigError` in `option`) implement `From<_>` into `DnsmasqError`.
+- Prefer safe Rust; keep `unsafe` tightly scoped to platform boundaries. Keep naming traceable to upstream where that aids review.
+
+## Porting rules
+
+- Preserve observable upstream behavior first. Read the upstream C for the target behavior before writing Rust.
+- Do not drop upstream behavior because the Rust shape is cleaner. Preserve flag semantics and wire format exactly unless the deviation is documented.
 - Map C unions, pointers, and flags into reviewable Rust forms without losing wire-format or decision logic.
-- Treat placeholder acceptance of config directives as a bug, not a convenience.
-- Keep unsupported behavior explicit in docs and TODOs.
+- Keep unsupported behavior explicit in docs and TODOs, and tracked in `tasks.md`.
+- Do not edit `original_dnsmasq_src/` or `old/`.
 
-## Testing Strategy
+## Testing strategy
 
-This project needs three layers of confidence.
+1. **Unit tests** — `#[cfg(test)]` blocks in each module, for parsers, state transitions, cache ops, packet construction, config application.
+2. **Property tests** — `tests/proptest_*.rs` with `proptest`, for parser panic-freedom, protocol roundtrips, and invariants. `tests/proptest_cache.proptest-regressions` is a committed regression corpus; keep new shrunk cases in it.
+3. **Functional parity** — `parity/` fixtures compared against the real upstream binary. Extend by adding a fixture directory under `parity/fixtures/dns/` and running with `FIXTURE=<name>`.
 
-### 1. Unit Tests
+Every behavior slice should land with happy-path, boundary, malformed-input, and error-path coverage in the same change, plus a regression test for every bug found.
 
-Use for deterministic logic:
+Keep capability-dependent tests (sockets, interface enumeration, bind-to-device) separated, gated, or expectation-aware, so restricted environments do not produce misleading failures — and do not read a restricted-environment failure as evidence the implementation is wrong.
 
-- parsers
-- state transitions
-- cache operations
-- packet construction
-- config application
+## Current priorities
 
-### 2. Property-Based Tests
-
-Use for:
-
-- parser panic-freedom
-- protocol roundtrips
-- invariant preservation
-- replacement and expiry behavior in stateful structures
-
-### 3. Functional Parity Tests
-
-This layer is still missing and must be built.
-
-Required shape:
-
-- launch upstream dnsmasq and `dnsmasq-rs` with the same fixture inputs
-- use isolated temp directories and test-specific ports
-- drive both binaries with the same DNS and DHCP requests
-- compare normalized behavior, not brittle log formatting
-
-Required parity areas:
-
-- DNS forwarding and reply semantics
-- cache behavior and expiry
-- config acceptance and rejection
-- DHCPv4 exchanges
-- DHCPv6 and RA behavior for supported scenarios
-- local data, filtering, and rebind protections
-- SIGHUP reload and related runtime state changes
-
-## Guidance For Contributors
-
-When implementing new work:
-
-- Start from upstream behavior, not from line-count completion goals.
-- Add tests in the same change.
-- Add a regression test for every bug found.
-- Keep capability-dependent tests distinct from pure logic tests.
-- Update `tasks.md` when a blocker is resolved or re-scoped.
-
-When reviewing:
-
-- Check for semantic drift against upstream.
-- Check that docs do not overclaim completion.
-- Check that externally visible behavior is either tested or still tracked as incomplete.
-
-## Files To Treat As Read-Only References
-
-- `original_dnsmasq_src/`
-- `old/`
-
-Do not edit those trees as part of the Rust implementation.
+1. Finish `src/option.rs` for the directives needed to boot realistic parity fixtures.
+2. Fix `--no-default-features` gate leakage in `src/option.rs`.
+3. Close the startup/reload/runtime gap in `src/dnsmasq.rs` and `src/main.rs` — especially real SIGHUP reload behavior.
+4. Expand `parity/` beyond the single DNS fixture: cache, reload, forwarding, then a capability-enabled DHCP lane.
+5. Resolve the `lib.rs` / `main.rs` module duplication rather than maintaining two trees.

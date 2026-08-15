@@ -1,2 +1,9 @@
 /target
 /parity/artifacts
+
+# Python bytecode from the harness tooling
+__pycache__/
+*.pyc
+
+# Harness per-cycle runtime records
+harness/state/
