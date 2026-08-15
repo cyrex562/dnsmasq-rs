@@ -83,12 +83,41 @@ pub mod dbus;
 pub mod bpf;
 pub mod tables;
 
-/// Command-line arguments.
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+use dnsmasq::{Listeners, StartupPipe};
+use types::constants::{OPT_DEBUG, OPT_NO_FORK};
+use types::daemon::Daemon;
+
+/// Process startup, in the order `dnsmasq.c`'s `main()` uses (lines 499-826):
+///
+/// ```text
+/// resolve user=/group=  →  bind listeners  →  chdir("/")  →  fork/setsid/fork
+///   →  write pid file   →  stdio to /dev/null  →  drop privileges  →  event loop
+/// ```
+///
+/// This deliberately is **not** `#[tokio::main]`.  That macro starts the
+/// runtime — and its worker threads — before the body runs, and `fork()` in a
+/// multi-threaded process gives the child only the calling thread, so a forked
+/// reactor deadlocks.  Everything above needs to happen while the process is
+/// still single-threaded; only then is the runtime built by hand.
+///
+/// Binding before forking is upstream's order too (dnsmasq.c:325-409), and it
+/// is what lets the daemon claim port 53 while it is still root and still
+/// report a bind failure on the terminal the user typed into.
+fn main() -> std::process::ExitCode {
+    match start() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        // Upstream's `die()`: one line on stderr, non-zero status.  Rust's
+        // default `Result`-returning `main` would print the Debug form instead.
+        Err(e) => {
+            eprintln!("dnsmasq-rs: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn start() -> Result<(), Box<dyn std::error::Error>> {
     use clap::Parser as _;
-    use tokio::signal::unix::{signal, SignalKind};
-    use tracing::{info, warn};
+    use tracing::info;
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -106,19 +135,90 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     lines.extend(option::config_lines_from_cli(&args));
 
-    let resolved = option::resolve_config(&lines)?;
-    let daemon_handle = dnsmasq::init_daemon_with(resolved.into_daemon());
+    let daemon = option::resolve_config(&lines)?.into_daemon();
+    let debug = daemon.option_bool(OPT_DEBUG);
 
-    {
-        let daemon = daemon_handle.read().await;
-        info!("dnsmasq-rs starting on port {}", daemon.port);
+    // Resolve names to ids first: an unknown user is fatal, and we want to say
+    // so on the terminal rather than into /dev/null after the fork.
+    let run_as = dnsmasq::resolve_run_as(&daemon)?;
+    let caps = dnsmasq::needed_capabilities(&daemon);
+    let listeners = dnsmasq::bind_listeners(&daemon)?;
+
+    info!("dnsmasq-rs starting on port {}", daemon.port);
+
+    // `-d`/`--no-daemon` (OPT_DEBUG) skips this entire block: no chdir, no
+    // fork, no pid file, no stdio redirect and no privilege drop.
+    // `-k`/`--keep-in-foreground` (OPT_NO_FORK) skips only the fork.
+    let mut startup = StartupPipe::disabled();
+    if !debug {
+        dnsmasq::chdir_root()?;
+        if !daemon.option_bool(OPT_NO_FORK) {
+            startup = dnsmasq::fork_into_background()?;
+        }
+        // Past this point we may have no terminal, so failures are reported
+        // through `startup` instead of returned.
+        if let Err(e) = write_pid_file_if_configured(&daemon, &run_as) {
+            startup.fail(&e.to_string());
+        }
+        if let Err(e) = dnsmasq::redirect_stdio_to_devnull() {
+            startup.fail(&e.to_string());
+        }
+        if nix::unistd::getuid().is_root() {
+            if let Err(e) = dnsmasq::drop_privileges_with(&run_as, caps) {
+                startup.fail(&e.to_string());
+            }
+        }
     }
 
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sighup = signal(SignalKind::hangup())?;
+    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => startup.fail(&format!("cannot start the async runtime: {e}")),
+    };
+
+    // Startup is complete: release the process the user invoked.
+    startup.ready();
+
+    runtime.block_on(run(daemon, listeners));
+    Ok(())
+}
+
+/// Write the pid file, if one was configured (dnsmasq.c:658-717).
+///
+/// The file is chowned to the run user while we are still root, and a failure
+/// is only fatal when we *are* root — upstream silently tolerates an unwritable
+/// pid file for the unprivileged "just testing it" case.
+fn write_pid_file_if_configured(
+    daemon: &Daemon,
+    run_as: &dnsmasq::RunAs,
+) -> Result<(), error::DnsmasqError> {
+    let Some(runfile) = daemon.runfile.as_deref() else {
+        return Ok(());
+    };
+
+    let root = nix::unistd::getuid().is_root();
+    // "if (getuid() == 0 && ent_pw && ent_pw->pw_uid != 0)" — dnsmasq.c:697.
+    let owner = match (root, run_as.uid, run_as.gid) {
+        (true, Some(uid), Some(gid)) if uid != 0 => Some((uid, gid)),
+        _ => None,
+    };
+
+    match dnsmasq::write_pid_file_as(runfile, std::process::id(), owner) {
+        Ok(()) => Ok(()),
+        Err(e) if root => Err(e),
+        Err(e) => {
+            tracing::warn!("{e} (ignored: not running as root)");
+            Ok(())
+        }
+    }
+}
+
+/// The async half of startup: everything that needs the tokio runtime.
+async fn run(daemon: Daemon, listeners: Listeners) {
+    use tracing::{info, warn};
+
+    let daemon_handle = dnsmasq::init_daemon_with(daemon);
 
     let (sighup_tx, mut sighup_rx) = tokio::sync::mpsc::channel::<()>(4);
-
     let daemon_clone = daemon_handle.clone();
     tokio::spawn(async move {
         while sighup_rx.recv().await.is_some() {
@@ -127,8 +227,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let result = dnsmasq::run_main_loop(daemon_handle, Some(sighup_tx)).await;
+    let result =
+        dnsmasq::run_main_loop_with(daemon_handle, Some(sighup_tx), Some(listeners)).await;
 
     info!("dnsmasq-rs stopped ({result:?})");
-    Ok(())
 }

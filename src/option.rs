@@ -126,9 +126,13 @@ pub struct CliArgs {
     #[arg(long = "no-rebind")]
     pub no_rebind: bool,
 
-    /// Stay in the foreground.
-    #[arg(long = "no-daemon")]
+    /// Do NOT fork into the background: run in debug mode.
+    #[arg(short = 'd', long = "no-daemon")]
     pub no_daemon: bool,
+
+    /// Do NOT fork into the background, do NOT run in debug mode.
+    #[arg(short = 'k', long = "keep-in-foreground")]
+    pub keep_in_foreground: bool,
 
     /// Bind only configured interfaces.
     #[arg(long = "bind-interfaces")]
@@ -342,6 +346,10 @@ pub fn config_lines_from_cli(args: &CliArgs) -> Vec<ConfigLine> {
         push_line("no-daemon", None);
     }
 
+    if args.keep_in_foreground {
+        push_line("keep-in-foreground", None);
+    }
+
     if args.bind_interfaces {
         push_line("bind-interfaces", None);
     }
@@ -530,6 +538,7 @@ pub fn resolve_config(lines: &[ConfigLine]) -> Result<ResolvedConfig, ConfigErro
 
 fn normalize_config(daemon: &mut Daemon) -> Result<(), ConfigError> {
     apply_dnssec_fast_retry_defaults(daemon);
+    apply_run_user_default(daemon);
     apply_local_ttl_defaults(daemon);
     apply_mx_defaults(daemon)?;
     apply_auth_defaults(daemon);
@@ -544,6 +553,16 @@ fn apply_dnssec_fast_retry_defaults(daemon: &mut Daemon) {
     if daemon.option_bool(OPT_DNSSEC_VALID) && daemon.fast_retry_time == 0 {
         daemon.fast_retry_timeout = UPSTREAM_TIMEOUT_SECS;
         daemon.fast_retry_time = DEFAULT_FAST_RETRY_MS;
+    }
+}
+
+/// Upstream seeds `daemon->username` with `CHUSER` before it parses anything
+/// (option.c:5976), so a config that never says `user=` still drops root to
+/// "nobody".  The group has no unconditional default — it is resolved at
+/// startup from `CHGRP` or the run user's primary group (dnsmasq.c:507-517).
+fn apply_run_user_default(daemon: &mut Daemon) {
+    if daemon.username.is_none() {
+        daemon.username = Some(CHUSER.to_string());
     }
 }
 
@@ -720,7 +739,11 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
         "all-servers"  => daemon.set_option(OPT_ALL_SERVERS),
         "reload-acl"   => daemon.set_option(OPT_RELOAD),
         "no-rebind"    => daemon.set_option(OPT_NO_REBIND),
-        "no-daemon"    => daemon.set_option(OPT_NO_FORK),
+        // `-d`/`--no-daemon` is debug mode (option.c:215,428): it suppresses the
+        // fork *and* the pid file, the stdio redirect and the privilege drop.
+        // `-k`/`--keep-in-foreground` (option.c:277,456) only suppresses the fork.
+        "no-daemon"    => daemon.set_option(OPT_DEBUG),
+        "keep-in-foreground" => daemon.set_option(OPT_NO_FORK),
         "bind-interfaces" => daemon.set_option(OPT_NOWILD),
         "selfmx"       => daemon.set_option(OPT_SELFMX),
         "localmx"      => daemon.set_option(OPT_LOCALMX),
@@ -5693,6 +5716,7 @@ mod tests {
             local_service: true,
             no_rebind: true,
             no_daemon: true,
+            keep_in_foreground: true,
             bind_interfaces: true,
             dnssec_debug: true,
             cache_size: Some(2048),
@@ -5729,7 +5753,7 @@ mod tests {
                 "port", "query-port", "min-port", "max-port", "no-resolv", "no-poll", "no-hosts",
                 "bogus-priv", "expand-hosts", "log-queries", "no-negcache", "all-servers",
                 "strict-order", "dnssec", "local-service", "no-rebind", "no-daemon",
-                "bind-interfaces", "dnssec-debug", "cache-size",
+                "keep-in-foreground", "bind-interfaces", "dnssec-debug", "cache-size",
                 "local-ttl", "neg-ttl", "max-ttl", "min-cache-ttl", "max-cache-ttl",
                 "use-stale-cache", "edns-packet-max", "fast-dns-retry", "domain", "user",
                 "group", "pid-file", "log-facility", "log-async", "servers-file", "lease-file",
@@ -5777,6 +5801,55 @@ mod tests {
         assert_eq!(server_values, vec!["8.8.8.8", "/example.com/1.1.1.1"]);
     }
 
+    // ── foreground flags (option.c:215,277,428,456) ───────────────────────────
+
+    /// `-d`/`--no-daemon` is debug mode, not merely "do not fork": upstream maps
+    /// it to `OPT_DEBUG`, which also suppresses the pid file and the privilege
+    /// drop.  Mapping it to `OPT_NO_FORK` would silently keep both.
+    #[test]
+    fn no_daemon_sets_debug_and_not_no_fork() {
+        let resolved = resolve_config(&parse_config_text("no-daemon", "test.conf").unwrap()).unwrap();
+        assert!(resolved.daemon.option_bool(OPT_DEBUG));
+        assert!(!resolved.daemon.option_bool(OPT_NO_FORK));
+    }
+
+    /// `-k`/`--keep-in-foreground` is the other half: no fork, but everything
+    /// else about a normal start still happens.
+    #[test]
+    fn keep_in_foreground_sets_no_fork_and_not_debug() {
+        let resolved =
+            resolve_config(&parse_config_text("keep-in-foreground", "test.conf").unwrap()).unwrap();
+        assert!(resolved.daemon.option_bool(OPT_NO_FORK));
+        assert!(!resolved.daemon.option_bool(OPT_DEBUG));
+    }
+
+    #[test]
+    fn keep_in_foreground_cli_flag_emits_its_directive() {
+        let lines = config_lines_from_cli(&CliArgs {
+            keep_in_foreground: true,
+            ..Default::default()
+        });
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].key, "keep-in-foreground");
+    }
+
+    // ── run-user default (option.c:5976) ──────────────────────────────────────
+
+    #[test]
+    fn run_user_defaults_to_chuser() {
+        let resolved = resolve_config(&[]).unwrap();
+        assert_eq!(resolved.daemon.username.as_deref(), Some(CHUSER));
+        // The group has no unconditional default; it is resolved at startup.
+        assert_eq!(resolved.daemon.groupname, None);
+    }
+
+    #[test]
+    fn explicit_user_overrides_the_default_run_user() {
+        let resolved =
+            resolve_config(&parse_config_text("user=dnsmasq", "test.conf").unwrap()).unwrap();
+        assert_eq!(resolved.daemon.username.as_deref(), Some("dnsmasq"));
+    }
+
     #[test]
     fn resolve_config_applies_later_cli_override() {
         let mut lines = parse_config_text("port=5353", "test.conf").unwrap();
@@ -5804,6 +5877,7 @@ mod tests {
             local_service: true,
             no_rebind: true,
             no_daemon: true,
+            keep_in_foreground: true,
             bind_interfaces: true,
             dnssec_debug: true,
             cache_size: Some(1024),
@@ -5845,6 +5919,7 @@ mod tests {
         assert!(resolved.daemon.option_bool(OPT_DNSSEC_VALID));
         assert!(!resolved.daemon.option_bool(OPT_LOCAL_SERVICE));
         assert!(resolved.daemon.option_bool(OPT_NO_REBIND));
+        assert!(resolved.daemon.option_bool(OPT_DEBUG));
         assert!(resolved.daemon.option_bool(OPT_NO_FORK));
         assert!(resolved.daemon.option_bool(OPT_NOWILD));
         assert!(resolved.daemon.option_bool(OPT_DNSSEC_DEBUG));
