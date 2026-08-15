@@ -291,7 +291,10 @@ pub async fn run_main_loop(
     #[cfg(feature = "dhcp")]
     use tokio::sync::watch;
     use tokio::signal::unix::{signal, SignalKind};
-    use tracing::{error, info, warn};
+    use tracing::{error, info};
+    // `warn!` is only reached from the DHCP socket-bind path below.
+    #[cfg(feature = "dhcp")]
+    use tracing::warn;
 
     use crate::forward::{ForwardConfig, ForwardEngine, run_forward_loop};
     #[cfg(feature = "dhcp")]
@@ -704,8 +707,7 @@ mod tests {
     fn daemon_local_data_carries_every_record_kind() {
         use crate::types::dns_records::{Cname, HostRecord, MxSrvRecord, Naptr, PtrRecord, TxtRecord};
 
-        let mut daemon = Daemon::default();
-        daemon.local_ttl = 60;
+        let mut daemon = Daemon { local_ttl: 60, ..Default::default() };
         daemon.host_records.push(HostRecord {
             ttl: 60,
             flags: 0,

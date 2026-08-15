@@ -88,6 +88,15 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   - `no-cache`/`do-bit`/`CD` handling, and the auth (`--auth-zone`) and conntrack
     allowlist branches of `udp_request()`, which have no Rust call site at all.
   - TCP DNS service. Only the UDP listener consults local data; there is no TCP listener.
+  - Answer-cache population. `run_forward_loop` builds a `DnsCache` and passes it to
+    `answer_request`, but nothing ever inserts forwarded upstream replies into it —
+    `ForwardEngine::process_reply` has no cache write. The cache therefore only ever
+    serves what `answer_request` itself stores, so the cache-hit branches of
+    `answer_request` (cached CNAME, cached NXDOMAIN, MX/SRV glue) are unreachable in the
+    live path. Upstream caches every forwarded reply in `cache_insert()`.
+  - `cache-size=0`. Upstream treats `0` as "caching disabled"; `DnsCache` has no disabled
+    mode, so `run_forward_loop` clamps the size to 1 entry (`cache_size.max(1)`) instead
+    of bypassing the cache.
 
 - [ ] Split pure logic tests from capability-dependent socket tests.
   Source of truth: current failing tests in `network.rs`, `forward.rs`, and `dhcp_common.rs`.
