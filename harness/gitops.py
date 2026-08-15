@@ -57,8 +57,37 @@ def push_and_pr(worktree, branch, title, body):
     return out.splitlines()[-1] if out else ""
 
 
+def pr_state(worktree, pr_url):
+    return _run(worktree, "gh", "pr", "view", pr_url, "--repo", REPO_SLUG,
+                "--json", "state", "--jq", ".state", check=False).stdout.strip()
+
+
 def squash_merge(worktree, pr_url):
-    _run(worktree, "gh", "pr", "merge", pr_url, "--squash", "--delete-branch")
+    """Squash-merge a PR, deciding success by the PR's state rather than gh's
+    exit code.
+
+    `gh pr merge --delete-branch` exits non-zero when branch deletion fails
+    even though the merge itself succeeded — and deletion reliably fails while
+    the branch is still checked out in the cycle's worktree. Trusting the exit
+    code once caused a successful merge to raise, which unwound the cycle past
+    the post-merge gate and left an unverified merge on master. The safety net
+    must not be skippable by a cleanup failure.
+
+    Branch deletion is handled separately, after the worktree is gone.
+    """
+    proc = _run(worktree, "gh", "pr", "merge", pr_url, "--squash", check=False)
+    state = pr_state(worktree, pr_url)
+    if state != "MERGED":
+        raise RuntimeError(
+            f"merge failed (pr state={state or 'unknown'}): "
+            f"{(proc.stderr or proc.stdout).strip()[:500]}"
+        )
+    return state
+
+
+def delete_remote_branch(repo, branch):
+    """Best-effort cleanup. Never raises: a leftover branch is untidy, not unsafe."""
+    _run(repo, "git", "push", "origin", "--delete", branch, check=False)
 
 
 def head_sha(repo):

@@ -3,7 +3,7 @@
     "default": {
       "cargo_flags": [],
       "tests": {
-        "passed": 3019,
+        "passed": 3033,
         "failed": 0,
         "ignored": 1
       },
@@ -14,7 +14,7 @@
         "--all-features"
       ],
       "tests": {
-        "passed": 3059,
+        "passed": 3073,
         "failed": 0,
         "ignored": 1
       },
@@ -25,18 +25,18 @@
         "--no-default-features"
       ],
       "tests": {
-        "passed": 1613,
+        "passed": 1627,
         "failed": 0,
         "ignored": 0
       },
       "clippy_warnings": 145
     }
   },
-  "git_commit": "d498ae88705c059980b39d2d429779c2d6c13d3b",
+  "git_commit": "17a47dbaf0654eca34fed98cdb5080369980ce8b",
   "parity": {
     "fixture": "dns/basic",
     "cases_total": 8,
-    "cases_passing": 0,
-    "note": "candidate answers no query; local-data path not wired into run_main_loop"
+    "cases_passing": 8,
+    "note": "raised to 8/8 by issue #2 (T0-1); local-data answering wired into run_main_loop"
   }
 }

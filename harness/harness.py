@@ -41,6 +41,48 @@ def log(msg):
 MAX_STORED_OUTPUT = 20000
 
 
+def _parity_line(raw):
+    p = (raw or {}).get("parity")
+    if not p:
+        return "parity: not run"
+    return f"parity: {p.get('passing', 0)}/{p.get('total', 0)} cases"
+
+
+def summarize_gate(result):
+    """Render the gate's actual numbers, not just its failures.
+
+    A passing gate used to be reported to the judge as the bare string
+    "gate clean". The judge is asked to verify acceptance criteria like
+    "parity passes 8/8" — and was handed no parity data to check it against,
+    which the first live cycle's judge correctly objected to. The ratchet only
+    fails on regression below baseline, so a clean gate proves nothing about
+    improvement; the numbers have to travel with it.
+    """
+    raw = result.raw or {}
+    lines = ["status: " + ("clean" if result.ok else "FAILED")]
+
+    tests = raw.get("tests") or {}
+    for name, t in tests.items():
+        lines.append(f"tests[{name}]: {t.get('passed', 0)} passed, {t.get('failed', 0)} failed")
+
+    clippy = raw.get("clippy") or {}
+    for name, n in clippy.items():
+        lines.append(f"clippy[{name}]: {n} warnings")
+
+    lines.append(_parity_line(raw))
+    p = raw.get("parity")
+    if p:
+        for c in p.get("cases", []):
+            lines.append(f"  parity case {c['name']} {c['qtype']}: {c['status']}"
+                         + (f" ({c['detail'][:120]})" if c.get("detail") else ""))
+
+    if result.failures:
+        lines.append("failures:")
+        lines.extend(f"  - {f}" for f in result.failures)
+
+    return "\n".join(lines)
+
+
 def _record_stage(record, name, model, fn):
     log(f"  {name} ({model})")
     try:
@@ -83,10 +125,11 @@ def _implement_until_gate_passes(meta, record, worktree, common, research,
         log("  gate")
         result = run_gate(worktree, parity=meta.wants_parity)
         record.gate_failures = result.failures
-        gate_output = "\n".join(result.failures) or "gate clean"
+        gate_output = summarize_gate(result)
         if result.ok:
+            log(f"  gate clean | {_parity_line(result.raw)}")
             return result, gate_output
-        log(f"  gate failed: {gate_output[:200]}")
+        log(f"  gate failed: {'; '.join(result.failures)[:200]}")
 
     return None, gate_output
 
@@ -101,8 +144,17 @@ def _merge_and_verify(meta, record, worktree, branch, judgement, review):
 
     gitops.squash_merge(worktree, pr)
     record.merged = True
+    _verify_or_revert(meta, record)
 
-    # The safety net for an unprotected master: verify what actually landed.
+
+def _verify_or_revert(meta, record):
+    """The safety net for an unprotected master: verify what actually landed.
+
+    Nothing may skip this once a merge has happened. It runs from the normal
+    path and again from the cycle's error handler, because the first live cycle
+    proved that an exception raised *after* a successful merge silently bypasses
+    verification and leaves master unchecked.
+    """
     gitops.sync_master(REPO)
     log("  post-merge gate")
     post = run_gate(REPO, parity=meta.wants_parity)
@@ -187,8 +239,24 @@ def run_cycle(meta, dry_run=False):
     except Exception as e:  # noqa: BLE001
         record.outcome = f"error: {e}"
         log(f"  ERROR {e}")
+        # A merge may have landed before the failure. Verification is the only
+        # thing protecting an unprotected master, so it must survive any
+        # exception raised after the merge — not just the ones we predicted.
+        if record.pr_url and not record.reverted:
+            try:
+                if gitops.pr_state(REPO, record.pr_url) == "MERGED":
+                    record.merged = True
+                    log("  merge landed despite the error — verifying anyway")
+                    _verify_or_revert(meta, record)
+            except Exception as verify_err:  # noqa: BLE001
+                log(f"  POST-MERGE VERIFICATION FAILED TO RUN: {verify_err}")
+                record.outcome = f"unverified-merge: {verify_err}"
     finally:
         gitops.remove_worktree(REPO, worktree)
+        # Only after the worktree is gone, or the branch is still checked out
+        # and deletion fails.
+        if record.merged:
+            gitops.delete_remote_branch(REPO, branch)
         save_record(record)
 
     return record
