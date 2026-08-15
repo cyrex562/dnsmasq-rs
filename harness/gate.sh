@@ -8,6 +8,21 @@
 set -uo pipefail
 
 REPO="${1:?usage: gate.sh <repo-dir> [--parity]}"
+
+# Every cargo invocation is bounded. A test that leaks a foreground child --
+# e.g. a daemon-startup test whose subject never exits -- blocks `cargo test`
+# forever, and an unbounded gate turns that into hours of dead time instead of
+# a failure the implementer can act on. Timeouts are generous: these are real
+# builds, not unit tests.
+CARGO_TIMEOUT="${GATE_CARGO_TIMEOUT:-1800}"
+PARITY_TIMEOUT="${GATE_PARITY_TIMEOUT:-2400}"
+
+# Kill anything the tests leaked behind, so the next feature set starts clean
+# and the harness does not accumulate orphaned daemons across a run.
+reap_strays() {
+  pkill -KILL -f "$REPO/target/debug/dnsmasq-rs" 2>/dev/null || true
+}
+trap reap_strays EXIT
 RUN_PARITY=0
 [[ "${2:-}" == "--parity" ]] && RUN_PARITY=1
 cd "$REPO" || exit 2
@@ -25,7 +40,7 @@ SETS=("default:" "all-features:--all-features" "no-default-features:--no-default
 for spec in "${SETS[@]}"; do
   name="${spec%%:*}"; flags="${spec#*:}"
   # shellcheck disable=SC2086
-  if out=$(cargo check $flags 2>&1); then
+  if out=$(timeout "$CARGO_TIMEOUT" cargo check $flags 2>&1); then
     record "check:$name" true ""
   else
     record "check:$name" false "$(echo "$out" | grep -E '^error' | head -5 | tr '\n' ';')"
@@ -36,7 +51,14 @@ done
 for spec in "${SETS[@]}"; do
   name="${spec%%:*}"; flags="${spec#*:}"
   # shellcheck disable=SC2086
-  out=$(cargo test $flags 2>&1)
+  out=$(timeout "$CARGO_TIMEOUT" cargo test $flags 2>&1)
+  rc=$?
+  reap_strays
+  if [[ $rc -eq 124 ]]; then
+    T_PASS[$name]=0; T_FAIL[$name]=0
+    record "test:$name" false "TIMED OUT after ${CARGO_TIMEOUT}s -- a test is hanging, most likely one that spawns the binary and waits for it to exit"
+    continue
+  fi
   p=$(echo "$out" | grep -oP '(?<=result: ok\. )\d+(?= passed)' | paste -sd+ | bc 2>/dev/null)
   f=$(echo "$out" | grep -oP '\d+(?= failed)' | paste -sd+ | bc 2>/dev/null)
   T_PASS[$name]=${p:-0}; T_FAIL[$name]=${f:-0}
@@ -54,7 +76,7 @@ done
 for spec in "${SETS[@]}"; do
   name="${spec%%:*}"; flags="${spec#*:}"
   # shellcheck disable=SC2086
-  n=$(cargo clippy --all-targets $flags 2>&1 | grep -cE '^warning')
+  n=$(timeout "$CARGO_TIMEOUT" cargo clippy --all-targets $flags 2>&1 | grep -cE '^warning')
   CLIPPY[$name]=${n:-0}
   record "clippy:$name" true "$n warnings"
 done
@@ -70,7 +92,7 @@ fi
 
 # ── parity (ratchet; the caller compares against baseline) ───────────────────
 if [[ "$RUN_PARITY" -eq 1 ]]; then
-  if out=$("$REPO/parity/run-major.sh" --json 2>/dev/null) && [[ -n "$out" ]]; then
+  if out=$(timeout "$PARITY_TIMEOUT" "$REPO/parity/run-major.sh" --json 2>/dev/null) && [[ -n "$out" ]]; then
     PARITY_JSON="$out"
     record "parity" true ""
   else
