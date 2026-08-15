@@ -16,6 +16,23 @@ READ_ONLY_TOOLS = (
     "Bash(git diff:*),Bash(git log:*),Bash(git show:*)"
 )
 
+# Tools the implement stage may use. This is deliberately an allowlist rather
+# than `--permission-mode bypassPermissions`: the stage runs unattended on a
+# developer machine, and it only ever needs to edit the tree and drive cargo
+# and git. Bypassing permissions would additionally grant arbitrary shell —
+# network access, package installs, writes outside the worktree — none of
+# which any port issue requires.
+WRITE_TOOLS = (
+    "Read,Grep,Glob,Write,Edit,NotebookEdit,TodoWrite,"
+    "Bash(cargo:*),Bash(git:*),"
+    "Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(rg:*),"
+    "Bash(mkdir:*),Bash(cp:*),Bash(mv:*),Bash(diff:*),Bash(sed:*),Bash(awk:*)"
+)
+
+# Escape hatch for running in a throwaway sandbox (container, VM) where the
+# allowlist gets in the way more than it protects. Off by default, on purpose.
+BYPASS_ENV = "HARNESS_BYPASS_PERMISSIONS"
+
 VERDICT_RE = re.compile(r"^\s*VERDICT:\s*(complete|incomplete)\s*$", re.I | re.M)
 
 # The judge template requires its verdict on the first line. Allowing a little
@@ -45,8 +62,10 @@ def run_stage(stage, model, cwd, prompt, read_only=False, timeout=5400):
     ]
     if read_only:
         cmd += ["--allowedTools", READ_ONLY_TOOLS]
-    else:
+    elif os.environ.get(BYPASS_ENV) == "1":
         cmd += ["--permission-mode", "bypassPermissions"]
+    else:
+        cmd += ["--allowedTools", WRITE_TOOLS, "--permission-mode", "acceptEdits"]
 
     proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
     if proc.returncode != 0:

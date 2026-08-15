@@ -63,5 +63,25 @@ class TestVerdict(unittest.TestCase):
         self.assertFalse(parse_verdict("")[0])
 
 
+class TestPermissions(unittest.TestCase):
+    """The implement stage runs unattended on a developer machine. It must not
+    get arbitrary shell by default."""
+
+    def test_write_tools_exclude_network_and_destructive_commands(self):
+        from claude_runner import WRITE_TOOLS
+        for banned in ("curl", "wget", "rm:", "sudo", "ssh", "pip", "npm"):
+            self.assertNotIn(banned, WRITE_TOOLS)
+
+    def test_write_tools_cover_what_implement_needs(self):
+        from claude_runner import WRITE_TOOLS
+        for needed in ("Write", "Edit", "Bash(cargo:*)", "Bash(git:*)"):
+            self.assertIn(needed, WRITE_TOOLS)
+
+    def test_read_only_tools_grant_no_write_capability(self):
+        from claude_runner import READ_ONLY_TOOLS
+        for banned in ("Write", "Edit", "Bash(git commit", "Bash(git add"):
+            self.assertNotIn(banned, READ_ONLY_TOOLS)
+
+
 if __name__ == "__main__":
     unittest.main()
