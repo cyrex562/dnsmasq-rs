@@ -41,6 +41,48 @@ def log(msg):
 MAX_STORED_OUTPUT = 20000
 
 
+def _parity_line(raw):
+    p = (raw or {}).get("parity")
+    if not p:
+        return "parity: not run"
+    return f"parity: {p.get('passing', 0)}/{p.get('total', 0)} cases"
+
+
+def summarize_gate(result):
+    """Render the gate's actual numbers, not just its failures.
+
+    A passing gate used to be reported to the judge as the bare string
+    "gate clean". The judge is asked to verify acceptance criteria like
+    "parity passes 8/8" — and was handed no parity data to check it against,
+    which the first live cycle's judge correctly objected to. The ratchet only
+    fails on regression below baseline, so a clean gate proves nothing about
+    improvement; the numbers have to travel with it.
+    """
+    raw = result.raw or {}
+    lines = ["status: " + ("clean" if result.ok else "FAILED")]
+
+    tests = raw.get("tests") or {}
+    for name, t in tests.items():
+        lines.append(f"tests[{name}]: {t.get('passed', 0)} passed, {t.get('failed', 0)} failed")
+
+    clippy = raw.get("clippy") or {}
+    for name, n in clippy.items():
+        lines.append(f"clippy[{name}]: {n} warnings")
+
+    lines.append(_parity_line(raw))
+    p = raw.get("parity")
+    if p:
+        for c in p.get("cases", []):
+            lines.append(f"  parity case {c['name']} {c['qtype']}: {c['status']}"
+                         + (f" ({c['detail'][:120]})" if c.get("detail") else ""))
+
+    if result.failures:
+        lines.append("failures:")
+        lines.extend(f"  - {f}" for f in result.failures)
+
+    return "\n".join(lines)
+
+
 def _record_stage(record, name, model, fn):
     log(f"  {name} ({model})")
     try:
@@ -83,10 +125,11 @@ def _implement_until_gate_passes(meta, record, worktree, common, research,
         log("  gate")
         result = run_gate(worktree, parity=meta.wants_parity)
         record.gate_failures = result.failures
-        gate_output = "\n".join(result.failures) or "gate clean"
+        gate_output = summarize_gate(result)
         if result.ok:
+            log(f"  gate clean | {_parity_line(result.raw)}")
             return result, gate_output
-        log(f"  gate failed: {gate_output[:200]}")
+        log(f"  gate failed: {'; '.join(result.failures)[:200]}")
 
     return None, gate_output
 
