@@ -56,7 +56,12 @@ def diff_against_master(worktree):
 
 
 def push_and_pr(worktree, branch, title, body):
-    _run(worktree, "git", "push", "-u", "origin", branch)
+    # --force-with-lease, because the cycle owns this branch name: a previous
+    # parked or interrupted attempt may have pushed to it, and a plain push is
+    # then rejected as non-fast-forward. Cycle 4 lost an approved, gate-clean
+    # diff that way — the judge had already returned complete. The lease still
+    # protects against clobbering a push we have not seen.
+    _run(worktree, "git", "push", "--force-with-lease", "-u", "origin", branch)
     out = _run(
         worktree, "gh", "pr", "create",
         "--repo", REPO_SLUG, "--base", BASE_BRANCH, "--head", branch,
