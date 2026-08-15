@@ -97,6 +97,12 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   - `cache-size=0`. Upstream treats `0` as "caching disabled"; `DnsCache` has no disabled
     mode, so `run_forward_loop` clamps the size to 1 entry (`cache_size.max(1)`) instead
     of bypassing the cache.
+  - Reload staleness. `run_main_loop` snapshots the local data once at startup and moves
+    the clone into the forward task, so the query loop keeps answering from the
+    startup-time config forever. Upstream re-reads `daemon->` config data on every query,
+    so a SIGHUP reload takes effect immediately. Whoever implements real SIGHUP reload
+    (`dnsmasq::on_sighup` / `clear_cache_and_reload`) must also republish the snapshot —
+    a shared `ArcSwap`/`watch` channel rather than a moved clone.
 
 - [ ] Split pure logic tests from capability-dependent socket tests.
   Source of truth: current failing tests in `network.rs`, `forward.rs`, and `dhcp_common.rs`.
