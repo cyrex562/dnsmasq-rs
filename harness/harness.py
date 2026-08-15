@@ -34,6 +34,13 @@ def log(msg):
     print(f"[harness] {msg}", flush=True)
 
 
+# Stage outputs are stored so a cycle can be audited after the fact — whether
+# the research actually understood the issue, what the judge objected to.
+# Truncated because a diff-heavy review can run long and these records are
+# meant to stay readable.
+MAX_STORED_OUTPUT = 20000
+
+
 def _record_stage(record, name, model, fn):
     log(f"  {name} ({model})")
     try:
@@ -41,7 +48,14 @@ def _record_stage(record, name, model, fn):
     except Exception as e:  # noqa: BLE001 — recorded, then re-raised
         record.stages.append({"stage": name, "model": model, "ok": False, "error": str(e)})
         raise
-    record.stages.append({"stage": name, "model": model, "ok": True})
+    text = out if isinstance(out, str) else str(out)
+    record.stages.append({
+        "stage": name,
+        "model": model,
+        "ok": True,
+        "output": text[:MAX_STORED_OUTPUT],
+        "truncated": len(text) > MAX_STORED_OUTPUT,
+    })
     return out
 
 
