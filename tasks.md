@@ -178,6 +178,89 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     is actually serving, so a failure inside `run_main_loop` still escapes the invoking
     process's notice.
 
+- [x] Apply `--interface` / `--except-interface` / `--listen-address` to the DNS listeners.
+  `run_main_loop` used to bind a single `0.0.0.0:{port}` socket and never read
+  `daemon.if_names`, `if_except` or `if_addrs`, so a config that named one LAN interface
+  listened on every interface — and `network::create_listeners`, `create_bound_listeners`,
+  `iface_allowed_v4`/`_v6` and `iface_check` had no non-test callers at all.
+
+  `dnsmasq::bind_dns_listeners` now mirrors the dispatch in `dnsmasq.c:378-409`:
+
+  - `--bind-interfaces` and `--bind-dynamic` are rejected together (`dnsmasq.c:378-379`).
+  - `network::enumerate_allowed_interfaces` walks `getifaddrs(3)` and offers every address
+    to `iface_allowed_v4`/`_v6`, which apply the `--interface`/`--except-interface`/
+    `--listen-address` filter and record the `INAME_USED` equivalent. It also ports
+    `network.c:500-519`: when `--interface` is given at all, loopback interfaces are added
+    to the allowed set, so a restricted box can still resolve names for itself. That rule
+    keys off `if_names` alone — a bare `--listen-address` does *not* pull loopback in.
+  - Bound mode (`--bind-interfaces`/`--bind-dynamic`) binds one socket per allowed address
+    via `create_bound_listeners`, plus one per `--listen-address` that no interface carries
+    (`network.c:1219-1233`). Under plain `--bind-interfaces` an unmatched `--interface` is
+    fatal with "unknown interface %s" (`dnsmasq.c:396-398`); `--bind-dynamic` tolerates it.
+  - Default mode binds the two wildcard sockets via `create_wildcard_listeners` and hands
+    the query loop a `network::WildcardFilter`. `run_forward_loop_on` now reads each
+    datagram with `recvmsg` + `IP_PKTINFO`/`IPV6_PKTINFO` (`network::recv_with_dest`) and
+    re-applies `iface_check`, with the `loopback_exception` and `label_exception` fallbacks,
+    exactly as `udp_request()` does at `forward.c:1771-1780`. Without this half,
+    `--listen-address` could not work at all in the mode that is actually the default.
+
+  `iface_check` itself was previously name-only; it now implements the full
+  `network.c:112-181` algorithm including address matching and the `match_addr` rule that
+  lets an explicit `--listen-address` outrank `--except-interface`. `loopback_exception`
+  was a one-line `addr.is_loopback()` and is now the real check (arrival interface is
+  loopback *and* the destination is an address we serve).
+
+  The forward loop takes N sockets instead of one (`poll_recv_ready` across all of them,
+  rotating to avoid starvation) and `PendingQuery` records which listener a query arrived
+  on so the reply leaves by the same socket. `run_main_loop_with` no longer has its own
+  `0.0.0.0:{port}` fallback bind: when it is handed no listeners it calls `bind_listeners`,
+  so there is one code path deciding what the daemon listens on.
+
+  Explicitly **not** covered — upstream behavior still missing:
+
+  - **TCP listeners are not created.** `ListenerKinds::UDP_ONLY` is passed everywhere,
+    because there is no TCP DNS serving loop; binding a listening TCP socket that nothing
+    `accept()`s would open a port that silently swallows connections. Upstream binds the
+    UDP/TCP pair. Whoever adds TCP DNS service must flip this and add a TCP accept loop.
+    TFTP listeners (`OPT_TFTP` → `iface->tftp_ok`) are likewise not created; `tftp_ok` is
+    computed by `iface_allowed_*` and then discarded.
+  - **Replies are sent with `send_to`, not `send_from`.** Upstream answers a wildcard-socket
+    query from the datagram's recorded destination address via `IP_PKTINFO` on the way out
+    (`forward.c` `send_from`); here the kernel picks the source by route lookup, which can
+    differ on a multi-homed host. `forward::send_from` exists and is tested but has no
+    caller.
+  - **`--bind-dynamic` does not actually re-bind.** It currently behaves as
+    `--bind-interfaces` that tolerates missing addresses at startup; there is no netlink
+    listener re-running `create_bound_listeners` when an interface appears, and no
+    `RTM_NEWADDR`/`RTM_DELADDR` handling. `is_dad_listeners`/DAD-tentative deferral
+    (`network.c:1300`) is absent too, so an IPv6 address still in DAD is bound or skipped
+    by whatever `getifaddrs` reports rather than retried.
+  - **The interface set is never garbage-collected.** `clean_interfaces` has no caller;
+    `WildcardFilter::refresh` re-enumerates on a failed check (matching upstream's
+    `enumerate_interfaces(0)` retry) but nothing releases listeners for addresses that went
+    away (`release_listener`).
+  - **`--local-service` (net) is not enforced.** `--local-service=host` works, because
+    `option.rs` lowers it to a NULL-named `--interface` plus `OPT_NOWILD` as upstream does,
+    and that path now reaches real listeners. Plain `--local-service` needs the
+    `daemon->interface_addrs` subnet-membership check on the *source* address
+    (`network.c:272`, `forward.c:1672`), which is not implemented — the option is parsed
+    and normalised but has no runtime effect.
+  - **`--auth-server` interfaces are ignored.** `iface_check`'s `auth` output parameter
+    (`network.c:153-179`) is not ported, so `iface->dns_auth` is always false and
+    `--auth-zone` interface names do not affect which queries are served.
+  - **Interface labels/aliases (`eth0:0`) are not enumerated.** `if-addrs` reports no label,
+    so `iface_allowed_v4` is always called with `label: None` and `is_label` is always
+    false. `label_exception` is wired into the arrival check but can only match on index +
+    address, never on a genuine alias name. `warn_wild_labels`/`warn_int_names`/
+    `warn_bound_listeners` (the "LOUD WARNING" for globally-routable `--bind-interfaces`
+    addresses, `network.c:1240-1275`) have no Rust equivalent.
+  - **DHCP socket binding is unchanged.** `bind_dhcp_socket_to_device` still picks the
+    first non-wildcard `--interface` name itself rather than going through the enumerated
+    set; `whichdevice`/`bind_dhcp_devices` (`dnsmasq.c:400-405`) are not ported.
+  - Capability-dependent assertions in `tests/listener_binding_integration.rs` skip rather
+    than fail when the sandbox has no spare loopback aliasing or refuses the bind, so a
+    restricted environment reports a pass it did not actually verify.
+
 - [ ] Split pure logic tests from capability-dependent socket tests.
   Source of truth: current failing tests in `network.rs`, `forward.rs`, and `dhcp_common.rs`.
   Required tests: deterministic unit coverage for pure logic, gated or capability-aware integration coverage for privileged paths.

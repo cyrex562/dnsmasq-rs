@@ -17,6 +17,13 @@ pub enum DnsmasqError {
     Daemonize(String),
     #[error("bind error on {0}: {1}")]
     Bind(String, String),
+    /// Mutually exclusive or otherwise unusable options (upstream `EC_BADCONF`).
+    #[error("bad configuration: {0}")]
+    BadConfig(String),
+    /// The network config names something that does not exist
+    /// (upstream `EC_BADNET`).
+    #[error("network error: {0}")]
+    BadNet(String),
     #[error("signal error: {0}")]
     Signal(String),
 }

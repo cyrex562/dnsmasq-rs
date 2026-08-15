@@ -40,6 +40,10 @@ pub struct PendingQuery {
     pub question_hash: [u8; 16],
     /// Number of retransmission attempts so far.
     pub retries: u8,
+    /// Index of the listening socket the query arrived on.  The reply has to go
+    /// back out the same socket, or it would leave with the wrong source
+    /// address once more than one listener is bound.
+    pub listener: usize,
 }
 
 /// Table of all in-flight queries, keyed by upstream transaction ID.
@@ -92,6 +96,7 @@ impl ForwardTable {
                         sent_at: Instant::now(),
                         question_hash,
                         retries: 0,
+                        listener: 0,
                     },
                 );
                 return id;
@@ -109,6 +114,7 @@ impl ForwardTable {
                         sent_at: Instant::now(),
                         question_hash,
                         retries: 0,
+                        listener: 0,
                     },
                 );
                 return id;
@@ -119,6 +125,14 @@ impl ForwardTable {
     /// Find a pending query by upstream transaction ID.
     pub fn lookup(&self, id: u16) -> Option<&PendingQuery> {
         self.queries.get(&id)
+    }
+
+    /// Record which listening socket a pending query arrived on, so its reply
+    /// can be sent back out the same one.
+    pub fn set_listener(&mut self, id: u16, listener: usize) {
+        if let Some(q) = self.queries.get_mut(&id) {
+            q.listener = listener;
+        }
     }
 
     /// Remove a completed query, returning it.
@@ -1316,6 +1330,92 @@ pub async fn run_forward_loop(
     client_sock: Arc<tokio::net::UdpSocket>,
     config: ForwardConfig,
 ) -> std::io::Result<()> {
+    run_forward_loop_on(
+        vec![DnsListener { sock: client_sock, wildcard: false }],
+        None,
+        config,
+    )
+    .await
+}
+
+/// One bound DNS listening socket.
+///
+/// `--bind-interfaces` / `--bind-dynamic` produce one of these per allowed
+/// interface address; the default wildcard mode produces one per address
+/// family.  Only wildcard sockets need the per-datagram arrival check, because
+/// a socket bound to a single address is already restricted by the bind.
+pub struct DnsListener {
+    /// The bound UDP socket.
+    pub sock: Arc<tokio::net::UdpSocket>,
+    /// True when the socket is bound to `0.0.0.0` / `::` and therefore receives
+    /// datagrams addressed to every local address.
+    pub wildcard: bool,
+}
+
+/// Wait until one of `listeners` has a datagram ready, returning its index.
+///
+/// `start` rotates the scan order so a busy listener cannot starve the others.
+async fn next_readable(
+    listeners: &[DnsListener],
+    start:     usize,
+) -> (usize, std::io::Result<()>) {
+    std::future::poll_fn(|cx| {
+        use std::task::Poll;
+        for offset in 0..listeners.len() {
+            let i = (start + offset) % listeners.len();
+            if let Poll::Ready(r) = listeners[i].sock.poll_recv_ready(cx) {
+                return Poll::Ready((i, r));
+            }
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+/// Receive one datagram from `listener`, with the destination metadata a
+/// wildcard socket needs.
+#[cfg(unix)]
+fn recv_datagram(
+    listener: &DnsListener,
+    buf:      &mut [u8],
+) -> std::io::Result<crate::network::RecvMeta> {
+    use std::os::unix::io::AsRawFd;
+    let fd = listener.sock.as_raw_fd();
+    listener
+        .sock
+        .try_io(tokio::io::Interest::READABLE, || crate::network::recv_with_dest(fd, buf))
+}
+
+/// Non-Unix fallback: no control messages, so no arrival metadata.
+#[cfg(not(unix))]
+fn recv_datagram(
+    listener: &DnsListener,
+    buf:      &mut [u8],
+) -> std::io::Result<crate::network::RecvMeta> {
+    let (len, src) = listener.sock.try_recv_from(buf)?;
+    Ok(crate::network::RecvMeta { len, src, dest: None, if_index: 0 })
+}
+
+/// Run the DNS UDP forwarding event loop over a set of bound listeners.
+///
+/// `filter` is consulted for datagrams arriving on wildcard listeners, which is
+/// where `--interface` / `--except-interface` / `--listen-address` are enforced
+/// in the default (non-`--bind-interfaces`) mode — upstream's
+/// `iface_check()` call in `udp_request()` (`forward.c:1771-1780`).  Bound
+/// listeners skip it: the bind is already the access control.
+pub async fn run_forward_loop_on(
+    listeners: Vec<DnsListener>,
+    filter:    Option<crate::network::WildcardFilter>,
+    config:    ForwardConfig,
+) -> std::io::Result<()> {
+    if listeners.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no DNS listening sockets were bound",
+        ));
+    }
+    let mut filter = filter;
+
     // Ephemeral socket for upstream communication.
     let upstream_sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
 
@@ -1327,18 +1427,41 @@ pub async fn run_forward_loop(
     let mut client_buf   = vec![0u8; MAX_PACKET_SIZE];
     let mut upstream_buf = vec![0u8; MAX_PACKET_SIZE];
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    let mut scan_from = 0usize;
 
     loop {
         tokio::select! {
             // ── Incoming client query ─────────────────────────────────────────
-            result = client_sock.recv_from(&mut client_buf) => {
-                let (len, src) = result?;
+            (idx, ready) = next_readable(&listeners, scan_from) => {
+                ready?;
+                scan_from = (idx + 1) % listeners.len();
+                let listener = &listeners[idx];
+                let meta = match recv_datagram(listener, &mut client_buf) {
+                    Ok(meta) => meta,
+                    // `poll_recv_ready` can produce a spurious wake-up; another
+                    // reader is not possible here, but the kernel may still say
+                    // "would block".
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(e) => return Err(e),
+                };
+                // A wildcard socket sees datagrams for every local address, so
+                // the config has to be re-applied per datagram.
+                if listener.wildcard {
+                    if let Some(f) = filter.as_mut() {
+                        if !f.accepts(meta.if_index, meta.dest) {
+                            continue;
+                        }
+                    }
+                }
+                let (len, src) = (meta.len, meta.src);
                 let pkt = &client_buf[..len];
                 // Only forward DNS queries (QR bit == 0).
                 if pkt.len() >= 12 && pkt[2] & 0x80 == 0 {
                     // Local data and cache first — exactly as upstream does.
-                    if !try_local_answer(&client_sock, pkt, src, &mut cache, &local).await {
-                        engine.forward_query(pkt, src, &upstream_sock).await;
+                    if !try_local_answer(&listener.sock, pkt, src, &mut cache, &local).await {
+                        if let Some(id) = engine.forward_query(pkt, src, &upstream_sock).await {
+                            engine.table.set_listener(id, idx);
+                        }
                     }
                 }
             }
@@ -1346,6 +1469,15 @@ pub async fn run_forward_loop(
             result = upstream_sock.recv_from(&mut upstream_buf) => {
                 let (len, upstream_addr) = result?;
                 let mut pkt = upstream_buf[..len].to_vec();
+                // Read the arrival listener before `handle_reply` consumes the
+                // pending entry.
+                let reply_listener = (pkt.len() >= 2)
+                    .then(|| u16::from_be_bytes([pkt[0], pkt[1]]))
+                    .and_then(|id| engine.table.lookup(id))
+                    .map(|q| q.listener)
+                    .filter(|i| *i < listeners.len())
+                    .unwrap_or(0);
+                let client_sock = &listeners[reply_listener].sock;
                 if let Some((client_addr, reply)) = engine.handle_reply(&mut pkt) {
                     if is_truncated(&reply) {
                         // TC bit set — retry over TCP.
