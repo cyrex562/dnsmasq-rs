@@ -62,6 +62,21 @@ class TestWorktree(unittest.TestCase):
         self.assertIn("two", d)
         remove_worktree(self.repo, wt)
 
+    def test_reused_branch_name_does_not_collide(self):
+        """Re-running a parked or interrupted issue must not fail on the branch
+        its previous attempt left behind."""
+        wt1 = make_worktree(self.repo, "harness/t0-3")
+        with open(os.path.join(wt1, "a.txt"), "w") as f:
+            f.write("attempt one\n")
+        commit_all(wt1, "attempt one")
+        remove_worktree(self.repo, wt1)
+
+        wt2 = make_worktree(self.repo, "harness/t0-3")
+        self.assertTrue(os.path.isdir(wt2))
+        with open(os.path.join(wt2, "a.txt")) as f:
+            self.assertEqual(f.read(), "one\n")  # reset to master, not carried over
+        remove_worktree(self.repo, wt2)
+
     def test_untouched_worktree_reports_no_changes(self):
         wt = make_worktree(self.repo, "feature-z")
         self.assertFalse(has_changes(wt))

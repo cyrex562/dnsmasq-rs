@@ -3,40 +3,40 @@
     "default": {
       "cargo_flags": [],
       "tests": {
-        "passed": 3033,
+        "passed": 3092,
         "failed": 0,
         "ignored": 1
       },
-      "clippy_warnings": 198
+      "clippy_warnings": 194
     },
     "all-features": {
       "cargo_flags": [
         "--all-features"
       ],
       "tests": {
-        "passed": 3073,
+        "passed": 3132,
         "failed": 0,
         "ignored": 1
       },
-      "clippy_warnings": 200
+      "clippy_warnings": 196
     },
     "no-default-features": {
       "cargo_flags": [
         "--no-default-features"
       ],
       "tests": {
-        "passed": 1627,
+        "passed": 1684,
         "failed": 0,
         "ignored": 0
       },
-      "clippy_warnings": 145
+      "clippy_warnings": 141
     }
   },
-  "git_commit": "17a47dbaf0654eca34fed98cdb5080369980ce8b",
+  "git_commit": "33cb836090bc794162afaeefb2f6636d34faef3e",
   "parity": {
     "fixture": "dns/basic",
     "cases_total": 8,
     "cases_passing": 8,
-    "note": "raised to 8/8 by issue #2 (T0-1); local-data answering wired into run_main_loop"
+    "note": "8/8 since issue #2 (T0-1) wired local-data answering"
   }
 }
