@@ -650,6 +650,7 @@ fn daemon_dhcp_runtime(daemon: &Daemon) -> Option<DhcpDaemonRuntime> {
             dhcp_opts: daemon.dhcp_opts.clone(),
             boot_configs: daemon.boot_config.clone(),
             domain_suffix: daemon.domain_suffix.clone(),
+            lease_file: daemon.lease_file.clone(),
         },
         loop_opts: crate::dhcp::DhcpLoopOptions {
             reply_port_override: (client_port != 68).then_some(client_port),
@@ -1095,9 +1096,19 @@ pub async fn run_main_loop_with(
                 }
             }
         }
+        let lease_db = match dhcp_runtime.server.lease_file.as_deref() {
+            Some(path) => match crate::lease::LeaseDb::load_from_file(path) {
+                Ok(db) => {
+                    info!("using DHCP lease file {path} ({} leases)", db.count());
+                    db
+                }
+                Err(_) => crate::lease::LeaseDb::new(),
+            },
+            None => crate::lease::LeaseDb::new(),
+        };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(async move {
-            if let Err(e) = run_dhcp_loop(dhcp_sock, dhcp_runtime.server, dhcp_runtime.loop_opts, shutdown_rx).await {
+            if let Err(e) = run_dhcp_loop(dhcp_sock, dhcp_runtime.server, dhcp_runtime.loop_opts, lease_db, shutdown_rx).await {
                 error!("dhcp loop exited: {e}");
             }
         });
@@ -1949,6 +1960,8 @@ mod tests {
             filter: vec![DhcpNetid { net: "pxe".into() }],
         });
 
+        daemon.lease_file = Some("/tmp/test-dnsmasq.leases".into());
+
         let runtime = daemon_dhcp_runtime(&daemon).expect("dhcp runtime should be built");
         assert_eq!(runtime.bind_addr, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 1067)));
         assert_eq!(runtime.server.pool_start, Ipv4Addr::new(10, 0, 0, 100));
@@ -1956,6 +1969,7 @@ mod tests {
         assert_eq!(runtime.server.server_ip, Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(runtime.server.reply_delays.len(), 1);
         assert_eq!(runtime.loop_opts.reply_port_override, None);
+        assert_eq!(runtime.server.lease_file.as_deref(), Some("/tmp/test-dnsmasq.leases"));
     }
 
     #[cfg(feature = "dhcp")]

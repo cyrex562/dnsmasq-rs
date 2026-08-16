@@ -135,7 +135,7 @@ proptest! {
         let [c, l, v] = option_msg_type(DhcpMsgType::Request);
         opts.extend_from_slice(&[c, l, v, OPTION_END]);
         let pkt = minimal_pkt(opts, Ipv4Addr::UNSPECIFIED);
-        let _ = handle_request(&pkt, pool_start, pool_end, server_ip, None);
+        let _ = handle_request(&pkt, pool_start, pool_end, server_ip, None, false);
     }
 
     /// REQUEST with in-pool IP → ACK; out-of-pool → NAK.
@@ -152,13 +152,13 @@ proptest! {
         // In-pool request.
         let [a, b, cc, d] = pool_start.octets();
         let mut in_opts = vec![50u8, 4, a, b, cc, d, c, l, v, OPTION_END];
-        let reply_in = handle_request(&minimal_pkt(in_opts, Ipv4Addr::UNSPECIFIED), pool_start, pool_end, server_ip, None);
+        let reply_in = handle_request(&minimal_pkt(in_opts, Ipv4Addr::UNSPECIFIED), pool_start, pool_end, server_ip, None, false);
         prop_assert!(reply_in.is_some());
         prop_assert_eq!(reply_in.unwrap().msg_type, DhcpMsgType::Ack);
 
         // Out-of-pool request (1.2.3.4 is never in a 10.x.x.x pool).
         let out_opts = vec![50u8, 4, 1, 2, 3, 4, c, l, v, OPTION_END];
-        let reply_out = handle_request(&minimal_pkt(out_opts, Ipv4Addr::UNSPECIFIED), pool_start, pool_end, server_ip, None);
+        let reply_out = handle_request(&minimal_pkt(out_opts, Ipv4Addr::UNSPECIFIED), pool_start, pool_end, server_ip, None, false);
         prop_assert!(reply_out.is_some());
         prop_assert_eq!(reply_out.unwrap().msg_type, DhcpMsgType::Nak);
     }

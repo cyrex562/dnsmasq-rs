@@ -655,6 +655,58 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     is still a one-time snapshot, so a resolv-file-driven server-list change only takes
     effect on the next process start, not the next query.
 
+- [x] Wire `LeaseDb` into DHCPv4 dispatch and reach Release/Decline/Inform.
+  `LeaseDb` (`src/lease.rs`) had zero callers outside its own tests; `dispatch_dhcp_with_meta`
+  (`src/dhcp.rs`) dropped RELEASE/DECLINE and never called the already-implemented
+  `rfc2131::handle_release/handle_decline/handle_inform`. Now: a REQUEST that is ACK'd
+  creates/renews a lease (`record_lease`, mirroring `lease_set_*` at `rfc2131.c:1683-1730`),
+  RELEASE frees the matching lease (`LeaseDb::remove_by_addr`, ported from `lease_prune`'s
+  by-address case), DECLINE removes the declined lease so it is not re-offered, and INFORM is
+  answered by `handle_inform` without allocating an address. `daemon.lease_file` now defaults
+  to `/var/lib/misc/dnsmasq.leases` when DHCP(v6) is configured and no `--dhcp-leasefile` was
+  given (`option::apply_dhcp_leasefile_default`, mirroring `dnsmasq.c:151-156`); it is threaded
+  through `DhcpServerConfig::lease_file` into `run_dhcp_loop`, which loads the file at spawn
+  and rewrites it whenever a dispatch marks `LeaseDb::file_dirty`. OFFER and the ACK answering
+  a REQUEST now carry `OPTION_LEASE_TIME` (51), matching `rfc2131.c:1384,1744`; the ACK
+  answering an INFORM deliberately does not (`rfc2131.c:1797-1810` only includes it there if
+  the client asked for it via the parameter request list). REQUEST also NAKs when the
+  requested address is a `dhcp-host` static reservation belonging to a *different* client
+  (`config_find_by_address(...) != config`, `rfc2131.c:1529-1530`), compared by pointer
+  identity into `cfg.configs`.
+  INFORM also never gets T1/T2 (options 58/59): `do_options()` only emits them when its
+  `lease_time` isn't `u32::MAX`, so `decorate_reply` passes `u32::MAX` there for INFORM while
+  still using the real `ctx.lease_time` for the (INFORM-excluded) option-51 value — mirroring
+  `rfc2131.c:1817` calling `do_options(..., 0xffffffff, ...)` for DHCPINFORM.
+  Covered by `dhcp::tests::{request_ack_creates_persisted_lease, release_frees_lease,
+  release_for_out_of_pool_ciaddr_leaves_lease_store_untouched, decline_removes_lease,
+  inform_returns_ack_without_allocating_address,
+  request_for_address_reserved_to_another_client_is_nak_d,
+  request_for_own_reserved_address_is_acked, offer_and_ack_carry_lease_time_option,
+  inform_ack_does_not_carry_lease_time_option, inform_ack_does_not_carry_t1_t2_options,
+  run_dhcp_loop_persists_lease_to_configured_file}`, `rfc2131::tests::handle_request_nak_when_reserved_for_other`,
+  `lease::tests::remove_by_addr_*`, and `option::tests::{dhcp_range_without_explicit_leasefile_defaults_lease_file,
+  explicit_dhcp_leasefile_is_not_overridden_by_default, no_dhcp_range_leaves_lease_file_unset}`.
+
+  Deliberate simplifications, still open:
+  - **No re-offer avoidance / DECLINE backoff.** Upstream bumps `context->addr_epoch` on a
+    DECLINE against a dynamic address, or sets `CONFIG_DECLINED` with a timed backoff when the
+    address is a `dhcp-host` static reservation (`rfc2131.c:1237-1269`). Neither `DhcpContext`
+    nor `DhcpConfig` carries mutable state across dispatch calls in this port, so a declined
+    address is only removed from `LeaseDb` — nothing currently stops it being immediately
+    re-offered to the same client on the next DISCOVER.
+  - **`handle_discover` never reuses an existing lease.** `dispatch_dhcp_with_meta` still calls
+    `handle_discover(..., None, ...)` unconditionally; upstream looks up `lease_find_by_client_id`
+    first so a returning client is re-offered its own address. `handle_discover`'s
+    `existing_lease` parameter (and its own unit test) already supports this — it is just not
+    wired to `LeaseDb` from dispatch.
+  - **Lease time value is not full `calc_time` fidelity.** OPTION_LEASE_TIME and the recorded
+    expiry both use `ctx.lease_time` (the same value `do_options` already used for T1/T2), not
+    `calc_time()`'s client-requested-lease-time negotiation, decline-time floor, or
+    `min_leasetime` clamp (`rfc2131.c` `calc_time()`).
+  - **RELEASE/DECLINE do not re-validate the server-id.** Upstream's `DHCPRELEASE`/`DHCPDECLINE`
+    cases call `narrow_context`/check the server-id option before acting; `handle_release`/
+    `handle_decline` only check the address against the pool bounds.
+
 - [ ] Audit runtime paths that currently exist only as simplified helpers.
   Source of truth: comments marked `stub`, `TODO`, `unimplemented`, and parity mismatches.
   Required tests: focused regression tests per audited path.

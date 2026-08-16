@@ -18,12 +18,14 @@ use crate::dhcp_common::{find_option, get_message_type, match_netid_wild};
 use crate::dhcp_protocol::{
     DhcpMsgType, DhcpPacket, BOOTREPLY, DHCP_CHADDR_MAX, DHCP_CLIENT_PORT, DHCP_COOKIE,
     DHCP_SERVER_PORT, OPTION_AGENT_ID, OPTION_ARCH, OPTION_CLIENT_ID, OPTION_END,
-    OPTION_HOSTNAME, OPTION_REQUESTED_OPTIONS, OPTION_USER_CLASS, OPTION_VENDOR_ID,
+    OPTION_HOSTNAME, OPTION_LEASE_TIME, OPTION_REQUESTED_OPTIONS, OPTION_USER_CLASS,
+    OPTION_VENDOR_ID,
 };
+use crate::lease::LeaseDb;
 use crate::metrics::{inc_metric, Metric};
 use crate::rfc2131::{
-    do_options, find_boot, handle_discover, handle_request, is_pxe_client, DhcpReply,
-    DoOptionsConfig,
+    do_options, find_boot, find_requested_ip, handle_decline, handle_discover, handle_inform,
+    handle_release, handle_request, is_pxe_client, option_put, DhcpReply, DoOptionsConfig,
 };
 use crate::dhcp_common::find_config;
 
@@ -62,6 +64,8 @@ pub struct DhcpServerConfig {
     pub boot_configs: Vec<crate::types::dhcp::DhcpBoot>,
     /// Optional default domain suffix for DHCP replies.
     pub domain_suffix: Option<String>,
+    /// Path to persist the lease database to (`--dhcp-leasefile`).
+    pub lease_file: Option<String>,
 }
 
 impl Default for DhcpServerConfig {
@@ -81,6 +85,7 @@ impl Default for DhcpServerConfig {
             dhcp_opts: Vec::new(),
             boot_configs: Vec::new(),
             domain_suffix: None,
+            lease_file: None,
         }
     }
 }
@@ -273,6 +278,12 @@ fn decorate_reply(
         file: [0u8; 128],
         options: reply.options.clone(),
     };
+    let lease_time = context.map_or(3600, |ctx| ctx.lease_time);
+    let is_inform = get_message_type(&pkt.options) == Some(DhcpMsgType::Inform);
+    // do_options() only emits T1/T2 when the lease time isn't "infinite"; C
+    // calls do_options() for DHCPINFORM with time == 0xffffffff precisely so
+    // it never sends T1/T2 there (rfc2131.c:1817).
+    let do_options_lease_time = if is_inform { u32::MAX } else { lease_time };
     let mut opt_cfg = DoOptionsConfig {
         context,
         req_options: find_option(&pkt.options, OPTION_REQUESTED_OPTIONS),
@@ -287,13 +298,28 @@ fn decorate_reply(
         pxe_arch: requested_arch(pkt),
         uuid: None,
         vendor_class: find_option(&pkt.options, OPTION_VENDOR_ID),
-        lease_time: context.map_or(3600, |ctx| ctx.lease_time),
+        lease_time: do_options_lease_time,
         fuzz: 0,
         pxevendor: None,
         config_opts: &mut config_opts,
         boot,
         dns_port: 53,
     };
+
+    // OPTION_LEASE_TIME (51) is written unconditionally for OFFER and for the
+    // ACK that answers a REQUEST (rfc2131.c:1384, :1744). It is deliberately
+    // *not* written for the ACK that answers an INFORM (rfc2131.c:1797-1810
+    // only includes it there if the client asked for it via the parameter
+    // request list, which ordinary clients don't).
+    let write_lease_time = match reply.msg_type {
+        DhcpMsgType::Offer => true,
+        DhcpMsgType::Ack => !is_inform,
+        _ => false,
+    };
+    if write_lease_time {
+        option_put(&mut reply_pkt.options, OPTION_LEASE_TIME, lease_time, 4);
+    }
+
     do_options(&mut reply_pkt, &mut opt_cfg);
     reply.options = reply_pkt.options;
 }
@@ -407,11 +433,39 @@ pub fn is_relayed(pkt: &DhcpPacket) -> bool {
 // Packet dispatch
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Create-or-renew the lease for a successful REQUEST/ACK, mirroring the
+/// `lease_set_*` calls in `rfc2131.c:1683-1730`. No-ops if the lease store is
+/// already at `max_leases`.
+fn record_lease(
+    lease_db: &mut LeaseDb,
+    addr: Ipv4Addr,
+    pkt: &DhcpPacket,
+    hw_len: usize,
+    clid: Option<&[u8]>,
+    hostname: Option<&str>,
+    lease_time: u32,
+) {
+    if lease_db.find_by_addr(addr).is_none() && lease_db.allocate_v4(addr).is_none() {
+        return;
+    }
+    lease_db.set_hwaddr(addr, &pkt.chaddr[..hw_len], i32::from(pkt.htype), clid);
+    lease_db.set_hostname(addr, hostname, false);
+    lease_db.set_expires(addr, lease_time);
+}
+
 /// Dispatch a received DHCP packet to the appropriate handler.
 ///
 /// Returns `Some(DhcpReply)` when a reply should be sent, `None` when the
 /// packet should be silently dropped (e.g. RELEASE, DECLINE, unknown type).
-pub fn dispatch_dhcp_with_meta(pkt: &DhcpPacket, cfg: &DhcpServerConfig) -> Option<DispatchedDhcpReply> {
+///
+/// `lease_db` is mutated in place: a REQUEST that is ACK'd creates or renews
+/// a lease, RELEASE frees it, and DECLINE removes it so the address is not
+/// handed out as an active lease again (rfc2131.c:1237-1285, :1683-1730).
+pub fn dispatch_dhcp_with_meta(
+    pkt: &DhcpPacket,
+    cfg: &DhcpServerConfig,
+    lease_db: &mut LeaseDb,
+) -> Option<DispatchedDhcpReply> {
     let msg_type = get_message_type(&pkt.options)?;
     let clid = find_option(&pkt.options, OPTION_CLIENT_ID);
     let hostname = find_option(&pkt.options, OPTION_HOSTNAME)
@@ -449,19 +503,36 @@ pub fn dispatch_dhcp_with_meta(pkt: &DhcpPacket, cfg: &DhcpServerConfig) -> Opti
         }
         DhcpMsgType::Request => {
             inc_metric(Metric::Dhcprequest);
-            handle_request(pkt, cfg.pool_start, cfg.pool_end, cfg.server_ip, static_addr)
+            let requested = find_requested_ip(&pkt.options)
+                .or_else(|| (pkt.ciaddr != Ipv4Addr::UNSPECIFIED).then_some(pkt.ciaddr));
+            // Address reserved as a static dhcp-host for a *different* client
+            // (rfc2131.c:1529-1530). `config` and the lookup below both point
+            // into `cfg.configs`, so pointer identity tells them apart.
+            let reserved_for_other = requested
+                .and_then(|addr| config_find_by_address(&cfg.configs, addr))
+                .is_some_and(|addr_cfg| !config.is_some_and(|c| std::ptr::eq(c, addr_cfg)));
+            handle_request(
+                pkt, cfg.pool_start, cfg.pool_end, cfg.server_ip, static_addr, reserved_for_other,
+            )
         }
         DhcpMsgType::Release => {
             inc_metric(Metric::Dhcprelease);
+            if handle_release(pkt, cfg.pool_start, cfg.pool_end) {
+                lease_db.remove_by_addr(pkt.ciaddr);
+            }
             None
         }
         DhcpMsgType::Inform => {
             inc_metric(Metric::Dhcpinform);
-            // INFORM clients already have an address; full handling in rfc2131.
-            None
+            handle_inform(pkt, cfg.server_ip)
         }
         DhcpMsgType::Decline => {
             inc_metric(Metric::Dhcpdecline);
+            if handle_decline(pkt, cfg.pool_start, cfg.pool_end) {
+                if let Some(declined) = find_requested_ip(&pkt.options) {
+                    lease_db.remove_by_addr(declined);
+                }
+            }
             None
         }
         _ => {
@@ -471,6 +542,16 @@ pub fn dispatch_dhcp_with_meta(pkt: &DhcpPacket, cfg: &DhcpServerConfig) -> Opti
     }?;
 
     decorate_reply(&mut reply, pkt, cfg, &tags, config);
+
+    // Only a REQUEST's ACK allocates a lease; INFORM's ACK never assigns an
+    // address (rfc2131.c:1683-1730 vs. the DHCPINFORM case at :1753-1818).
+    if reply.msg_type == DhcpMsgType::Ack
+        && reply.yiaddr != Ipv4Addr::UNSPECIFIED
+        && get_message_type(&pkt.options) != Some(DhcpMsgType::Inform)
+    {
+        let lease_time = context_for_reply(cfg, &reply).map_or(3600, |ctx| ctx.lease_time);
+        record_lease(lease_db, reply.yiaddr, pkt, hw_len, clid, hostname, lease_time);
+    }
 
     let delay_secs = if reply.msg_type == DhcpMsgType::Offer {
         select_reply_delay(&tags, cfg)
@@ -485,8 +566,12 @@ pub fn dispatch_dhcp_with_meta(pkt: &DhcpPacket, cfg: &DhcpServerConfig) -> Opti
 ///
 /// Returns `Some(DhcpReply)` when a reply should be sent, `None` when the
 /// packet should be silently dropped (e.g. RELEASE, DECLINE, unknown type).
-pub fn dispatch_dhcp(pkt: &DhcpPacket, cfg: &DhcpServerConfig) -> Option<DhcpReply> {
-    dispatch_dhcp_with_meta(pkt, cfg).map(|out| out.reply)
+pub fn dispatch_dhcp(
+    pkt: &DhcpPacket,
+    cfg: &DhcpServerConfig,
+    lease_db: &mut LeaseDb,
+) -> Option<DhcpReply> {
+    dispatch_dhcp_with_meta(pkt, cfg, lease_db).map(|out| out.reply)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -551,10 +636,14 @@ pub async fn send_dhcp_reply(
 
 /// Receive DHCP packets on `socket`, dispatch them, and send replies until
 /// `shutdown` is set to `true`.
+///
+/// `lease_db` should be pre-loaded from `cfg.lease_file` (if any) by the
+/// caller; it is written back to that file whenever a dispatch marks it dirty.
 pub async fn run_dhcp_loop(
     socket: std::sync::Arc<tokio::net::UdpSocket>,
     cfg: DhcpServerConfig,
     opts: DhcpLoopOptions,
+    mut lease_db: LeaseDb,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let mut buf = vec![0u8; cfg.max_packet.max(300)];
@@ -574,7 +663,18 @@ pub async fn run_dhcp_loop(
                     debug!("ignoring malformed DHCP packet from {src}");
                     continue;
                 };
-                let Some(dispatched) = dispatch_dhcp_with_meta(&pkt, &cfg) else {
+                let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db);
+
+                if lease_db.file_dirty {
+                    if let Some(path) = cfg.lease_file.as_deref() {
+                        if let Err(err) = lease_db.write_to_file(path) {
+                            warn!("failed to write DHCP lease file {path}: {err}");
+                        }
+                    }
+                    lease_db.file_dirty = false;
+                }
+
+                let Some(dispatched) = dispatched else {
                     continue;
                 };
 
@@ -881,6 +981,7 @@ mod tests {
             dhcp_opts: vec![],
             boot_configs: vec![],
             domain_suffix: None,
+            lease_file: None,
         }
     }
 
@@ -888,7 +989,7 @@ mod tests {
     fn discover_produces_offer() {
         let pkt = base_packet();
         let cfg = default_cfg();
-        let reply = dispatch_dhcp(&pkt, &cfg);
+        let reply = dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new());
         assert!(reply.is_some());
         assert_eq!(reply.unwrap().msg_type, DhcpMsgType::Offer);
     }
@@ -898,7 +999,7 @@ mod tests {
         let mut pkt = base_packet();
         pkt.options = vec![OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Release as u8, OPTION_END];
         let cfg = default_cfg();
-        assert!(dispatch_dhcp(&pkt, &cfg).is_none());
+        assert!(dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new()).is_none());
     }
 
     #[test]
@@ -906,7 +1007,7 @@ mod tests {
         let mut pkt = base_packet();
         pkt.options = vec![OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Decline as u8, OPTION_END];
         let cfg = default_cfg();
-        assert!(dispatch_dhcp(&pkt, &cfg).is_none());
+        assert!(dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new()).is_none());
     }
 
     #[test]
@@ -939,7 +1040,7 @@ mod tests {
         pkt.chaddr[..6].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
         let mut cfg = default_cfg();
         cfg.configs.push(ignore);
-        assert!(dispatch_dhcp(&pkt, &cfg).is_none());
+        assert!(dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new()).is_none());
     }
 
     #[test]
@@ -972,7 +1073,7 @@ mod tests {
         pkt.chaddr[..6].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
         let mut cfg = default_cfg();
         cfg.configs.push(static_cfg);
-        let reply = dispatch_dhcp(&pkt, &cfg).expect("static config should offer");
+        let reply = dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new()).expect("static config should offer");
         assert_eq!(reply.msg_type, DhcpMsgType::Offer);
         assert_eq!(reply.yiaddr, Ipv4Addr::new(10, 0, 0, 42));
     }
@@ -1008,7 +1109,7 @@ mod tests {
             netid: DhcpNetid { net: "pxe".into() },
             vendor_class: b"PXEClient".to_vec(),
         });
-        assert!(dispatch_dhcp(&pkt, &cfg).is_none());
+        assert!(dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new()).is_none());
     }
 
     #[test]
@@ -1042,7 +1143,7 @@ mod tests {
             netid: DhcpNetid { net: "accounts".into() },
             user_class: b"accounts".to_vec(),
         });
-        assert!(dispatch_dhcp(&pkt, &cfg).is_none());
+        assert!(dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new()).is_none());
     }
 
     #[test]
@@ -1076,7 +1177,7 @@ mod tests {
             netid: DhcpNetid { net: "legacy".into() },
             user_class: b"legacy".to_vec(),
         });
-        assert!(dispatch_dhcp(&pkt, &cfg).is_none());
+        assert!(dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new()).is_none());
     }
 
     #[test]
@@ -1109,7 +1210,7 @@ mod tests {
             hwaddr_type: 1,
             wildcard_mask: 0b000111,
         });
-        assert!(dispatch_dhcp(&pkt, &cfg).is_none());
+        assert!(dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new()).is_none());
     }
 
     #[test]
@@ -1145,7 +1246,7 @@ mod tests {
             subopt: crate::dhcp_protocol::SUBOPT_CIRCUIT_ID,
             data: b"uplink".to_vec(),
         });
-        assert!(dispatch_dhcp(&pkt, &cfg).is_none());
+        assert!(dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new()).is_none());
     }
 
     #[test]
@@ -1181,7 +1282,7 @@ mod tests {
             subopt: crate::dhcp_protocol::SUBOPT_CIRCUIT_ID,
             data: vec![0x01, 0x02, 0x03, 0x04],
         });
-        assert!(dispatch_dhcp(&pkt, &cfg).is_none());
+        assert!(dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new()).is_none());
     }
 
     #[test]
@@ -1217,7 +1318,7 @@ mod tests {
             subopt: crate::dhcp_protocol::SUBOPT_REMOTE_ID,
             data: b"remote-id1".to_vec(),
         });
-        assert!(dispatch_dhcp(&pkt, &cfg).is_none());
+        assert!(dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new()).is_none());
     }
 
     #[test]
@@ -1253,7 +1354,7 @@ mod tests {
             subopt: crate::dhcp_protocol::SUBOPT_SUBSCR_ID,
             data: b"subscriber-1a".to_vec(),
         });
-        assert!(dispatch_dhcp(&pkt, &cfg).is_none());
+        assert!(dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new()).is_none());
     }
 
     #[test]
@@ -1267,7 +1368,7 @@ mod tests {
             filter: vec![],
         });
 
-        let reply = dispatch_dhcp_with_meta(&pkt, &cfg).expect("discover should produce an offer");
+        let reply = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new()).expect("discover should produce an offer");
         assert_eq!(reply.reply.msg_type, DhcpMsgType::Offer);
         assert_eq!(reply.delay_secs, 5);
     }
@@ -1297,7 +1398,7 @@ mod tests {
             filter: vec![],
         });
 
-        let reply = dispatch_dhcp_with_meta(&pkt, &cfg).expect("discover should produce an offer");
+        let reply = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new()).expect("discover should produce an offer");
         assert_eq!(reply.reply.msg_type, DhcpMsgType::Offer);
         assert_eq!(reply.delay_secs, 2);
     }
@@ -1317,7 +1418,7 @@ mod tests {
             filter: vec![],
         });
 
-        let reply = dispatch_dhcp_with_meta(&pkt, &cfg).expect("discover should produce an offer");
+        let reply = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new()).expect("discover should produce an offer");
         assert_eq!(reply.reply.msg_type, DhcpMsgType::Offer);
         assert_eq!(reply.delay_secs, 7);
     }
@@ -1339,9 +1440,267 @@ mod tests {
             filter: vec![],
         });
 
-        let reply = dispatch_dhcp_with_meta(&pkt, &cfg).expect("request should produce an ack");
+        let reply = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new()).expect("request should produce an ack");
         assert_eq!(reply.reply.msg_type, DhcpMsgType::Ack);
         assert_eq!(reply.delay_secs, 0);
+    }
+
+    // ── lease store integration ─────────────────────────────────────────────
+
+    #[test]
+    fn request_ack_creates_persisted_lease() {
+        let mut pkt = base_packet();
+        pkt.chaddr[..6].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        pkt.options = vec![
+            OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Request as u8,
+            crate::dhcp_protocol::OPTION_REQUESTED_IP, 4, 10, 0, 0, 123,
+            OPTION_END,
+        ];
+        let cfg = default_cfg();
+        let mut lease_db = LeaseDb::new();
+
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db).expect("request should ack");
+        assert_eq!(dispatched.reply.msg_type, DhcpMsgType::Ack);
+
+        let lease = lease_db
+            .find_by_addr(Ipv4Addr::new(10, 0, 0, 123))
+            .expect("lease should be recorded");
+        assert_eq!(&lease.hwaddr[..6], &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        assert!(lease.expires.is_some());
+    }
+
+    #[test]
+    fn release_frees_lease() {
+        let addr = Ipv4Addr::new(10, 0, 0, 150);
+        let mut lease_db = LeaseDb::new();
+        lease_db.allocate_v4(addr);
+        assert!(lease_db.find_by_addr(addr).is_some());
+
+        let mut pkt = base_packet();
+        pkt.ciaddr = addr;
+        pkt.options = vec![OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Release as u8, OPTION_END];
+        let cfg = default_cfg();
+
+        assert!(dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db).is_none());
+        assert!(lease_db.find_by_addr(addr).is_none());
+    }
+
+    #[test]
+    fn release_for_out_of_pool_ciaddr_leaves_lease_store_untouched() {
+        let addr = Ipv4Addr::new(10, 0, 0, 150);
+        let mut lease_db = LeaseDb::new();
+        lease_db.allocate_v4(addr);
+
+        let mut pkt = base_packet();
+        pkt.ciaddr = Ipv4Addr::new(192, 168, 1, 50); // not in cfg's pool
+        pkt.options = vec![OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Release as u8, OPTION_END];
+        let cfg = default_cfg();
+
+        assert!(dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db).is_none());
+        // Unrelated lease must survive an out-of-pool RELEASE.
+        assert!(lease_db.find_by_addr(addr).is_some());
+    }
+
+    #[test]
+    fn decline_removes_lease() {
+        let addr = Ipv4Addr::new(10, 0, 0, 160);
+        let mut lease_db = LeaseDb::new();
+        lease_db.allocate_v4(addr);
+
+        let mut pkt = base_packet();
+        pkt.options = vec![
+            OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Decline as u8,
+            crate::dhcp_protocol::OPTION_REQUESTED_IP, 4, 10, 0, 0, 160,
+            OPTION_END,
+        ];
+        let cfg = default_cfg();
+
+        assert!(dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db).is_none());
+        assert!(lease_db.find_by_addr(addr).is_none());
+    }
+
+    #[test]
+    fn inform_returns_ack_without_allocating_address() {
+        let mut pkt = base_packet();
+        pkt.ciaddr = Ipv4Addr::new(10, 0, 0, 55);
+        pkt.options = vec![OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Inform as u8, OPTION_END];
+        let cfg = default_cfg();
+        let mut lease_db = LeaseDb::new();
+
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db).expect("inform should ack");
+        assert_eq!(dispatched.reply.msg_type, DhcpMsgType::Ack);
+        assert_eq!(dispatched.reply.yiaddr, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(lease_db.count(), 0);
+    }
+
+    #[test]
+    fn request_for_address_reserved_to_another_client_is_nak_d() {
+        use crate::types::dhcp::{DhcpConfig, HwaddrConfig, CONFIG_ADDR};
+
+        let mut reserved_hw = [0u8; DHCP_CHADDR_MAX];
+        reserved_hw[..6].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        let reserved_cfg = DhcpConfig {
+            flags: CONFIG_ADDR,
+            clid: None,
+            hostname: None,
+            domain: None,
+            netid: vec![],
+            filter: vec![],
+            addr: Ipv4Addr::new(10, 0, 0, 150),
+            decline_time: None,
+            lease_time: 0,
+            hwaddrs: vec![HwaddrConfig {
+                hwaddr: reserved_hw,
+                hwaddr_len: 6,
+                hwaddr_type: 1,
+                wildcard_mask: 0,
+            }],
+            #[cfg(feature = "dhcp6")]
+            addr6: vec![],
+        };
+
+        let mut cfg = default_cfg();
+        cfg.configs.push(reserved_cfg);
+
+        // A different client (no matching config) requests the reserved address.
+        let mut pkt = base_packet();
+        pkt.chaddr[..6].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        pkt.options = vec![
+            OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Request as u8,
+            crate::dhcp_protocol::OPTION_REQUESTED_IP, 4, 10, 0, 0, 150,
+            OPTION_END,
+        ];
+
+        let reply = dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new()).expect("request should reply");
+        assert_eq!(reply.msg_type, DhcpMsgType::Nak);
+    }
+
+    #[test]
+    fn request_for_own_reserved_address_is_acked() {
+        use crate::types::dhcp::{DhcpConfig, HwaddrConfig, CONFIG_ADDR};
+
+        let mut hw = [0u8; DHCP_CHADDR_MAX];
+        hw[..6].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        let owner_cfg = DhcpConfig {
+            flags: CONFIG_ADDR,
+            clid: None,
+            hostname: None,
+            domain: None,
+            netid: vec![],
+            filter: vec![],
+            addr: Ipv4Addr::new(10, 0, 0, 150),
+            decline_time: None,
+            lease_time: 0,
+            hwaddrs: vec![HwaddrConfig {
+                hwaddr: hw,
+                hwaddr_len: 6,
+                hwaddr_type: 1,
+                wildcard_mask: 0,
+            }],
+            #[cfg(feature = "dhcp6")]
+            addr6: vec![],
+        };
+
+        let mut cfg = default_cfg();
+        cfg.configs.push(owner_cfg);
+
+        // The client that actually owns the reservation requests it.
+        let mut pkt = base_packet();
+        pkt.chaddr[..6].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        pkt.options = vec![
+            OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Request as u8,
+            crate::dhcp_protocol::OPTION_REQUESTED_IP, 4, 10, 0, 0, 150,
+            OPTION_END,
+        ];
+
+        let reply = dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new()).expect("request should reply");
+        assert_eq!(reply.msg_type, DhcpMsgType::Ack);
+    }
+
+    #[test]
+    fn offer_and_ack_carry_lease_time_option() {
+        let pkt = base_packet(); // discover
+        let cfg = default_cfg();
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new()).expect("discover should offer");
+        assert!(find_option(&dispatched.reply.options, crate::dhcp_protocol::OPTION_LEASE_TIME).is_some());
+
+        let mut req_pkt = base_packet();
+        req_pkt.options = vec![
+            OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Request as u8,
+            crate::dhcp_protocol::OPTION_REQUESTED_IP, 4, 10, 0, 0, 123,
+            OPTION_END,
+        ];
+        let dispatched = dispatch_dhcp_with_meta(&req_pkt, &cfg, &mut LeaseDb::new()).expect("request should ack");
+        assert!(find_option(&dispatched.reply.options, crate::dhcp_protocol::OPTION_LEASE_TIME).is_some());
+    }
+
+    #[test]
+    fn inform_ack_does_not_carry_lease_time_option() {
+        let mut pkt = base_packet();
+        pkt.ciaddr = Ipv4Addr::new(10, 0, 0, 55);
+        pkt.options = vec![OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Inform as u8, OPTION_END];
+        let cfg = default_cfg();
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new()).expect("inform should ack");
+        assert!(find_option(&dispatched.reply.options, crate::dhcp_protocol::OPTION_LEASE_TIME).is_none());
+    }
+
+    #[test]
+    fn inform_ack_does_not_carry_t1_t2_options() {
+        // RFC 2131 says DHCPINFORM shouldn't carry lease-time parameters at
+        // all; do_options() is only given a finite lease time for OFFER/ACK
+        // answering a REQUEST (rfc2131.c:1817 passes 0xffffffff for INFORM).
+        let mut pkt = base_packet();
+        pkt.ciaddr = Ipv4Addr::new(10, 0, 0, 55);
+        pkt.options = vec![OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Inform as u8, OPTION_END];
+        let cfg = default_cfg();
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new()).expect("inform should ack");
+        assert!(find_option(&dispatched.reply.options, crate::dhcp_protocol::OPTION_T1).is_none());
+        assert!(find_option(&dispatched.reply.options, crate::dhcp_protocol::OPTION_T2).is_none());
+    }
+
+    #[tokio::test]
+    async fn run_dhcp_loop_persists_lease_to_configured_file() {
+        let Some(server) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+        let Some(client) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+        let Some(receiver) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loop_leases.dat");
+        let path_str = path.to_str().unwrap().to_string();
+
+        let receiver_addr = receiver.local_addr().unwrap();
+        let server = std::sync::Arc::new(server);
+        let mut cfg = default_cfg();
+        cfg.lease_file = Some(path_str.clone());
+        let opts = DhcpLoopOptions {
+            reply_port_override: Some(receiver_addr.port()),
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, LeaseDb::new(), shutdown_rx));
+
+        let mut pkt = base_packet();
+        pkt.options = vec![
+            OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Request as u8,
+            crate::dhcp_protocol::OPTION_REQUESTED_IP, 4, 10, 0, 0, 123,
+            OPTION_END,
+        ];
+        let wire = packet_to_wire(&pkt);
+        client.send_to(&wire, server.local_addr().unwrap()).await.unwrap();
+
+        let mut buf = [0u8; 512];
+        let (len, _) = tokio::time::timeout(Duration::from_millis(250), receiver.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for DHCP loop reply")
+            .unwrap();
+        let reply = parse_dhcp_packet(&buf[..len]).expect("loop reply should parse");
+        assert_eq!(get_message_type(&reply.options), Some(DhcpMsgType::Ack));
+
+        shutdown_tx.send(true).unwrap();
+        loop_task.await.unwrap().unwrap();
+
+        let persisted = LeaseDb::load_from_file(&path_str).expect("lease file should have been written");
+        assert!(persisted.find_by_addr(Ipv4Addr::new(10, 0, 0, 123)).is_some());
     }
 
     #[test]
@@ -1392,7 +1751,7 @@ mod tests {
             vendor_class: None,
         });
 
-        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg).expect("discover should produce an offer");
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new()).expect("discover should produce an offer");
         assert!(find_option(&dispatched.reply.options, crate::dhcp_protocol::OPTION_DOMAINNAME).is_some());
         assert!(find_option(&dispatched.reply.options, crate::dhcp_protocol::OPTION_ROUTER).is_some());
     }
@@ -1476,7 +1835,7 @@ mod tests {
             vendor_class: None,
         });
 
-        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg).expect("discover should produce an offer");
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new()).expect("discover should produce an offer");
         assert_eq!(
             find_option(&dispatched.reply.options, crate::dhcp_protocol::OPTION_DOMAINNAME),
             Some(&b"lab.example"[..])
@@ -1497,7 +1856,7 @@ mod tests {
             netid: vec![],
         });
 
-        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg).expect("discover should produce an offer");
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new()).expect("discover should produce an offer");
         assert_eq!(dispatched.reply.siaddr, Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(dispatched.reply.file.as_deref(), Some("pxelinux.0"));
         assert_eq!(dispatched.reply.sname.as_deref(), Some("boot.example"));
@@ -1565,7 +1924,7 @@ mod tests {
 
         let pkt = base_packet();
         let cfg = default_cfg();
-        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg).expect("discover should produce an offer");
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new()).expect("discover should produce an offer");
 
         let sent = match send_dhcp_reply_to(&sender, &pkt, &dispatched, dest).await {
             Ok(sent) => sent,
@@ -1600,7 +1959,7 @@ mod tests {
             delay_secs: 1,
             filter: vec![],
         });
-        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg).expect("discover should produce an offer");
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new()).expect("discover should produce an offer");
         assert_eq!(dispatched.delay_secs, 1);
 
         let started = tokio::time::Instant::now();
@@ -1647,7 +2006,7 @@ mod tests {
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, shutdown_rx));
+        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, LeaseDb::new(), shutdown_rx));
 
         let pkt = base_packet();
         let wire = packet_to_wire(&pkt);
@@ -1686,7 +2045,7 @@ mod tests {
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, shutdown_rx));
+        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, LeaseDb::new(), shutdown_rx));
 
         let pkt = base_packet();
         let wire = packet_to_wire(&pkt);
