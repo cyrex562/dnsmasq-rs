@@ -15,7 +15,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::cache::DnsCache;
 use crate::hash_questions::hash_questions;
 use crate::metrics::{inc_metric, Metric};
-use crate::rfc1035::{answer_request, private_net, private_net6, DnsPacket, LocalConfig};
+use crate::rfc1035::{
+    answer_request, private_net, private_net6, DnsPacket, ExtractConfig, ExtractResult,
+    LocalConfig,
+};
 use crate::types::constants::{F_IPV4, F_IPV6, F_SERVER};
 use crate::types::dns_records::{Cname, HostRecord, MxSrvRecord, Naptr, PtrRecord, TxtRecord};
 
@@ -49,7 +52,6 @@ pub struct PendingQuery {
 /// Table of all in-flight queries, keyed by upstream transaction ID.
 pub struct ForwardTable {
     queries: HashMap<u16, PendingQuery>,
-    next_id: u16,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -61,14 +63,30 @@ impl ForwardTable {
     pub fn new() -> Self {
         Self {
             queries: HashMap::new(),
-            next_id: 1,
         }
     }
 
-    /// Allocate a new pending query and return the upstream transaction ID.
+    /// Draw an unused outgoing transaction ID.
     ///
-    /// The ID is chosen by incrementing an internal counter, wrapping around
-    /// and skipping any ID that is already in use.
+    /// Mirrors C's `get_id()` (`forward.c:3302`), which draws from `rand16()`.
+    /// The ID must be *unpredictable*, not merely unique: an off-path attacker
+    /// who can observe or guess one outgoing ID can otherwise compute the next
+    /// one and race the real server with a forged answer.
+    fn fresh_id(&self) -> u16 {
+        for _ in 0..64 {
+            let id = rand::random::<u16>();
+            if !self.queries.contains_key(&id) {
+                return id;
+            }
+        }
+        // The table holds a large fraction of the 65536 IDs; scan for a free
+        // one rather than clobbering a live query.
+        (0..=u16::MAX)
+            .find(|id| !self.queries.contains_key(id))
+            .unwrap_or_else(rand::random)
+    }
+
+    /// Allocate a new pending query and return the upstream transaction ID.
     pub fn alloc_query(
         &mut self,
         orig_id: u16,
@@ -76,50 +94,21 @@ impl ForwardTable {
         upstream_idx: usize,
         question_hash: [u8; 16],
     ) -> u16 {
-        // Find the next unused ID, wrapping through the full u16 range.
-        let start = self.next_id;
-        loop {
-            let id = self.next_id;
-            // Advance counter, skip 0.
-            self.next_id = self.next_id.wrapping_add(1);
-            if self.next_id == 0 {
-                self.next_id = 1;
-            }
-            if !self.queries.contains_key(&id) {
-                self.queries.insert(
-                    id,
-                    PendingQuery {
-                        id,
-                        orig_id,
-                        client,
-                        upstream_idx,
-                        sent_at: Instant::now(),
-                        question_hash,
-                        retries: 0,
-                        listener: 0,
-                    },
-                );
-                return id;
-            }
-            // Safety valve: if every possible ID is occupied, overwrite the
-            // start position (extremely unlikely in practice).
-            if self.next_id == start {
-                self.queries.insert(
-                    id,
-                    PendingQuery {
-                        id,
-                        orig_id,
-                        client,
-                        upstream_idx,
-                        sent_at: Instant::now(),
-                        question_hash,
-                        retries: 0,
-                        listener: 0,
-                    },
-                );
-                return id;
-            }
-        }
+        let id = self.fresh_id();
+        self.queries.insert(
+            id,
+            PendingQuery {
+                id,
+                orig_id,
+                client,
+                upstream_idx,
+                sent_at: Instant::now(),
+                question_hash,
+                retries: 0,
+                listener: 0,
+            },
+        );
+        id
     }
 
     /// Find a pending query by upstream transaction ID.
@@ -796,17 +785,61 @@ pub struct ForwardConfig {
     /// Locally-configured DNS data consulted before forwarding.
     pub local: LocalData,
     /// Maximum number of entries in the answer cache (`cache-size`).
+    /// `0` disables caching without disabling anything else on the reply path.
     pub cache_size: usize,
+    /// `--min-cache-ttl`: floor applied to a cached DNS answer (0 = none).
+    pub min_cache_ttl: u32,
+    /// `--max-cache-ttl`: ceiling applied to a cached DNS answer (0 = none).
+    pub max_cache_ttl: u32,
+    /// `--max-ttl`: ceiling applied to a TTL as it is read off the wire
+    /// (`rfc1035.c:752,834`).  Distinct from `max_cache_ttl`, which C applies
+    /// later, inside `cache_insert()`.
+    pub max_ttl: u32,
+    /// `--neg-ttl`: negative-cache TTL used when a reply carries no SOA.
+    pub neg_ttl: u32,
+    /// `--no-negcache`: never cache NXDOMAIN / NODATA answers.
+    pub no_neg_cache: bool,
+    /// `--stop-dns-rebind`: reject private addresses in upstream answers.
+    pub check_rebind: bool,
+    /// `--rebind-domain-ok`: domains exempt from the rebind check.
+    pub no_rebind: Vec<RebindDomain>,
 }
 
 impl Default for ForwardConfig {
     fn default() -> Self {
         Self {
-            upstreams:   Vec::new(),
-            timeout:     Duration::from_secs(QUERY_TIMEOUT_SECS),
-            max_retries: 2,
-            local:       LocalData::default(),
-            cache_size:  DEFAULT_CACHE_SIZE,
+            upstreams:     Vec::new(),
+            timeout:       Duration::from_secs(QUERY_TIMEOUT_SECS),
+            max_retries:   2,
+            local:         LocalData::default(),
+            cache_size:    DEFAULT_CACHE_SIZE,
+            min_cache_ttl: 0,
+            max_cache_ttl: 0,
+            max_ttl:       0,
+            neg_ttl:       0,
+            no_neg_cache:  false,
+            check_rebind:  false,
+            no_rebind:     Vec::new(),
+        }
+    }
+}
+
+impl ForwardConfig {
+    /// Build the [`ExtractConfig`] for a reply to a query for `qname`.
+    ///
+    /// The rebind check is decided per query name, not globally: C records
+    /// `FREC_NOREBIND` at forward time from `domain_no_rebind()`
+    /// (`forward.c:413`) and turns it back into `check_rebind` when the reply
+    /// arrives (`forward.c:1416`).
+    pub fn extract_config(&self, qname: &str) -> ExtractConfig {
+        ExtractConfig {
+            max_ttl:      self.max_ttl,
+            neg_ttl:      self.neg_ttl,
+            check_rebind: self.check_rebind && !domain_no_rebind(qname, &self.no_rebind),
+            no_neg_cache: self.no_neg_cache,
+            // DNSSEC validation is not wired into the forward path yet, so no
+            // reply is ever marked authenticated.  See `tasks.md`.
+            secure:       false,
         }
     }
 }
@@ -870,18 +903,63 @@ impl ForwardEngine {
         }
     }
 
+    /// Validate an upstream reply against the pending query it claims to
+    /// answer, returning that query's transaction ID.
+    ///
+    /// This is the set of checks C makes before a reply is allowed to affect
+    /// anything (`forward.c:1164-1209`):
+    ///
+    /// - the packet is a well-formed response (QR set, header-complete);
+    /// - a pending query with that transaction ID exists;
+    /// - the reply answers the *same question* that was sent — C gets this
+    ///   from `lookup_frec()`, which matches name/class/type alongside the ID
+    ///   (`forward.c:1173`);
+    /// - the reply came from the server the query was actually sent to
+    ///   (`forward.c:1201-1209`).
+    ///
+    /// A 16-bit ID on its own is far too weak a credential to admit a packet
+    /// that will be cached: matching on the ID alone turns one lucky forged
+    /// datagram into a cache entry every later client is served from.
+    ///
+    /// Returns `None` — leaving the pending entry in place, so the genuine
+    /// answer can still arrive — for anything that fails a check.
+    fn validate_reply(&self, reply: &[u8], from: SocketAddr) -> Option<u16> {
+        if reply.len() < 12 || reply[2] & 0x80 == 0 {
+            return None;
+        }
+        let id = u16::from_be_bytes([reply[0], reply[1]]);
+        let pending = self.table.lookup(id)?;
+        if hash_questions(reply)? != pending.question_hash {
+            return None;
+        }
+        if self.config.upstreams.get(pending.upstream_idx) != Some(&from) {
+            return None;
+        }
+        Some(id)
+    }
+
+    /// Validate an upstream reply and claim its pending query.
+    ///
+    /// See [`Self::validate_reply`] for the checks applied.  On success the
+    /// pending entry is removed and returned; the caller still has to patch
+    /// the transaction ID back to `orig_id` before sending to the client.
+    pub fn accept_reply(&mut self, reply: &[u8], from: SocketAddr) -> Option<PendingQuery> {
+        let id = self.validate_reply(reply, from)?;
+        self.table.remove(id)
+    }
+
     /// Process an upstream reply.
     ///
-    /// Matches the reply's transaction ID against the pending table.  Returns:
+    /// Matches the reply against the pending table.  Returns:
     /// - `Ok(Some((client_addr, reply)))` — valid reply, restore client ID
     /// - `Ok(None)` — no matching pending query (ignore)
     /// - `Err(pending)` — SERVFAIL reply; caller should retry with `retry_query`
     pub fn handle_reply_with_failover(
         &mut self,
         reply: &mut Vec<u8>,
+        from:  SocketAddr,
     ) -> Result<Option<(SocketAddr, Vec<u8>)>, PendingQuery> {
-        if reply.len() < 12 { return Ok(None); }
-        let reply_id = u16::from_be_bytes([reply[0], reply[1]]);
+        let Some(reply_id) = self.validate_reply(reply, from) else { return Ok(None) };
         // Peek at rcode (lower 4 bits of byte 3).
         let rcode = reply[3] & 0x0F;
         if rcode == 2 /* SERVFAIL */ {
@@ -937,19 +1015,6 @@ impl ForwardEngine {
                 None
             }
         }
-    }
-
-    /// Process an upstream reply.
-    ///
-    /// Matches the reply's transaction ID against the pending table.  If a
-    /// match is found, restores the original client ID and returns
-    /// `(client_addr, reply_bytes)`.
-    pub fn handle_reply(&mut self, reply: &mut Vec<u8>) -> Option<(SocketAddr, Vec<u8>)> {
-        if reply.len() < 2 { return None; }
-        let reply_id = u16::from_be_bytes([reply[0], reply[1]]);
-        let pending = self.table.remove(reply_id)?;
-        patch_id(reply, pending.orig_id);
-        Some((pending.client, reply.clone()))
     }
 
     /// Expire timed-out pending queries.
@@ -1401,6 +1466,93 @@ fn recv_datagram(
     Ok(crate::network::RecvMeta { len, src, dest: None, if_index: 0 })
 }
 
+/// Rebuild `parsed` as a wire packet with no resource records at all, keeping
+/// its header flags and question section and forcing `rcode`.
+///
+/// This is what C does when `extract_addresses()` returns non-zero
+/// (`forward.c:826-832`): the client still gets an answer packet, but an empty
+/// one.  Re-serialising rather than just zeroing the count fields also drops
+/// the record bytes themselves, so nothing is left dangling after the question
+/// section — C gets the same effect from `resize_packet()`.
+fn strip_records(parsed: &DnsPacket, rcode: u8) -> Vec<u8> {
+    let mut header = parsed.header;
+    header.ancount = 0;
+    header.nscount = 0;
+    header.arcount = 0;
+    header.set_rcode(rcode);
+    DnsPacket {
+        header,
+        questions:  parsed.questions.clone(),
+        answers:    Vec::new(),
+        authority:  Vec::new(),
+        additional: Vec::new(),
+    }
+    .write()
+    .to_vec()
+}
+
+/// Feed an accepted upstream reply into the cache, and apply the answer-side
+/// policy `process_reply()` applies around that call (`forward.c:815-841`).
+///
+/// `extract_addresses` runs for **every** accepted, non-truncated reply that
+/// carries cacheable data — never gated on whether caching is enabled.  It is
+/// also where DNS-rebind protection lives, so gating it on `cache_size` would
+/// let `cache-size=0` silently disable `--stop-dns-rebind`.  A zero cache size
+/// only makes the eventual insert fail to commit, exactly as C's zero
+/// `daemon->cachesize` leaves `really_insert()` with no free `crec`.
+///
+/// Returns `true` when a rebind attack was blocked.
+fn cache_upstream_reply(
+    pkt:    &mut Vec<u8>,
+    cache:  &mut DnsCache,
+    config: &ForwardConfig,
+) -> bool {
+    let Ok(parsed) = DnsPacket::parse(pkt) else {
+        // Unparseable body.  It cannot be re-serialised, so zero the counts in
+        // place and SERVFAIL it, matching C's handling of `extract_addresses()`
+        // returning 2.  The question section is known good — `validate_reply`
+        // already hashed it.
+        if pkt.len() >= 12 {
+            pkt[6..12].fill(0);
+            set_rcode(pkt, 2 /* SERVFAIL */);
+        }
+        return false;
+    };
+    // Only QUERY replies carrying NOERROR or NXDOMAIN hold cacheable data;
+    // everything else is passed straight through (`forward.c:778-791`).
+    if parsed.header.opcode() != 0 {
+        return false;
+    }
+    let rcode = parsed.header.rcode();
+    if rcode != 0 && rcode != 3 {
+        return false;
+    }
+    let Some(question) = parsed.questions.first() else { return false };
+    let qname = question.name.to_lowercase();
+
+    match crate::cache::cache_reply(pkt, cache, &config.extract_config(&qname)) {
+        ExtractResult::Cached => false,
+        ExtractResult::RebindBlocked => {
+            // Sections cleared, rcode left alone: C logs and blocks but does
+            // not rewrite the rcode for a rebind hit.
+            *pkt = strip_records(&parsed, rcode);
+            tracing::warn!("possible DNS-rebind attack detected: {qname}");
+            true
+        }
+        ExtractResult::BadPacket => {
+            *pkt = strip_records(&parsed, 2 /* SERVFAIL */);
+            false
+        }
+    }
+}
+
+/// Overwrite the RCODE nibble of a DNS packet in place.
+fn set_rcode(pkt: &mut [u8], rcode: u8) {
+    if pkt.len() >= 12 {
+        pkt[3] = (pkt[3] & 0xF0) | (rcode & 0x0F);
+    }
+}
+
 /// Run the DNS UDP forwarding event loop over a set of bound listeners.
 ///
 /// `filter` is consulted for datagrams arriving on any listener whose
@@ -1428,7 +1580,13 @@ pub async fn run_forward_loop_on(
     // Local data and cache are owned by the loop; `LocalConfig` borrows from
     // `local` and is rebuilt per query.
     let local            = config.local.clone();
-    let mut cache        = DnsCache::new(config.cache_size.max(1));
+    // The TTL bounds have to live on the cache itself: `really_insert` is the
+    // only place they are enforced, and it is the live insert path.
+    let mut cache        = DnsCache::with_ttl_limits(
+        config.cache_size,
+        config.min_cache_ttl,
+        config.max_cache_ttl,
+    );
     let mut engine       = ForwardEngine::new(config);
     let mut client_buf   = vec![0u8; MAX_PACKET_SIZE];
     let mut upstream_buf = vec![0u8; MAX_PACKET_SIZE];
@@ -1476,33 +1634,32 @@ pub async fn run_forward_loop_on(
             result = upstream_sock.recv_from(&mut upstream_buf) => {
                 let (len, upstream_addr) = result?;
                 let mut pkt = upstream_buf[..len].to_vec();
-                // Read the arrival listener before `handle_reply` consumes the
-                // pending entry.
-                let reply_listener = (pkt.len() >= 2)
-                    .then(|| u16::from_be_bytes([pkt[0], pkt[1]]))
-                    .and_then(|id| engine.table.lookup(id))
-                    .map(|q| q.listener)
-                    .filter(|i| *i < listeners.len())
-                    .unwrap_or(0);
+
+                // Nothing may act on this datagram until it has proved it
+                // answers an outstanding query, from the server that query
+                // went to.  A failed check leaves the pending entry alone so
+                // the genuine answer can still be accepted.
+                let Some(pending) = engine.accept_reply(&pkt, upstream_addr) else { continue };
+
+                let reply_listener = if pending.listener < listeners.len() {
+                    pending.listener
+                } else {
+                    0
+                };
                 let client_sock = &listeners[reply_listener].sock;
-                if let Some((client_addr, reply)) = engine.handle_reply(&mut pkt) {
-                    if is_truncated(&reply) {
-                        // TC bit set — retry over TCP.
-                        let pending = engine.table.lookup(
-                            u16::from_be_bytes([reply[0], reply[1]])
-                        ).cloned();
-                        if let Some(q) = pending {
-                            let timeout = engine.config.timeout;
-                            if let Some(full) = tcp_fallback(
-                                upstream_addr, &pkt, q.orig_id, timeout
-                            ).await {
-                                let _ = client_sock.send_to(&full, client_addr).await;
-                                continue;
-                            }
-                        }
-                    }
-                    let _ = client_sock.send_to(&reply, client_addr).await;
+
+                // A truncated reply is relayed to the client as-is and nothing
+                // is cached from it: C logs "truncated" and skips
+                // `extract_addresses()` (`forward.c:791-792`), leaving the
+                // client to retry over TCP itself.  It does not escalate to TCP
+                // on the client's behalf, so neither do we — see `tasks.md` for
+                // the missing TCP listener.
+                if !is_truncated(&pkt) {
+                    cache_upstream_reply(&mut pkt, &mut cache, &engine.config);
                 }
+
+                patch_id(&mut pkt, pending.orig_id);
+                let _ = client_sock.send_to(&pkt, pending.client).await;
             }
             // ── Periodic expiry cleanup ───────────────────────────────────────
             _ = ticker.tick() => {
@@ -1514,17 +1671,9 @@ pub async fn run_forward_loop_on(
 
 // ─── Reply processing helpers ─────────────────────────────────────────────────
 
-/// A rebind-exclusion domain entry.
-///
-/// RFC 5735 / RFC 1918 addresses returned for names in these domains are
-/// *not* rejected as possible DNS-rebind attacks.  Mirrors dnsmasq's
-/// `struct rebind_domain`.
-#[derive(Debug, Clone, Default)]
-pub struct RebindDomain {
-    /// The domain suffix to exempt, e.g. `"home.arpa"`.
-    /// An empty string means "any single-label name".
-    pub domain: String,
-}
+/// A rebind-exclusion domain entry — the same type `Daemon::no_rebind` holds,
+/// re-exported here because `domain_no_rebind` is the only consumer.
+pub use crate::types::server::RebindDomain;
 
 /// Check whether `domain` appears in the no-rebind exclusion list.
 ///
@@ -1897,6 +2046,34 @@ mod tests {
         assert!(ft.remove(9999).is_none());
     }
 
+    /// C draws outgoing IDs from `rand16()` (`get_id()`, `forward.c:3302`).
+    /// A counter would make every ID after the first one predictable, which is
+    /// half the credential a forged reply has to guess.
+    #[test]
+    fn alloc_query_ids_are_not_sequential() {
+        let mut ft = ForwardTable::new();
+        let ids: Vec<u16> = (0..32)
+            .map(|i| ft.alloc_query(i, dummy_addr(), 0, dummy_hash()))
+            .collect();
+
+        let all_consecutive = ids
+            .windows(2)
+            .all(|w| w[1] == w[0].wrapping_add(1));
+        assert!(
+            !all_consecutive,
+            "transaction IDs must be unpredictable, got a run of consecutive ids: {ids:?}",
+        );
+    }
+
+    #[test]
+    fn alloc_query_ids_stay_unique_under_load() {
+        let mut ft = ForwardTable::new();
+        let ids: HashSet<u16> = (0..1000)
+            .map(|i| ft.alloc_query(i, dummy_addr(), 0, dummy_hash()))
+            .collect();
+        assert_eq!(ids.len(), 1000, "every in-flight query needs its own id");
+    }
+
     #[test]
     fn expire_old_removes_timed_out_leaves_fresh() {
         let mut ft = ForwardTable::new();
@@ -2018,38 +2195,96 @@ mod tests {
 
     // ── ForwardEngine ─────────────────────────────────────────────────────────
 
-    #[test]
-    fn forward_engine_handle_reply_restores_id() {
+    /// The address every engine built by `engine_with_pending` forwards to.
+    fn upstream_addr() -> SocketAddr {
+        "127.0.0.1:5353".parse().unwrap()
+    }
+
+    /// Turn a query into the reply an honest server would send: same ID, same
+    /// question, QR set.
+    fn reply_for(query: &[u8], upstream_id: u16) -> Vec<u8> {
+        let mut reply = query.to_vec();
+        patch_id(&mut reply, upstream_id);
+        reply[2] |= 0x80; // QR
+        reply
+    }
+
+    /// An engine with one outstanding query for `qname`, plus the wire bytes of
+    /// that query and the upstream ID it was sent with.
+    fn engine_with_pending(qname: &str, orig_id: u16) -> (ForwardEngine, Vec<u8>, u16) {
         let config = ForwardConfig {
-            upstreams: vec!["127.0.0.1:5353".parse().unwrap()],
+            upstreams: vec![upstream_addr()],
             ..Default::default()
         };
         let mut engine = ForwardEngine::new(config);
         let client: SocketAddr = "127.0.0.1:1234".parse().unwrap();
-
-        // Simulate inserting a pending query with orig_id=42.
-        let new_id = engine.table.alloc_query(42, client, 0, [0u8; 16]);
-
-        // Build a fake reply with the upstream ID.
-        let mut reply = vec![
-            (new_id >> 8) as u8, (new_id & 0xFF) as u8, // upstream ID
-            0x84, 0x00, // QR=1, AA=1
-            0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, // counts
-        ];
-        let (addr, patched) = engine.handle_reply(&mut reply).expect("should match");
-        assert_eq!(addr, client);
-        // Restored to original client ID 42.
-        let restored_id = u16::from_be_bytes([patched[0], patched[1]]);
-        assert_eq!(restored_id, 42);
+        let mut query = make_dns_query(qname, 1);
+        patch_id(&mut query, orig_id);
+        let qhash = hash_questions(&query).expect("query must hash");
+        let upstream_id = engine.table.alloc_query(orig_id, client, 0, qhash);
+        (engine, query, upstream_id)
     }
 
     #[test]
-    fn forward_engine_handle_reply_unknown_id_returns_none() {
-        let config = ForwardConfig::default();
-        let mut engine = ForwardEngine::new(config);
-        let mut reply = vec![0xAB, 0xCD, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
-                             0x00, 0x00, 0x00, 0x00];
-        assert!(engine.handle_reply(&mut reply).is_none());
+    fn accept_reply_claims_the_matching_pending_query() {
+        let (mut engine, query, upstream_id) = engine_with_pending("example.com", 42);
+        let reply = reply_for(&query, upstream_id);
+
+        let pending = engine
+            .accept_reply(&reply, upstream_addr())
+            .expect("a matching reply from the right server must be accepted");
+        assert_eq!(pending.orig_id, 42);
+        assert_eq!(pending.client, "127.0.0.1:1234".parse::<SocketAddr>().unwrap());
+        // The entry is consumed, so a duplicate reply finds nothing.
+        assert!(engine.accept_reply(&reply, upstream_addr()).is_none());
+    }
+
+    #[test]
+    fn accept_reply_rejects_an_unknown_transaction_id() {
+        let (mut engine, query, upstream_id) = engine_with_pending("example.com", 42);
+        let mut reply = reply_for(&query, upstream_id);
+        patch_id(&mut reply, upstream_id.wrapping_add(1));
+        assert!(engine.accept_reply(&reply, upstream_addr()).is_none());
+    }
+
+    #[test]
+    fn accept_reply_rejects_a_reply_from_another_address() {
+        let (mut engine, query, upstream_id) = engine_with_pending("example.com", 42);
+        let reply = reply_for(&query, upstream_id);
+        let spoofer: SocketAddr = "127.0.0.2:5353".parse().unwrap();
+
+        assert!(
+            engine.accept_reply(&reply, spoofer).is_none(),
+            "a correct ID from the wrong source must not be accepted",
+        );
+        // The pending entry survives, so the real server can still answer.
+        assert!(engine.accept_reply(&reply, upstream_addr()).is_some());
+    }
+
+    #[test]
+    fn accept_reply_rejects_a_reply_answering_a_different_question() {
+        let (mut engine, _query, upstream_id) = engine_with_pending("example.com", 42);
+        // Right ID, right source, wrong question — a cache-poisoning attempt.
+        let forged = reply_for(&make_dns_query("victim.test", 1), upstream_id);
+
+        assert!(
+            engine.accept_reply(&forged, upstream_addr()).is_none(),
+            "a reply for a different name must not be accepted",
+        );
+    }
+
+    #[test]
+    fn accept_reply_rejects_a_packet_without_the_qr_bit() {
+        let (mut engine, query, upstream_id) = engine_with_pending("example.com", 42);
+        let mut not_a_reply = reply_for(&query, upstream_id);
+        not_a_reply[2] &= !0x80;
+        assert!(engine.accept_reply(&not_a_reply, upstream_addr()).is_none());
+    }
+
+    #[test]
+    fn accept_reply_rejects_a_truncated_header() {
+        let (mut engine, _query, _id) = engine_with_pending("example.com", 42);
+        assert!(engine.accept_reply(&[0u8; 4], upstream_addr()).is_none());
     }
 
     #[test]
@@ -2081,15 +2316,14 @@ mod tests {
         };
         let client: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         let mut engine = ForwardEngine::new(config);
-        let new_id = engine.table.alloc_query(42, client, 0, [0u8; 16]);
+        let query = make_dns_query("example.com", 1);
+        let qhash = hash_questions(&query).expect("query must hash");
+        let new_id = engine.table.alloc_query(42, client, 0, qhash);
 
-        // Build a SERVFAIL reply (rcode=2 in byte 3).
-        let mut reply = vec![
-            (new_id >> 8) as u8, (new_id & 0xFF) as u8,
-            0x84, 0x02, // QR=1, rcode=SERVFAIL
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        ];
-        let result = engine.handle_reply_with_failover(&mut reply);
+        // A SERVFAIL reply (rcode=2 in byte 3) from the server we asked.
+        let mut reply = reply_for(&query, new_id);
+        reply[3] = (reply[3] & 0xF0) | 0x02;
+        let result = engine.handle_reply_with_failover(&mut reply, upstream_addr());
         // Should return Err(pending) because retries < max_retries.
         assert!(result.is_err(), "SERVFAIL with retries left should return Err");
         let pending = result.unwrap_err();
@@ -2106,14 +2340,13 @@ mod tests {
         };
         let client: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         let mut engine = ForwardEngine::new(config);
-        let new_id = engine.table.alloc_query(99, client, 0, [0u8; 16]);
+        let query = make_dns_query("example.com", 1);
+        let qhash = hash_questions(&query).expect("query must hash");
+        let new_id = engine.table.alloc_query(99, client, 0, qhash);
 
-        let mut reply = vec![
-            (new_id >> 8) as u8, (new_id & 0xFF) as u8,
-            0x84, 0x02, // SERVFAIL
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        ];
-        let result = engine.handle_reply_with_failover(&mut reply);
+        let mut reply = reply_for(&query, new_id);
+        reply[3] = (reply[3] & 0xF0) | 0x02; // SERVFAIL
+        let result = engine.handle_reply_with_failover(&mut reply, upstream_addr());
         // max_retries=0 → return SERVFAIL to client.
         assert!(result.is_ok());
         let inner = result.unwrap();

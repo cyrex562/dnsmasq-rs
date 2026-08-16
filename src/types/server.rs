@@ -116,7 +116,12 @@ pub struct Frec {
 }
 
 /// Rebound-domain entry — prevents rebinding attacks.
-#[derive(Debug, Clone)]
+///
+/// RFC 5735 / RFC 1918 addresses returned for names under one of these domain
+/// suffixes are *not* rejected as possible DNS-rebind attacks.  Mirrors
+/// dnsmasq's `struct rebind_domain`.  An empty `domain` means "any
+/// single-label name".
+#[derive(Debug, Clone, Default)]
 pub struct RebindDomain {
     pub domain: String,
 }

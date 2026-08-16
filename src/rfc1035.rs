@@ -664,7 +664,7 @@ pub fn extract_addresses(
                     Err(_) => return ExtractResult::BadPacket,
                 };
                 let ttl = clamp_ttl(rr.ttl, config.max_ttl);
-                cache.insert(CacheRecord {
+                cache.really_insert(CacheRecord {
                     name:    target,
                     flags:   addr_flag | F_REVERSE | secflag,
                     ttl,
@@ -672,7 +672,7 @@ pub fn extract_addresses(
                     addr:    Some(ip_addr.clone()),
                     rdata:   None,
                     uid:     UID_NONE,
-                });
+                }, now);
                 found = true;
             }
             if found {
@@ -708,7 +708,7 @@ pub fn extract_addresses(
                     Ok(t)  => t.to_lowercase(),
                     Err(_) => return ExtractResult::BadPacket,
                 };
-                cache.insert(CacheRecord {
+                cache.really_insert(CacheRecord {
                     name:    current_name.clone(),
                     flags:   F_CNAME | F_FORWARD | secflag,
                     ttl,
@@ -720,7 +720,7 @@ pub fn extract_addresses(
                     })),
                     rdata: None,
                     uid:   UID_NONE,
-                });
+                }, now);
                 cname_hops += 1;
                 current_name = target;
                 continue 'cname_loop; // restart loop for the CNAME target
@@ -754,7 +754,7 @@ pub fn extract_addresses(
                     data:   rr.rdata.clone(),
                 }),
             };
-            cache.insert(CacheRecord {
+            cache.really_insert(CacheRecord {
                 name:    current_name.clone(),
                 flags:   addr_flag | F_FORWARD | secflag,
                 ttl,
@@ -762,7 +762,10 @@ pub fn extract_addresses(
                 addr:    Some(addr),
                 rdata:   None,
                 uid:     UID_NONE,
-            });
+            }, now);
+            // C sets `found` from the answer section, not from whether the
+            // insert committed (`rfc1035.c:1036`): a refused or dropped insert
+            // must not turn a real answer into a negative-cache entry.
             found = true;
         }
         break 'cname_loop;
@@ -779,7 +782,7 @@ pub fn extract_addresses(
             } else {
                 addr_flag | F_NEG | F_FORWARD | secflag
             };
-            cache.insert(CacheRecord {
+            cache.really_insert(CacheRecord {
                 name:    qname_lower,
                 flags:   neg_flags,
                 ttl,
@@ -787,7 +790,7 @@ pub fn extract_addresses(
                 addr:    None,
                 rdata:   None,
                 uid:     UID_NONE,
-            });
+            }, now);
         }
     }
 
@@ -907,20 +910,23 @@ pub fn answer_request(
             continue;
         }
 
-        // Cached CNAME.
-        let cname_target: Option<String> = cache
+        // Cached CNAME.  It carries its own TTL — `ttl` here is `local-ttl`,
+        // a static-record default that says nothing about an upstream answer.
+        let cname_target: Option<(String, u32)> = cache
             .lookup_by_name(&name, F_CNAME, now)
             .and_then(|r| {
                 if let Some(AllAddr::Cname(ref c)) = r.addr {
-                    c.target_name.clone()
+                    c.target_name.clone().map(|t| (t, DnsCache::crec_ttl(r, now)))
                 } else {
                     None
                 }
             });
-        if let Some(target) = cname_target {
+        if let Some((target, cname_ttl)) = cname_target {
             let mut rd = BytesMut::new();
             write_name(&mut rd, &target);
-            answers.push(DnsRr { name: name.clone(), rtype: 5, class: 1, ttl, rdata: rd.to_vec() });
+            answers.push(DnsRr {
+                name: name.clone(), rtype: 5, class: 1, ttl: cname_ttl, rdata: rd.to_vec(),
+            });
             name = target.to_lowercase();
             ans  = true;
             continue;
@@ -988,8 +994,8 @@ pub fn answer_request(
                     // Try cache reverse lookup.
                     let cached = cache
                         .lookup_by_addr(&addr, now)
-                        .map(|r| (r.name.clone(), r.flags));
-                    if let Some((hostname, flags)) = cached {
+                        .map(|r| (r.name.clone(), r.flags, DnsCache::crec_ttl(r, now)));
+                    if let Some((hostname, flags, cached_ttl)) = cached {
                         if flags & F_NXDOMAIN != 0 {
                             nxdomain = true;
                             ans      = true;
@@ -997,7 +1003,8 @@ pub fn answer_request(
                             let mut rd = BytesMut::new();
                             write_name(&mut rd, &hostname);
                             answers.push(DnsRr {
-                                name: name.clone(), rtype: 12, class: 1, ttl, rdata: rd.to_vec(),
+                                name: name.clone(), rtype: 12, class: 1,
+                                ttl: cached_ttl, rdata: rd.to_vec(),
                             });
                             ans = true;
                         }
@@ -1043,7 +1050,7 @@ pub fn answer_request(
             if want_a {
                 let cached = cache
                     .lookup_by_name(&name, F_IPV4, now)
-                    .map(|r| (r.addr.clone(), r.flags, r.ttl));
+                    .map(|r| (r.addr.clone(), r.flags, DnsCache::crec_ttl(r, now)));
                 if let Some((addr, flags, cached_ttl)) = cached {
                     if flags & F_NEG != 0 {
                         if flags & F_NXDOMAIN != 0 {
@@ -1062,7 +1069,7 @@ pub fn answer_request(
             if want_aaaa {
                 let cached = cache
                     .lookup_by_name(&name, F_IPV6, now)
-                    .map(|r| (r.addr.clone(), r.flags, r.ttl));
+                    .map(|r| (r.addr.clone(), r.flags, DnsCache::crec_ttl(r, now)));
                 if let Some((addr, flags, cached_ttl)) = cached {
                     if flags & F_NEG != 0 {
                         if flags & F_NXDOMAIN != 0 {

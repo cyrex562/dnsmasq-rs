@@ -88,21 +88,88 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   - `no-cache`/`do-bit`/`CD` handling, and the auth (`--auth-zone`) and conntrack
     allowlist branches of `udp_request()`, which have no Rust call site at all.
   - TCP DNS service. Only the UDP listener consults local data; there is no TCP listener.
-  - Answer-cache population. `run_forward_loop` builds a `DnsCache` and passes it to
-    `answer_request`, but nothing ever inserts forwarded upstream replies into it —
-    `ForwardEngine::process_reply` has no cache write. The cache therefore only ever
-    serves what `answer_request` itself stores, so the cache-hit branches of
-    `answer_request` (cached CNAME, cached NXDOMAIN, MX/SRV glue) are unreachable in the
-    live path. Upstream caches every forwarded reply in `cache_insert()`.
-  - `cache-size=0`. Upstream treats `0` as "caching disabled"; `DnsCache` has no disabled
-    mode, so `run_forward_loop` clamps the size to 1 entry (`cache_size.max(1)`) instead
-    of bypassing the cache.
   - Reload staleness. `run_main_loop` snapshots the local data once at startup and moves
     the clone into the forward task, so the query loop keeps answering from the
     startup-time config forever. Upstream re-reads `daemon->` config data on every query,
     so a SIGHUP reload takes effect immediately. Whoever implements real SIGHUP reload
     (`dnsmasq::on_sighup` / `clear_cache_and_reload`) must also republish the snapshot —
     a shared `ArcSwap`/`watch` channel rather than a moved clone.
+
+- [x] Wire the DNS answer cache into the live forward path.
+  `run_forward_loop_on` now calls `forward::cache_upstream_reply` → `cache::cache_reply` →
+  `rfc1035::extract_addresses` for every accepted, non-truncated upstream reply, mirroring
+  the unconditional `extract_addresses()` call `process_reply()` makes at `forward.c:824`.
+  A repeated query is answered from the cache and never reaches an upstream server.
+  Covered by `tests/forward_cache_integration.rs` (10 tests driving the real loop against a
+  scripted fake upstream, counting the datagrams that actually reach it) and the round-trip
+  hit/miss tests in `tests/cache_integration.rs`.
+
+  What that wiring **does** now reach, and where the enforcement lives:
+
+  - `dnsmasq::daemon_forward_config` is the single `Daemon` → `ForwardConfig` conversion.
+    `cache-size`, `min-cache-ttl`, `max-cache-ttl`, `max-ttl`, `neg-ttl`, `no-negcache`,
+    `stop-dns-rebind` (`OPT_NO_REBIND`) and `rebind-domain-ok` (`no_rebind`) are all copied
+    there and all observably affect run-time behavior.
+  - `min-cache-ttl` / `max-cache-ttl` are enforced in `DnsCache::really_insert`, and
+    `extract_addresses` now inserts through `really_insert` rather than `insert`. Building
+    the cache with `with_ttl_limits` alone would *look* wired without being wired — the
+    live insert path has to reach the clamping function. Same for zero-TTL rejection and
+    static-record conflict detection, which also live in `really_insert`.
+  - `max-ttl` is applied earlier, in `extract_addresses` itself (`rfc1035.c:752,834`), which
+    is a different clamp from `max-cache-ttl` (`cache.c:680-683`). Both now apply.
+  - `cache-size=0` means "caching disabled": `DnsCache::new(0)` keeps no storage and
+    `really_insert` reports `CachingDisabled`. It does **not** short-circuit the reply
+    path — `extract_addresses` still runs, so `stop-dns-rebind` keeps working with a zero
+    cache size, matching C, where a zero `cachesize` only leaves `really_insert()` with no
+    free `crec`.
+  - Cached records are served with their remaining lifetime (`DnsCache::crec_ttl`, a port
+    of `rfc1035.c:1570`), not the TTL they were stored with. This applies to the cached
+    A/AAAA, cached-CNAME and cached-PTR branches of `answer_request`; the cached-CNAME
+    branch previously replayed `local-ttl` (0 by default), which is a static-record default
+    unrelated to an upstream answer.
+  - Upstream replies are now validated before they can affect anything, since a cached
+    reply is a persistent one. `ForwardEngine::accept_reply` requires the QR bit, a known
+    transaction ID, a question hash matching the outstanding query (what C gets from
+    `lookup_frec()`'s name/class/type match at `forward.c:1173`) and a source address equal
+    to the server the query went to (`forward.c:1201-1209`). Transaction IDs are drawn from
+    `rand::random` rather than a counter, mirroring `get_id()` (`forward.c:3302`). A failed
+    check drops the datagram and leaves the pending entry in place so the genuine answer can
+    still arrive.
+
+  Explicitly **not** covered — upstream behavior still missing on this path:
+
+  - DNSSEC. `ForwardConfig::extract_config` always sets `secure: false`, so no cached record
+    is ever marked `F_DNSSECOK` and `cache_secure` / `bogusanswer` have no live equivalent.
+    `process_reply`/`ProcessReplyConfig` in `forward.rs` model this but have no live caller.
+  - `--dhcp-ttl` / `use_dhcp_ttl`. `crec_ttl` returns the stored TTL for any `F_IMMORTAL`
+    record; C additionally applies a lease-length ceiling to `F_DHCP` entries
+    (`rfc1035.c:1577-1585`).
+  - `--max-ttl` as a *serve-time* ceiling. C applies it again in `crec_ttl()`
+    (`rfc1035.c:1597`); the Rust port only applies it at insert time.
+  - Zero-TTL answers. `really_insert` drops them; C caches them with `ttd == now` so they
+    can be served once before going stale.
+  - Cache lookups for record types `answer_request` does not consult. Only A, AAAA, CNAME,
+    NXDOMAIN and PTR are read back out of the cache, so an upstream MX/TXT/SRV answer is
+    cached as `F_RR` but re-forwarded on every query.
+  - SERVFAIL failover. `ForwardEngine::handle_reply_with_failover` now runs the same
+    `validate_reply` checks as `accept_reply`, but the live loop still does not call it (nor
+    `retry_query`), so a SERVFAIL is relayed to the client instead of retried against the
+    next server.
+  - `forward::reply_query` / `process_reply` remain a second, unreached reply-handling path.
+    They carry rcode and rebind *policy* that `accept_reply` does not, but they check only
+    the source address, not the question — anything wiring them in must add the question
+    check first or it reopens the poisoning hole `accept_reply` closes.
+  - `bogus-addr` wildcard filtering, `--doctor` address rewriting, `rrfilter`, ipset/nftset
+    population and the NXDOMAIN→NODATA conversion for locally-known names — all part of C's
+    `process_reply()` around the `extract_addresses()` call, none of them ported.
+    `rfc1035::check_for_bogus_wildcard` is implemented but has no live caller, and still
+    inserts via `DnsCache::insert`; wiring it in means routing it through `really_insert`
+    like `extract_addresses` now does.
+  - `forward::tcp_fallback` / `tcp_query` still have no non-test caller, deliberately. They
+    escalate a truncated UDP reply to TCP, which upstream does *not* do on the client's
+    behalf — C relays the truncated reply and the client retries. They are also wired to
+    resend the reply packet rather than the original query, so activating them as they stand
+    would send a QR=1 packet upstream. The real gap is the missing TCP listener, above.
 
 - [x] Wire daemonization, pid-file writing and privilege dropping into `src/main.rs`.
   `main` is no longer `#[tokio::main]`: it runs the upstream startup sequence
