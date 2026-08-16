@@ -11,18 +11,20 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 
 use crate::cache::{DnsCache, SharedDnsCache};
 use crate::hash_questions::hash_questions;
 use crate::metrics::{inc_metric, Metric};
-use crate::dns_protocol::{HB4_AD, HB4_CD, HB4_RA};
+use crate::dns_protocol::{Ede, EDNS0_OPTION_EDE, HB3_AA, HB4_AD, HB4_CD, HB4_RA};
+use crate::edns0::Edns0Option;
 use crate::rfc1035::{
-    answer_request, private_net, private_net6, DnsPacket, DnsRr, ExtractConfig, ExtractResult,
-    LocalConfig,
+    answer_request, DnsPacket, DnsRr, ExtractConfig, ExtractResult, LocalConfig,
 };
 use crate::types::constants::{F_IPV4, F_IPV6, F_SERVER};
-use crate::types::dns_records::{Cname, HostRecord, MxSrvRecord, Naptr, PtrRecord, TxtRecord};
+use crate::types::dns_records::{
+    BogusAddr, Cname, HostRecord, MxSrvRecord, Naptr, PtrRecord, TxtRecord,
+};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Types
@@ -1065,6 +1067,23 @@ pub struct ForwardConfig {
     pub local_rebind_ok: bool,
     /// `--rebind-domain-ok`: domains exempt from the rebind check.
     pub no_rebind: Vec<RebindDomain>,
+    /// `--bogus-nxdomain`: address ranges that mark an ISP wildcard answer.  A
+    /// reply carrying one is rewritten into an empty NXDOMAIN.
+    pub bogus_addr: Vec<BogusAddr>,
+    /// `--ignore-address`: a reply carrying one of these addresses is dropped
+    /// outright and never reaches the client.
+    pub ignore_addr: Vec<BogusAddr>,
+    /// `--filter-rr` / `--filter-a` / `--filter-aaaa`: RR types elided from an
+    /// answer on its way back to the client.
+    pub filter_rr: Vec<u16>,
+    /// `--dnssec` (`OPT_DNSSEC_VALID`).  Validation itself is not implemented —
+    /// see `tasks.md` — but the option still gates the reply-side DNSSEC
+    /// handling C puts behind it: clearing a DO bit the client did not set, and
+    /// stripping DNSSEC RRs from the answer (`forward.c:750`, `forward.c:869`).
+    pub dnssec_valid: bool,
+    /// `--proxy-dnssec` (`OPT_DNSSEC_PROXY`): relay the upstream AD bit instead
+    /// of clearing it (`forward.c:762-764`).
+    pub dnssec_proxy: bool,
     /// `--dns-forward-max` (`daemon->ftabsize`): the cap on queries in flight to
     /// one server group, and on duplicate-client records overall.  Exceeding it
     /// makes the query REFUSED rather than queued.
@@ -1090,6 +1109,11 @@ impl Default for ForwardConfig {
             check_rebind:  false,
             local_rebind_ok: false,
             no_rebind:     Vec::new(),
+            bogus_addr:    Vec::new(),
+            ignore_addr:   Vec::new(),
+            filter_rr:     Vec::new(),
+            dnssec_valid:  false,
+            dnssec_proxy:  false,
             ftabsize:      FTABSIZE,
             randport_limit: RANDPORT_LIMIT,
         }
@@ -1152,8 +1176,15 @@ pub struct ReplyTarget {
 /// What the engine decided about an upstream datagram.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplyAction {
-    /// A good answer: deliver it to every client on the list.
-    Deliver(Vec<ReplyTarget>),
+    /// A good answer: process it under `flags` and deliver it to every client
+    /// on the list.
+    ///
+    /// `flags` is the completed query's `FREC_*` bitfield.  It has to come out
+    /// with the targets because the query record is freed here, and
+    /// [`process_reply`] cannot do its job without it: whether the client sent
+    /// an OPT record, asked for DNSSEC, or set CD is decided at *query* time and
+    /// is what C threads into `process_reply()` (`forward.c:1429-1433`).
+    Deliver { targets: Vec<ReplyTarget>, flags: u32 },
     /// The server failed the query and it has been re-sent to another one.
     Retried,
     /// Not an answer to anything outstanding, or it failed validation.
@@ -1422,6 +1453,22 @@ impl ForwardEngine {
         };
 
         let rcode = reply[3] & 0x0F;
+
+        // `--ignore-address`: a NOERROR answer carrying a listed address is
+        // dropped where it stands, *before* the failover and completion logic
+        // below (`forward.c:1228-1230`).  C `return`s without freeing the frec,
+        // so the query stays in flight and a later, honest answer from another
+        // server can still be accepted — hence `Ignore` rather than a delivery
+        // with no targets.
+        if !self.config.ignore_addr.is_empty() && rcode == 0 {
+            if let Ok(parsed) = DnsPacket::parse(reply) {
+                if crate::rfc1035::check_for_ignored_address(&parsed, &self.config.ignore_addr) {
+                    tracing::debug!("discarding DNS reply: --ignore-address match");
+                    return ReplyAction::Ignore;
+                }
+            }
+        }
+
         if rcode == 2 /* SERVFAIL */ || rcode == 5 /* REFUSED */ {
             if let Some(next_idx) = self.next_untried_server(idx) {
                 if let Some(frec) = self.table.get_mut(idx) {
@@ -1441,11 +1488,12 @@ impl ForwardEngine {
             }
         }
 
-        let targets: Vec<ReplyTarget> = self
+        let (targets, flags) = self
             .table
             .get(idx)
             .map(|f| {
-                f.srcs()
+                let targets: Vec<ReplyTarget> = f
+                    .srcs()
                     .filter_map(|s| {
                         Some(ReplyTarget {
                             client:   s.source?,
@@ -1453,13 +1501,14 @@ impl ForwardEngine {
                             orig_id:  s.orig_id,
                         })
                     })
-                    .collect()
+                    .collect();
+                (targets, f.flags)
             })
             .unwrap_or_default();
 
         self.table.free_frec(idx);
         self.release_rfds();
-        ReplyAction::Deliver(targets)
+        ReplyAction::Deliver { targets, flags }
     }
 
     /// The next upstream server this query has not been sent to, if the retry
@@ -1924,33 +1973,50 @@ fn recv_datagram(
     Ok(crate::network::RecvMeta { len, src, dest: None, if_index: 0 })
 }
 
-/// Rebuild `parsed` as a wire packet with no resource records at all, keeping
-/// its header flags and question section and forcing `rcode`.
+/// Rebuild `parsed` as a wire packet with no resource records, keeping its
+/// header flags, its question section and any OPT pseudo-RR, and forcing
+/// `rcode`.
 ///
-/// This is what C does when `extract_addresses()` returns non-zero
-/// (`forward.c:826-832`): the client still gets an answer packet, but an empty
-/// one.  Re-serialising rather than just zeroing the count fields also drops
-/// the record bytes themselves, so nothing is left dangling after the question
-/// section — C gets the same effect from `resize_packet()`.
+/// This is what C does when `extract_addresses()` returns non-zero, or when
+/// `check_for_bogus_wildcard()` fires (`forward.c:813-832`): the client still
+/// gets an answer packet, but an empty one.  Re-serialising rather than just
+/// zeroing the count fields also drops the record bytes themselves, so nothing
+/// is left dangling after the question section.
+///
+/// The OPT record survives because C's `resize_packet()` puts the pseudoheader
+/// back once the sections are gone (`rfc1035.c:resize_packet`) — and because
+/// the EDE option this reply is about to earn has nowhere else to live.
 fn strip_records(parsed: &DnsPacket, rcode: u8) -> Vec<u8> {
+    let additional: Vec<DnsRr> =
+        parsed.additional.iter().filter(|rr| rr.rtype == 41).cloned().collect();
     let mut header = parsed.header;
     header.ancount = 0;
     header.nscount = 0;
-    header.arcount = 0;
+    header.arcount = additional.len() as u16;
     header.set_rcode(rcode);
     DnsPacket {
         header,
         questions:  parsed.questions.clone(),
         answers:    Vec::new(),
         authority:  Vec::new(),
-        additional: Vec::new(),
+        additional,
     }
     .write()
     .to_vec()
 }
 
+/// Clear the AA (authoritative answer) bit in place.
+///
+/// A forced NXDOMAIN is ours, not the upstream server's, so the claim of
+/// authority has to go with the records (`forward.c:818`).
+fn clear_authoritative(pkt: &mut [u8]) {
+    if pkt.len() >= DNS_HEADER_LEN {
+        pkt[2] &= !HB3_AA;
+    }
+}
+
 /// Feed an accepted upstream reply into the cache, and apply the answer-side
-/// policy `process_reply()` applies around that call (`forward.c:815-841`).
+/// policy `process_reply()` applies around that call (`forward.c:806-846`).
 ///
 /// `extract_addresses` runs for **every** accepted, non-truncated reply that
 /// carries cacheable data — never gated on whether caching is enabled.  It is
@@ -1959,47 +2025,54 @@ fn strip_records(parsed: &DnsPacket, rcode: u8) -> Vec<u8> {
 /// only makes the eventual insert fail to commit, exactly as C's zero
 /// `daemon->cachesize` leaves `really_insert()` with no free `crec`.
 ///
-/// Returns `true` when a rebind attack was blocked.
+/// Returns the [`Ede`] code the outcome earns, which is what the caller
+/// reports back to an EDNS0-speaking client.
 fn cache_upstream_reply(
     pkt:    &mut Vec<u8>,
     cache:  &mut DnsCache,
+    now:    Instant,
     config: &ForwardConfig,
-) -> bool {
+) -> Ede {
     let Ok(parsed) = DnsPacket::parse(pkt) else {
         // Unparseable body.  It cannot be re-serialised, so zero the counts in
         // place and SERVFAIL it, matching C's handling of `extract_addresses()`
         // returning 2.  The question section is known good — `validate_reply`
         // already hashed it.
-        if pkt.len() >= 12 {
+        if pkt.len() >= DNS_HEADER_LEN {
             pkt[6..12].fill(0);
             set_rcode(pkt, 2 /* SERVFAIL */);
         }
-        return false;
+        return Ede::Other;
     };
-    // Only QUERY replies carrying NOERROR or NXDOMAIN hold cacheable data;
-    // everything else is passed straight through (`forward.c:778-791`).
-    if parsed.header.opcode() != 0 {
-        return false;
-    }
     let rcode = parsed.header.rcode();
-    if rcode != 0 && rcode != 3 {
-        return false;
-    }
-    let Some(question) = parsed.questions.first() else { return false };
+    let Some(question) = parsed.questions.first() else { return Ede::Unset };
     let qname = question.name.to_lowercase();
 
+    // `--bogus-nxdomain`.  C's comment is the whole story: "check_for_bogus_
+    // wildcard() does its own caching, so don't call extract_addresses() if it
+    // triggers" (`forward.c:809-821`).  It cannot fire on an answer that is
+    // already NXDOMAIN, since there would be no address to match.
+    if rcode != 3 /* NXDOMAIN */
+        && crate::rfc1035::check_for_bogus_wildcard(&parsed, cache, now, &config.bogus_addr)
+    {
+        *pkt = strip_records(&parsed, 3 /* NXDOMAIN */);
+        clear_authoritative(pkt);
+        tracing::info!("bogus-nxdomain wildcard address for {qname}: answering NXDOMAIN");
+        return Ede::Blocked;
+    }
+
     match crate::cache::cache_reply(pkt, cache, &config.extract_config(&qname)) {
-        ExtractResult::Cached => false,
+        ExtractResult::Cached => Ede::Unset,
         ExtractResult::RebindBlocked => {
             // Sections cleared, rcode left alone: C logs and blocks but does
             // not rewrite the rcode for a rebind hit.
             *pkt = strip_records(&parsed, rcode);
             tracing::warn!("possible DNS-rebind attack detected: {qname}");
-            true
+            Ede::Blocked
         }
         ExtractResult::BadPacket => {
             *pkt = strip_records(&parsed, 2 /* SERVFAIL */);
-            false
+            Ede::Other
         }
     }
 }
@@ -2156,26 +2229,25 @@ pub async fn run_forward_loop_on(
                 // answers an outstanding query, from the server that query
                 // went to.  A failed check leaves the query in flight so the
                 // genuine answer can still be accepted.
-                let targets = match engine.accept_reply(&pkt, upstream_addr, *arrived_on).await {
-                    ReplyAction::Deliver(targets) => targets,
-                    ReplyAction::Retried | ReplyAction::Ignore => continue,
-                };
+                let (targets, flags) =
+                    match engine.accept_reply(&pkt, upstream_addr, *arrived_on).await {
+                        ReplyAction::Deliver { targets, flags } => (targets, flags),
+                        ReplyAction::Retried | ReplyAction::Ignore => continue,
+                    };
 
-                // Answer the client as a recursive resolver, whatever the
-                // upstream server claimed to be (`forward.c:776`).  This
-                // precedes both the truncation check and extraction, exactly as
-                // it does in C.
-                set_recursion_available(&mut pkt);
-
-                // A truncated reply is relayed to the client as-is and nothing
-                // is cached from it: C logs "truncated" and skips
-                // `extract_addresses()` (`forward.c:791-792`), leaving the
-                // client to retry over TCP itself.  It does not escalate to TCP
-                // on the client's behalf, so neither do we — see `tasks.md` for
-                // the missing TCP listener.
-                if !is_truncated(&pkt) {
+                // Everything C's `process_reply()` does to an accepted answer
+                // before it is handed to the waiting clients: EDNS0 fix-up,
+                // rebind and bogus-wildcard blocking, caching, RR filtering,
+                // the DNSSEC strip and the EDE option (`forward.c:696-889`).
+                {
                     let mut cache = cache.lock().await;
-                    cache_upstream_reply(&mut pkt, &mut cache, &engine.config);
+                    process_reply(
+                        &mut pkt,
+                        &mut cache,
+                        Instant::now(),
+                        &engine.config,
+                        ReplyContext::from_flags(flags),
+                    );
                 }
 
                 // One upstream answer, one reply per waiting client, each under
@@ -2342,124 +2414,208 @@ pub fn domain_find_sets<'a>(setlist: &'a [IpSet], domain: &str) -> Option<&'a Ip
     result
 }
 
-/// Outcome of `process_reply`.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ProcessReplyResult {
-    /// The reply is ready to be forwarded; the final RCODE is included.
-    Forward { rcode: u8 },
-    /// The reply was silently discarded (policy or parse error).
-    Discard,
-    /// DNS-rebind attack detected; the caller should log a warning.
-    RebindAttack { name: String },
+/// The per-query context [`process_reply`] runs under — C's `frec->flags`,
+/// unpacked.
+///
+/// C passes these as five separate `int` parameters derived from the completed
+/// query's flags (`forward.c:1429-1433`).  They are decided when the *client*
+/// asks, not when the answer arrives, which is why they have to be carried out
+/// of [`ForwardEngine::accept_reply`] alongside the reply targets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReplyContext {
+    /// `FREC_HAS_PHEADER`: the client's query carried an EDNS0 OPT record.
+    /// When it did not, C added one on the way upstream and has to strip it off
+    /// the answer — its `added_pheader` argument is exactly `!has_pheader`.
+    pub has_pheader:       bool,
+    /// `FREC_AD_QUESTION`: the client asked for authenticated data.
+    pub ad_question:       bool,
+    /// `FREC_DO_QUESTION`: the client set the DNSSEC OK bit.
+    pub do_question:       bool,
+    /// `FREC_CHECKING_DISABLED`: the client set CD in its query.
+    pub checking_disabled: bool,
 }
 
-/// Configuration flags passed to `process_reply`.
-#[derive(Debug, Clone, Default)]
-pub struct ProcessReplyConfig {
-    /// Reject RFC 1918 / 5735 addresses that resolve via global DNS.
-    pub check_rebind: bool,
-    /// `--rebind-localhost-ok`: exempt loopback addresses from that check
-    /// (`private_net(addr, !option_bool(OPT_LOCAL_REBIND))`, `rfc1035.c:997`).
-    pub local_rebind_ok: bool,
-    /// Skip caching even for valid answers.
-    pub no_cache:     bool,
-    /// Answer has been validated as DNSSEC-secure.
-    pub cache_secure: bool,
-    /// Answer was flagged bogus by DNSSEC validation.
-    pub bogus_answer: bool,
-    /// Client requested the AD bit (authenticated data).
-    pub ad_reqd:      bool,
-    /// Client set the DNSSEC OK bit.
-    pub do_bit:       bool,
+impl ReplyContext {
+    /// Unpack a `Frec`'s flag word.
+    pub fn from_flags(flags: u32) -> Self {
+        Self {
+            has_pheader:       flags & FREC_HAS_PHEADER != 0,
+            ad_question:       flags & FREC_AD_QUESTION != 0,
+            do_question:       flags & FREC_DO_QUESTION != 0,
+            checking_disabled: flags & FREC_CHECKING_DISABLED != 0,
+        }
+    }
 }
 
-/// Lightweight reply-processing pipeline, independent of global state.
+/// Byte offset of an OPT record's CLASS field — C's `sizep`, the pointer
+/// `find_pseudoheader()` hands back so the caller can rewrite the advertised
+/// payload size and the flags word behind it (`edns0.c:19`).
 ///
-/// This mirrors the core logic of `process_reply()` in `forward.c`:
-/// - Validates the reply opcode and RCODE.
-/// - Detects truncation and logs it.
-/// - Applies rebind protection.
-/// - Propagates the AD bit if secure and requested.
-/// - Returns a disposition for the caller.
+/// `opt_offset` is the start of the OPT RR (its name).  The layout from there
+/// is name, TYPE(2), CLASS(2), TTL(4), RDLENGTH(2); `sizep` points at CLASS,
+/// so `sizep + 2` is the extended RCODE, `sizep + 3` the EDNS version and
+/// `sizep + 4 .. sizep + 6` the flags word holding the DO bit.
+fn opt_sizep(pkt: &[u8], opt_offset: usize) -> Option<usize> {
+    let mut pos = opt_offset;
+    crate::rfc1035::skip_name(pkt, &mut pos).ok()?;
+    (pos + 10 <= pkt.len()).then_some(pos + 2)
+}
+
+/// Attach an Extended DNS Error option to the reply's OPT record.
 ///
-/// Full integration (EDNS0 stripping, bogus-wildcard detection, rrfilter,
-/// `extract_addresses`, DNSSEC validation) requires the relevant modules
-/// to be ported; those paths are marked as TODO below.
+/// Port of the `add_pseudoheader(..., EDNS0_OPTION_EDE, ...)` call at the tail
+/// of `process_reply()` (`forward.c:877-882`).  C passes `replace = 1`, so an
+/// EDE already present is overwritten rather than duplicated; the reply's other
+/// EDNS0 options, and its advertised payload size and flags, are kept.
+///
+/// Returns `None` when the reply has no pseudoheader to hang the option on —
+/// C guards the call on `pheader` for the same reason.
+fn attach_ede(pkt: &[u8], ede: Ede) -> Option<Vec<u8>> {
+    let info = crate::edns0::find_pseudoheader(pkt)?;
+    let mut options: Vec<Edns0Option> = info
+        .options
+        .iter()
+        .filter(|o| o.code != EDNS0_OPTION_EDE)
+        .cloned()
+        .collect();
+    options.push(Edns0Option {
+        code: EDNS0_OPTION_EDE,
+        // INFO-CODE is a 16-bit big-endian field; the EXTRA-TEXT C omits is
+        // simply absent, which RFC 8914 sect 2 allows.
+        data: (ede as i16 as u16).to_be_bytes().to_vec(),
+    });
+    crate::edns0::add_pseudoheader(pkt, info.udp_size, info.flags, &options).ok()
+}
+
+/// Turn an accepted upstream answer into the packet the client gets.
+///
+/// Port of `process_reply()` (`forward.c:696`), which upstream calls once per
+/// accepted reply from `return_reply()` (`forward.c:1429`).  In order:
+///
+/// 1. restore the CD bit the client sent — C does this in its caller
+///    (`forward.c:1418-1422`), but it belongs to the same reply rewrite;
+/// 2. EDNS0: strip the OPT record entirely when the client never sent one,
+///    otherwise advertise *our* payload size and clear a DO bit the client did
+///    not ask for;
+/// 3. clear AD unless `--proxy-dnssec` (RFC 4035 sect 4.6 para 3), and set RA,
+///    because we are the recursive resolver whatever upstream claimed to be;
+/// 4. pass non-QUERY opcodes and non-NOERROR/NXDOMAIN rcodes straight through;
+/// 5. for anything else that is not truncated: `--bogus-nxdomain`, then
+///    `extract_addresses()` (caching, and the rebind check), then `--filter-rr`;
+/// 6. strip DNSSEC RRs a DO=0 client must not be sent;
+/// 7. attach an EDE option describing anything that was blocked or filtered.
+///
+/// Not yet ported, and tracked in `tasks.md`: DNSSEC validation itself (so C's
+/// `bogusanswer`/`cache_secure` are always false here and the AD bit is never
+/// *set*), `--alias` address rewriting (`do_doctor`), the NXDOMAIN→NODATA
+/// conversion for locally-known names, `--add-subnet` reply verification, and
+/// ipset/nftset population.
 pub fn process_reply(
-    pkt:    &[u8],
-    name:   &str,
-    config: &ProcessReplyConfig,
-    no_rebind: &[RebindDomain],
-) -> ProcessReplyResult {
-    if pkt.len() < 12 {
-        return ProcessReplyResult::Discard;
+    pkt:    &mut Vec<u8>,
+    cache:  &mut DnsCache,
+    now:    Instant,
+    config: &ForwardConfig,
+    ctx:    ReplyContext,
+) {
+    if pkt.len() < DNS_HEADER_LEN {
+        return;
     }
 
-    let flags2 = pkt[3]; // hb3 (QR|AA|TC|RD) ; hb4 (RA|Z|AD|CD|RCODE4bits)
-    let hb4    = pkt[3]; // second octet of flags word
-    let rcode  = hb4 & 0x0F;
+    // ── Restore the CD bit to the value in the query (`forward.c:1418-1422`) ─
+    if ctx.checking_disabled {
+        pkt[3] |= HB4_CD;
+    } else {
+        pkt[3] &= !HB4_CD;
+    }
+
+    // ── EDNS0 pseudoheader (`forward.c:720-758`) ─────────────────────────────
+    //
+    // `has_pheader` below tracks C's `pheader` *after* this block: it is only
+    // true when the reply still carries an OPT record we may write to, which is
+    // what gates the EDE option at the end.
+    let mut has_pheader = false;
+    let mut ext_rcode   = 0u8;
+    if let Some(info) = crate::edns0::find_pseudoheader(pkt) {
+        ext_rcode = info.ext_rcode;
+        if !ctx.has_pheader {
+            // The client didn't send EDNS0, so it must not get an OPT record
+            // back — C strips the one it added itself on the way upstream.
+            if let Ok(stripped) = crate::rrfilter::filter_rr_types(pkt, &[41 /* T_OPT */]) {
+                *pkt = stripped;
+            }
+        } else if let Some(sizep) = opt_sizep(pkt, info.offset) {
+            has_pheader = true;
+            // Advertise our max UDP packet to the client, not upstream's.
+            pkt[sizep..sizep + 2].copy_from_slice(&config.local.edns_pktsz.to_be_bytes());
+            // If the client didn't set the DO bit, but we did, reset it.
+            if config.dnssec_valid && !ctx.do_question {
+                let flags = u16::from_be_bytes([pkt[sizep + 4], pkt[sizep + 5]]) & !0x8000;
+                pkt[sizep + 4..sizep + 6].copy_from_slice(&flags.to_be_bytes());
+            }
+        }
+    }
+
+    // ── Header bits (`forward.c:762-776`) ────────────────────────────────────
+    // RFC 4035 sect 4.6 para 3: we have not validated this answer, so we must
+    // not let the upstream server's AD bit tell the client that we did.
+    if !config.dnssec_proxy {
+        pkt[3] &= !HB4_AD;
+    }
+    set_recursion_available(pkt);
+
+    // The full 12-bit rcode: four bits in the header, eight more in the OPT
+    // record's extended-RCODE byte (`forward.c:723`).
+    let rcode  = u16::from(pkt[3] & 0x0F) | (u16::from(ext_rcode) << 4);
     let opcode = (pkt[2] >> 3) & 0x0F;
-    let is_tc  = (pkt[2] & 0x02) != 0; // TC bit is bit 1 of byte 2 (hb3)
 
-    let _ = flags2; // suppress warning
-
-    // Only handle standard queries (OPCODE=0).
-    if opcode != 0 {
-        // Non-QUERY opcodes pass through unchanged.
-        return ProcessReplyResult::Forward { rcode };
+    // Non-QUERY opcodes, and errors other than NXDOMAIN, carry nothing worth
+    // inspecting (`forward.c:778-789`).
+    if opcode != 0 || (rcode != 0 && rcode != 3) {
+        return;
     }
 
-    // Truncated replies — log and pass through.
-    if is_tc {
-        // Caller should log "truncated"; we just forward.
-        return ProcessReplyResult::Forward { rcode };
-    }
+    let mut ede = Ede::Unset;
 
-    // RCODE filtering: only NOERROR and NXDOMAIN carry useful data.
-    if rcode != 0 && rcode != 3 /* NXDOMAIN */ {
-        return ProcessReplyResult::Forward { rcode };
-    }
+    // A truncated reply is relayed to the client as-is and nothing is cached
+    // from it: C logs "truncated" and skips `extract_addresses()`
+    // (`forward.c:791-792`), leaving the client to retry over TCP itself.  It
+    // does not escalate to TCP on the client's behalf, so neither do we — see
+    // `tasks.md` for the missing TCP listener.
+    if is_truncated(pkt) {
+        tracing::debug!("upstream reply truncated");
+    } else {
+        ede = cache_upstream_reply(pkt, cache, now, config);
 
-    // Rebind check for NOERROR answers.
-    if config.check_rebind && rcode == 0 && !domain_no_rebind(name, no_rebind) {
-        let parsed = match DnsPacket::parse(pkt) {
-            Ok(pkt) => pkt,
-            Err(_) => return ProcessReplyResult::Discard,
-        };
-
-        let rebind = parsed.answers.iter().any(|rr| match rr.rtype {
-            1 if rr.class == 1 && rr.rdata.len() >= 4 => {
-                let ip = Ipv4Addr::new(rr.rdata[0], rr.rdata[1], rr.rdata[2], rr.rdata[3]);
-                private_net(ip, !config.local_rebind_ok)
+        // `--filter-rr` / `--filter-a` / `--filter-aaaa` (`forward.c:848-849`).
+        // Only a NOERROR answer has anything to filter.
+        if pkt.len() >= DNS_HEADER_LEN && pkt[3] & 0x0F == 0 && !config.filter_rr.is_empty() {
+            if let Ok((filtered, removed)) =
+                crate::rrfilter::filter_configured_rr_types(pkt, &config.filter_rr)
+            {
+                if removed > 0 {
+                    *pkt = filtered;
+                    ede  = Ede::Filtered;
+                }
             }
-            28 if rr.class == 1 && rr.rdata.len() >= 16 => {
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(&rr.rdata[..16]);
-                private_net6(&Ipv6Addr::from(octets), !config.local_rebind_ok)
-            }
-            _ => false,
-        });
-
-        if rebind {
-            return ProcessReplyResult::RebindAttack {
-                name: name.to_string(),
-            };
         }
     }
 
-    // DNSSEC: bogus answers become SERVFAIL (if CD bit not set).
-    if config.bogus_answer {
-        let cd_bit = (pkt[3] & 0x10) != 0;
-        if !cd_bit {
-            return ProcessReplyResult::Forward { rcode: 2 /* SERVFAIL */ };
+    // ── DNSSEC (`forward.c:853-873`) ─────────────────────────────────────────
+    // Validation is not implemented, so there is never a bogus answer to turn
+    // into SERVFAIL and never a secure one to set AD on.  What *is* live is the
+    // last step: a client that didn't set DO must not be sent DNSSEC records.
+    if config.dnssec_valid && !ctx.do_question {
+        if let Ok(stripped) = crate::rrfilter::strip_dnssec_if_not_requested(pkt) {
+            *pkt = stripped;
         }
     }
 
-    // DNSSEC: set AD bit if the answer is secure and was requested.
-    // (Actual bit mutation would happen on a mutable copy of the packet.)
-    // TODO: mutate pkt copy for AD bit.
-
-    ProcessReplyResult::Forward { rcode }
+    // ── Extended DNS Error (`forward.c:877-882`) ─────────────────────────────
+    if has_pheader && ede != Ede::Unset {
+        if let Some(with_ede) = attach_ede(pkt, ede) {
+            *pkt = with_ede;
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2518,6 +2674,7 @@ pub fn is_private_reply(addr_bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use bytes::BytesMut;
     use std::net::SocketAddr;
     use crate::rfc1035::{write_name, write_question};
@@ -2948,7 +3105,7 @@ mod tests {
 
     fn delivered(action: ReplyAction) -> Option<Vec<ReplyTarget>> {
         match action {
-            ReplyAction::Deliver(t) => Some(t),
+            ReplyAction::Deliver { targets, .. } => Some(targets),
             _ => None,
         }
     }
@@ -3848,82 +4005,160 @@ mod tests {
         pkt
     }
 
+    /// Run `process_reply` over `pkt` with a throwaway cache, returning the
+    /// rewritten packet parsed back out.
+    fn run_process_reply(pkt: &[u8], config: &ForwardConfig, ctx: ReplyContext) -> Vec<u8> {
+        let mut cache = DnsCache::new(100);
+        let mut wire  = pkt.to_vec();
+        process_reply(&mut wire, &mut cache, Instant::now(), config, ctx);
+        wire
+    }
+
+    fn bogus_v4(octets: [u8; 4], prefix: i32) -> BogusAddr {
+        BogusAddr {
+            is6: false,
+            prefix,
+            addr: crate::types::addr::AllAddr::Addr4(Ipv4Addr::from(octets)),
+        }
+    }
+
     #[test]
     fn process_reply_noerror_forwards() {
         let pkt = minimal_reply(0, true, 0, false);
-        let cfg = ProcessReplyConfig::default();
-        let result = process_reply(&pkt, "example.com", &cfg, &[]);
-        assert_eq!(result, ProcessReplyResult::Forward { rcode: 0 });
+        let out = run_process_reply(&pkt, &ForwardConfig::default(), ReplyContext::default());
+        assert_eq!(out[3] & 0x0F, 0);
     }
 
     #[test]
     fn process_reply_nxdomain_forwards() {
         let pkt = minimal_reply(3, true, 0, false);
-        let cfg = ProcessReplyConfig::default();
-        let result = process_reply(&pkt, "example.com", &cfg, &[]);
-        assert_eq!(result, ProcessReplyResult::Forward { rcode: 3 });
+        let out = run_process_reply(&pkt, &ForwardConfig::default(), ReplyContext::default());
+        assert_eq!(out[3] & 0x0F, 3);
     }
 
+    /// A truncated reply is relayed untouched apart from the header bits — in
+    /// particular nothing is extracted from it (`forward.c:791-792`).
     #[test]
     fn process_reply_truncated_forwards() {
         let pkt = minimal_reply(0, true, 0, true);
-        let cfg = ProcessReplyConfig::default();
-        let result = process_reply(&pkt, "example.com", &cfg, &[]);
-        assert_eq!(result, ProcessReplyResult::Forward { rcode: 0 });
+        let out = run_process_reply(&pkt, &ForwardConfig::default(), ReplyContext::default());
+        assert_eq!(out[3] & 0x0F, 0);
+        assert_ne!(out[2] & 0x02, 0, "the TC bit must survive");
     }
 
     #[test]
-    fn process_reply_too_short_discards() {
-        let cfg = ProcessReplyConfig::default();
-        let result = process_reply(&[0u8; 5], "x", &cfg, &[]);
-        assert_eq!(result, ProcessReplyResult::Discard);
+    fn process_reply_too_short_is_left_alone() {
+        let out = run_process_reply(&[0u8; 5], &ForwardConfig::default(), ReplyContext::default());
+        assert_eq!(out, vec![0u8; 5]);
+    }
+
+    /// A non-QUERY opcode is passed straight through: no extraction, no
+    /// filtering (`forward.c:778-779`).
+    #[test]
+    fn process_reply_non_query_opcode_passes_through() {
+        let pkt = minimal_reply(0, true, 4 /* NOTIFY */, false);
+        let config = ForwardConfig { filter_rr: vec![1], ..ForwardConfig::default() };
+        let out = run_process_reply(&pkt, &config, ReplyContext::default());
+        assert_eq!(out[3] & 0x0F, 0);
     }
 
     #[test]
-    fn process_reply_rebind_attack_ipv4_detected() {
+    fn process_reply_rebind_attack_ipv4_is_stripped() {
         let pkt = reply_with_single_answer("example.com", 1, &[192, 168, 1, 10]);
-        let cfg = ProcessReplyConfig {
-            check_rebind: true,
-            ..ProcessReplyConfig::default()
-        };
-        let result = process_reply(&pkt, "example.com", &cfg, &[]);
-        assert_eq!(
-            result,
-            ProcessReplyResult::RebindAttack {
-                name: "example.com".to_string(),
-            }
-        );
+        let config = ForwardConfig { check_rebind: true, ..ForwardConfig::default() };
+        let out = run_process_reply(&pkt, &config, ReplyContext::default());
+        let parsed = DnsPacket::parse(&out).expect("the blocked answer must still be well formed");
+        assert!(parsed.answers.is_empty(), "the private address must not survive");
     }
 
     #[test]
-    fn process_reply_rebind_attack_ipv6_detected() {
-        let pkt = reply_with_single_answer(
-            "example.com",
-            28,
-            &Ipv6Addr::LOCALHOST.octets(),
-        );
-        let cfg = ProcessReplyConfig {
-            check_rebind: true,
-            ..ProcessReplyConfig::default()
-        };
-        let result = process_reply(&pkt, "example.com", &cfg, &[]);
-        assert_eq!(
-            result,
-            ProcessReplyResult::RebindAttack {
-                name: "example.com".to_string(),
-            }
-        );
+    fn process_reply_rebind_attack_ipv6_is_stripped() {
+        let pkt = reply_with_single_answer("example.com", 28, &Ipv6Addr::LOCALHOST.octets());
+        let config = ForwardConfig { check_rebind: true, ..ForwardConfig::default() };
+        let out = run_process_reply(&pkt, &config, ReplyContext::default());
+        let parsed = DnsPacket::parse(&out).expect("the blocked answer must still be well formed");
+        assert!(parsed.answers.is_empty());
     }
 
     #[test]
     fn process_reply_rebind_exclusion_allows_private_answer() {
         let pkt = reply_with_single_answer("router.home.arpa", 1, &[192, 168, 1, 1]);
-        let cfg = ProcessReplyConfig {
+        let config = ForwardConfig {
             check_rebind: true,
-            ..ProcessReplyConfig::default()
+            no_rebind: vec![rebind("home.arpa")],
+            ..ForwardConfig::default()
         };
-        let result = process_reply(&pkt, "router.home.arpa", &cfg, &[rebind("home.arpa")]);
-        assert_eq!(result, ProcessReplyResult::Forward { rcode: 0 });
+        let out = run_process_reply(&pkt, &config, ReplyContext::default());
+        let parsed = DnsPacket::parse(&out).expect("the answer must still be well formed");
+        assert_eq!(parsed.answers.len(), 1, "an excluded domain keeps its private address");
+    }
+
+    /// `--bogus-nxdomain` short-circuits extraction and forces an empty,
+    /// non-authoritative NXDOMAIN (`forward.c:811-820`).
+    #[test]
+    fn process_reply_bogus_wildcard_becomes_empty_nxdomain() {
+        let pkt = reply_with_single_answer("typo.test", 1, &[64, 94, 110, 11]);
+        let config = ForwardConfig {
+            bogus_addr: vec![bogus_v4([64, 94, 110, 11], 32)],
+            ..ForwardConfig::default()
+        };
+        let out = run_process_reply(&pkt, &config, ReplyContext::default());
+        let parsed = DnsPacket::parse(&out).expect("the forced NXDOMAIN must be well formed");
+        assert_eq!(parsed.header.rcode(), 3);
+        assert!(parsed.answers.is_empty());
+        assert!(!parsed.header.is_aa(), "the forced NXDOMAIN is not authoritative");
+        assert_eq!(parsed.questions.len(), 1, "the question section is preserved");
+    }
+
+    /// The CD bit the client gets is the one it sent, whatever upstream echoed
+    /// (`forward.c:1418-1422`).
+    #[test]
+    fn process_reply_restores_the_checking_disabled_bit() {
+        let mut pkt = minimal_reply(0, true, 0, false);
+        pkt[3] |= HB4_CD;
+        let out = run_process_reply(&pkt, &ForwardConfig::default(), ReplyContext::default());
+        assert_eq!(out[3] & HB4_CD, 0, "a client that did not set CD must not get it back");
+
+        let ctx = ReplyContext { checking_disabled: true, ..ReplyContext::default() };
+        let out = run_process_reply(&minimal_reply(0, true, 0, false), &ForwardConfig::default(), ctx);
+        assert_ne!(out[3] & HB4_CD, 0, "a client that set CD must get it back");
+    }
+
+    /// RFC 4035 sect 4.6 para 3 (`forward.c:762-764`).
+    #[test]
+    fn process_reply_clears_the_ad_bit_unless_proxying() {
+        let mut pkt = minimal_reply(0, true, 0, false);
+        pkt[3] |= HB4_AD;
+        let out = run_process_reply(&pkt, &ForwardConfig::default(), ReplyContext::default());
+        assert_eq!(out[3] & HB4_AD, 0);
+
+        let config = ForwardConfig { dnssec_proxy: true, ..ForwardConfig::default() };
+        let out = run_process_reply(&pkt, &config, ReplyContext::default());
+        assert_ne!(out[3] & HB4_AD, 0, "--proxy-dnssec relays the upstream AD bit");
+    }
+
+    #[test]
+    fn process_reply_sets_recursion_available() {
+        let pkt = minimal_reply(0, true, 0, false);
+        let out = run_process_reply(&pkt, &ForwardConfig::default(), ReplyContext::default());
+        assert_ne!(out[3] & HB4_RA, 0);
+    }
+
+    #[test]
+    fn reply_context_unpacks_the_frec_flags() {
+        let ctx = ReplyContext::from_flags(
+            FREC_HAS_PHEADER | FREC_DO_QUESTION | FREC_AD_QUESTION | FREC_CHECKING_DISABLED,
+        );
+        assert_eq!(
+            ctx,
+            ReplyContext {
+                has_pheader: true,
+                ad_question: true,
+                do_question: true,
+                checking_disabled: true,
+            }
+        );
+        assert_eq!(ReplyContext::from_flags(0), ReplyContext::default());
     }
 
     // ── make_refused_answer ───────────────────────────────────────────────────
