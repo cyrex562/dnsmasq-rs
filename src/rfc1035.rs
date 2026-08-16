@@ -1332,78 +1332,74 @@ fn addr_in_bogus_range(addr: &AllAddr, ba: &BogusAddr) -> bool {
     }
 }
 
-/// Check whether any A record in `packet` matches a bogus-address list.
+/// The address an answer RR carries, if it is an A or AAAA in class IN.
+///
+/// The `class == C_IN` test and the two record types are exactly what C's
+/// `check_bad_address()` looks at (`rfc1035.c:1330-1370`).
+fn answer_address(rr: &DnsRr) -> Option<AllAddr> {
+    if rr.class != 1 {
+        return None;
+    }
+    match rr.rtype {
+        1 if rr.rdata.len() >= 4 => Some(AllAddr::Addr4(Ipv4Addr::new(
+            rr.rdata[0], rr.rdata[1], rr.rdata[2], rr.rdata[3],
+        ))),
+        28 if rr.rdata.len() >= 16 => {
+            let mut b = [0u8; 16];
+            b.copy_from_slice(&rr.rdata[..16]);
+            Some(AllAddr::Addr6(Ipv6Addr::from(b)))
+        }
+        _ => None,
+    }
+}
+
+/// The first answer RR whose address falls in one of `ranges`, with its TTL.
+///
+/// Port of `check_bad_address()` (`rfc1035.c:1319`), the shared engine behind
+/// both `check_for_bogus_wildcard()` and `check_for_ignored_address()`.
+fn find_bad_address(packet: &DnsPacket, ranges: &[BogusAddr]) -> Option<u32> {
+    if ranges.is_empty() {
+        return None;
+    }
+    packet.answers.iter().find_map(|rr| {
+        let addr = answer_address(rr)?;
+        ranges.iter().any(|r| addr_in_bogus_range(&addr, r)).then_some(rr.ttl)
+    })
+}
+
+/// Check whether any A or AAAA record in `packet` matches a bogus-address list
+/// (`--bogus-nxdomain`).
 ///
 /// If a match is found, inserts an NXDOMAIN negative cache entry for the
-/// question name (TTL = `local_ttl`) and returns `true`.
+/// question name and returns `true`.  The TTL comes from the offending answer
+/// record: C notes that there is "no SOA record to get the ttl from in the
+/// normal processing" and uses the bogus answer's own TTL (`rfc1035.c:1406`).
 pub fn check_for_bogus_wildcard(
-    packet:     &DnsPacket,
-    cache:      &mut DnsCache,
-    now:        Instant,
+    packet:      &DnsPacket,
+    cache:       &mut DnsCache,
+    now:         Instant,
     bogus_addrs: &[BogusAddr],
-    local_ttl:  u32,
 ) -> bool {
-    if bogus_addrs.is_empty() { return false; }
+    let Some(ttl) = find_bad_address(packet, bogus_addrs) else { return false };
 
-    let qname = packet.questions.first().map(|q| q.name.to_lowercase());
-
-    for rr in &packet.answers {
-        if rr.class != 1 || rr.rdata.len() < 4 { continue; }
-        let addr_opt: Option<AllAddr> = match rr.rtype {
-            1 if rr.rdata.len() >= 4 => Some(AllAddr::Addr4(Ipv4Addr::new(
-                rr.rdata[0], rr.rdata[1], rr.rdata[2], rr.rdata[3],
-            ))),
-            _ => None,
-        };
-        if let Some(addr) = addr_opt {
-            for ba in bogus_addrs {
-                if addr_in_bogus_range(&addr, ba) {
-                    if let Some(ref name) = qname {
-                        cache.insert(CacheRecord {
-                            name:    name.clone(),
-                            flags:   F_FORWARD | F_NEG | F_NXDOMAIN,
-                            ttl:     local_ttl,
-                            expires: now + Duration::from_secs(u64::from(local_ttl)),
-                            addr:    None,
-                            rdata:   None,
-                            uid:     UID_NONE,
-                        });
-                    }
-                    return true;
-                }
-            }
-        }
+    if let Some(name) = packet.questions.first().map(|q| q.name.to_lowercase()) {
+        cache.insert(CacheRecord {
+            name,
+            flags:   F_FORWARD | F_NEG | F_NXDOMAIN,
+            ttl,
+            expires: now + Duration::from_secs(u64::from(ttl)),
+            addr:    None,
+            rdata:   None,
+            uid:     UID_NONE,
+        });
     }
-    false
+    true
 }
 
 /// Check whether any A or AAAA record in `packet` matches an address in the
 /// ignore list.  If so, the reply should be silently dropped.
 pub fn check_for_ignored_address(packet: &DnsPacket, ignore_addrs: &[BogusAddr]) -> bool {
-    if ignore_addrs.is_empty() { return false; }
-
-    for rr in &packet.answers {
-        if rr.class != 1 { continue; }
-        let addr_opt: Option<AllAddr> = match rr.rtype {
-            1 if rr.rdata.len() >= 4 => Some(AllAddr::Addr4(Ipv4Addr::new(
-                rr.rdata[0], rr.rdata[1], rr.rdata[2], rr.rdata[3],
-            ))),
-            28 if rr.rdata.len() >= 16 => {
-                let mut b = [0u8; 16];
-                b.copy_from_slice(&rr.rdata[..16]);
-                Some(AllAddr::Addr6(Ipv6Addr::from(b)))
-            }
-            _ => None,
-        };
-        if let Some(addr) = addr_opt {
-            for ia in ignore_addrs {
-                if addr_in_bogus_range(&addr, ia) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+    find_bad_address(packet, ignore_addrs).is_some()
 }
 
 /// Returns `true` if `name` matches any locally-configured record type.
@@ -2523,10 +2519,29 @@ mod tests {
 
         let mut cache = DnsCache::new(100);
         let now = Instant::now();
-        assert!(check_for_bogus_wildcard(&dp, &mut cache, now, std::slice::from_ref(&ba), 300));
-        // NXDOMAIN entry should now be in cache
+        assert!(check_for_bogus_wildcard(&dp, &mut cache, now, std::slice::from_ref(&ba)));
+        // NXDOMAIN entry should now be in cache, at the offending answer's TTL.
         let rec = cache.lookup_by_name("evil.example.com", F_NXDOMAIN | F_NEG, now);
-        assert!(rec.is_some());
+        assert_eq!(rec.map(|r| r.ttl), Some(60));
+    }
+
+    /// `--bogus-nxdomain` takes an IPv6 prefix too, and `check_bad_address()`
+    /// looks at AAAA records as well as A.
+    #[test]
+    fn check_bogus_wildcard_matches_an_ipv6_prefix() {
+        let ba = BogusAddr {
+            is6: true,
+            prefix: 32,
+            addr: AllAddr::Addr6("2001:db8::".parse().unwrap()),
+        };
+        let mut pkt = reply_header(15, 1, 1, 0, 0);
+        push_question(&mut pkt, "evil6.example.com", 28);
+        let v6: std::net::Ipv6Addr = "2001:db8::dead".parse().unwrap();
+        push_rr(&mut pkt, "evil6.example.com", 28, 60, &v6.octets());
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        let mut cache = DnsCache::new(100);
+        assert!(check_for_bogus_wildcard(&dp, &mut cache, Instant::now(), std::slice::from_ref(&ba)));
     }
 
     #[test]

@@ -181,15 +181,9 @@ Both are reference-only. Do not treat either tree as code to edit in place.
 
   - DNSSEC. `ForwardConfig::extract_config` always sets `secure: false`, so no cached record
     is ever marked `F_DNSSECOK` and `cache_secure` / `bogusanswer` have no live equivalent.
-    `process_reply`/`ProcessReplyConfig` in `forward.rs` model this but have no live caller.
-  - The `AD` bit on a relayed reply. `RA` is now set the way C does it, but C also *clears*
-    `AD` twelve lines earlier — `if (!is_sign && !option_bool(OPT_DNSSEC_PROXY)) header->hb4
-    &= ~HB4_AD;` (`forward.c:764`, RFC 4035 §4.6 para 3) — so a non-validating forwarder does
-    not pass an upstream server's `AD` claim through. The Rust reply path relays `AD`
-    untouched, which makes `proxy-dnssec` (`OPT_DNSSEC_PROXY`, parsed at `option.rs:773`) an
-    option nothing reads. Porting it needs the `is_sign` half too: C leaves the header alone
-    when the reply carries a SIG(0)/TSIG record, and `find_pseudoheader` has no Rust
-    equivalent on this path.
+    `process_reply` therefore never turns a bogus answer into SERVFAIL and never *sets* the
+    `AD` bit; the `--dnssec`-gated halves it does run are the DO-bit reset and the DNSSEC RR
+    strip. See the reply-path entry below.
   - `--dhcp-ttl` / `use_dhcp_ttl`. `crec_ttl` returns the stored TTL for any `F_IMMORTAL`
     record; C additionally applies a lease-length ceiling to `F_DHCP` entries
     (`rfc1035.c:1577-1585`).
@@ -202,25 +196,74 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     cached as `F_RR` but re-forwarded on every query. The NODATA negative entry for such a
     query is likewise stored under `F_RR | F_NEG` and never probed — `lookup_forward` closes
     this only for the A and AAAA types that `answer_request` actually reads.
-  - EDNS0 beyond re-attaching the OPT record: no client option (EDE, client-subnet, cookies)
-    is parsed, echoed or generated, and the advertised payload size is not used to size or
-    truncate a locally generated answer.
-  - `forward::process_reply` / `ProcessReplyConfig` remain an unreached reply-policy path.
-    They carry rcode and rebind decisions that `accept_reply` does not, but they check only
-    the source address, not the question — anything wiring them in must add the question
-    check first or it reopens the poisoning hole `accept_reply` closes. (`reply_query`, the
-    wrapper that drove them off the deleted `ForwardTable`, is gone.)
-  - `bogus-addr` wildcard filtering, `--doctor` address rewriting, `rrfilter`, ipset/nftset
-    population and the NXDOMAIN→NODATA conversion for locally-known names — all part of C's
-    `process_reply()` around the `extract_addresses()` call, none of them ported.
-    `rfc1035::check_for_bogus_wildcard` is implemented but has no live caller, and still
-    inserts via `DnsCache::insert`; wiring it in means routing it through `really_insert`
-    like `extract_addresses` now does.
+  - EDNS0 on a *locally generated* answer beyond re-attaching the OPT record: no client
+    option (client-subnet, cookies) is parsed or echoed, and the advertised payload size is
+    not used to size or truncate a locally generated answer. The relayed-reply path is
+    covered separately, below.
   - `forward::tcp_fallback` / `tcp_query` still have no non-test caller, deliberately. They
     escalate a truncated UDP reply to TCP, which upstream does *not* do on the client's
     behalf — C relays the truncated reply and the client retries. They are also wired to
     resend the reply packet rather than the original query, so activating them as they stand
     would send a QR=1 packet upstream. The real gap is the missing TCP listener, above.
+
+- [x] Wire `process_reply` into the live reply path (rebind, bogus-wildcard, rrfilter, EDNS0).
+  `forward::process_reply` was an unreached copy of a *subset* of C's `process_reply()`; it
+  never mutated the packet it was handed, so even the rebind branch it implemented could not
+  have taken effect. It is now the real thing, called once per accepted upstream answer from
+  `run_forward_loop_on`, in C's order (`forward.c:696-889`): restore the client's CD bit →
+  EDNS0 fix-up → clear `AD` / set `RA` → opcode and rcode gates → truncation gate →
+  `--bogus-nxdomain` → `extract_addresses` (caching + rebind) → `--filter-rr` → DNSSEC RR
+  strip → EDE option.
+
+  Load-bearing details:
+
+  - The per-query context C threads into `process_reply()` (`FREC_HAS_PHEADER`,
+    `FREC_DO_QUESTION`, `FREC_AD_QUESTION`, `FREC_CHECKING_DISABLED`) is decided when the
+    *client* asks, not when the answer arrives, so `ReplyAction::Deliver` now carries the
+    completed `Frec`'s flags out of `accept_reply` — the record is freed there.
+    `ReplyContext::from_flags` unpacks them.
+  - `--ignore-address` is checked in `accept_reply`, not `process_reply`, because C checks it
+    in `reply_query()` *before* the REFUSED/SERVFAIL failover (`forward.c:1228-1230`) and
+    returns without freeing the frec: the reply is dropped but the query stays in flight, so
+    an honest answer from another server can still be accepted.
+  - `rrfilter.rs` is now a faithful port of the four-pass algorithm, not a byte-splice.
+    Eliding records from the middle of a message invalidates every compression pointer past
+    the first removal; upstream rewrites the survivors and abandons the whole operation if
+    one points *into* an elided record (`rrfilter.c:23-155`). The previous implementation did
+    neither, which was harmless while nothing called it and a corruption bug the moment
+    something did.
+  - `strip_dnssec_if_not_requested` no longer removes DNSKEY (C's `RRFILTER_DNSSEC` lists
+    only RRSIG/NSEC/NSEC3) and keeps an answer-section record that is exactly what was asked
+    for, so a query *for* RRSIG still gets one.
+  - `check_for_bogus_wildcard` now matches AAAA as well as A — `--bogus-nxdomain` takes an
+    IPv6 prefix (`option.c` case `'B'`) and `check_bad_address()` checks both — and takes the
+    negative entry's TTL from the offending answer rather than `local-ttl`, which is what C
+    does and why (`rfc1035.c:1406`: "there is no SOA record to get the ttl from").
+  - The DNSSEC halves are gated on `--dnssec` (`OPT_DNSSEC_VALID`) exactly as C gates them.
+    Without it, C neither resets the DO bit nor strips DNSSEC RRs, so neither do we.
+
+  Explicitly **not** covered on this path:
+
+  - `do_doctor` (`--alias` address rewriting) is implemented in `rfc1035.rs` and still has no
+    caller. C runs it between the NXDOMAIN→NODATA conversion and the bogus-wildcard check
+    (`forward.c:806-807`).
+  - The NXDOMAIN→NODATA conversion for a locally-known name (`forward.c:795-804`). Needs
+    `check_for_local_domain` plus a `lookup_domain(F_CONFIG)` equivalent.
+  - `is_sign`. C leaves the pseudoheader and the `AD` bit alone when the reply carries a
+    TSIG/SIG(0) record; there is no TSIG support here, so the check is unconditional.
+  - `--add-subnet` reply verification (`check_source()`, `forward.c:727-731`) and the
+    `FREC_NO_CACHE` handling that goes with it. `edns0::check_source_subnet` and
+    `verify_ecs_reply` exist and are still uncalled.
+  - ipset / nftset population. `domain_find_sets` is ported; nothing consumes it.
+  - The reply is not sized against each client's advertised `udp_pkt_size`, so C's
+    per-`frec_src` truncation fallback (`forward.c:1463-1475`) has no equivalent — this port
+    also never rewrites the payload size on the *outgoing* query, so it forwards whatever the
+    client advertised.
+  - `--rebind-domain-ok` only accepts a plain domain. C strips a leading `/` and splits the
+    rest on `/` (`option.c` case `LOPT_NO_REBIND`), so `rebind-domain-ok=/lan/` is stored here
+    as one literal domain named `/lan/` and matches nothing. `parse_rebind_domains` splits on
+    `,` instead. Fixing it is an `option.rs` change, tracked here so the misparse is not
+    mistaken for a reply-path bug.
 
 - [x] Wire daemonization, pid-file writing and privilege dropping into `src/main.rs`.
   `main` is no longer `#[tokio::main]`: it runs the upstream startup sequence

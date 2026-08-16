@@ -1,7 +1,19 @@
 //! DNS resource record filtering.
 //!
-//! Provides utilities to strip RRs from a DNS packet by type.
-//! Ported from `rrfilter.c` in dnsmasq.
+//! Port of `rrfilter.c` — "Code to safely remove RRs from a DNS answer".
+//!
+//! *Safely* is the whole point of the file.  Removing bytes from the middle of
+//! a DNS message shifts everything after them, so every compression pointer in
+//! a record we keep either has to be rewritten or the removal has to be
+//! abandoned.  Upstream does this in four passes (`rrfilter.c:160`):
+//!
+//! 1. find the records to elide;
+//! 2. check that no surviving name points *into* one of them — if one does,
+//!    give up and return the answer unchanged;
+//! 3. rewrite the surviving pointers to their post-removal offsets;
+//! 4. move the kept bytes down and fix the section counts.
+//!
+//! This module does the same, on a copy rather than in place.
 
 use crate::dns_protocol::{DnsHeader, RrType};
 use crate::rfc1035::{DnsError, skip_name};
@@ -22,6 +34,290 @@ fn skip_questions_to(pkt: &[u8], offset: &mut usize, count: u16) -> Result<(), D
     Ok(())
 }
 
+/// Byte ranges (start, end) of the records being elided, in ascending order.
+type Elided = [(usize, usize)];
+
+/// Where a byte offset into the original packet ends up once `elided` is
+/// removed, or `None` if it lands *inside* an elided record.
+///
+/// Port of the pointer-scaling loop in `check_name()` (`rrfilter.c:49-60`),
+/// which walks the flattened start/end array and gives up on an odd index —
+/// i.e. between a start and its matching end.
+fn shift_offset(elided: &Elided, off: usize) -> Option<usize> {
+    let mut delta = 0usize;
+    for &(start, end) in elided {
+        if off < start {
+            break;
+        }
+        if off < end {
+            return None;
+        }
+        delta += end - start;
+    }
+    Some(off - delta)
+}
+
+/// Walk one wire-format name, checking (and optionally rewriting) any
+/// compression pointer in it.
+///
+/// Returns `false` — "give up, leave the answer alone" — for a malformed name
+/// or a pointer into an elided record.  Port of `check_name()`
+/// (`rrfilter.c:23`).
+fn check_name(pkt: &mut [u8], pos: &mut usize, elided: &Elided, fixup: bool) -> bool {
+    loop {
+        if *pos >= pkt.len() {
+            return false;
+        }
+        match pkt[*pos] & 0xC0 {
+            0xC0 => {
+                // Compression pointer.
+                if *pos + 2 > pkt.len() {
+                    return false;
+                }
+                let offset = ((usize::from(pkt[*pos]) & 0x3F) << 8) | usize::from(pkt[*pos + 1]);
+                let Some(shifted) = shift_offset(elided, offset) else { return false };
+                if fixup {
+                    pkt[*pos]     = ((shifted >> 8) as u8) | 0xC0;
+                    pkt[*pos + 1] = (shifted & 0xFF) as u8;
+                }
+                *pos += 2;
+                return true;
+            }
+            0x80 => return false, // reserved label type
+            0x40 => {
+                // Extended label type; only bitstrings (RFC 2673) are understood.
+                if *pos + 2 > pkt.len() || pkt[*pos] & 0x3F != 1 {
+                    return false;
+                }
+                let count = usize::from(pkt[*pos + 1]);
+                *pos += 2;
+                let bytes = if count == 0 { 32 } else { ((count - 1) >> 3) + 1 };
+                if *pos + bytes > pkt.len() {
+                    return false;
+                }
+                *pos += bytes;
+            }
+            _ => {
+                let len = usize::from(pkt[*pos] & 0x3F);
+                *pos += 1;
+                if *pos + len > pkt.len() {
+                    return false;
+                }
+                *pos += len;
+                if len == 0 {
+                    return true; // root label ends the name
+                }
+            }
+        }
+    }
+}
+
+/// RR types that carry domain names inside their RDATA, and where.
+///
+/// `0` means "a name starts here", a positive value means "skip this many
+/// fixed bytes".  Port of `rrfilter_desc()` (`rrfilter.c:296`); an empty slice
+/// is C's catch-all entry for types that need no mangling.
+fn rrfilter_desc(rtype: u16) -> &'static [i16] {
+    match rtype {
+        // NS, MD, MF, CNAME, MB, MG, MR, PTR, NXT, DNAME
+        2 | 3 | 4 | 5 | 7 | 8 | 9 | 12 | 30 | 39 => &[0],
+        6  => &[0, 0],    // SOA
+        14 => &[0, 0],    // MINFO
+        15 => &[2, 0],    // MX
+        17 => &[0, 0],    // RP
+        18 => &[2, 0],    // AFSDB
+        21 => &[2, 0],    // RT
+        24 => &[18, 0],   // SIG
+        26 => &[2, 0, 0], // PX
+        33 => &[6, 0],    // SRV
+        36 => &[2, 0],    // KX
+        _  => &[],
+    }
+}
+
+/// Walk every surviving RR, checking (or fixing) the names it contains.
+///
+/// Port of `check_rrs()` (`rrfilter.c:105`).  Records that are themselves being
+/// elided are skipped — their contents no longer matter.
+fn check_rrs(
+    pkt:    &mut [u8],
+    mut pos: usize,
+    total:  usize,
+    elided: &Elided,
+    fixup:  bool,
+) -> bool {
+    for _ in 0..total {
+        let rr_start = pos;
+        if skip_name(pkt, &mut pos).is_err() || pos + 10 > pkt.len() {
+            return false;
+        }
+        let rtype = u16::from_be_bytes([pkt[pos],     pkt[pos + 1]]);
+        let class = u16::from_be_bytes([pkt[pos + 2], pkt[pos + 3]]);
+        let rdlen = usize::from(u16::from_be_bytes([pkt[pos + 8], pkt[pos + 9]]));
+        pos += 10;
+
+        if !elided.iter().any(|&(start, _)| start == rr_start) {
+            let mut name_pos = rr_start;
+            if !check_name(pkt, &mut name_pos, elided, fixup) {
+                return false;
+            }
+            if class == 1 {
+                let mut rdata_pos = pos;
+                for &step in rrfilter_desc(rtype) {
+                    if step != 0 {
+                        rdata_pos += step as usize;
+                        if rdata_pos > pkt.len() {
+                            return false;
+                        }
+                    } else if !check_name(pkt, &mut rdata_pos, elided, fixup) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        if pos + rdlen > pkt.len() {
+            return false;
+        }
+        pos += rdlen;
+    }
+    true
+}
+
+/// What the caller wants done with one record.
+enum Verdict {
+    Keep,
+    Remove,
+    /// Stop scanning entirely; every remaining record is kept.  C's `break` out
+    /// of the first pass once it is past the answer section (`rrfilter.c:228`).
+    Stop,
+}
+
+/// The parts of the question a filtering decision may depend on.
+struct Question {
+    qtype:  u16,
+    qclass: u16,
+}
+
+/// Shared core of the three public filters: decide per record, then elide
+/// safely.
+///
+/// `decide` is called with the record's index across the concatenated
+/// answer/authority/additional sections, its TYPE and CLASS, and the section
+/// boundaries.  Returns the rewritten packet and the number of records removed.
+///
+/// A packet whose records cannot be walked, or one where a surviving name
+/// points into a record being removed, comes back unchanged — this is C's
+/// "we give up and leave the answer unchanged" (`rrfilter.c:255-257`).
+fn filter_with<F>(pkt: &[u8], mut decide: F) -> Result<(Vec<u8>, usize), DnsError>
+where
+    F: FnMut(usize, u16, u16, &Question) -> Verdict,
+{
+    let hdr = DnsHeader::from_bytes(pkt).ok_or(DnsError::PacketTooShort)?;
+
+    let mut pos = 12usize;
+    skip_questions_to(pkt, &mut pos, hdr.qdcount)?;
+
+    // The first question drives the DNSSEC and RFC 8482 decisions; a packet
+    // with no question section has neither.
+    let question = if hdr.qdcount >= 1 {
+        let mut qpos = 12usize;
+        skip_name(pkt, &mut qpos)?;
+        if qpos + 4 > pkt.len() {
+            return Err(DnsError::PacketTooShort);
+        }
+        Question {
+            qtype:  u16::from_be_bytes([pkt[qpos],     pkt[qpos + 1]]),
+            qclass: u16::from_be_bytes([pkt[qpos + 2], pkt[qpos + 3]]),
+        }
+    } else {
+        Question { qtype: 0, qclass: 0 }
+    };
+
+    let an = usize::from(hdr.ancount);
+    let ns = usize::from(hdr.nscount);
+    let total = an + ns + usize::from(hdr.arcount);
+
+    // ── Pass 1: which records go? ────────────────────────────────────────────
+    let mut elided: Vec<(usize, usize)> = Vec::new();
+    let (mut chop_an, mut chop_ns, mut chop_ar) = (0u16, 0u16, 0u16);
+
+    for i in 0..total {
+        let start = pos;
+        skip_name(pkt, &mut pos)?;
+        if pos + 10 > pkt.len() {
+            return Err(DnsError::PacketTooShort);
+        }
+        let rtype = u16::from_be_bytes([pkt[pos],     pkt[pos + 1]]);
+        let class = u16::from_be_bytes([pkt[pos + 2], pkt[pos + 3]]);
+        let rdlen = usize::from(u16::from_be_bytes([pkt[pos + 8], pkt[pos + 9]]));
+        pos += 10 + rdlen;
+        if pos > pkt.len() {
+            return Err(DnsError::UnexpectedEof);
+        }
+
+        match decide(i, rtype, class, &question) {
+            Verdict::Keep => continue,
+            Verdict::Stop => break,
+            Verdict::Remove => {}
+        }
+        elided.push((start, pos));
+        if i < an {
+            chop_an += 1;
+        } else if i < an + ns {
+            chop_ns += 1;
+        } else {
+            chop_ar += 1;
+        }
+    }
+
+    if elided.is_empty() {
+        return Ok((pkt.to_vec(), 0));
+    }
+    let removed = elided.len();
+    let mut work = pkt.to_vec();
+
+    // ── Pass 2: would any surviving name break? ──────────────────────────────
+    // ── Pass 3: if not, rewrite the pointers.  ───────────────────────────────
+    for fixup in [false, true] {
+        let mut p = 12usize;
+        let mut ok = true;
+        for _ in 0..hdr.qdcount {
+            if !check_name(&mut work, &mut p, &elided, fixup) {
+                ok = false;
+                break;
+            }
+            p += 4;
+        }
+        if ok {
+            ok = check_rrs(&mut work, p, total, &elided, fixup);
+        }
+        if !ok {
+            // Only reachable on the checking pass — the fixing pass walks the
+            // exact same ground.  Leave the answer alone.
+            return Ok((pkt.to_vec(), 0));
+        }
+    }
+
+    // ── Pass 4: move the kept bytes down. ────────────────────────────────────
+    let mut out = Vec::with_capacity(work.len());
+    let mut cursor = 0usize;
+    for &(start, end) in &elided {
+        out.extend_from_slice(&work[cursor..start]);
+        cursor = end;
+    }
+    out.extend_from_slice(&work[cursor..]);
+
+    let new_an = hdr.ancount - chop_an;
+    let new_ns = hdr.nscount - chop_ns;
+    let new_ar = hdr.arcount - chop_ar;
+    out[6..8].copy_from_slice(&new_an.to_be_bytes());
+    out[8..10].copy_from_slice(&new_ns.to_be_bytes());
+    out[10..12].copy_from_slice(&new_ar.to_be_bytes());
+
+    Ok((out, removed))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
@@ -29,14 +325,12 @@ fn skip_questions_to(pkt: &[u8], offset: &mut usize, count: u16) -> Result<(), D
 /// Remove all RRs whose wire TYPE value is in `remove_types` from the
 /// answer, authority, and additional sections of `pkt`.
 ///
-/// Returns the new (possibly shorter) packet bytes.
+/// Returns the new (possibly shorter) packet bytes.  Compression pointers in
+/// the surviving records are rewritten; if one of them points into a record
+/// being removed the packet comes back unchanged, as upstream does.
 ///
-/// # Notes
-/// * The question section is left untouched.
-/// * Section counts in the header are updated to match the filtered result.
-/// * Name compression pointers in retained RRs are preserved verbatim; pointers
-///   that referred only to removed RRs are not rewritten (this is safe for the
-///   common cases — OPT and DNSSEC — that this function is used for).
+/// This is how the reply path performs C's `RRFILTER_EDNS0` — stripping the
+/// OPT pseudo-RR from a reply whose client never sent one (`forward.c:738`).
 pub fn filter_rr_types(pkt: &[u8], remove_types: &[u16]) -> Result<Vec<u8>, DnsError> {
     if pkt.len() < 12 {
         return Err(DnsError::PacketTooShort);
@@ -44,82 +338,86 @@ pub fn filter_rr_types(pkt: &[u8], remove_types: &[u16]) -> Result<Vec<u8>, DnsE
     if remove_types.is_empty() {
         return Ok(pkt.to_vec());
     }
-
-    let hdr = DnsHeader::from_bytes(pkt).ok_or(DnsError::PacketTooShort)?;
-
-    // Locate start of RR sections (right after the question section).
-    let mut rr_start = 12usize;
-    skip_questions_to(pkt, &mut rr_start, hdr.qdcount)?;
-
-    // Collect (start, end, rtype) for every RR.
-    let total = hdr.ancount as usize + hdr.nscount as usize + hdr.arcount as usize;
-    let mut rr_info: Vec<(usize, usize, u16)> = Vec::with_capacity(total);
-    let mut offset = rr_start;
-
-    for _ in 0..total {
-        let start = offset;
-        skip_name(pkt, &mut offset)?;
-        if offset + 10 > pkt.len() {
-            return Err(DnsError::PacketTooShort);
-        }
-        let rtype = u16::from_be_bytes([pkt[offset], pkt[offset + 1]]);
-        let rdlen = u16::from_be_bytes([pkt[offset + 8], pkt[offset + 9]]) as usize;
-        offset += 10 + rdlen;
-        if offset > pkt.len() {
-            return Err(DnsError::UnexpectedEof);
-        }
-        rr_info.push((start, offset, rtype));
-    }
-
-    // Build output: header + questions + kept RRs.
-    let mut result = pkt[..rr_start].to_vec(); // header + question section
-    let mut new_an = hdr.ancount;
-    let mut new_ns = hdr.nscount;
-    let mut new_ar = hdr.arcount;
-
-    for (i, (start, end, rtype)) in rr_info.iter().enumerate() {
-        if remove_types.contains(rtype) {
-            if i < hdr.ancount as usize {
-                new_an -= 1;
-            } else if i < (hdr.ancount + hdr.nscount) as usize {
-                new_ns -= 1;
-            } else {
-                new_ar -= 1;
-            }
-        } else {
-            result.extend_from_slice(&pkt[*start..*end]);
-        }
-    }
-
-    // Patch section counts.
-    result[6]  = (new_an >> 8) as u8;
-    result[7]  = (new_an & 0xFF) as u8;
-    result[8]  = (new_ns >> 8) as u8;
-    result[9]  = (new_ns & 0xFF) as u8;
-    result[10] = (new_ar >> 8) as u8;
-    result[11] = (new_ar & 0xFF) as u8;
-
-    Ok(result)
+    filter_with(pkt, |_, rtype, _, _| {
+        if remove_types.contains(&rtype) { Verdict::Remove } else { Verdict::Keep }
+    })
+    .map(|(out, _)| out)
 }
 
-/// Remove DNSSEC records (RRSIG, NSEC, NSEC3, DNSKEY) from a packet,
-/// **unless** the DO bit is set in the OPT RR.
+/// Remove the DNSSEC records a client that did not set the DO bit must not be
+/// sent — C's `RRFILTER_DNSSEC` (`rrfilter.c:206-214`).
+///
+/// RRSIG, NSEC and NSEC3 go from all three sections.  DNSKEY does *not*:
+/// upstream leaves it alone, since it is ordinary data a client may have asked
+/// for.  An answer-section record that is exactly what was asked for is kept
+/// for the same reason — a query *for* RRSIG still gets its RRSIG back.
 pub fn strip_dnssec_if_not_requested(pkt: &[u8]) -> Result<Vec<u8>, DnsError> {
-    // Check the DO bit via the edns0 module.
+    // The DO bit is in the OPT RR's flags word; set means "send me DNSSEC".
     if let Some(info) = crate::edns0::find_pseudoheader(pkt) {
         if info.flags & 0x8000 != 0 {
             return Ok(pkt.to_vec());
         }
     }
 
-    const DNSSEC_TYPES: &[u16] = &[
-        RrType::RRSIG  as u16,
-        RrType::NSEC   as u16,
-        RrType::NSEC3  as u16,
-        RrType::DNSKEY as u16,
-    ];
+    let ancount = usize::from(DnsHeader::from_bytes(pkt).ok_or(DnsError::PacketTooShort)?.ancount);
 
-    filter_rr_types(pkt, DNSSEC_TYPES)
+    filter_with(pkt, |i, rtype, class, q| {
+        let is_dnssec = rtype == RrType::RRSIG as u16
+            || rtype == RrType::NSEC  as u16
+            || rtype == RrType::NSEC3 as u16;
+        if !is_dnssec {
+            return Verdict::Keep;
+        }
+        // Don't remove the answer.
+        if i < ancount && rtype == q.qtype && class == q.qclass {
+            return Verdict::Keep;
+        }
+        Verdict::Remove
+    })
+    .map(|(out, _)| out)
+}
+
+/// Apply `--filter-rr` / `--filter-a` / `--filter-aaaa` to a reply — C's
+/// `RRFILTER_CONF` (`rrfilter.c:216-235`), called from `process_reply()`
+/// (`forward.c:848`).
+///
+/// Two distinct behaviours, exactly as upstream:
+///
+/// * For a plain query, only the **answer** section is filtered, and only
+///   class-IN records whose type is on the list.
+/// * For an `ANY` query when `ANY` is itself on the list, the reply is trimmed
+///   to A/AAAA/MX/CNAME "in the spirit of RFC 8482 para 4.3" — everything else
+///   in class IN goes, from every section.
+///
+/// Returns the rewritten packet and how many records were removed; a non-zero
+/// count is what makes the reply report `EDE_FILTERED`.
+pub fn filter_configured_rr_types(
+    pkt:       &[u8],
+    filter_rr: &[u16],
+) -> Result<(Vec<u8>, usize), DnsError> {
+    if pkt.len() < 12 {
+        return Err(DnsError::PacketTooShort);
+    }
+    if filter_rr.is_empty() {
+        return Ok((pkt.to_vec(), 0));
+    }
+    let ancount = usize::from(DnsHeader::from_bytes(pkt).ok_or(DnsError::PacketTooShort)?.ancount);
+    let any_query = filter_rr.contains(&(RrType::ANY as u16));
+
+    filter_with(pkt, |i, rtype, class, q| {
+        if q.qtype == RrType::ANY as u16 && any_query {
+            let keep = class != 1
+                || rtype == RrType::A     as u16
+                || rtype == RrType::AAAA  as u16
+                || rtype == RrType::MX    as u16
+                || rtype == RrType::CNAME as u16;
+            return if keep { Verdict::Keep } else { Verdict::Remove };
+        }
+        if i >= ancount {
+            return Verdict::Stop;
+        }
+        if class == 1 && filter_rr.contains(&rtype) { Verdict::Remove } else { Verdict::Keep }
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -130,7 +428,7 @@ pub fn strip_dnssec_if_not_requested(pkt: &[u8]) -> Result<Vec<u8>, DnsError> {
 mod tests {
     use super::*;
     use crate::dns_protocol::RrType;
-    use crate::rfc1035::{write_name, write_rr, DnsRr};
+    use crate::rfc1035::{write_rr, DnsRr};
     use bytes::BytesMut;
 
     // ── helpers ───────────────────────────────────────────────────────────────
@@ -150,19 +448,30 @@ mod tests {
 
     /// Build a minimal response packet with the given RRs in the answer section.
     fn response_with_answers(rrs: &[Vec<u8>]) -> Vec<u8> {
-        let ancount = rrs.len() as u16;
+        response_with(rrs, &[], &[], 1)
+    }
+
+    /// Build a response with explicit answer / authority / additional sections
+    /// and a chosen QTYPE.  The question is always `example.com IN`.
+    fn response_with(
+        answers:    &[Vec<u8>],
+        authority:  &[Vec<u8>],
+        additional: &[Vec<u8>],
+        qtype:      u16,
+    ) -> Vec<u8> {
+        let counts = [answers.len() as u16, authority.len() as u16, additional.len() as u16];
         let mut pkt = vec![
             0x00, 0x01, // ID
             0x81, 0x80, // flags: QR+RD+RA
             0x00, 0x01, // QDCOUNT=1
-            (ancount >> 8) as u8, (ancount & 0xFF) as u8,
-            0x00, 0x00, // NSCOUNT=0
-            0x00, 0x00, // ARCOUNT=0
         ];
-        // Question: example.com A IN
+        for c in counts {
+            pkt.extend_from_slice(&c.to_be_bytes());
+        }
         pkt.extend_from_slice(b"\x07example\x03com\x00");
-        pkt.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
-        for rr in rrs {
+        pkt.extend_from_slice(&qtype.to_be_bytes());
+        pkt.extend_from_slice(&[0x00, 0x01]); // QCLASS=IN
+        for rr in answers.iter().chain(authority).chain(additional) {
             pkt.extend_from_slice(rr);
         }
         pkt
@@ -215,6 +524,56 @@ mod tests {
     #[test]
     fn filter_too_short_returns_err() {
         assert!(filter_rr_types(&[0u8; 4], &[1]).is_err());
+    }
+
+    // ── compression-pointer safety ────────────────────────────────────────────
+
+    /// The four-pass dance exists for this case: a record that survives carries
+    /// a compression pointer to a name that sits *after* the removed record, so
+    /// the pointer has to be rewritten or the answer is corrupt.
+    #[test]
+    fn a_surviving_pointer_past_an_elided_record_is_rewritten() {
+        // Answer 1: TXT (to be removed) — its owner name is a literal.
+        let txt = make_rr("example.com", RrType::TXT as u16, b"\x05hello");
+        // Answer 2: NS whose *name* is a literal at a known offset, and whose
+        // RDATA is a pointer back to that name.
+        let ns_name_offset = 12 + 17 + txt.len(); // header + question + TXT
+        let mut ns_rdata = BytesMut::new();
+        ns_rdata.extend_from_slice(&[0xC0 | (ns_name_offset >> 8) as u8, (ns_name_offset & 0xFF) as u8]);
+        let ns = make_rr("ns.example.com", RrType::NS as u16, &ns_rdata);
+
+        let pkt = response_with_answers(&[txt, ns]);
+        let filtered = filter_rr_types(&pkt, &[RrType::TXT as u16]).unwrap();
+
+        // The NS record must still parse, and its RDATA pointer must resolve to
+        // its own owner name at the new offset.  Left un-rescaled the pointer
+        // still *looks* like a pointer — it just addresses the wrong bytes —
+        // so the assertion has to be on the name it resolves to.
+        let parsed = crate::rfc1035::DnsPacket::parse(&filtered).expect("filtered packet must parse");
+        assert_eq!(parsed.answers.len(), 1);
+        let mut pos = 0usize;
+        let target = crate::rfc1035::extract_name(&parsed.answers[0].rdata, &mut pos)
+            .expect("NS rdata must decode");
+        assert_eq!(target, "ns.example.com", "pointer must be rescaled to the moved record");
+    }
+
+    /// A pointer *into* a record being removed cannot be rescaled, so upstream
+    /// abandons the whole filtering operation rather than emit a broken answer.
+    #[test]
+    fn a_pointer_into_an_elided_record_abandons_the_filter() {
+        let txt = make_rr("example.com", RrType::TXT as u16, b"\x05hello");
+        // Point at the TXT record's owner name, which is about to disappear.
+        let txt_name_offset = 12 + 17;
+        let mut ns_rdata = BytesMut::new();
+        ns_rdata.extend_from_slice(&[
+            0xC0 | (txt_name_offset >> 8) as u8,
+            (txt_name_offset & 0xFF) as u8,
+        ]);
+        let ns = make_rr("ns.example.com", RrType::NS as u16, &ns_rdata);
+
+        let pkt = response_with_answers(&[txt, ns]);
+        let filtered = filter_rr_types(&pkt, &[RrType::TXT as u16]).unwrap();
+        assert_eq!(filtered, pkt, "the answer must be left exactly as it arrived");
     }
 
     // ── strip_dnssec_if_not_requested ─────────────────────────────────────────
@@ -270,8 +629,11 @@ mod tests {
         assert_eq!(hdr.ancount, 1);
     }
 
+    /// RRSIG, NSEC and NSEC3 go — DNSKEY stays.  C's `RRFILTER_DNSSEC` lists
+    /// exactly three types (`rrfilter.c:208`); DNSKEY is ordinary queryable
+    /// data, not validation scaffolding added on our behalf.
     #[test]
-    fn strip_dnssec_removes_all_four_types() {
+    fn strip_dnssec_removes_the_three_validation_types_but_keeps_dnskey() {
         let rrs = vec![
             make_rr("example.com", RrType::A      as u16, &[1, 2, 3, 4]),
             make_rr("example.com", RrType::RRSIG  as u16, &[0x01]),
@@ -282,6 +644,99 @@ mod tests {
         let pkt = response_with_answers(&rrs);
         let stripped = strip_dnssec_if_not_requested(&pkt).unwrap();
         let hdr = DnsHeader::from_bytes(&stripped).unwrap();
-        assert_eq!(hdr.ancount, 1); // only A remains
+        assert_eq!(hdr.ancount, 2, "A and DNSKEY remain");
+    }
+
+    /// A client asking *for* RRSIG gets its answer, DO bit or not.
+    #[test]
+    fn strip_dnssec_keeps_an_rrsig_that_was_the_question() {
+        let rrsig = make_rr("example.com", RrType::RRSIG as u16, &[0x01]);
+        let pkt = response_with(&[rrsig], &[], &[], RrType::RRSIG as u16);
+
+        let stripped = strip_dnssec_if_not_requested(&pkt).unwrap();
+        let hdr = DnsHeader::from_bytes(&stripped).unwrap();
+        assert_eq!(hdr.ancount, 1, "the answer to the question must survive");
+    }
+
+    /// The same RRSIG in the authority section is not the answer, so it goes.
+    #[test]
+    fn strip_dnssec_removes_an_rrsig_from_the_authority_section() {
+        let a     = make_rr("example.com", RrType::A     as u16, &[1, 2, 3, 4]);
+        let rrsig = make_rr("example.com", RrType::RRSIG as u16, &[0x01]);
+        let pkt = response_with(&[a], &[rrsig], &[], RrType::RRSIG as u16);
+
+        let stripped = strip_dnssec_if_not_requested(&pkt).unwrap();
+        let hdr = DnsHeader::from_bytes(&stripped).unwrap();
+        assert_eq!(hdr.ancount, 1);
+        assert_eq!(hdr.nscount, 0);
+    }
+
+    // ── filter_configured_rr_types (RRFILTER_CONF) ────────────────────────────
+
+    #[test]
+    fn conf_filter_removes_a_listed_type_from_the_answer() {
+        let a   = make_rr("example.com", RrType::A   as u16, &[1, 2, 3, 4]);
+        let caa = make_rr("example.com", RrType::CAA as u16, b"\x00\x05issue");
+        let pkt = response_with_answers(&[a, caa]);
+
+        let (out, n) = filter_configured_rr_types(&pkt, &[RrType::CAA as u16]).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(DnsHeader::from_bytes(&out).unwrap().ancount, 1);
+    }
+
+    /// Only the answer section: C `break`s out of the scan once it is past it.
+    #[test]
+    fn conf_filter_leaves_the_authority_section_alone() {
+        let a   = make_rr("example.com", RrType::A   as u16, &[1, 2, 3, 4]);
+        let caa = make_rr("example.com", RrType::CAA as u16, b"\x00\x05issue");
+        let pkt = response_with(&[a], &[caa], &[], 1);
+
+        let (out, n) = filter_configured_rr_types(&pkt, &[RrType::CAA as u16]).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(out, pkt);
+        assert_eq!(DnsHeader::from_bytes(&out).unwrap().nscount, 1);
+    }
+
+    #[test]
+    fn conf_filter_ignores_a_non_internet_class_record() {
+        let mut chaos = make_rr("example.com", RrType::TXT as u16, b"\x05hello");
+        // Rewrite CLASS (2 bytes after the 2-byte TYPE, which follows the name).
+        let class_at = chaos.len() - 2 - 4 - 2 - 6;
+        chaos[class_at] = 0x00;
+        chaos[class_at + 1] = 0x03; // CH
+        let pkt = response_with_answers(&[chaos]);
+
+        let (_, n) = filter_configured_rr_types(&pkt, &[RrType::TXT as u16]).unwrap();
+        assert_eq!(n, 0, "only class IN is filtered");
+    }
+
+    /// RFC 8482: an `ANY` query with `ANY` on the filter list is trimmed to
+    /// A/AAAA/MX/CNAME, across every section.
+    #[test]
+    fn conf_filter_trims_an_any_query_to_the_rfc8482_set() {
+        let a    = make_rr("example.com", RrType::A     as u16, &[1, 2, 3, 4]);
+        let txt  = make_rr("example.com", RrType::TXT   as u16, b"\x05hello");
+        let soa  = make_rr("example.com", RrType::SOA   as u16, b"\x00\x00");
+        let pkt = response_with(&[a, txt], &[soa], &[], RrType::ANY as u16);
+
+        let (out, n) = filter_configured_rr_types(&pkt, &[RrType::ANY as u16]).unwrap();
+        assert_eq!(n, 2, "TXT and SOA both go");
+        let hdr = DnsHeader::from_bytes(&out).unwrap();
+        assert_eq!(hdr.ancount, 1);
+        assert_eq!(hdr.nscount, 0);
+    }
+
+    #[test]
+    fn conf_filter_with_an_empty_list_is_a_no_op() {
+        let a = make_rr("example.com", RrType::A as u16, &[1, 2, 3, 4]);
+        let pkt = response_with_answers(&[a]);
+        let (out, n) = filter_configured_rr_types(&pkt, &[]).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(out, pkt);
+    }
+
+    #[test]
+    fn conf_filter_too_short_returns_err() {
+        assert!(filter_configured_rr_types(&[0u8; 4], &[1]).is_err());
     }
 }

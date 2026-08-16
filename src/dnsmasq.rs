@@ -559,7 +559,9 @@ pub async fn build_shared_cache(daemon_handle: &DaemonHandle) -> crate::cache::S
 /// so anything added to `ForwardConfig` has to be threaded through this
 /// function as well.
 pub fn daemon_forward_config(daemon: &Daemon) -> crate::forward::ForwardConfig {
-    use crate::types::constants::{OPT_LOCAL_REBIND, OPT_NO_NEG, OPT_NO_REBIND};
+    use crate::types::constants::{
+        OPT_DNSSEC_PROXY, OPT_DNSSEC_VALID, OPT_LOCAL_REBIND, OPT_NO_NEG, OPT_NO_REBIND,
+    };
 
     crate::forward::ForwardConfig {
         upstreams: daemon
@@ -577,6 +579,13 @@ pub fn daemon_forward_config(daemon: &Daemon) -> crate::forward::ForwardConfig {
         check_rebind:  daemon.option_bool(OPT_NO_REBIND),
         local_rebind_ok: daemon.option_bool(OPT_LOCAL_REBIND),
         no_rebind:     daemon.no_rebind.clone(),
+        // Reply-side answer policy: `--bogus-nxdomain`, `--ignore-address` and
+        // the `--filter-rr` family all act in `process_reply()`.
+        bogus_addr:    daemon.bogus_addr.clone(),
+        ignore_addr:   daemon.ignore_addr.clone(),
+        filter_rr:     daemon.rrlist_filter.iter().map(|rr| rr.rr).collect(),
+        dnssec_valid:  daemon.option_bool(OPT_DNSSEC_VALID),
+        dnssec_proxy:  daemon.option_bool(OPT_DNSSEC_PROXY),
         // `--dns-forward-max` and `--port-limit`.  Both are clamped away from
         // zero: a zero query table would refuse every query, and a zero port
         // limit would make `allocate_rfd()` reuse a transaction's first socket
@@ -1849,6 +1858,39 @@ mod tests {
     #[test]
     fn daemon_local_data_empty_by_default() {
         assert!(daemon_local_data(&Daemon::default()).is_empty());
+    }
+
+    /// Every knob `process_reply` consults has to survive the trip from a
+    /// parsed `Daemon` into `ForwardConfig`, or the directive behind it is a
+    /// silent no-op at run time.
+    ///
+    /// The end-to-end coverage for these lives in
+    /// `tests/reply_processing_integration.rs`, but every test there skips when
+    /// the environment forbids binding loopback sockets — this one does not, so
+    /// the threading stays pinned in a restricted sandbox.
+    #[test]
+    fn daemon_forward_config_carries_the_reply_policy() {
+        let lines = crate::option::parse_config_text(
+            "bogus-nxdomain=64.94.110.11\n\
+             ignore-address=198.51.100.9\n\
+             filter-rr=CAA\n\
+             filter-AAAA\n\
+             dnssec\n\
+             proxy-dnssec\n\
+             stop-dns-rebind\n",
+            "test",
+        )
+        .unwrap();
+        let mut daemon = Daemon::default();
+        crate::option::apply_config(&mut daemon, &lines).unwrap();
+
+        let config = daemon_forward_config(&daemon);
+        assert_eq!(config.bogus_addr.len(), 1, "--bogus-nxdomain must reach the reply path");
+        assert_eq!(config.ignore_addr.len(), 1, "--ignore-address must reach the reply path");
+        assert_eq!(config.filter_rr, vec![257, 28], "--filter-rr and --filter-AAAA both land");
+        assert!(config.dnssec_valid, "--dnssec gates the reply-side DNSSEC handling");
+        assert!(config.dnssec_proxy, "--proxy-dnssec must be readable");
+        assert!(config.check_rebind);
     }
 
     #[test]
