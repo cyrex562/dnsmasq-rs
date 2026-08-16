@@ -66,10 +66,12 @@ class TestRoute(unittest.TestCase):
 
 
 class TestModelCeiling(unittest.TestCase):
-    """Set 2026-08-16 to hold opus spend down after tier 0. The judge must
-    stay exempt: it is the safety check, not a cost lever, and it is what
-    caught every serious defect (cache poisoning, a rebind bypass, silent
-    lease loss) across tier 0's cycles."""
+    """Set 2026-08-16 to hold opus spend down after tier 0, and extended the
+    same day to cover the judge too, "until further notice" — a deliberate,
+    user-directed risk: every serious tier-0 defect caught after a clean gate
+    and passing review (cache poisoning, a rebind bypass, silent lease loss)
+    was found by an opus judge. HARNESS_MODEL_CEILING=opus restores the judge
+    to full strength."""
 
     def setUp(self):
         self._orig_ceiling = routing.MODEL_CEILING
@@ -86,13 +88,17 @@ class TestModelCeiling(unittest.TestCase):
             "sonnet",
         )
 
-    def test_judge_ignores_a_sonnet_ceiling(self):
+    def test_judge_respects_a_sonnet_ceiling(self):
         routing.MODEL_CEILING = "sonnet"
-        self.assertEqual(route(m(risk="high", model="opus"), "judge"), "opus")
+        self.assertEqual(route(m(risk="high", model="opus"), "judge"), "sonnet")
 
-    def test_judge_ignores_a_haiku_ceiling(self):
+    def test_judge_respects_a_haiku_ceiling(self):
         routing.MODEL_CEILING = "haiku"
-        self.assertEqual(route(m(risk="high", model="opus"), "judge"), "opus")
+        self.assertEqual(route(m(risk="high", model="opus"), "judge"), "haiku")
+
+    def test_opus_ceiling_restores_the_judge_too(self):
+        routing.MODEL_CEILING = "opus"
+        self.assertEqual(route(m(), "judge"), "opus")
 
     def test_high_risk_is_capped_at_sonnet_not_opus(self):
         routing.MODEL_CEILING = "sonnet"
@@ -123,8 +129,9 @@ class TestModelCeiling(unittest.TestCase):
     def test_env_var_sets_the_default(self):
         # MODEL_CEILING is read once at import time; this documents the
         # override mechanism without needing a subprocess re-import.
-        self.assertIn("HARNESS_MODEL_CEILING", open(
-            os.path.join(os.path.dirname(__file__), "..", "routing.py")).read())
+        path = os.path.join(os.path.dirname(__file__), "..", "routing.py")
+        with open(path) as f:
+            self.assertIn("HARNESS_MODEL_CEILING", f.read())
 
 
 class TestEscalate(unittest.TestCase):

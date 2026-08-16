@@ -215,8 +215,9 @@ def run_cycle(meta, dry_run=False):
                 claude_runner.render("review", diff=diff, **common), read_only=True))
 
             # Fresh process, curated context, no implementer or reviewer narrative.
-            judgement = _record_stage(record, "judge", "opus", lambda: claude_runner.run_stage(
-                "judge", "opus", worktree,
+            judge_model = routing.route(meta, "judge")
+            judgement = _record_stage(record, "judge", judge_model, lambda: claude_runner.run_stage(
+                "judge", judge_model, worktree,
                 claude_runner.render("judge", diff=diff, gate_output=gate_output, **common),
                 read_only=True))
 
