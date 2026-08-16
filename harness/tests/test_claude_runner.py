@@ -83,5 +83,17 @@ class TestPermissions(unittest.TestCase):
             self.assertNotIn(banned, READ_ONLY_TOOLS)
 
 
+class TestLargePrompt(unittest.TestCase):
+    """Regression: a 136969-byte judge prompt exceeded Linux MAX_ARG_STRLEN
+    (131072) and killed a cycle after the work was done and gate-clean."""
+
+    def test_prompt_is_not_passed_as_an_argv_element(self):
+        import inspect
+        import claude_runner
+        src = inspect.getsource(claude_runner.run_stage)
+        self.assertIn("input=prompt", src)
+        self.assertNotIn('"-p", prompt', src)
+
+
 if __name__ == "__main__":
     unittest.main()
