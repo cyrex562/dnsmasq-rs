@@ -16,9 +16,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::cache::{DnsCache, SharedDnsCache};
 use crate::hash_questions::hash_questions;
 use crate::metrics::{inc_metric, Metric};
-use crate::dns_protocol::HB4_RA;
+use crate::dns_protocol::{HB4_AD, HB4_CD, HB4_RA};
 use crate::rfc1035::{
-    answer_request, private_net, private_net6, DnsPacket, ExtractConfig, ExtractResult,
+    answer_request, private_net, private_net6, DnsPacket, DnsRr, ExtractConfig, ExtractResult,
     LocalConfig,
 };
 use crate::types::constants::{F_IPV4, F_IPV6, F_SERVER};
@@ -55,6 +55,119 @@ pub const FREC_NOREBIND:           u32 = 1;
 
 /// Default timeout seconds before a forwarded query is considered stale.
 pub const FREC_TIMEOUT_SECS: u64 = 10;
+
+/// The flags two queries must agree on before one may be folded onto the other.
+///
+/// C's `flagmask` argument to the duplicate-detection `lookup_frec()` call
+/// (`forward.c:196-197`).
+pub const DEDUP_MASK: u32 = FREC_CHECKING_DISABLED
+    | FREC_AD_QUESTION
+    | FREC_DO_QUESTION
+    | FREC_HAS_PHEADER
+    | FREC_DNSKEY_QUERY
+    | FREC_DS_QUERY
+    | FREC_NO_CACHE;
+
+/// DO bit (RFC 3225) within an OPT record's TTL field.
+const EDNS_DO: u32 = 0x8000;
+
+/// Fixed size of a DNS message header.
+const DNS_HEADER_LEN: usize = 12;
+
+/// Locate an EDNS0 OPT pseudo-header in a DNS message, returning its CLASS (the
+/// sender's advertised UDP payload size) and TTL (extended rcode, version and
+/// flags — bit 15 is DO).
+///
+/// Port of `find_pseudoheader()` (`edns0.c:19`) for the query path, where C
+/// passes `is_sign = NULL` and so does no TSIG/TKEY inspection.  Like C, the
+/// OPT record is recognised by TYPE alone, wherever in the additional section
+/// it sits, and the *last* one wins.
+///
+/// This walks the raw wire bytes rather than a parsed packet because it runs on
+/// every client query, including ones the full parser would reject: a query
+/// this port cannot fully parse must still be recognised as carrying EDNS0, or
+/// it would be folded onto a plain query in [`FrecTable::lookup_frec_by_question`].
+pub fn find_pseudoheader(pkt: &[u8]) -> Option<(u16, u32)> {
+    use crate::rfc1035::skip_name;
+
+    if pkt.len() < DNS_HEADER_LEN {
+        return None;
+    }
+    let qdcount = u16::from_be_bytes([pkt[4], pkt[5]]) as usize;
+    let ancount = u16::from_be_bytes([pkt[6], pkt[7]]) as usize;
+    let nscount = u16::from_be_bytes([pkt[8], pkt[9]]) as usize;
+    let arcount = u16::from_be_bytes([pkt[10], pkt[11]]) as usize;
+    if arcount == 0 {
+        return None;
+    }
+
+    let mut pos = DNS_HEADER_LEN;
+    for _ in 0..qdcount {
+        skip_name(pkt, &mut pos).ok()?;
+        pos = pos.checked_add(4)?;
+    }
+    // Every record has a fixed 10-byte type/class/ttl/rdlength preamble after
+    // its name, then `rdlength` bytes of RDATA.
+    let skip_rr = |pos: &mut usize| -> Option<(u16, u16, u32)> {
+        skip_name(pkt, pos).ok()?;
+        let end = pos.checked_add(10)?;
+        if end > pkt.len() {
+            return None;
+        }
+        let rtype  = u16::from_be_bytes([pkt[*pos], pkt[*pos + 1]]);
+        let class  = u16::from_be_bytes([pkt[*pos + 2], pkt[*pos + 3]]);
+        let ttl    = u32::from_be_bytes([pkt[*pos + 4], pkt[*pos + 5], pkt[*pos + 6], pkt[*pos + 7]]);
+        let rdlen  = u16::from_be_bytes([pkt[*pos + 8], pkt[*pos + 9]]) as usize;
+        *pos = end.checked_add(rdlen)?;
+        if *pos > pkt.len() {
+            return None;
+        }
+        Some((rtype, class, ttl))
+    };
+
+    for _ in 0..(ancount + nscount) {
+        skip_rr(&mut pos)?;
+    }
+    let mut found = None;
+    for _ in 0..arcount {
+        let (rtype, class, ttl) = skip_rr(&mut pos)?;
+        if rtype == 41 {
+            found = Some((class, ttl));
+        }
+    }
+    found
+}
+
+/// Derive the EDNS0/DNSSEC context flags a query is forwarded under.
+///
+/// Port of C's `fwd_flags` computation in `receive_query()`
+/// (`forward.c:1867-1898`).  These are stored on the `Frec` (`forward.c:373`)
+/// and are what makes two identical questions genuinely interchangeable — or
+/// not — for duplicate folding.
+pub fn fwd_flags_from_query(pkt: &[u8]) -> u32 {
+    if pkt.len() < DNS_HEADER_LEN {
+        return 0;
+    }
+    let mut flags  = 0;
+    let mut do_bit = false;
+
+    if let Some((_udp_size, ttl)) = find_pseudoheader(pkt) {
+        flags |= FREC_HAS_PHEADER;
+        do_bit = ttl & EDNS_DO != 0;
+    }
+
+    // RFC 6840 5.7: DO implies the client can handle AD.
+    if do_bit || pkt[3] & HB4_AD != 0 {
+        flags |= FREC_AD_QUESTION;
+    }
+    if do_bit {
+        flags |= FREC_DO_QUESTION;
+    }
+    if pkt[3] & HB4_CD != 0 {
+        flags |= FREC_CHECKING_DISABLED;
+    }
+    flags
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Frec — in-flight forwarded query (mirrors C `struct frec`)
@@ -462,23 +575,32 @@ impl FrecTable {
     /// question rather than the transaction ID so that a *second client's* query
     /// can be folded onto an existing upstream transaction.
     ///
-    /// The flag mask is the one C passes there: a query is only a duplicate of
-    /// another if the EDNS/DNSSEC context they were forwarded under agrees, and
-    /// DNSSEC sub-queries and uncacheable queries are never returned.
-    pub fn lookup_frec_by_question(&self, now: Instant, question_hash: [u8; 16]) -> Option<usize> {
-        const DEDUP_MASK: u32 = FREC_CHECKING_DISABLED
-            | FREC_AD_QUESTION
-            | FREC_DO_QUESTION
-            | FREC_HAS_PHEADER
-            | FREC_DNSKEY_QUERY
-            | FREC_DS_QUERY
-            | FREC_NO_CACHE;
+    /// `fwd_flags` is the incoming query's own context, from
+    /// [`fwd_flags_from_query`].  C requires *equality* on the mask it passes —
+    /// `(f->flags & flagmask) == flags` (`forward.c:3226`) — not merely that the
+    /// candidate is context-free, and that equality is load-bearing: two clients
+    /// asking the same name under different EDNS0/DNSSEC context need different
+    /// answers.  Folding a plain query onto a DO=1 one would hand it an OPT
+    /// record and RRSIGs it never asked for (RFC 6891 §6.1.1 forbids the
+    /// former); folding the other way would hand a validating stub an answer it
+    /// cannot validate.
+    ///
+    /// The mask also covers `FREC_DNSKEY_QUERY`, `FREC_DS_QUERY` and
+    /// `FREC_NO_CACHE`, none of which `fwd_flags` can contain — so a DNSSEC
+    /// sub-query or a source-address-contingent query is never returned here,
+    /// exactly as C notes at `forward.c:184-190`.
+    pub fn lookup_frec_by_question(
+        &self,
+        now:           Instant,
+        question_hash: [u8; 16],
+        fwd_flags:     u32,
+    ) -> Option<usize> {
         let hard_timeout = Duration::from_secs(4 * FREC_TIMEOUT_SECS);
         for (i, f) in self.frecs.iter().enumerate() {
             if f.sentto.is_none() || f.question_hash != question_hash {
                 continue;
             }
-            if (f.flags & DEDUP_MASK) != 0 {
+            if (f.flags & DEDUP_MASK) != (fwd_flags & DEDUP_MASK) {
                 continue;
             }
             if now.duration_since(f.sent_at) >= hard_timeout {
@@ -787,12 +909,17 @@ impl RandFdPool {
         }
     }
 
-    /// Every live socket, for the reply poll set.
-    pub fn sockets(&self) -> Vec<Arc<tokio::net::UdpSocket>> {
+    /// Every live socket, paired with its slot index, for the reply poll set.
+    ///
+    /// The slot index is the identity a `Frec` records in its `rfds`, so the
+    /// reply path can tell whether a datagram arrived on a socket the query it
+    /// claims to answer actually sent from — C's check against `forward->rfds`
+    /// at `forward.c:1181-1184`.
+    pub fn sockets(&self) -> Vec<(usize, Arc<tokio::net::UdpSocket>)> {
         self.slots
             .iter()
-            .flatten()
-            .map(|r| Arc::clone(&r.socket))
+            .enumerate()
+            .filter_map(|(i, s)| s.as_ref().map(|r| (i, Arc::clone(&r.socket))))
             .collect()
     }
 
@@ -1080,8 +1207,12 @@ impl ForwardEngine {
         let Some(qhash) = hash_questions(pkt) else { return ForwardOutcome::Dropped };
         let orig_id = u16::from_be_bytes([pkt[0], pkt[1]]);
         let now = Instant::now();
+        // The EDNS0/DNSSEC context this query is forwarded under: two clients
+        // may only share one upstream transaction if theirs agree
+        // (`forward.c:1867-1898`, then `forward.c:195-197`).
+        let fwd_flags = fwd_flags_from_query(pkt);
 
-        if let Some(idx) = self.table.lookup_frec_by_question(now, qhash) {
+        if let Some(idx) = self.table.lookup_frec_by_question(now, qhash, fwd_flags) {
             return self.join_in_flight(idx, now, orig_id, client, listener).await;
         }
 
@@ -1108,6 +1239,7 @@ impl ForwardEngine {
             frec.sentto        = Some(server_idx);
             frec.new_id        = new_id;
             frec.question_hash = qhash;
+            frec.flags         = fwd_flags;   // C: `forward->flags = fwd_flags` (`forward.c:373`)
             frec.stash         = Some(pkt.to_vec());
             frec.frec_src      = FrecSrc {
                 source:  Some(client),
@@ -1214,6 +1346,11 @@ impl ForwardEngine {
     /// - the reply answers the *same question* that was sent — C gets this
     ///   from `lookup_frec()`, which matches name/class/type alongside the ID
     ///   (`forward.c:1173`);
+    /// - **it arrived on one of the sockets that query was actually sent from**
+    ///   — C: "Check that this arrived on the file descriptor we expected",
+    ///   walking `forward->rfds` and returning if none matches
+    ///   (`forward.c:1178-1199`).  `arrived_on` is the [`RandFdPool`] slot the
+    ///   datagram was read from;
     /// - the reply came from the server the query was actually sent to
     ///   (`forward.c:1201-1209`).
     ///
@@ -1221,11 +1358,15 @@ impl ForwardEngine {
     /// that will be cached: matching on the ID alone turns one lucky forged
     /// datagram into a cache entry every later client is served from.  The
     /// source port the query left from is the other half of that credential,
-    /// which is why each transaction gets its own — see [`RandFdPool`].
+    /// which is why each transaction gets its own — see [`RandFdPool`].  The
+    /// arrival check above is what makes that half *count*: without it an
+    /// attacker need only land on any one of the ports this resolver currently
+    /// holds open, rather than the one specific port belonging to the query
+    /// being poisoned.
     ///
     /// Returns `None` — leaving the query in flight, so the genuine answer can
     /// still arrive — for anything that fails a check.
-    fn validate_reply(&self, reply: &[u8], from: SocketAddr) -> Option<usize> {
+    fn validate_reply(&self, reply: &[u8], from: SocketAddr, arrived_on: usize) -> Option<usize> {
         if reply.len() < 12 || reply[2] & 0x80 == 0 {
             return None;
         }
@@ -1233,6 +1374,12 @@ impl ForwardEngine {
         let idx = self.table.lookup_frec(Instant::now(), id, 0, 0)?;
         let frec = self.table.get(idx)?;
         if hash_questions(reply)? != frec.question_hash {
+            return None;
+        }
+        // C falls back to the per-server bound sockets (`server->sfd`) when the
+        // fd is not in `forward->rfds`; this port has no such sockets — every
+        // send goes out through the pool — so the rfd list is the whole set.
+        if !frec.rfds.contains(&arrived_on) {
             return None;
         }
         if self.config.upstreams.get(frec.sentto?) != Some(&from) {
@@ -1247,8 +1394,18 @@ impl ForwardEngine {
     /// left to ask: C re-enters `forward_query()` with the saved query in that
     /// case (`forward.c:1242-1250`).  Anything else completes the query, frees
     /// its source socket(s), and yields one [`ReplyTarget`] per waiting client.
-    pub async fn accept_reply(&mut self, reply: &[u8], from: SocketAddr) -> ReplyAction {
-        let Some(idx) = self.validate_reply(reply, from) else { return ReplyAction::Ignore };
+    ///
+    /// `arrived_on` is the [`RandFdPool`] slot the datagram was read from; see
+    /// [`ForwardEngine::validate_reply`] for why it matters.
+    pub async fn accept_reply(
+        &mut self,
+        reply:      &[u8],
+        from:       SocketAddr,
+        arrived_on: usize,
+    ) -> ReplyAction {
+        let Some(idx) = self.validate_reply(reply, from, arrived_on) else {
+            return ReplyAction::Ignore;
+        };
 
         let rcode = reply[3] & 0x0F;
         if rcode == 2 /* SERVFAIL */ || rcode == 5 /* REFUSED */ {
@@ -1946,7 +2103,9 @@ pub async fn run_forward_loop_on(
                             // so the client fails fast instead of timing out
                             // (`forward.c:369`, `domain-match.c:430`).
                             ForwardOutcome::Refused => {
-                                if let Some(wire) = make_refused_answer(pkt) {
+                                if let Some(wire) =
+                                    make_refused_answer(pkt, engine.config.local.edns_pktsz)
+                                {
                                     let _ = listener.sock.send_to(&wire, src).await;
                                 }
                             }
@@ -1958,14 +2117,17 @@ pub async fn run_forward_loop_on(
                 }
             }
             // ── Upstream reply ────────────────────────────────────────────────
-            (sock_idx, ready) = next_upstream_readable(&upstream_socks, upstream_scan_from),
+            (pos, ready) = next_upstream_readable(&upstream_socks, upstream_scan_from),
                     if !upstream_socks.is_empty() => {
-                upstream_scan_from = sock_idx + 1;
+                upstream_scan_from = pos + 1;
                 // One sick outbound socket must not take the whole resolver
                 // down; the query it belongs to will simply time out.
                 if ready.is_err() { continue }
-                let (len, upstream_addr) = match upstream_socks[sock_idx]
-                    .try_recv_from(&mut upstream_buf) {
+                // The pool slot — not the position in this pass's snapshot — is
+                // the identity a query records in its `rfds`, and is what the
+                // reply has to match.
+                let (arrived_on, sock) = &upstream_socks[pos];
+                let (len, upstream_addr) = match sock.try_recv_from(&mut upstream_buf) {
                     Ok(v)  => v,
                     Err(_) => continue,
                 };
@@ -1975,7 +2137,7 @@ pub async fn run_forward_loop_on(
                 // answers an outstanding query, from the server that query
                 // went to.  A failed check leaves the query in flight so the
                 // genuine answer can still be accepted.
-                let targets = match engine.accept_reply(&pkt, upstream_addr).await {
+                let targets = match engine.accept_reply(&pkt, upstream_addr, *arrived_on).await {
                     ReplyAction::Deliver(targets) => targets,
                     ReplyAction::Retried | ReplyAction::Ignore => continue,
                 };
@@ -2017,7 +2179,8 @@ pub async fn run_forward_loop_on(
     }
 }
 
-/// Wait until one of `socks` has a datagram ready, returning its index.
+/// Wait until one of `socks` has a datagram ready, returning its **position in
+/// `socks`** — the caller reads the pool slot back out of the pair.
 ///
 /// The outbound set changes as queries start and finish, so unlike
 /// [`next_readable`] this works from a snapshot the caller takes for one pass
@@ -2025,14 +2188,14 @@ pub async fn run_forward_loop_on(
 /// obvious thing to do once an attacker has found one of our ports — cannot
 /// starve the replies every other query is waiting for.
 async fn next_upstream_readable(
-    socks: &[Arc<tokio::net::UdpSocket>],
+    socks: &[(usize, Arc<tokio::net::UdpSocket>)],
     start: usize,
 ) -> (usize, std::io::Result<()>) {
     std::future::poll_fn(|cx| {
         use std::task::Poll;
         for offset in 0..socks.len() {
             let i = (start + offset) % socks.len();
-            if let Poll::Ready(r) = socks[i].poll_recv_ready(cx) {
+            if let Poll::Ready(r) = socks[i].1.poll_recv_ready(cx) {
                 return Poll::Ready((i, r));
             }
         }
@@ -2046,19 +2209,39 @@ async fn next_upstream_readable(
 /// `setup_reply()` with no flags set (`domain-match.c:416`,
 /// `rfc1035.c:setup_reply`): question section kept, every record section
 /// dropped, QR and RA set, AA/TC/AD cleared, RCODE REFUSED.  Re-serialising
-/// rather than editing the counts in place also drops the record bytes — the
-/// OPT pseudo-header included, which C re-adds only for a query that had one.
-fn make_refused_answer(query: &[u8]) -> Option<Vec<u8>> {
+/// rather than editing the counts in place also drops the record bytes.
+///
+/// A query that carried an OPT record gets one back: C's `reply:` path calls
+/// `add_pseudoheader()` after `make_local_answer()` whenever
+/// `fwd_flags & FREC_HAS_PHEADER` (`forward.c:595-601`).  As there, the OPT we
+/// return advertises *our* payload size rather than echoing the client's, drops
+/// whatever options the client sent, and carries only the DO bit forward.
+/// C also attaches an EDE option when it has a reason code to report; this path
+/// has none of C's `ede` plumbing yet — see `tasks.md`.
+fn make_refused_answer(query: &[u8], edns_pktsz: u16) -> Option<Vec<u8>> {
     let parsed = DnsPacket::parse(query).ok()?;
     let mut header = parsed.header;
     crate::rfc1035::setup_reply(&mut header, 0);
+    let additional = parsed
+        .additional
+        .iter()
+        .find(|rr| rr.rtype == 41)
+        .map(|opt| DnsRr {
+            name:  String::new(), // root: OPT always has an empty name
+            rtype: 41,            // T_OPT
+            class: edns_pktsz,
+            ttl:   opt.ttl & EDNS_DO, // extended rcode 0, version 0, DO copied
+            rdata: Vec::new(),
+        })
+        .into_iter()
+        .collect();
     Some(
         DnsPacket {
             header,
             questions:  parsed.questions.clone(),
             answers:    Vec::new(),
             authority:  Vec::new(),
-            additional: Vec::new(),
+            additional,
         }
         .write()
         .to_vec(),
@@ -2354,9 +2537,15 @@ mod tests {
             fd: 0,
             ..FrecSrc::default()
         };
+        // Stand in for the pool slot a real send would have recorded, so the
+        // reply path's arrival check has something to match.
+        frec.rfds = vec![TEST_RFD_SLOT];
         frec.tried.insert(server_idx);
         idx
     }
+
+    /// The pool slot `insert_frec` pretends the query was sent from.
+    const TEST_RFD_SLOT: usize = 0;
 
     fn src_from(client: SocketAddr, orig_id: u16) -> FrecSrc {
         FrecSrc { source: Some(client), orig_id, fd: 0, ..FrecSrc::default() }
@@ -2429,14 +2618,14 @@ mod tests {
     fn lookup_frec_by_question_finds_the_identical_question() {
         let mut ft = FrecTable::new(64);
         let idx = insert_frec(&mut ft, 1, dummy_addr(), 0, dummy_hash());
-        assert_eq!(ft.lookup_frec_by_question(Instant::now(), dummy_hash()), Some(idx));
+        assert_eq!(ft.lookup_frec_by_question(Instant::now(), dummy_hash(), 0), Some(idx));
     }
 
     #[test]
     fn lookup_frec_by_question_ignores_a_different_question() {
         let mut ft = FrecTable::new(64);
         insert_frec(&mut ft, 1, dummy_addr(), 0, dummy_hash());
-        assert_eq!(ft.lookup_frec_by_question(Instant::now(), [9u8; 16]), None);
+        assert_eq!(ft.lookup_frec_by_question(Instant::now(), [9u8; 16], 0), None);
     }
 
     #[test]
@@ -2444,18 +2633,119 @@ mod tests {
         let mut ft = FrecTable::new(64);
         let idx = insert_frec(&mut ft, 1, dummy_addr(), 0, dummy_hash());
         ft.free_frec(idx);
-        assert_eq!(ft.lookup_frec_by_question(Instant::now(), dummy_hash()), None);
+        assert_eq!(ft.lookup_frec_by_question(Instant::now(), dummy_hash(), 0), None);
     }
 
     /// A DNSSEC sub-query or a query whose answer depends on client-specific
     /// EDNS options must never absorb another client's question
-    /// (`forward.c:194-196`).
+    /// (`forward.c:194-196`).  Neither flag can appear in a client query's
+    /// `fwd_flags`, so the equality test excludes them however it is called.
     #[test]
     fn lookup_frec_by_question_skips_context_specific_queries() {
         let mut ft = FrecTable::new(64);
         let idx = insert_frec(&mut ft, 1, dummy_addr(), 0, dummy_hash());
         ft.get_mut(idx).unwrap().flags = FREC_NO_CACHE;
-        assert_eq!(ft.lookup_frec_by_question(Instant::now(), dummy_hash()), None);
+        assert_eq!(ft.lookup_frec_by_question(Instant::now(), dummy_hash(), 0), None);
+    }
+
+    /// The EDNS/DNSSEC context has to *match*, not merely be absent: C compares
+    /// `(f->flags & flagmask) == flags` (`forward.c:3226`).
+    #[test]
+    fn lookup_frec_by_question_requires_matching_edns_context() {
+        let mut ft = FrecTable::new(64);
+        let idx = insert_frec(&mut ft, 1, dummy_addr(), 0, dummy_hash());
+        let edns = FREC_HAS_PHEADER | FREC_DO_QUESTION | FREC_AD_QUESTION;
+        ft.get_mut(idx).unwrap().flags = edns;
+
+        assert_eq!(
+            ft.lookup_frec_by_question(Instant::now(), dummy_hash(), edns),
+            Some(idx),
+            "the same context folds together",
+        );
+        assert_eq!(
+            ft.lookup_frec_by_question(Instant::now(), dummy_hash(), 0),
+            None,
+            "a plain query must not be folded onto a DO=1 one",
+        );
+        assert_eq!(
+            ft.lookup_frec_by_question(Instant::now(), dummy_hash(), FREC_HAS_PHEADER),
+            None,
+            "EDNS without DO is a different context again",
+        );
+    }
+
+    // ── fwd_flags_from_query / find_pseudoheader ──────────────────────────────
+
+    /// Build a query, optionally with an OPT record, and with chosen header
+    /// bits — the four inputs C reads to compute `fwd_flags`.
+    fn ctx_query(opt: Option<u32>, hb4: u8) -> Vec<u8> {
+        let mut pkt = DnsPacket {
+            header:     crate::dns_protocol::DnsHeader {
+                id: 1, hb3: 0, hb4, qdcount: 1, ..Default::default()
+            },
+            questions:  vec![crate::rfc1035::DnsQuestion {
+                name: "example.com".into(), qtype: 1, qclass: 1,
+            }],
+            answers:    Vec::new(),
+            authority:  Vec::new(),
+            additional: Vec::new(),
+        };
+        if let Some(ttl) = opt {
+            pkt.additional.push(DnsRr {
+                name: String::new(), rtype: 41, class: 4096, ttl, rdata: Vec::new(),
+            });
+        }
+        pkt.write().to_vec()
+    }
+
+    #[test]
+    fn a_plain_query_has_no_context_flags() {
+        assert_eq!(fwd_flags_from_query(&ctx_query(None, 0)), 0);
+        assert_eq!(find_pseudoheader(&ctx_query(None, 0)), None);
+    }
+
+    #[test]
+    fn an_opt_record_sets_has_pheader() {
+        let pkt = ctx_query(Some(0), 0);
+        assert_eq!(find_pseudoheader(&pkt), Some((4096, 0)));
+        assert_eq!(fwd_flags_from_query(&pkt), FREC_HAS_PHEADER);
+    }
+
+    /// RFC 6840 5.7: DO implies the client can handle AD, so C sets both.
+    #[test]
+    fn the_do_bit_sets_do_and_ad() {
+        let pkt = ctx_query(Some(EDNS_DO), 0);
+        assert_eq!(
+            fwd_flags_from_query(&pkt),
+            FREC_HAS_PHEADER | FREC_DO_QUESTION | FREC_AD_QUESTION,
+        );
+    }
+
+    #[test]
+    fn the_header_ad_and_cd_bits_are_read() {
+        assert_eq!(fwd_flags_from_query(&ctx_query(None, HB4_AD)), FREC_AD_QUESTION);
+        assert_eq!(
+            fwd_flags_from_query(&ctx_query(None, HB4_CD)),
+            FREC_CHECKING_DISABLED,
+        );
+    }
+
+    /// `find_pseudoheader` runs on unvalidated client input; a truncated or
+    /// lying packet must yield `None`, never a panic.
+    #[test]
+    fn find_pseudoheader_survives_malformed_input() {
+        assert_eq!(find_pseudoheader(&[]), None);
+        assert_eq!(find_pseudoheader(&[0u8; 11]), None);
+        // arcount claims a record that is not there.
+        let mut lying = ctx_query(None, 0);
+        lying[11] = 1;
+        assert_eq!(find_pseudoheader(&lying), None);
+        assert_eq!(fwd_flags_from_query(&lying), 0);
+        // Every truncation of a valid EDNS query.
+        let full = ctx_query(Some(EDNS_DO), 0);
+        for n in 0..full.len() {
+            let _ = find_pseudoheader(&full[..n]);
+        }
     }
 
     // ── FrecTable: duplicate-client budget ────────────────────────────────────
@@ -2649,13 +2939,13 @@ mod tests {
         let (mut engine, query, upstream_id) = engine_with_pending("example.com", 42);
         let reply = reply_for(&query, upstream_id);
 
-        let targets = delivered(engine.accept_reply(&reply, upstream_addr()).await)
+        let targets = delivered(engine.accept_reply(&reply, upstream_addr(), TEST_RFD_SLOT).await)
             .expect("a matching reply from the right server must be accepted");
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].orig_id, 42);
         assert_eq!(targets[0].client, client_addr());
         // The entry is consumed, so a duplicate reply finds nothing.
-        assert_eq!(engine.accept_reply(&reply, upstream_addr()).await, ReplyAction::Ignore);
+        assert_eq!(engine.accept_reply(&reply, upstream_addr(), TEST_RFD_SLOT).await, ReplyAction::Ignore);
     }
 
     #[tokio::test]
@@ -2663,7 +2953,7 @@ mod tests {
         let (mut engine, query, upstream_id) = engine_with_pending("example.com", 42);
         let mut reply = reply_for(&query, upstream_id);
         patch_id(&mut reply, upstream_id.wrapping_add(1));
-        assert_eq!(engine.accept_reply(&reply, upstream_addr()).await, ReplyAction::Ignore);
+        assert_eq!(engine.accept_reply(&reply, upstream_addr(), TEST_RFD_SLOT).await, ReplyAction::Ignore);
     }
 
     #[tokio::test]
@@ -2673,12 +2963,31 @@ mod tests {
         let spoofer: SocketAddr = "127.0.0.2:5353".parse().unwrap();
 
         assert_eq!(
-            engine.accept_reply(&reply, spoofer).await,
+            engine.accept_reply(&reply, spoofer, TEST_RFD_SLOT).await,
             ReplyAction::Ignore,
             "a correct ID from the wrong source must not be accepted",
         );
         // The pending entry survives, so the real server can still answer.
-        assert!(delivered(engine.accept_reply(&reply, upstream_addr()).await).is_some());
+        assert!(delivered(engine.accept_reply(&reply, upstream_addr(), TEST_RFD_SLOT).await).is_some());
+    }
+
+    /// C: "Check that this arrived on the file descriptor we expected"
+    /// (`forward.c:1178-1184`).  Everything else about this datagram is right —
+    /// the source address, the transaction ID, the question — so the arrival
+    /// socket is the only thing rejecting it, and it is the thing that makes
+    /// per-query source ports worth having.
+    #[tokio::test]
+    async fn accept_reply_rejects_a_reply_on_another_querys_socket() {
+        let (mut engine, query, upstream_id) = engine_with_pending("example.com", 42);
+        let reply = reply_for(&query, upstream_id);
+
+        assert_eq!(
+            engine.accept_reply(&reply, upstream_addr(), TEST_RFD_SLOT + 1).await,
+            ReplyAction::Ignore,
+            "a reply on a socket this query never sent from must not be accepted",
+        );
+        // The query is untouched, so the genuine answer still lands.
+        assert!(delivered(engine.accept_reply(&reply, upstream_addr(), TEST_RFD_SLOT).await).is_some());
     }
 
     #[tokio::test]
@@ -2688,7 +2997,7 @@ mod tests {
         let forged = reply_for(&make_dns_query("victim.test", 1), upstream_id);
 
         assert_eq!(
-            engine.accept_reply(&forged, upstream_addr()).await,
+            engine.accept_reply(&forged, upstream_addr(), TEST_RFD_SLOT).await,
             ReplyAction::Ignore,
             "a reply for a different name must not be accepted",
         );
@@ -2700,7 +3009,7 @@ mod tests {
         let mut not_a_reply = reply_for(&query, upstream_id);
         not_a_reply[2] &= !0x80;
         assert_eq!(
-            engine.accept_reply(&not_a_reply, upstream_addr()).await,
+            engine.accept_reply(&not_a_reply, upstream_addr(), TEST_RFD_SLOT).await,
             ReplyAction::Ignore,
         );
     }
@@ -2708,7 +3017,7 @@ mod tests {
     #[tokio::test]
     async fn accept_reply_rejects_a_truncated_header() {
         let (mut engine, _query, _id) = engine_with_pending("example.com", 42);
-        assert_eq!(engine.accept_reply(&[0u8; 4], upstream_addr()).await, ReplyAction::Ignore);
+        assert_eq!(engine.accept_reply(&[0u8; 4], upstream_addr(), TEST_RFD_SLOT).await, ReplyAction::Ignore);
     }
 
     /// One upstream answer, one reply target per client that asked.
@@ -2723,7 +3032,7 @@ mod tests {
         assert!(engine.table.add_src(idx, src_from(second, 0xBEEF)));
 
         let reply = reply_for(&query, upstream_id);
-        let targets = delivered(engine.accept_reply(&reply, upstream_addr()).await)
+        let targets = delivered(engine.accept_reply(&reply, upstream_addr(), TEST_RFD_SLOT).await)
             .expect("reply must be delivered");
 
         assert_eq!(
@@ -2770,7 +3079,7 @@ mod tests {
 
         let mut reply = reply_for(&query, first_id);
         reply[3] = (reply[3] & 0xF0) | 0x02; // SERVFAIL
-        assert_eq!(engine.accept_reply(&reply, upstream_addr()).await, ReplyAction::Retried);
+        assert_eq!(engine.accept_reply(&reply, upstream_addr(), TEST_RFD_SLOT).await, ReplyAction::Retried);
 
         let frec = engine.table.get(idx).expect("query stays in flight for the retry");
         assert_eq!(frec.retries, 1);
@@ -2799,7 +3108,7 @@ mod tests {
 
         let mut reply = reply_for(&query, new_id);
         reply[3] = (reply[3] & 0xF0) | 0x02; // SERVFAIL
-        let targets = delivered(engine.accept_reply(&reply, upstream_addr()).await)
+        let targets = delivered(engine.accept_reply(&reply, upstream_addr(), TEST_RFD_SLOT).await)
             .expect("with nowhere left to retry the failure goes to the client");
         assert_eq!(targets, vec![ReplyTarget { client: client_addr(), listener: 0, orig_id: 99 }]);
     }
@@ -2822,7 +3131,7 @@ mod tests {
         let mut reply = reply_for(&query, new_id);
         reply[3] = (reply[3] & 0xF0) | 0x02; // SERVFAIL
         assert!(
-            delivered(engine.accept_reply(&reply, upstream_addr()).await).is_some(),
+            delivered(engine.accept_reply(&reply, upstream_addr(), TEST_RFD_SLOT).await).is_some(),
             "max_retries = 0 must not open another upstream query",
         );
     }
@@ -2888,7 +3197,7 @@ mod tests {
         assert_eq!(engine.table.active_count(), 1, "still one upstream transaction");
         let idx = engine
             .table
-            .lookup_frec_by_question(Instant::now(), hash_questions(&first).unwrap())
+            .lookup_frec_by_question(Instant::now(), hash_questions(&first).unwrap(), 0)
             .expect("the query is in flight");
         let srcs: Vec<(u16, i32)> = engine
             .table
@@ -3501,7 +3810,7 @@ mod tests {
         let mut query = make_dns_query("full.test", 1);
         patch_id(&mut query, 0x9876);
 
-        let wire  = make_refused_answer(&query).expect("a well-formed query must be answerable");
+        let wire  = make_refused_answer(&query, 4096).expect("a well-formed query must be answerable");
         let reply = DnsPacket::parse(&wire).expect("the refusal must be well formed");
 
         assert_eq!(reply.header.id, 0x9876, "the client's own ID comes back");
@@ -3518,7 +3827,26 @@ mod tests {
 
     #[test]
     fn refused_answer_declines_an_unparseable_query() {
-        assert!(make_refused_answer(&[0u8; 4]).is_none());
+        assert!(make_refused_answer(&[0u8; 4], 4096).is_none());
+    }
+
+    /// C re-attaches the pseudo-header on the `reply:` path whenever the query
+    /// carried one (`forward.c:595-601`), advertising our own payload size.
+    #[test]
+    fn refused_answer_re_attaches_the_pseudoheader() {
+        let query = ctx_query(Some(EDNS_DO), 0);
+        let wire  = make_refused_answer(&query, 1232).expect("an EDNS query must be answerable");
+        let reply = DnsPacket::parse(&wire).expect("the refusal must be well formed");
+
+        assert_eq!(reply.header.rcode(), 5);
+        let opt = reply
+            .additional
+            .iter()
+            .find(|rr| rr.rtype == 41)
+            .expect("the OPT record comes back");
+        assert_eq!(opt.class, 1232, "our payload size, not the client's");
+        assert_eq!(opt.ttl, EDNS_DO, "only the DO bit is carried forward");
+        assert!(opt.rdata.is_empty(), "the client's options are dropped");
     }
 
     // ── xor_array ────────────────────────────────────────────────────────────

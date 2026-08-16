@@ -447,14 +447,42 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     same global `ftabsize` C uses, and exhausting it returns REFUSED. Queries less than two
     seconds old are not re-forwarded, matching `forward.c:315-318`.
 
+    Folding is bounded by the query's EDNS0/DNSSEC context, not just its question.
+    `fwd_flags_from_query` ports C's `fwd_flags` derivation (`forward.c:1867-1898`) —
+    `FREC_HAS_PHEADER` from an OPT record found by `find_pseudoheader` (a port of
+    `edns0.c:19`), `FREC_DO_QUESTION`/`FREC_AD_QUESTION` from the DO bit and header AD
+    (RFC 6840 5.7), `FREC_CHECKING_DISABLED` from header CD — the result is stored on the
+    `Frec` (`forward.c:373`), and `lookup_frec_by_question` requires *equality* on C's mask
+    (`forward.c:3226`) before it will merge. Without that, a plain query folded onto a DO=1
+    one would come back carrying an OPT record and RRSIGs it never asked for (RFC 6891
+    §6.1.1 forbids the former), and the reverse would hand a validating stub an answer it
+    cannot validate.
+
+  The reply path checks *which socket* a datagram arrived on before anything acts on it —
+  C's "Check that this arrived on the file descriptor we expected", which walks
+  `forward->rfds` and returns if none matches (`forward.c:1178-1199`). `RandFdPool::sockets`
+  yields each live socket with its slot index, the loop carries that index into
+  `accept_reply`, and `validate_reply` requires it to be in the query's own `rfds`. This is
+  what makes the per-query source port worth anything: without it an attacker need only land
+  a forgery on *any* port the resolver currently holds open, not the one specific port
+  belonging to the query being poisoned. (C's fallback to a server's bound `sfd` has no
+  counterpart here because this port has no such sockets — every send goes through the pool.)
+
   SERVFAIL/REFUSED failover is also wired into the live loop for the first time
   (`forward.c:1242-1250`): `accept_reply` re-sends to the next untried server, on a new
   source port, instead of relaying the failure. `sent_at` is deliberately not refreshed on a
   retry, because C only ever sets `forward->time` in `get_new_frec()`.
 
+  A REFUSED generated here re-attaches the client's pseudo-header when the query carried
+  one, as C's `reply:` path does via `add_pseudoheader()` (`forward.c:595-601`), advertising
+  our own payload size rather than echoing the client's.
+
   Covered by `tests/forward_source_port_dedup.rs` (distinct source ports for concurrent
-  queries, REFUSED past `--dns-forward-max`, two clients folded onto one upstream query) and
-  unit coverage of the pool, the duplicate lookup, the `FrecSrc` budget and the failover
+  queries, a forged reply delivered to another in-flight query's socket being ignored while
+  the identical datagram on the right socket is accepted, REFUSED past `--dns-forward-max`,
+  two clients folded onto one upstream query, two clients *not* folded across an EDNS
+  boundary, an EDNS-shaped REFUSED) and unit coverage of the pool, the flag derivation and
+  its malformed-input behaviour, the duplicate lookup, the `FrecSrc` budget and the failover
   path. Each integration test was checked red against a deliberately broken implementation.
 
   Explicitly **not** covered — upstream behavior still missing:
@@ -487,6 +515,18 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   - **`fast_retry` (`--fast-dns-retry`) is not ported.** C's `frec->forward_delay` and
     `frec->forward_timestamp` (`forward.c:626-660`) have no counterpart on `Frec`, so a slow
     server is never re-probed before the query times out.
+  - **No EDE option on a locally generated REFUSED.** C attaches `EDNS0_OPTION_EDE` with a
+    reason code whenever it has one (`forward.c:597-599`); this path has none of C's `ede`
+    plumbing, so the OPT record it re-attaches is always empty.
+  - **`FREC_NO_CACHE` is never set**, because `add_edns0_config` (`--add-subnet`,
+    `--add-mac`, `--add-cpe-id`) is not ported at all — no client-specific EDNS option is
+    ever added, so no query is contingent on one (`forward.c:1934-1939`). If those
+    directives land, the flag has to be set with them or such queries become eligible for
+    duplicate folding, which C forbids.
+  - **`Frec::flags` carries only the four `fwd_flags` bits.** `FREC_NOREBIND`,
+    `FREC_GONE_TO_TCP`, `FREC_ANSWER` and the DNSSEC sub-query flags are defined but never
+    assigned, since the paths that set them (rebind policy on the live reply path, TCP
+    escalation, DNSSEC validation) are themselves not ported.
 
 - [ ] Split pure logic tests from capability-dependent socket tests.
   Source of truth: current failing tests in `network.rs`, `forward.rs`, and `dhcp_common.rs`.
