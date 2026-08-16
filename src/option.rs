@@ -1768,7 +1768,7 @@ fn parse_server_or_address(
     Ok(())
 }
 
-fn new_server(flags: u16, domain: String, addr: MySockAddr, source_addr: MySockAddr) -> Server {
+pub(crate) fn new_server(flags: u16, domain: String, addr: MySockAddr, source_addr: MySockAddr) -> Server {
     Server {
         flags,
         domain,

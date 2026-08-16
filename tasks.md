@@ -88,12 +88,16 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   - `no-cache`/`do-bit`/`CD` handling, and the auth (`--auth-zone`) and conntrack
     allowlist branches of `udp_request()`, which have no Rust call site at all.
   - TCP DNS service. Only the UDP listener consults local data; there is no TCP listener.
-  - Reload staleness. `run_main_loop` snapshots the local data once at startup and moves
-    the clone into the forward task, so the query loop keeps answering from the
-    startup-time config forever. Upstream re-reads `daemon->` config data on every query,
-    so a SIGHUP reload takes effect immediately. Whoever implements real SIGHUP reload
-    (`dnsmasq::on_sighup` / `clear_cache_and_reload`) must also republish the snapshot —
-    a shared `ArcSwap`/`watch` channel rather than a moved clone.
+  - Reload staleness (partially fixed). SIGHUP reload (`dnsmasq::on_sighup` /
+    `clear_cache_and_reload`) now flushes and rebuilds the *live* `DnsCache` — it is a
+    `cache::SharedDnsCache` threaded into `run_forward_loop_on` rather than a task-local
+    value, so cache effects are immediate. What is still stale: `run_main_loop_with`
+    snapshots `ForwardConfig` (upstream server list, host-records, CNAMEs, TXT/MX/PTR/
+    NAPTR records) once at startup and moves the clone into the forward task, so a
+    config change — including the `daemon.servers` update `clear_cache_and_reload` now
+    makes from `--resolv-file` — only reaches the query loop on the next process start,
+    not the next query. Closing this needs the same treatment the cache got: a shared
+    `ArcSwap`/`watch` channel for `ForwardConfig` rather than a moved clone.
 
 - [x] Wire the DNS answer cache into the live forward path.
   `run_forward_loop_on` now calls `forward::cache_upstream_reply` → `cache::cache_reply` →
@@ -420,10 +424,40 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   Required tests: bind failure tests, address family tests, listener reuse tests, mark/bindtodevice behavior tests where supported.
   Done when: runtime setup failures degrade or report errors in a controlled and upstream-compatible way.
 
-- [ ] Replace remaining daemon reload stubs with real behavior.
-  Source of truth: upstream reload flow, current `clear_cache_and_reload`, `main.rs` SIGHUP handling.
-  Required tests: repeated SIGHUP, cache invalidation, hosts/resolv reload, no-op reload stability.
-  Done when: reload mutates runtime state intentionally and repeatably instead of only toggling placeholder flags.
+- [x] Replace remaining daemon reload stubs with real behavior.
+  Source of truth: upstream reload flow (`dnsmasq.c` `async_event()` EVENT_RELOAD,
+  `clear_cache_and_reload()`, `network.c` `reload_servers()`), current `clear_cache_and_reload`,
+  `main.rs` SIGHUP handling.
+  `main.rs`'s SIGHUP handler now calls `dnsmasq::on_sighup`, which calls the real
+  `clear_cache_and_reload`. The forward loop's `DnsCache` is now a
+  `cache::SharedDnsCache` (`Arc<tokio::sync::Mutex<DnsCache>>`) built once by
+  `dnsmasq::build_shared_cache` and threaded through `run_main_loop_with` /
+  `run_forward_loop_on`, rather than a task-local value — reload flushes the exact
+  cache the running loop reads from, using the already-tested `cache::reload_hosts`
+  to flush and rebuild `F_HOSTS` entries from `/etc/hosts` (unless `--no-hosts`) and
+  each `--addn-hosts` file. `--resolv-file` entries are re-read and merged into
+  `daemon.servers` as `SERV_FROM_RESOLV`-flagged entries, replacing only the
+  previously-resolv-derived ones so explicit `--server=` entries survive.
+  Covered by `dnsmasq::tests::clear_cache_and_reload_*` / `on_sighup_*` (cache flush,
+  hosts reload, resolv reload, repeated-SIGHUP idempotency, explicit-server survival)
+  and `tests/forward_cache_integration.rs::sighup_reload_flushes_the_live_forward_cache`
+  (drives the real `run_forward_loop_on` loop and confirms a cached answer is evicted).
+
+  Deliberate simplifications, still open:
+  - Upstream only discards non-`F_DHCP` cache entries on reload
+    (`cache_unhash_dhcp`-adjacent logic in `cache_reload()`); this port's cache never
+    receives `F_DHCP` records yet, so a full flush is currently equivalent but must be
+    revisited once DHCP leases feed the cache.
+  - Upstream gates the resolv-file re-read on `OPT_NO_POLL` (`dnsmasq.c:1552`) because
+    otherwise a periodic poll/inotify watch is expected to catch the change; this port
+    has no such watch, so SIGHUP always re-reads regardless of `--no-poll`.
+  - `--servers-file` re-read (`read_servers_file()`) and DHCP reload
+    (`reread_dhcp`/`dhcp_read_ethers`/`lease_update_from_configs`/`rerun_scripts`) are not
+    implemented — SIGHUP is DNS-only for now.
+  - See "Reload staleness" below: `daemon.servers` is updated correctly, but the
+    already-running forward task's `ForwardConfig` (upstream list, host-records, CNAMEs)
+    is still a one-time snapshot, so a resolv-file-driven server-list change only takes
+    effect on the next process start, not the next query.
 
 - [ ] Audit runtime paths that currently exist only as simplified helpers.
   Source of truth: comments marked `stub`, `TODO`, `unimplemented`, and parity mismatches.

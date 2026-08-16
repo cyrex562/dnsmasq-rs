@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use bytes::{BufMut, BytesMut};
 
+use dnsmasq_rs::cache::{new_shared_cache, SharedDnsCache};
 use dnsmasq_rs::dns_protocol::{DnsHeader, HB3_QR, HB3_RD, HB4_CD, HB4_RA};
 use dnsmasq_rs::forward::{run_forward_loop_on, DnsListener, ForwardConfig};
 use dnsmasq_rs::option::{apply_config, parse_config_text};
@@ -160,14 +161,22 @@ struct Server {
     task: tokio::task::JoinHandle<()>,
 }
 
-async fn spawn_server(config: ForwardConfig) -> Option<Server> {
+/// Spawn the loop over a cache the caller keeps a handle to, so a test can
+/// flush it out-of-band (as SIGHUP reload does) and observe the effect on the
+/// running loop.
+async fn spawn_server_with_cache(config: ForwardConfig, cache: SharedDnsCache) -> Option<Server> {
     let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.ok()?;
     let addr = sock.local_addr().ok()?;
     let listener = DnsListener { sock: Arc::new(sock), check_dst: false };
     let task = tokio::spawn(async move {
-        let _ = run_forward_loop_on(vec![listener], None, config).await;
+        let _ = run_forward_loop_on(vec![listener], None, config, cache).await;
     });
     Some(Server { addr, task })
+}
+
+async fn spawn_server(config: ForwardConfig) -> Option<Server> {
+    let cache = new_shared_cache(config.cache_size, config.min_cache_ttl, config.max_cache_ttl);
+    spawn_server_with_cache(config, cache).await
 }
 
 /// Build a `ForwardConfig` the way `dnsmasq.rs` does: through the real config
@@ -1064,6 +1073,41 @@ async fn reply_with_the_cd_bit_is_relayed_but_not_cached() {
         upstream.misses(),
         2,
         "a reply with CD set must not populate the cache",
+    );
+
+    shutdown(server, upstream);
+}
+
+/// SIGHUP reload (`dnsmasq::on_sighup`) must flush the *running* loop's
+/// cache, not a disconnected copy — this is the behavior that makes it real
+/// rather than the old stub that only toggled a bookkeeping flag.
+#[tokio::test]
+async fn sighup_reload_flushes_the_live_forward_cache() {
+    let Some(upstream) = spawn_upstream(|q| {
+        Some(reply_to(q, 0, vec![a_rr("reload.test", Ipv4Addr::new(192, 0, 2, 77), 300)], vec![]))
+    })
+    .await
+    else {
+        return;
+    };
+    let config = config_from_text("cache-size=150\n", upstream.addr);
+    let cache = new_shared_cache(config.cache_size, config.min_cache_ttl, config.max_cache_ttl);
+    let Some(server) = spawn_server_with_cache(config, cache.clone()).await else {
+        return;
+    };
+
+    assert!(ask(server.addr, &query_wire("reload.test", 1, 1)).await.is_some());
+    assert!(ask(server.addr, &query_wire("reload.test", 1, 2)).await.is_some());
+    assert_eq!(upstream.misses(), 1, "the second query must be a cache hit before reload");
+
+    let daemon_handle = dnsmasq_rs::dnsmasq::init_daemon_with(Daemon::default());
+    dnsmasq_rs::dnsmasq::on_sighup(&daemon_handle, &cache).await;
+
+    assert!(ask(server.addr, &query_wire("reload.test", 1, 3)).await.is_some());
+    assert_eq!(
+        upstream.misses(),
+        2,
+        "SIGHUP must flush the live cache, forcing the next query back upstream",
     );
 
     shutdown(server, upstream);

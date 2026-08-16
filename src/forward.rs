@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use crate::cache::DnsCache;
+use crate::cache::{DnsCache, SharedDnsCache};
 use crate::hash_questions::hash_questions;
 use crate::metrics::{inc_metric, Metric};
 use crate::dns_protocol::HB4_RA;
@@ -1389,21 +1389,15 @@ pub async fn tcp_fallback(
 /// *not* be forwarded.  A packet that fails to parse is left to the forwarding
 /// path, matching upstream's behaviour of forwarding whatever `answer_request`
 /// declines to answer.
-async fn try_local_answer(
-    client_sock: &tokio::net::UdpSocket,
-    pkt:         &[u8],
-    src:         SocketAddr,
-    cache:       &mut DnsCache,
-    local:       &LocalData,
-) -> bool {
-    let Ok(query) = DnsPacket::parse(pkt) else { return false };
-    let Some(reply) = answer_request(&query, cache, Instant::now(), &local.as_config()) else {
-        return false;
-    };
-    let wire = reply.write();
-    let _ = client_sock.send_to(&wire, src).await;
-    inc_metric(Metric::DnsLocalAnswered);
-    true
+/// Build a locally-answerable reply, if `cache`/`local` can supply one.
+///
+/// Takes only what `answer_request` needs — no socket — so the caller can
+/// drop the cache lock before sending, instead of holding it across the
+/// `send_to` await.
+fn answer_locally(pkt: &[u8], cache: &mut DnsCache, local: &LocalData) -> Option<Vec<u8>> {
+    let query = DnsPacket::parse(pkt).ok()?;
+    let reply = answer_request(&query, cache, Instant::now(), &local.as_config())?;
+    Some(reply.write().to_vec())
 }
 
 /// Run the DNS UDP forwarding event loop.
@@ -1412,7 +1406,7 @@ async fn try_local_answer(
 /// * `config`      — forwarding configuration (upstreams, timeout, local data).
 ///
 /// Each client query is first offered to [`answer_request`] via
-/// [`try_local_answer`]; only queries it declines are forwarded upstream.  This
+/// [`answer_locally`]; only queries it declines are forwarded upstream.  This
 /// is the ordering upstream's `udp_request()` uses, and it is what lets a
 /// purely local configuration (no upstream servers at all) answer queries.
 ///
@@ -1422,10 +1416,16 @@ pub async fn run_forward_loop(
     client_sock: Arc<tokio::net::UdpSocket>,
     config: ForwardConfig,
 ) -> std::io::Result<()> {
+    let cache = crate::cache::new_shared_cache(
+        config.cache_size,
+        config.min_cache_ttl,
+        config.max_cache_ttl,
+    );
     run_forward_loop_on(
         vec![DnsListener { sock: client_sock, check_dst: false }],
         None,
         config,
+        cache,
     )
     .await
 }
@@ -1613,6 +1613,7 @@ pub async fn run_forward_loop_on(
     listeners: Vec<DnsListener>,
     filter:    Option<crate::network::ArrivalFilter>,
     config:    ForwardConfig,
+    cache:     SharedDnsCache,
 ) -> std::io::Result<()> {
     if listeners.is_empty() {
         return Err(std::io::Error::new(
@@ -1625,16 +1626,11 @@ pub async fn run_forward_loop_on(
     // Ephemeral socket for upstream communication.
     let upstream_sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
 
-    // Local data and cache are owned by the loop; `LocalConfig` borrows from
-    // `local` and is rebuilt per query.
+    // Local data is owned by the loop; `LocalConfig` borrows from `local` and
+    // is rebuilt per query.  The cache is shared with SIGHUP reload handling
+    // (`dnsmasq::clear_cache_and_reload`), which is the only other thing that
+    // ever touches it, so a `tokio::sync::Mutex` needs no fairness tuning.
     let local            = config.local.clone();
-    // The TTL bounds have to live on the cache itself: `really_insert` is the
-    // only place they are enforced, and it is the live insert path.
-    let mut cache        = DnsCache::with_ttl_limits(
-        config.cache_size,
-        config.min_cache_ttl,
-        config.max_cache_ttl,
-    );
     let mut engine       = ForwardEngine::new(config);
     let mut client_buf   = vec![0u8; MAX_PACKET_SIZE];
     let mut upstream_buf = vec![0u8; MAX_PACKET_SIZE];
@@ -1671,7 +1667,17 @@ pub async fn run_forward_loop_on(
                 // Only forward DNS queries (QR bit == 0).
                 if pkt.len() >= 12 && pkt[2] & 0x80 == 0 {
                     // Local data and cache first — exactly as upstream does.
-                    if !try_local_answer(&listener.sock, pkt, src, &mut cache, &local).await {
+                    // The lock is dropped before `send_to` so a slow client
+                    // send can't hold up a concurrent SIGHUP reload (or vice
+                    // versa) — only the lookup itself needs the cache.
+                    let local_wire = {
+                        let mut cache = cache.lock().await;
+                        answer_locally(pkt, &mut cache, &local)
+                    };
+                    if let Some(wire) = local_wire {
+                        let _ = listener.sock.send_to(&wire, src).await;
+                        inc_metric(Metric::DnsLocalAnswered);
+                    } else {
                         if let Some(id) = engine.forward_query(pkt, src, &upstream_sock).await {
                             engine.table.set_listener(id, idx);
                         }
@@ -1709,6 +1715,7 @@ pub async fn run_forward_loop_on(
                 // on the client's behalf, so neither do we — see `tasks.md` for
                 // the missing TCP listener.
                 if !is_truncated(&pkt) {
+                    let mut cache = cache.lock().await;
                     cache_upstream_reply(&mut pkt, &mut cache, &engine.config);
                 }
 

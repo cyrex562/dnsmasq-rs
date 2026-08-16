@@ -542,6 +542,15 @@ pub fn daemon_cache_size(daemon: &Daemon) -> usize {
     }
 }
 
+/// Build the [`SharedDnsCache`] the forwarding loop and SIGHUP reload share.
+///
+/// Sized and TTL-bounded from `daemon` exactly like [`daemon_forward_config`],
+/// so the two must be built from the same snapshot to stay consistent.
+pub async fn build_shared_cache(daemon_handle: &DaemonHandle) -> crate::cache::SharedDnsCache {
+    let d = daemon_handle.read().await;
+    crate::cache::new_shared_cache(daemon_cache_size(&d), d.min_cache_ttl, d.max_cache_ttl)
+}
+
 /// Build the [`ForwardConfig`](crate::forward::ForwardConfig) the forwarding
 /// loop runs with from a resolved [`Daemon`].
 ///
@@ -955,7 +964,8 @@ pub async fn run_main_loop(
     daemon_handle: DaemonHandle,
     sighup_tx: Option<tokio::sync::mpsc::Sender<()>>,
 ) -> RunResult {
-    run_main_loop_with(daemon_handle, sighup_tx, None).await
+    let cache = build_shared_cache(&daemon_handle).await;
+    run_main_loop_with(daemon_handle, sighup_tx, None, cache).await
 }
 
 /// Run the main daemon event loop over sockets that were bound earlier.
@@ -963,10 +973,16 @@ pub async fn run_main_loop(
 /// `listeners` is `Some` when `main` bound them before forking and dropping
 /// root (the upstream order); `None` makes this bind them itself, which is what
 /// [`run_main_loop`] and the in-process tests do.
+///
+/// `cache` is the [`SharedDnsCache`](crate::cache::SharedDnsCache) the
+/// forwarding task answers and caches through; the caller keeps its own clone
+/// so SIGHUP reload ([`on_sighup`]) can flush the very cache the running
+/// forward loop is reading from, rather than a disconnected copy.
 pub async fn run_main_loop_with(
     daemon_handle: DaemonHandle,
     sighup_tx: Option<tokio::sync::mpsc::Sender<()>>,
     listeners: Option<Listeners>,
+    cache: crate::cache::SharedDnsCache,
 ) -> RunResult {
     use std::sync::Arc;
     #[cfg(feature = "dhcp")]
@@ -1033,7 +1049,7 @@ pub async fn run_main_loop_with(
 
     // ── Spawn the forwarding engine ──────────────────────────────────────────
     let fwd_task = tokio::spawn(async move {
-        if let Err(e) = run_forward_loop_on(dns_listeners, arrival_filter, fwd_config).await {
+        if let Err(e) = run_forward_loop_on(dns_listeners, arrival_filter, fwd_config, cache).await {
             error!("forward loop exited: {e}");
         }
     });
@@ -1149,11 +1165,15 @@ pub async fn run_main_loop_with(
 ///
 /// Flushes the DNS cache and reloads `/etc/hosts` and any servers-file entries.
 /// Delegates the actual work to [`clear_cache_and_reload`].
-pub async fn on_sighup(daemon_handle: &DaemonHandle) {
+///
+/// `cache` must be the same [`SharedDnsCache`](crate::cache::SharedDnsCache)
+/// the running forward loop was started with (see [`run_main_loop_with`]) —
+/// flushing a disconnected copy would leave the live cache untouched.
+pub async fn on_sighup(daemon_handle: &DaemonHandle, cache: &crate::cache::SharedDnsCache) {
     use tracing::info;
 
     info!("SIGHUP: initiating cache flush and config reload");
-    clear_cache_and_reload(daemon_handle).await;
+    clear_cache_and_reload(daemon_handle, cache).await;
 
     // Increment the reload counter so other subsystems can detect reloads.
     let mut d = daemon_handle.write().await;
@@ -1187,7 +1207,7 @@ pub async fn on_alarm(daemon_handle: &DaemonHandle) {
     );
 
     // In a full implementation:
-    // - d.dns_cache.expire_old(now) once Daemon owns the cache
+    // - cache.expire_old(now) against the running loop's SharedDnsCache
     // - Check DHCP lease expiry
     // - Prune stale forward table entries
 }
@@ -1216,23 +1236,87 @@ pub fn spawn_alarm_task(
 
 /// Flush the DNS cache and reload configuration data.
 ///
-/// Logs the action and marks the daemon's DNS data as dirty so that
-/// downstream consumers know to re-query.  In a full implementation this
-/// would call `cache.clear()` and re-read `/etc/hosts`.
-pub async fn clear_cache_and_reload(daemon_handle: &DaemonHandle) {
-    use tracing::info;
+/// Mirrors upstream's `EVENT_RELOAD`/`EVENT_INIT` handling in `async_event()`
+/// (`dnsmasq.c:1546-1565`):
+/// * `clear_cache_and_reload()` (`dnsmasq.c:1807`) → flush and rebuild the
+///   `F_HOSTS` cache entries from `/etc/hosts` and `--addn-hosts`, here via
+///   [`crate::cache::reload_hosts`].
+/// * `reload_servers()` (`network.c:1699`) → re-read each `--resolv-file`
+///   into `daemon->servers`, replacing only the previous `SERV_FROM_RESOLV`
+///   entries so explicitly configured (`--server=`) servers survive.
+///
+/// Two deliberate simplifications versus upstream, both tracked in
+/// `tasks.md`:
+/// * Upstream only preserves `F_DHCP` cache entries across the flush; this
+///   port's cache never receives `F_DHCP` records yet, so a full flush is
+///   currently equivalent and needs revisiting once DHCP leases feed the
+///   cache.
+/// * Upstream gates the resolv-file re-read on `OPT_NO_POLL`, because without
+///   it a periodic poll/inotify watch is expected to pick up the change
+///   instead; this port has no such watch, so SIGHUP always re-reads.
+pub async fn clear_cache_and_reload(daemon_handle: &DaemonHandle, cache: &crate::cache::SharedDnsCache) {
+    use tracing::{info, warn};
+    use crate::types::constants::OPT_NO_HOSTS;
 
     info!("flushing cache and reloading");
 
+    let (hosts_paths, local_ttl, resolv_paths) = {
+        let d = daemon_handle.read().await;
+        let mut hosts_paths = Vec::new();
+        if !d.option_bool(OPT_NO_HOSTS) {
+            hosts_paths.push("/etc/hosts".to_string());
+        }
+        hosts_paths.extend(d.addn_hosts.iter().map(|h| h.fname.clone()));
+        let resolv_paths: Vec<String> = d.resolv_files.iter().map(|r| r.name.clone()).collect();
+        (hosts_paths, d.local_ttl, resolv_paths)
+    };
+
+    // Flush and rebuild the F_HOSTS entries.
+    {
+        let mut c = cache.lock().await;
+        crate::cache::reload_hosts(&hosts_paths, local_ttl, &mut c);
+    }
+
+    // Re-read resolv-file-style server lists, if any are configured.  A file
+    // that fails to read (temporarily missing, permission change, mid-rewrite)
+    // must leave the existing server list untouched rather than emptying it —
+    // upstream's `reload_servers()` does the equivalent by `fopen`ing and
+    // returning early, before `mark_servers()` touches anything
+    // (`network.c:1699-1709`).
+    let mut any_resolv_read = false;
+    let mut discovered = Vec::new();
+    for path in &resolv_paths {
+        match std::fs::read_to_string(path) {
+            // 53 is the standard nameserver port (`NAMESERVER_PORT` in C);
+            // resolv.conf entries never carry an explicit port.
+            Ok(text) => {
+                any_resolv_read = true;
+                discovered.extend(crate::network::parse_resolv_conf(&text, 53));
+            }
+            Err(e) => warn!("could not read {path}: {e}"),
+        }
+    }
+
     let mut d = daemon_handle.write().await;
+    if any_resolv_read {
+        use crate::types::addr::MySockAddr;
+        use crate::types::server::{SERV_4ADDR, SERV_6ADDR, SERV_FROM_RESOLV};
+
+        let dummy_source = MySockAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
+        d.servers.retain(|s| s.flags & SERV_FROM_RESOLV == 0);
+        for addr in discovered {
+            let flags = SERV_FROM_RESOLV | if addr.is_ipv6() { SERV_6ADDR } else { SERV_4ADDR };
+            d.servers.push(crate::option::new_server(
+                flags,
+                String::new(),
+                MySockAddr::from(addr),
+                dummy_source.clone(),
+            ));
+        }
+    }
+
     // Mark DNS data as dirty so consumers know to refresh.
     d.dns_dirty = true;
-
-    // In a full implementation:
-    // - d.dns_cache.clear()
-    // - Re-read /etc/hosts into the cache
-    // - Re-parse servers-file
-    // - Re-read /etc/resolv.conf for upstream server addresses
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1684,10 +1768,13 @@ mod tests {
             .expect("a socket must be bound");
 
         let daemon = Daemon { port, ..Default::default() };
+        let daemon_handle = init_daemon_with(daemon);
+        let cache = build_shared_cache(&daemon_handle).await;
         let task = tokio::spawn(run_main_loop_with(
-            init_daemon_with(daemon),
+            daemon_handle,
             None,
             Some(listeners),
+            cache,
         ));
 
         // If the pre-bound socket were dropped and rebound, this would race or
@@ -1881,8 +1968,9 @@ mod tests {
     #[tokio::test]
     async fn on_sighup_does_not_panic() {
         let handle = init_daemon();
+        let cache = crate::cache::new_shared_cache(150, 0, 0);
         // Should run without panic; cache clear is a no-op on empty cache.
-        on_sighup(&handle).await;
+        on_sighup(&handle, &cache).await;
     }
 
     // ── Alarm timer ───────────────────────────────────────────────────────────
@@ -1992,25 +2080,242 @@ mod tests {
     #[tokio::test]
     async fn clear_cache_and_reload_sets_dns_dirty() {
         let handle = init_daemon();
+        let cache = crate::cache::new_shared_cache(150, 0, 0);
         {
             let d = handle.read().await;
             assert!(!d.dns_dirty);
         }
 
-        clear_cache_and_reload(&handle).await;
+        clear_cache_and_reload(&handle, &cache).await;
 
         let d = handle.read().await;
         assert!(d.dns_dirty);
     }
 
     #[tokio::test]
+    async fn clear_cache_and_reload_flushes_a_live_forwarded_answer() {
+        use crate::cache::CacheRecord;
+        use crate::types::addr::AllAddr;
+        use crate::types::constants::{F_IPV4, OPT_NO_HOSTS};
+
+        let handle = init_daemon();
+        // Isolate this test from whatever /etc/hosts happens to contain on
+        // the machine running it.
+        handle.write().await.set_option(OPT_NO_HOSTS);
+        let cache = crate::cache::new_shared_cache(150, 0, 0);
+        {
+            let mut c = cache.lock().await;
+            c.insert(CacheRecord {
+                name: "forwarded.test".to_string(),
+                flags: F_IPV4,
+                addr: Some(AllAddr::Addr4(Ipv4Addr::new(192, 0, 2, 1))),
+                rdata: None,
+                ttl: 300,
+                expires: Instant::now() + Duration::from_secs(300),
+                uid: 0,
+            });
+            assert_eq!(c.len(), 1, "the answer must be in the cache before reload");
+        }
+
+        clear_cache_and_reload(&handle, &cache).await;
+
+        let c = cache.lock().await;
+        assert_eq!(c.len(), 0, "reload must flush a forwarded answer out of the live cache");
+    }
+
+    #[tokio::test]
+    async fn clear_cache_and_reload_reloads_addn_hosts_into_the_cache() {
+        use crate::types::network::HostsFile;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("extra.hosts");
+        std::fs::write(&path, "192.0.2.9 reloaded.test\n").unwrap();
+
+        let handle = init_daemon();
+        {
+            let mut d = handle.write().await;
+            d.set_option(crate::types::constants::OPT_NO_HOSTS); // skip the real /etc/hosts
+            d.addn_hosts.push(HostsFile {
+                flags: 0,
+                fname: path.to_str().unwrap().to_string(),
+                index: 0,
+            });
+        }
+        let cache = crate::cache::new_shared_cache(150, 0, 0);
+
+        clear_cache_and_reload(&handle, &cache).await;
+
+        let mut c = cache.lock().await;
+        let now = Instant::now();
+        assert!(
+            c.lookup_by_name("reloaded.test", crate::types::constants::F_IPV4, now).is_some(),
+            "reload must load --addn-hosts entries into the cache",
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_cache_and_reload_reloads_resolv_file_servers() {
+        use crate::types::network::Resolvc;
+        use crate::types::server::SERV_FROM_RESOLV;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "nameserver 198.51.100.9\n").unwrap();
+
+        let handle = init_daemon();
+        {
+            let mut d = handle.write().await;
+            d.resolv_files.push(Resolvc {
+                is_default: false,
+                logged: false,
+                mtime: 0,
+                ino: 0,
+                name: path.to_str().unwrap().to_string(),
+                #[cfg(feature = "inotify")]
+                wd: -1,
+                #[cfg(feature = "inotify")]
+                file: None,
+            });
+        }
+        let cache = crate::cache::new_shared_cache(150, 0, 0);
+
+        clear_cache_and_reload(&handle, &cache).await;
+
+        let d = handle.read().await;
+        assert!(
+            d.servers.iter().any(|s| {
+                s.flags & SERV_FROM_RESOLV != 0
+                    && SocketAddr::from(s.addr.clone())
+                        == SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)), 53)
+            }),
+            "reload must add the resolv-file server, got {:?}",
+            d.servers.iter().map(|s| (s.flags, s.addr.clone())).collect::<Vec<_>>(),
+        );
+    }
+
+    /// A resolv-file read failure must not wipe the servers a previous,
+    /// successful reload already discovered — upstream's `reload_servers()`
+    /// leaves the list untouched when `fopen` fails, before `mark_servers()`
+    /// ever runs (`network.c:1699-1709`).
+    #[tokio::test]
+    async fn clear_cache_and_reload_preserves_servers_when_resolv_file_becomes_unreadable() {
+        use crate::types::network::Resolvc;
+        use crate::types::server::SERV_FROM_RESOLV;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "nameserver 198.51.100.9\n").unwrap();
+
+        let handle = init_daemon();
+        {
+            let mut d = handle.write().await;
+            d.resolv_files.push(Resolvc {
+                is_default: false,
+                logged: false,
+                mtime: 0,
+                ino: 0,
+                name: path.to_str().unwrap().to_string(),
+                #[cfg(feature = "inotify")]
+                wd: -1,
+                #[cfg(feature = "inotify")]
+                file: None,
+            });
+        }
+        let cache = crate::cache::new_shared_cache(150, 0, 0);
+
+        clear_cache_and_reload(&handle, &cache).await;
+        {
+            let d = handle.read().await;
+            assert_eq!(
+                d.servers.iter().filter(|s| s.flags & SERV_FROM_RESOLV != 0).count(),
+                1,
+                "the server must be discovered on the first, successful reload",
+            );
+        }
+
+        // The file goes away between reloads (e.g. a momentarily-missing,
+        // mid-rewrite resolv.conf): the read fails, and the previously
+        // discovered server must survive rather than being wiped.
+        std::fs::remove_file(&path).unwrap();
+        clear_cache_and_reload(&handle, &cache).await;
+
+        let d = handle.read().await;
+        assert_eq!(
+            d.servers.iter().filter(|s| s.flags & SERV_FROM_RESOLV != 0).count(),
+            1,
+            "a failed resolv-file read must not empty the existing resolv-derived server list",
+        );
+    }
+
+    #[tokio::test]
     async fn clear_cache_and_reload_idempotent() {
         let handle = init_daemon();
-        clear_cache_and_reload(&handle).await;
-        clear_cache_and_reload(&handle).await;
+        let cache = crate::cache::new_shared_cache(150, 0, 0);
+        clear_cache_and_reload(&handle, &cache).await;
+        clear_cache_and_reload(&handle, &cache).await;
 
         let d = handle.read().await;
         assert!(d.dns_dirty);
+    }
+
+    /// A no-op reload (nothing on disk changed) must leave the resolv-derived
+    /// server list stable rather than duplicating it — the acceptance
+    /// criterion for "repeated SIGHUP is stable and idempotent".
+    #[tokio::test]
+    async fn clear_cache_and_reload_resolv_servers_do_not_accumulate_across_reloads() {
+        use crate::types::network::Resolvc;
+        use crate::types::server::SERV_FROM_RESOLV;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "nameserver 198.51.100.9\n").unwrap();
+
+        let handle = init_daemon();
+        {
+            let mut d = handle.write().await;
+            d.resolv_files.push(Resolvc {
+                is_default: false,
+                logged: false,
+                mtime: 0,
+                ino: 0,
+                name: path.to_str().unwrap().to_string(),
+                #[cfg(feature = "inotify")]
+                wd: -1,
+                #[cfg(feature = "inotify")]
+                file: None,
+            });
+        }
+        let cache = crate::cache::new_shared_cache(150, 0, 0);
+
+        clear_cache_and_reload(&handle, &cache).await;
+        clear_cache_and_reload(&handle, &cache).await;
+        clear_cache_and_reload(&handle, &cache).await;
+
+        let d = handle.read().await;
+        let resolv_derived =
+            d.servers.iter().filter(|s| s.flags & SERV_FROM_RESOLV != 0).count();
+        assert_eq!(
+            resolv_derived, 1,
+            "an unchanged resolv file must not accumulate duplicate server entries",
+        );
+    }
+
+    /// Explicit `--server=` entries are not `SERV_FROM_RESOLV` and must survive
+    /// a reload untouched, even when a resolv-file is also configured.
+    #[tokio::test]
+    async fn clear_cache_and_reload_keeps_explicitly_configured_servers() {
+        let handle = init_daemon();
+        {
+            let mut d = handle.write().await;
+            d.servers.push(test_server("eth0"));
+        }
+        let cache = crate::cache::new_shared_cache(150, 0, 0);
+
+        clear_cache_and_reload(&handle, &cache).await;
+
+        let d = handle.read().await;
+        assert_eq!(d.servers.len(), 1, "an explicit server must not be dropped by reload");
+        assert_eq!(d.servers[0].interface, "eth0");
     }
 
     // ── send_alarm ──────────────────────────────────────────────────────────
@@ -2067,13 +2372,14 @@ mod tests {
     #[tokio::test]
     async fn on_sighup_sets_dns_dirty_and_increments_reload() {
         let handle = init_daemon();
+        let cache = crate::cache::new_shared_cache(150, 0, 0);
         {
             let d = handle.read().await;
             assert_eq!(d.reload_count, 0);
             assert!(!d.dns_dirty);
         }
 
-        on_sighup(&handle).await;
+        on_sighup(&handle, &cache).await;
 
         let d = handle.read().await;
         assert!(d.dns_dirty);
@@ -2083,10 +2389,11 @@ mod tests {
     #[tokio::test]
     async fn on_sighup_increments_reload_count_each_time() {
         let handle = init_daemon();
+        let cache = crate::cache::new_shared_cache(150, 0, 0);
 
-        on_sighup(&handle).await;
-        on_sighup(&handle).await;
-        on_sighup(&handle).await;
+        on_sighup(&handle, &cache).await;
+        on_sighup(&handle, &cache).await;
+        on_sighup(&handle, &cache).await;
 
         let d = handle.read().await;
         assert_eq!(d.reload_count, 3);
