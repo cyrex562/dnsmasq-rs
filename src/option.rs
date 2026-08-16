@@ -52,6 +52,10 @@ pub enum ConfigError {
 const UPSTREAM_TIMEOUT_SECS: i32 = 10;
 const DEFAULT_FAST_RETRY_MS: i32 = 1000;
 const STALE_CACHE_EXPIRY_SECS: i32 = 86_400;
+/// Compiled-in default lease file path, matching upstream's `LEASEFILE` for
+/// Linux (`config.h:219`).
+#[cfg(feature = "dhcp")]
+const DEFAULT_LEASEFILE: &str = "/var/lib/misc/dnsmasq.leases";
 
 /// Thin CLI syntax layer. These arguments are translated into [`ConfigLine`]s
 /// so CLI and config-file inputs share one normalization pipeline.
@@ -559,8 +563,33 @@ fn normalize_config(daemon: &mut Daemon) -> Result<(), ConfigError> {
     apply_mx_defaults(daemon)?;
     apply_auth_defaults(daemon);
     apply_local_service_defaults(daemon);
+    #[cfg(feature = "dhcp")]
+    apply_dhcp_leasefile_default(daemon);
     validate_auth_config(daemon)?;
     Ok(())
+}
+
+/// Fill in the default lease file when DHCP(v6) is configured and no
+/// `--dhcp-leasefile`/`--lease-file` was given, mirroring `dnsmasq.c:151-156`
+/// (`if (!daemon->lease_file) if (daemon->dhcp || daemon->dhcp6) daemon->lease_file = LEASEFILE;`).
+#[cfg(feature = "dhcp")]
+fn apply_dhcp_leasefile_default(daemon: &mut Daemon) {
+    if daemon.lease_file.is_some() {
+        return;
+    }
+    let dhcp6_configured = {
+        #[cfg(feature = "dhcp6")]
+        {
+            !daemon.dhcp6.is_empty()
+        }
+        #[cfg(not(feature = "dhcp6"))]
+        {
+            false
+        }
+    };
+    if !daemon.dhcp.is_empty() || dhcp6_configured {
+        daemon.lease_file = Some(DEFAULT_LEASEFILE.to_string());
+    }
 }
 
 fn apply_dnssec_fast_retry_defaults(daemon: &mut Daemon) {
@@ -5193,6 +5222,36 @@ mod tests {
             assert_eq!(ctx.end, "192.168.0.50".parse::<Ipv4Addr>().unwrap());
             assert_eq!(ctx.lease_time, 12 * 3600);
         }
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn dhcp_range_without_explicit_leasefile_defaults_lease_file() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-range=192.168.0.10,192.168.0.50,12h", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.lease_file.as_deref(), Some(DEFAULT_LEASEFILE));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn explicit_dhcp_leasefile_is_not_overridden_by_default() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text(
+            "dhcp-range=192.168.0.10,192.168.0.50,12h\ndhcp-leasefile=/custom/leases.dat",
+            "test",
+        )
+        .unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.lease_file.as_deref(), Some("/custom/leases.dat"));
+    }
+
+    #[test]
+    fn no_dhcp_range_leaves_lease_file_unset() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("domain=example.com", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.lease_file, None);
     }
 
     #[test]

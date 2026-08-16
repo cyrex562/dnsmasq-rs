@@ -114,7 +114,10 @@ pub fn handle_discover(
 /// Process a DHCP REQUEST packet and produce an ACK or NAK reply.
 ///
 /// The requested IP is taken from option 50; if it lies within the pool the
-/// reply is ACK, otherwise NAK.
+/// reply is ACK, otherwise NAK. `reserved_for_other` forces a NAK regardless
+/// of pool/static match — it is true when the requested address is a
+/// `dhcp-host` static reservation belonging to a *different* client
+/// (`config_find_by_address(...) != config`, rfc2131.c:1529-1530).
 #[cfg(feature = "dhcp")]
 pub fn handle_request(
     pkt: &DhcpPacket,
@@ -122,15 +125,17 @@ pub fn handle_request(
     pool_end: Ipv4Addr,
     server_id: Ipv4Addr,
     static_addr: Option<Ipv4Addr>,
+    reserved_for_other: bool,
 ) -> Option<DhcpReply> {
     // Find the requested IP (option 50) in the packet options, falling back to
     // ciaddr for the renewal/rebind path.
     let requested = find_requested_ip(&pkt.options)
         .or_else(|| (pkt.ciaddr != Ipv4Addr::UNSPECIFIED).then_some(pkt.ciaddr))?;
 
-    let in_range = static_addr.map(|addr| requested == addr).unwrap_or_else(|| {
-        in_pool(requested, pool_start, pool_end)
-    });
+    let in_range = !reserved_for_other
+        && static_addr.map(|addr| requested == addr).unwrap_or_else(|| {
+            in_pool(requested, pool_start, pool_end)
+        });
 
     if in_range {
         Some(DhcpReply {
@@ -157,7 +162,7 @@ pub fn handle_request(
 
 /// Extract the requested IP address from option 50 in a raw options buffer.
 #[cfg(feature = "dhcp")]
-fn find_requested_ip(options: &[u8]) -> Option<Ipv4Addr> {
+pub(crate) fn find_requested_ip(options: &[u8]) -> Option<Ipv4Addr> {
     let data = crate::dhcp_common::find_option(options, OPTION_REQUESTED_IP)?;
     if data.len() < 4 {
         return None;
@@ -1499,7 +1504,7 @@ mod tests {
         let requested = Ipv4Addr::new(192, 168, 1, 50);
         let mut pkt = base_packet();
         pkt.options = opts_with_requested_ip(requested);
-        let reply = handle_request(&pkt, start, end, server, None).unwrap();
+        let reply = handle_request(&pkt, start, end, server, None, false).unwrap();
         assert_eq!(reply.msg_type, DhcpMsgType::Ack);
         assert_eq!(reply.yiaddr, requested);
     }
@@ -1512,7 +1517,21 @@ mod tests {
         let out_of_pool = Ipv4Addr::new(10, 0, 0, 1);
         let mut pkt = base_packet();
         pkt.options = opts_with_requested_ip(out_of_pool);
-        let reply = handle_request(&pkt, start, end, server, None).unwrap();
+        let reply = handle_request(&pkt, start, end, server, None, false).unwrap();
+        assert_eq!(reply.msg_type, DhcpMsgType::Nak);
+    }
+
+    #[test]
+    fn handle_request_nak_when_reserved_for_other() {
+        let start = Ipv4Addr::new(192, 168, 1, 10);
+        let end = Ipv4Addr::new(192, 168, 1, 200);
+        let server = Ipv4Addr::new(192, 168, 1, 1);
+        // In-pool and no static_addr override, but the caller has determined
+        // this address is reserved for a different client's dhcp-host entry.
+        let requested = Ipv4Addr::new(192, 168, 1, 50);
+        let mut pkt = base_packet();
+        pkt.options = opts_with_requested_ip(requested);
+        let reply = handle_request(&pkt, start, end, server, None, true).unwrap();
         assert_eq!(reply.msg_type, DhcpMsgType::Nak);
     }
 

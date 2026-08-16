@@ -458,6 +458,21 @@ impl LeaseDb {
         Self::deserialize(&data)
     }
 
+    /// Remove and return the lease at `addr`, if any.
+    ///
+    /// Port of `lease_prune()`'s free-the-matching-lease behaviour from
+    /// lease.c, restricted to the by-address case used by RELEASE/DECLINE.
+    pub fn remove_by_addr(&mut self, addr: Ipv4Addr) -> Option<DhcpLease> {
+        let key = self
+            .leases
+            .iter()
+            .find(|(_, l)| l.addr == addr)
+            .map(|(k, _)| *k)?;
+        self.file_dirty = true;
+        self.dns_dirty = true;
+        self.leases.remove(&key)
+    }
+
     /// Return the number of active leases.
     pub fn count(&self) -> usize {
         self.leases.len()
@@ -1229,6 +1244,41 @@ mod tests {
         let db = LeaseDb::new();
         db.write_to_file(path_str).unwrap();
         assert!(path.exists());
+    }
+
+    // ── remove_by_addr tests ──
+
+    #[test]
+    fn remove_by_addr_removes_matching_lease() {
+        let mut db = LeaseDb::new();
+        let addr = Ipv4Addr::new(10, 0, 0, 5);
+        db.insert(make_lease(addr, [0x01, 0, 0, 0, 0, 0], None));
+        db.file_dirty = false;
+
+        let removed = db.remove_by_addr(addr);
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().addr, addr);
+        assert!(db.find_by_addr(addr).is_none());
+        assert!(db.file_dirty);
+    }
+
+    #[test]
+    fn remove_by_addr_nonexistent_returns_none() {
+        let mut db = LeaseDb::new();
+        assert!(db.remove_by_addr(Ipv4Addr::new(10, 0, 0, 99)).is_none());
+    }
+
+    #[test]
+    fn remove_by_addr_leaves_other_leases_intact() {
+        let mut db = LeaseDb::new();
+        let addr1 = Ipv4Addr::new(10, 0, 0, 1);
+        let addr2 = Ipv4Addr::new(10, 0, 0, 2);
+        db.insert(make_lease(addr1, [0x01, 0, 0, 0, 0, 0], None));
+        db.insert(make_lease(addr2, [0x02, 0, 0, 0, 0, 0], None));
+
+        db.remove_by_addr(addr1);
+        assert!(db.find_by_addr(addr1).is_none());
+        assert!(db.find_by_addr(addr2).is_some());
     }
 
     // ── count tests ──
