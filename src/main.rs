@@ -237,18 +237,20 @@ async fn run(daemon: Daemon, listeners: Listeners) {
     use tracing::{info, warn};
 
     let daemon_handle = dnsmasq::init_daemon_with(daemon);
+    let cache = dnsmasq::build_shared_cache(&daemon_handle).await;
 
     let (sighup_tx, mut sighup_rx) = tokio::sync::mpsc::channel::<()>(4);
     let daemon_clone = daemon_handle.clone();
+    let cache_clone = cache.clone();
     tokio::spawn(async move {
         while sighup_rx.recv().await.is_some() {
-            warn!("SIGHUP: reloading configuration (stub — implement cache_reload here)");
-            let _d = daemon_clone.read().await;
+            warn!("SIGHUP: reloading configuration");
+            dnsmasq::on_sighup(&daemon_clone, &cache_clone).await;
         }
     });
 
     let result =
-        dnsmasq::run_main_loop_with(daemon_handle, Some(sighup_tx), Some(listeners)).await;
+        dnsmasq::run_main_loop_with(daemon_handle, Some(sighup_tx), Some(listeners), cache).await;
 
     info!("dnsmasq-rs stopped ({result:?})");
 }

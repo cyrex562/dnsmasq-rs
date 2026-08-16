@@ -136,6 +136,21 @@ pub struct DnsCache {
     pub misses:    u64,
 }
 
+/// A [`DnsCache`] shared between the forwarding loop and reload handling.
+///
+/// Upstream's cache is a set of static globals in `cache.c`, reachable from
+/// anywhere in the process; `run_forward_loop_on` and SIGHUP reload each need
+/// their own reference to the same live cache, so the Rust port makes that
+/// sharing explicit instead of inventing a second, unsynchronized copy.
+pub type SharedDnsCache = std::sync::Arc<tokio::sync::Mutex<DnsCache>>;
+
+/// Build a [`SharedDnsCache`] with the given size and TTL bounds.
+pub fn new_shared_cache(max_size: usize, min_ttl: u32, max_ttl: u32) -> SharedDnsCache {
+    std::sync::Arc::new(tokio::sync::Mutex::new(DnsCache::with_ttl_limits(
+        max_size, min_ttl, max_ttl,
+    )))
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
