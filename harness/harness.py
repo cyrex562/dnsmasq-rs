@@ -184,8 +184,9 @@ def run_cycle(meta, dry_run=False):
         claude_runner.render("research", **common), read_only=True))
 
     if meta.risk == "high":
-        _record_stage(record, "design", "opus", lambda: claude_runner.run_stage(
-            "design", "opus", REPO,
+        design_model = routing.route(meta, "design")
+        _record_stage(record, "design", design_model, lambda: claude_runner.run_stage(
+            "design", design_model, REPO,
             claude_runner.render("design", research=research, **common), read_only=True))
 
     if dry_run:
