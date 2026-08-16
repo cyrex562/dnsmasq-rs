@@ -8,16 +8,18 @@ import os
 
 TIERS = ["haiku", "sonnet", "opus"]
 
-# Ceiling on the model tier for design/implement (and research/review, which
-# already default within it). Set by the user 2026-08-16 to hold opus spend
+# Ceiling on the model tier for every stage, including the judge as of
+# 2026-08-16 (user directive, "until further notice"). Set to hold opus spend
 # down after tier 0's run of high-risk, multi-round opus cycles.
 #
-# The judge is exempt: it is the last check before an unattended merge, not a
-# cost lever, and every tier-0 defect the judge caught (cache poisoning, a
-# rebind bypass, silent lease loss) was found by opus. Capping it would trade
-# the one thing standing between a plausible diff and master for a lower bill.
+# Capping the judge is a deliberate risk, not an oversight: every tier-0 defect
+# it caught after a clean gate and a passing review (cache poisoning and a
+# rebind-with-caching-off bypass in #3, silent lease loss on restart in #9) was
+# found by opus. Whether a capped judge catches the same class of bug at the
+# same rate is unverified — watch judge output closely while this is in effect.
 #
-# Override with HARNESS_MODEL_CEILING=opus to restore the original policy.
+# Override with HARNESS_MODEL_CEILING=opus to restore the judge to full
+# strength (and design/implement along with it).
 MODEL_CEILING = os.environ.get("HARNESS_MODEL_CEILING", "sonnet")
 
 # Files where a wrong edit is expensive or the logic is intricate enough that
@@ -31,8 +33,10 @@ HOT_FILES = (
     "src/crypto.rs",
 )
 
-# Stages whose model never varies. The judge is pinned to the top tier because
-# it is the only thing standing between a plausible diff and master.
+# Stages whose model never varies except by the ceiling above. Historically the
+# judge was pinned to the top tier unconditionally, since it is the only thing
+# standing between a plausible diff and master — see MODEL_CEILING's docstring
+# for why that is currently overridden.
 FIXED_STAGES = {"research": "sonnet", "review": "sonnet", "judge": "opus"}
 
 
@@ -48,9 +52,6 @@ def _capped(model):
 
 
 def route(meta, stage, attempt=0):
-    if stage == "judge":
-        return FIXED_STAGES["judge"]  # exempt from the ceiling; see module docstring
-
     if stage in FIXED_STAGES:
         return _capped(FIXED_STAGES[stage])
 
