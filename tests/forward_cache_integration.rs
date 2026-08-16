@@ -66,8 +66,10 @@ fn soa_rr(name: &str, ttl: u32, minimum: u32) -> DnsRr {
 
 /// Build a reply to `query` carrying `answers` / `authority` at `rcode`.
 ///
-/// `RA` is set because a recursive resolver sets it, and C refuses to commit
-/// anything to the cache from a reply that has it clear (`rfc1035.c:1124-1127`).
+/// `RA` is set because that is what a recursive resolver answers with; it is not
+/// load-bearing for caching, since the forwarder sets the bit itself before the
+/// reply is extracted (`forward.c:776`) — see
+/// `reply_without_the_ra_bit_is_cached_and_relayed_with_ra_set`.
 fn reply_to(query: &DnsPacket, rcode: u8, answers: Vec<DnsRr>, authority: Vec<DnsRr>) -> DnsPacket {
     let mut header = query.header;
     header.hb3 |= HB3_QR;
@@ -503,6 +505,109 @@ async fn rebind_protection_blocks_the_answer_even_with_caching_disabled() {
     shutdown(server, upstream);
 }
 
+/// `127.0.0.0/8` counts as private for the rebind test by default: C passes
+/// `!option_bool(OPT_LOCAL_REBIND)` to `private_net()` (`rfc1035.c:997`), and
+/// without `rebind-localhost-ok` that argument is true.
+#[tokio::test]
+async fn stop_dns_rebind_blocks_a_loopback_answer_by_default() {
+    let Some(upstream) = spawn_upstream(|q| {
+        Some(reply_to(q, 0, vec![a_rr("lo.test", Ipv4Addr::new(127, 0, 0, 1), 300)], vec![]))
+    })
+    .await
+    else {
+        return;
+    };
+    let Some(server) =
+        spawn_server(config_from_text("cache-size=150\nstop-dns-rebind\n", upstream.addr)).await
+    else {
+        return;
+    };
+
+    let reply = ask(server.addr, &query_wire("lo.test", 1, 0x51))
+        .await
+        .expect("a blocked reply is still delivered");
+    assert!(
+        reply.answers.is_empty(),
+        "stop-dns-rebind alone must block a 127.0.0.0/8 answer, got {:?}",
+        reply.answers,
+    );
+
+    shutdown(server, upstream);
+}
+
+/// `rebind-localhost-ok` exempts `127.0.0.0/8` (and `::1`) from the rebind test
+/// — `private_net(addr, !option_bool(OPT_LOCAL_REBIND))` (`rfc1035.c:997,1001`).
+/// The directive is parsed into `OPT_LOCAL_REBIND` by `option.rs`, so it must
+/// reach the live extraction path rather than being a silent no-op.
+#[tokio::test]
+async fn rebind_localhost_ok_lets_a_loopback_answer_through() {
+    let Some(upstream) = spawn_upstream(|q| {
+        Some(reply_to(q, 0, vec![a_rr("lo.test", Ipv4Addr::new(127, 0, 0, 1), 300)], vec![]))
+    })
+    .await
+    else {
+        return;
+    };
+    let Some(server) = spawn_server(config_from_text(
+        "cache-size=150\nstop-dns-rebind\nrebind-localhost-ok\n",
+        upstream.addr,
+    ))
+    .await
+    else {
+        return;
+    };
+
+    let reply = ask(server.addr, &query_wire("lo.test", 1, 0x52))
+        .await
+        .expect("the answer must be delivered");
+    assert_eq!(
+        first_a(&reply).map(|(ip, _)| ip),
+        Some(Ipv4Addr::new(127, 0, 0, 1)),
+        "rebind-localhost-ok must let a loopback answer through",
+    );
+
+    // Exempt from the *rebind* test does not mean exempt from caching: the
+    // answer is committed like any other, so the repeat is a hit.
+    assert!(ask(server.addr, &query_wire("lo.test", 1, 0x53)).await.is_some());
+    assert_eq!(upstream.misses(), 1, "the allowed loopback answer must be cached");
+
+    // A non-loopback private address is still blocked — the directive narrows
+    // the check, it does not disable it.
+    shutdown(server, upstream);
+}
+
+/// `rebind-localhost-ok` narrows the rebind test to the loopback range only;
+/// RFC1918 space stays blocked.
+#[tokio::test]
+async fn rebind_localhost_ok_still_blocks_rfc1918() {
+    let Some(upstream) = spawn_upstream(|q| {
+        Some(reply_to(q, 0, vec![a_rr("evil.test", Ipv4Addr::new(10, 1, 2, 3), 300)], vec![]))
+    })
+    .await
+    else {
+        return;
+    };
+    let Some(server) = spawn_server(config_from_text(
+        "cache-size=150\nstop-dns-rebind\nrebind-localhost-ok\n",
+        upstream.addr,
+    ))
+    .await
+    else {
+        return;
+    };
+
+    let reply = ask(server.addr, &query_wire("evil.test", 1, 0x54))
+        .await
+        .expect("a blocked reply is still delivered");
+    assert!(
+        reply.answers.is_empty(),
+        "10.0.0.0/8 must still be blocked with rebind-localhost-ok, got {:?}",
+        reply.answers,
+    );
+
+    shutdown(server, upstream);
+}
+
 /// C logs a truncated reply and relays it (`forward.c:791`), leaving the client
 /// to retry over TCP.  Nothing may be cached from it, because the answer it
 /// carries is by definition incomplete.
@@ -873,12 +978,17 @@ async fn nodata_for_one_type_does_not_answer_another_type() {
     shutdown(server, upstream);
 }
 
-/// "Don't cache replies from non-recursive nameservers, since we may get a reply
-/// containing a CNAME but not its target, even though the target does exist."
-/// (`rfc1035.c:1121-1128`).  C skips `cache_end_insert()` entirely when `RA` is
-/// clear, so nothing from such a reply is committed.
+/// `RA` clear on the wire does **not** stop caching.  C sets `HB4_RA` on every
+/// reply it processes (`forward.c:776`) before it ever reaches
+/// `extract_addresses()` (`forward.c:824`), so the `RA` test guarding
+/// `cache_end_insert()` (`rfc1035.c:1124-1127`) is always true on the live path.
+/// The visible consequences: an answer from a non-recursive server — a plain
+/// authoritative nameserver named by `server=/domain/addr` answers `RA=0` — is
+/// cached like any other, and every relayed reply reaches the client with `RA`
+/// set, because that is what *this* server offers regardless of what upstream
+/// does.
 #[tokio::test]
-async fn reply_without_the_ra_bit_is_relayed_but_not_cached() {
+async fn reply_without_the_ra_bit_is_cached_and_relayed_with_ra_set() {
     let Some(upstream) = spawn_upstream(|q| {
         let mut reply =
             reply_to(q, 0, vec![a_rr("norec.test", Ipv4Addr::new(192, 0, 2, 21), 300)], vec![]);
@@ -902,12 +1012,24 @@ async fn reply_without_the_ra_bit_is_relayed_but_not_cached() {
         Some(Ipv4Addr::new(192, 0, 2, 21)),
         "the answer itself must reach the client untouched",
     );
+    assert_ne!(
+        first.header.hb4 & HB4_RA,
+        0,
+        "a relayed reply must carry RA: C sets it unconditionally at forward.c:776",
+    );
 
-    assert!(ask(server.addr, &query_wire("norec.test", 1, 2)).await.is_some());
+    let second = ask(server.addr, &query_wire("norec.test", 1, 2))
+        .await
+        .expect("the repeat must be answered");
+    assert_eq!(
+        first_a(&second).map(|(ip, _)| ip),
+        Some(Ipv4Addr::new(192, 0, 2, 21)),
+        "the cached answer must carry the same address",
+    );
     assert_eq!(
         upstream.misses(),
-        2,
-        "a reply with RA clear must not populate the cache",
+        1,
+        "an RA-clear reply is cached like any other, so the repeat is a hit",
     );
 
     shutdown(server, upstream);

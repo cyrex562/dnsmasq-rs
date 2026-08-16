@@ -1876,7 +1876,8 @@ mod tests {
         use crate::dns_protocol::DnsHeader;
         let pkt = DnsPacket {
             header: DnsHeader {
-                // RA set: nothing from a non-recursive reply is ever committed.
+                // RA set, as the forwarding path sets it before extraction
+                // (`forward.c:776`); `commit_staged` tests the bit.
                 id: 1, hb3: 0x84, hb4: crate::dns_protocol::HB4_RA,
                 qdcount: 1, ancount: 1, nscount: 0, arcount: 0,
             },

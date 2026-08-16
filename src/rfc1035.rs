@@ -556,6 +556,10 @@ pub struct ExtractConfig {
     /// Reject DNS replies containing RFC 1918 / private IPv4 or
     /// ULA / link-local IPv6 addresses (DNS rebind protection).
     pub check_rebind: bool,
+    /// `--rebind-localhost-ok` (`OPT_LOCAL_REBIND`): exempt `127.0.0.0/8` and
+    /// `::1` from the rebind check.  C passes the negation of this option as
+    /// `private_net()`'s `ban_localhost` argument (`rfc1035.c:997,1001`).
+    pub local_rebind_ok: bool,
     /// Suppress negative caching entirely.
     pub no_neg_cache: bool,
     /// The reply was DNSSEC-validated; set `F_DNSSECOK` on cached records.
@@ -568,6 +572,7 @@ impl Default for ExtractConfig {
             max_ttl: 0,
             neg_ttl: 0,
             check_rebind: false,
+            local_rebind_ok: false,
             no_neg_cache: false,
             secure: false,
         }
@@ -621,13 +626,21 @@ fn find_soa_minimum_ttl(authority: &[DnsRr]) -> Option<u32> {
 /// Commit the records staged by [`extract_addresses`], the way C commits its
 /// `new_chain` list in `cache_end_insert()` (`rfc1035.c:1121-1128`).
 ///
-/// Two kinds of reply are staged and then dropped without ever being committed:
+/// Two header bits are tested there, and they behave very differently in
+/// practice:
 ///
+/// * `CD` set — the client asked to do its own validation, so the answer is not
+///   ours to keep.  This is a live gate: the bit is the client's, echoed by the
+///   upstream server.
 /// * `RA` clear — "don't cache replies from non-recursive nameservers, since we
 ///   may get a reply containing a CNAME but not its target, even though the
-///   target does exist".
-/// * `CD` set — the client asked to do its own validation, so the answer is not
-///   ours to keep.
+///   target does exist".  This one is vestigial on the forwarding path, because
+///   `process_reply()` sets `HB4_RA` on the reply (`forward.c:776`) before it
+///   calls `extract_addresses()` (`forward.c:824`) — see
+///   `forward::set_recursion_available`.  The test is kept here so this function
+///   stays a faithful port for any caller that has *not* been through that step;
+///   it is deliberately not what stops a non-recursive server's answers from
+///   being cached, because upstream does cache them.
 ///
 /// Staging is also what makes a bail-out leave *nothing* behind: C never reaches
 /// `cache_end_insert()` when `extract_addresses()` returns 1 (rebind) or 2 (bad
@@ -772,7 +785,7 @@ pub fn extract_addresses(
                     let ip = Ipv4Addr::new(
                         rr.rdata[0], rr.rdata[1], rr.rdata[2], rr.rdata[3],
                     );
-                    if config.check_rebind && private_net(ip, true) {
+                    if config.check_rebind && private_net(ip, !config.local_rebind_ok) {
                         return ExtractResult::RebindBlocked;
                     }
                     AllAddr::Addr4(ip)
@@ -782,7 +795,7 @@ pub fn extract_addresses(
                     let mut b = [0u8; 16];
                     b.copy_from_slice(&rr.rdata[..16]);
                     let ip = Ipv6Addr::from(b);
-                    if config.check_rebind && private_net6(&ip, true) {
+                    if config.check_rebind && private_net6(&ip, !config.local_rebind_ok) {
                         return ExtractResult::RebindBlocked;
                     }
                     AllAddr::Addr6(ip)
@@ -2049,6 +2062,59 @@ mod tests {
         assert_eq!(cache.inserts, 0);
     }
 
+    /// `rebind-localhost-ok` is C's `private_net(addr, !option_bool(OPT_LOCAL_REBIND))`
+    /// (`rfc1035.c:997`): loopback stops counting as private, everything else
+    /// still does.
+    #[test]
+    fn extract_rebind_localhost_ok_exempts_loopback_only() {
+        let cfg = ExtractConfig { check_rebind: true, local_rebind_ok: true, ..Default::default() };
+
+        let mut pkt = reply_header(22, 1, 1, 0, 0);
+        push_question(&mut pkt, "lo.example.com", 1);
+        push_rr(&mut pkt, "lo.example.com", 1, 300, &[127, 0, 0, 1]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        assert_eq!(extract_addresses(&dp, &mut cache, now, &cfg), ExtractResult::Cached);
+        assert!(cache.lookup_by_name("lo.example.com", F_IPV4, now).is_some());
+
+        // ::1 likewise, via private_net6().
+        let mut v6 = reply_header(23, 1, 1, 0, 0);
+        push_question(&mut v6, "lo6.example.com", 28);
+        push_rr(&mut v6, "lo6.example.com", 28, 300, &Ipv6Addr::LOCALHOST.octets());
+        let dp6 = DnsPacket::parse(&v6).unwrap();
+        assert_eq!(extract_addresses(&dp6, &mut cache, now, &cfg), ExtractResult::Cached);
+        assert!(cache.lookup_by_name("lo6.example.com", F_IPV6, now).is_some());
+
+        // RFC1918 space is still blocked: the option narrows the check, it does
+        // not disable it.
+        let mut priv4 = reply_header(24, 1, 1, 0, 0);
+        push_question(&mut priv4, "evil.example.com", 1);
+        push_rr(&mut priv4, "evil.example.com", 1, 300, &[10, 1, 2, 3]);
+        let dp4 = DnsPacket::parse(&priv4).unwrap();
+        assert_eq!(
+            extract_addresses(&dp4, &mut cache, now, &cfg),
+            ExtractResult::RebindBlocked
+        );
+    }
+
+    /// Without the option, loopback is private — the default `ban_localhost`
+    /// argument is `true`.
+    #[test]
+    fn extract_rebind_blocks_loopback_by_default() {
+        let mut pkt = reply_header(25, 1, 1, 0, 0);
+        push_question(&mut pkt, "lo.example.com", 1);
+        push_rr(&mut pkt, "lo.example.com", 1, 300, &[127, 0, 0, 1]);
+
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        let mut cache = DnsCache::new(100);
+        let cfg = ExtractConfig { check_rebind: true, ..Default::default() };
+        assert_eq!(
+            extract_addresses(&dp, &mut cache, Instant::now(), &cfg),
+            ExtractResult::RebindBlocked
+        );
+    }
+
     /// C never reaches `cache_end_insert()` when `extract_addresses()` bails out
     /// with the rebind code, so the records it walked *before* the offending one
     /// are discarded with it.  Committing record-by-record would leave the
@@ -2081,6 +2147,11 @@ mod tests {
     /// "Don't cache replies from non-recursive nameservers, since we may get a
     /// reply containing a CNAME but not its target, even though the target does
     /// exist." (`rfc1035.c:1121-1127`).
+    ///
+    /// This tests the gate at *this* layer only.  The forwarding path sets `RA`
+    /// on every reply before extraction (`forward.c:776`), so a real
+    /// non-recursive answer is cached — see
+    /// `tests/forward_cache_integration.rs::reply_without_the_ra_bit_is_cached_and_relayed_with_ra_set`.
     #[test]
     fn reply_without_ra_is_parsed_but_not_committed() {
         let mut pkt = reply_header(21, 1, 1, 0, 0);

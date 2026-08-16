@@ -550,7 +550,7 @@ pub fn daemon_cache_size(daemon: &Daemon) -> usize {
 /// so anything added to `ForwardConfig` has to be threaded through this
 /// function as well.
 pub fn daemon_forward_config(daemon: &Daemon) -> crate::forward::ForwardConfig {
-    use crate::types::constants::{OPT_NO_NEG, OPT_NO_REBIND};
+    use crate::types::constants::{OPT_LOCAL_REBIND, OPT_NO_NEG, OPT_NO_REBIND};
 
     crate::forward::ForwardConfig {
         upstreams: daemon
@@ -566,6 +566,7 @@ pub fn daemon_forward_config(daemon: &Daemon) -> crate::forward::ForwardConfig {
         neg_ttl:       daemon.neg_ttl,
         no_neg_cache:  daemon.option_bool(OPT_NO_NEG),
         check_rebind:  daemon.option_bool(OPT_NO_REBIND),
+        local_rebind_ok: daemon.option_bool(OPT_LOCAL_REBIND),
         no_rebind:     daemon.no_rebind.clone(),
         ..Default::default()
     }

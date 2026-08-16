@@ -15,6 +15,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::cache::DnsCache;
 use crate::hash_questions::hash_questions;
 use crate::metrics::{inc_metric, Metric};
+use crate::dns_protocol::HB4_RA;
 use crate::rfc1035::{
     answer_request, private_net, private_net6, DnsPacket, ExtractConfig, ExtractResult,
     LocalConfig,
@@ -823,6 +824,8 @@ pub struct ForwardConfig {
     pub no_neg_cache: bool,
     /// `--stop-dns-rebind`: reject private addresses in upstream answers.
     pub check_rebind: bool,
+    /// `--rebind-localhost-ok`: exempt loopback addresses from that check.
+    pub local_rebind_ok: bool,
     /// `--rebind-domain-ok`: domains exempt from the rebind check.
     pub no_rebind: Vec<RebindDomain>,
 }
@@ -841,6 +844,7 @@ impl Default for ForwardConfig {
             neg_ttl:       0,
             no_neg_cache:  false,
             check_rebind:  false,
+            local_rebind_ok: false,
             no_rebind:     Vec::new(),
         }
     }
@@ -858,6 +862,7 @@ impl ForwardConfig {
             max_ttl:      self.max_ttl,
             neg_ttl:      self.neg_ttl,
             check_rebind: self.check_rebind && !domain_no_rebind(qname, &self.no_rebind),
+            local_rebind_ok: self.local_rebind_ok,
             no_neg_cache: self.no_neg_cache,
             // DNSSEC validation is not wired into the forward path yet, so no
             // reply is ever marked authenticated.  See `tasks.md`.
@@ -1568,6 +1573,27 @@ fn cache_upstream_reply(
     }
 }
 
+/// Set `RA` (recursion available) on a reply in place.
+///
+/// C does this to every reply it processes — `header->hb4 |= HB4_RA;`
+/// (`forward.c:776`) — before the opcode and rcode checks, before the
+/// truncation check, and before `extract_addresses()`.  Two consequences follow
+/// and both are load-bearing:
+///
+/// * The client is told what *this* server offers, not what the upstream server
+///   happened to answer with.  `dnsmasq` recurses on the client's behalf, so
+///   `RA` is always true of it.
+/// * The `RA` test guarding `cache_end_insert()` (`rfc1035.c:1124-1127`) is
+///   consequently always true on the live path, so a reply from a
+///   non-recursive nameserver — an authoritative server named by
+///   `server=/domain/addr` answers `RA=0` — is cached like any other.  Skipping
+///   this bit would leave caching inert for that whole class of configuration.
+fn set_recursion_available(pkt: &mut [u8]) {
+    if pkt.len() >= 12 {
+        pkt[3] |= HB4_RA;
+    }
+}
+
 /// Overwrite the RCODE nibble of a DNS packet in place.
 fn set_rcode(pkt: &mut [u8], rcode: u8) {
     if pkt.len() >= 12 {
@@ -1662,6 +1688,12 @@ pub async fn run_forward_loop_on(
                 // went to.  A failed check leaves the pending entry alone so
                 // the genuine answer can still be accepted.
                 let Some(pending) = engine.accept_reply(&pkt, upstream_addr) else { continue };
+
+                // Answer the client as a recursive resolver, whatever the
+                // upstream server claimed to be (`forward.c:776`).  This
+                // precedes both the truncation check and extraction, exactly as
+                // it does in C.
+                set_recursion_available(&mut pkt);
 
                 let reply_listener = if pending.listener < listeners.len() {
                     pending.listener
@@ -1782,6 +1814,9 @@ pub enum ProcessReplyResult {
 pub struct ProcessReplyConfig {
     /// Reject RFC 1918 / 5735 addresses that resolve via global DNS.
     pub check_rebind: bool,
+    /// `--rebind-localhost-ok`: exempt loopback addresses from that check
+    /// (`private_net(addr, !option_bool(OPT_LOCAL_REBIND))`, `rfc1035.c:997`).
+    pub local_rebind_ok: bool,
     /// Skip caching even for valid answers.
     pub no_cache:     bool,
     /// Answer has been validated as DNSSEC-secure.
@@ -1851,12 +1886,12 @@ pub fn process_reply(
         let rebind = parsed.answers.iter().any(|rr| match rr.rtype {
             1 if rr.class == 1 && rr.rdata.len() >= 4 => {
                 let ip = Ipv4Addr::new(rr.rdata[0], rr.rdata[1], rr.rdata[2], rr.rdata[3]);
-                private_net(ip, true)
+                private_net(ip, !config.local_rebind_ok)
             }
             28 if rr.class == 1 && rr.rdata.len() >= 16 => {
                 let mut octets = [0u8; 16];
                 octets.copy_from_slice(&rr.rdata[..16]);
-                private_net6(&Ipv6Addr::from(octets), true)
+                private_net6(&Ipv6Addr::from(octets), !config.local_rebind_ok)
             }
             _ => false,
         });
@@ -2716,6 +2751,26 @@ mod tests {
     fn domain_no_rebind_no_match() {
         let list = vec![rebind("home.arpa")];
         assert!(!domain_no_rebind("example.com", &list));
+    }
+
+    // ── set_recursion_available ───────────────────────────────────────────────
+
+    /// `header->hb4 |= HB4_RA` (`forward.c:776`) — set the bit, touch nothing
+    /// else, including the RCODE nibble that shares the octet.
+    #[test]
+    fn set_recursion_available_sets_only_the_ra_bit() {
+        let mut pkt = vec![0u8; 12];
+        pkt[3] = 0x03; // NXDOMAIN, RA clear
+        set_recursion_available(&mut pkt);
+        assert_eq!(pkt[3], HB4_RA | 0x03);
+        assert!(pkt[..3].iter().all(|b| *b == 0) && pkt[4..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn set_recursion_available_ignores_a_runt_packet() {
+        let mut pkt = vec![0u8; 4];
+        set_recursion_available(&mut pkt);
+        assert_eq!(pkt, vec![0u8; 4], "a header-less datagram must not be rewritten");
     }
 
     // ── domain_find_sets ──────────────────────────────────────────────────────

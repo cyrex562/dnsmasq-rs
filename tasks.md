@@ -100,7 +100,7 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   `rfc1035::extract_addresses` for every accepted, non-truncated upstream reply, mirroring
   the unconditional `extract_addresses()` call `process_reply()` makes at `forward.c:824`.
   A repeated query is answered from the cache and never reaches an upstream server.
-  Covered by `tests/forward_cache_integration.rs` (19 tests driving the real loop against a
+  Covered by `tests/forward_cache_integration.rs` (22 tests driving the real loop against a
   scripted fake upstream, counting the datagrams that actually reach it) and the round-trip
   hit/miss tests in `tests/cache_integration.rs`.
 
@@ -108,8 +108,14 @@ Both are reference-only. Do not treat either tree as code to edit in place.
 
   - `dnsmasq::daemon_forward_config` is the single `Daemon` → `ForwardConfig` conversion.
     `cache-size`, `min-cache-ttl`, `max-cache-ttl`, `max-ttl`, `neg-ttl`, `no-negcache`,
-    `stop-dns-rebind` (`OPT_NO_REBIND`) and `rebind-domain-ok` (`no_rebind`) are all copied
-    there and all observably affect run-time behavior.
+    `stop-dns-rebind` (`OPT_NO_REBIND`), `rebind-localhost-ok` (`OPT_LOCAL_REBIND`) and
+    `rebind-domain-ok` (`no_rebind`) are all copied there and all observably affect run-time
+    behavior.
+  - `rebind-localhost-ok` reaches the rebind test as `ExtractConfig::local_rebind_ok` and is
+    passed to `private_net` / `private_net6` as `!local_rebind_ok`, which is C's
+    `private_net(addr.addr4, !option_bool(OPT_LOCAL_REBIND))` (`rfc1035.c:997,1001`). It
+    narrows the check to exempt `127.0.0.0/8` and `::1`; RFC1918, ULA and link-local space
+    stay blocked.
   - `min-cache-ttl` / `max-cache-ttl` are enforced in `DnsCache::really_insert`, and
     `extract_addresses` now inserts through `really_insert` rather than `insert`. Building
     the cache with `with_ttl_limits` alone would *look* wired without being wired — the
@@ -140,8 +146,14 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     into a local list and `commit_staged` writes them only when the walk finishes cleanly, so
     a reply that bails out with `RebindBlocked` or `BadPacket` leaves nothing behind — not
     even the records processed before the offending one. The same gate drops replies with
-    `RA` clear (a non-recursive server can return a CNAME without its target) or `CD` set
-    (the client is validating for itself).
+    `CD` set (the client is validating for itself).
+  - Every accepted reply gets `RA` set before anything else looks at it
+    (`forward::set_recursion_available`, C's `header->hb4 |= HB4_RA` at `forward.c:776`),
+    which is both what the client sees and why the `RA` half of `commit_staged`'s gate
+    (`rfc1035.c:1124-1127`) is always true on the live path. An answer from a non-recursive
+    nameserver — what an authoritative server named by `server=/domain/addr` returns — is
+    therefore cached like any other, as it is in C. The check is kept in `commit_staged` for
+    fidelity to `rfc1035.c`, but it is not what governs caching here.
   - A cached CNAME does **not** answer a query by itself. Upstream sets `ans` for a CNAME only
     when the record is `F_CONFIG` or `qtype == T_CNAME` (`rfc1035.c:1704-1705`); otherwise the
     chain has to bottom out in something that answers, or `if (!ans) return 0`
@@ -166,6 +178,14 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   - DNSSEC. `ForwardConfig::extract_config` always sets `secure: false`, so no cached record
     is ever marked `F_DNSSECOK` and `cache_secure` / `bogusanswer` have no live equivalent.
     `process_reply`/`ProcessReplyConfig` in `forward.rs` model this but have no live caller.
+  - The `AD` bit on a relayed reply. `RA` is now set the way C does it, but C also *clears*
+    `AD` twelve lines earlier — `if (!is_sign && !option_bool(OPT_DNSSEC_PROXY)) header->hb4
+    &= ~HB4_AD;` (`forward.c:764`, RFC 4035 §4.6 para 3) — so a non-validating forwarder does
+    not pass an upstream server's `AD` claim through. The Rust reply path relays `AD`
+    untouched, which makes `proxy-dnssec` (`OPT_DNSSEC_PROXY`, parsed at `option.rs:773`) an
+    option nothing reads. Porting it needs the `is_sign` half too: C leaves the header alone
+    when the reply carries a SIG(0)/TSIG record, and `find_pseudoheader` has no Rust
+    equivalent on this path.
   - `--dhcp-ttl` / `use_dhcp_ttl`. `crec_ttl` returns the stored TTL for any `F_IMMORTAL`
     record; C additionally applies a lease-length ceiling to `F_DHCP` entries
     (`rfc1035.c:1577-1585`).
