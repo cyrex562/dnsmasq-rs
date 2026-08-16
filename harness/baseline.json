@@ -3,36 +3,36 @@
     "default": {
       "cargo_flags": [],
       "tests": {
-        "passed": 3092,
+        "passed": 3223,
         "failed": 0,
         "ignored": 1
       },
-      "clippy_warnings": 194
+      "clippy_warnings": 192
     },
     "all-features": {
       "cargo_flags": [
         "--all-features"
       ],
       "tests": {
-        "passed": 3132,
+        "passed": 3263,
         "failed": 0,
         "ignored": 1
       },
-      "clippy_warnings": 196
+      "clippy_warnings": 194
     },
     "no-default-features": {
       "cargo_flags": [
         "--no-default-features"
       ],
       "tests": {
-        "passed": 1684,
+        "passed": 1815,
         "failed": 0,
         "ignored": 0
       },
-      "clippy_warnings": 141
+      "clippy_warnings": 139
     }
   },
-  "git_commit": "33cb836090bc794162afaeefb2f6636d34faef3e",
+  "git_commit": "0a85775a403184b93d9fbd3cc29eb46a8dc261e4",
   "parity": {
     "fixture": "dns/basic",
     "cases_total": 8,
