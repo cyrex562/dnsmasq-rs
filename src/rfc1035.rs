@@ -1353,17 +1353,27 @@ fn answer_address(rr: &DnsRr) -> Option<AllAddr> {
     }
 }
 
-/// The first answer RR whose address falls in one of `ranges`, with its TTL.
+/// The first answer RR whose address falls in one of `ranges`, with its owner
+/// name and TTL.
 ///
 /// Port of `check_bad_address()` (`rfc1035.c:1319`), the shared engine behind
 /// both `check_for_bogus_wildcard()` and `check_for_ignored_address()`.
-fn find_bad_address(packet: &DnsPacket, ranges: &[BogusAddr]) -> Option<u32> {
+///
+/// C's `name` parameter is an in/out buffer that `extract_name()` overwrites
+/// with each answer's owner as the walk proceeds (`rfc1035.c:1332-1333`), so
+/// when the function returns 1 the caller's buffer holds the *matching*
+/// record's owner name — which after a CNAME chain is the chain target, not the
+/// question.  Returning the name here keeps that observable.
+fn find_bad_address<'a>(packet: &'a DnsPacket, ranges: &[BogusAddr]) -> Option<(&'a str, u32)> {
     if ranges.is_empty() {
         return None;
     }
     packet.answers.iter().find_map(|rr| {
         let addr = answer_address(rr)?;
-        ranges.iter().any(|r| addr_in_bogus_range(&addr, r)).then_some(rr.ttl)
+        ranges
+            .iter()
+            .any(|r| addr_in_bogus_range(&addr, r))
+            .then_some((rr.name.as_str(), rr.ttl))
     })
 }
 
@@ -1371,28 +1381,35 @@ fn find_bad_address(packet: &DnsPacket, ranges: &[BogusAddr]) -> Option<u32> {
 /// (`--bogus-nxdomain`).
 ///
 /// If a match is found, inserts an NXDOMAIN negative cache entry for the
-/// question name and returns `true`.  The TTL comes from the offending answer
-/// record: C notes that there is "no SOA record to get the ttl from in the
+/// offending record's owner name and returns `true`.  The TTL comes from that
+/// same record: C notes that there is "no SOA record to get the ttl from in the
 /// normal processing" and uses the bogus answer's own TTL (`rfc1035.c:1406`).
+///
+/// The insert goes through [`DnsCache::really_insert`] because C reaches it via
+/// `cache_insert()` (`cache.c:661-687`), which applies `max-cache-ttl` /
+/// `min-cache-ttl` clamping and zero-TTL rejection before the entry lands.
+/// Calling `insert()` directly here would make both directives silent no-ops on
+/// this path.
 pub fn check_for_bogus_wildcard(
     packet:      &DnsPacket,
     cache:       &mut DnsCache,
     now:         Instant,
     bogus_addrs: &[BogusAddr],
 ) -> bool {
-    let Some(ttl) = find_bad_address(packet, bogus_addrs) else { return false };
+    let Some((name, ttl)) = find_bad_address(packet, bogus_addrs) else { return false };
 
-    if let Some(name) = packet.questions.first().map(|q| q.name.to_lowercase()) {
-        cache.insert(CacheRecord {
-            name,
+    cache.really_insert(
+        CacheRecord {
+            name:    name.to_lowercase(),
             flags:   F_FORWARD | F_NEG | F_NXDOMAIN,
             ttl,
             expires: now + Duration::from_secs(u64::from(ttl)),
             addr:    None,
             rdata:   None,
             uid:     UID_NONE,
-        });
-    }
+        },
+        now,
+    );
     true
 }
 
@@ -2523,6 +2540,98 @@ mod tests {
         // NXDOMAIN entry should now be in cache, at the offending answer's TTL.
         let rec = cache.lookup_by_name("evil.example.com", F_NXDOMAIN | F_NEG, now);
         assert_eq!(rec.map(|r| r.ttl), Some(60));
+    }
+
+    /// C caches the NXDOMAIN under the owner name of the *matching* answer RR,
+    /// not the question name: `check_bad_address()` re-extracts `name` from
+    /// every answer as it walks (`rfc1035.c:1332-1333`), so whatever is left in
+    /// the buffer when it returns 1 is the offending record's owner.  After a
+    /// CNAME chain that is the chain target, not the question.
+    #[test]
+    fn check_bogus_wildcard_caches_under_the_matching_owner_name() {
+        let ba = BogusAddr {
+            is6: false,
+            prefix: 32,
+            addr: AllAddr::Addr4(Ipv4Addr::new(1, 2, 3, 4)),
+        };
+        let mut pkt = reply_header(16, 1, 2, 0, 0);
+        push_question(&mut pkt, "www.example.com", 1);
+        // CNAME www.example.com -> wildcard.isp.example, then the bogus A.
+        let mut target = BytesMut::new();
+        write_name(&mut target, "wildcard.isp.example");
+        push_rr(&mut pkt, "www.example.com", 5, 60, &target);
+        push_rr(&mut pkt, "wildcard.isp.example", 1, 60, &[1, 2, 3, 4]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        assert!(check_for_bogus_wildcard(&dp, &mut cache, now, std::slice::from_ref(&ba)));
+        assert!(cache.lookup_by_name("wildcard.isp.example", F_NXDOMAIN | F_NEG, now).is_some());
+        assert!(cache.lookup_by_name("www.example.com", F_NXDOMAIN | F_NEG, now).is_none());
+    }
+
+    /// The insert goes through `really_insert()`, so `--max-cache-ttl` clamps it
+    /// exactly as it clamps every other DNS answer.  C reaches this entry via
+    /// `cache_insert()` (`cache.c:661-687`), which applies the clamp before
+    /// `really_insert()` ever sees the record.
+    #[test]
+    fn check_bogus_wildcard_insert_obeys_max_cache_ttl() {
+        let ba = BogusAddr {
+            is6: false,
+            prefix: 32,
+            addr: AllAddr::Addr4(Ipv4Addr::new(1, 2, 3, 4)),
+        };
+        let mut pkt = reply_header(17, 1, 1, 0, 0);
+        push_question(&mut pkt, "evil.example.com", 1);
+        push_rr(&mut pkt, "evil.example.com", 1, 86400, &[1, 2, 3, 4]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        let mut cache = DnsCache::with_ttl_limits(100, 0, 60);
+        let now = Instant::now();
+        assert!(check_for_bogus_wildcard(&dp, &mut cache, now, std::slice::from_ref(&ba)));
+        let rec = cache.lookup_by_name("evil.example.com", F_NXDOMAIN | F_NEG, now);
+        assert_eq!(rec.map(|r| r.ttl), Some(60));
+    }
+
+    /// `--min-cache-ttl` raises the floor on the same path.
+    #[test]
+    fn check_bogus_wildcard_insert_obeys_min_cache_ttl() {
+        let ba = BogusAddr {
+            is6: false,
+            prefix: 32,
+            addr: AllAddr::Addr4(Ipv4Addr::new(1, 2, 3, 4)),
+        };
+        let mut pkt = reply_header(18, 1, 1, 0, 0);
+        push_question(&mut pkt, "evil.example.com", 1);
+        push_rr(&mut pkt, "evil.example.com", 1, 5, &[1, 2, 3, 4]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        let mut cache = DnsCache::with_ttl_limits(100, 600, 0);
+        let now = Instant::now();
+        assert!(check_for_bogus_wildcard(&dp, &mut cache, now, std::slice::from_ref(&ba)));
+        let rec = cache.lookup_by_name("evil.example.com", F_NXDOMAIN | F_NEG, now);
+        assert_eq!(rec.map(|r| r.ttl), Some(600));
+    }
+
+    /// A zero-TTL bogus answer is rejected by `really_insert()` rather than
+    /// stored as an instantly-stale entry — but the reply is still rewritten to
+    /// NXDOMAIN, since the return value drives the caller, not the insert.
+    #[test]
+    fn check_bogus_wildcard_drops_a_zero_ttl_insert_but_still_fires() {
+        let ba = BogusAddr {
+            is6: false,
+            prefix: 32,
+            addr: AllAddr::Addr4(Ipv4Addr::new(1, 2, 3, 4)),
+        };
+        let mut pkt = reply_header(19, 1, 1, 0, 0);
+        push_question(&mut pkt, "evil.example.com", 1);
+        push_rr(&mut pkt, "evil.example.com", 1, 0, &[1, 2, 3, 4]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        assert!(check_for_bogus_wildcard(&dp, &mut cache, now, std::slice::from_ref(&ba)));
+        assert!(cache.lookup_by_name("evil.example.com", F_NXDOMAIN | F_NEG, now).is_none());
     }
 
     /// `--bogus-nxdomain` takes an IPv6 prefix too, and `check_bad_address()`

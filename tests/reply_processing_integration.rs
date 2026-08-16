@@ -88,6 +88,12 @@ fn rrsig_rr(name: &str, covered: u16, ttl: u32) -> DnsRr {
     DnsRr { name: name.to_string(), rtype: 46, class: 1, ttl, rdata: rd.to_vec() }
 }
 
+fn cname_rr(name: &str, target: &str, ttl: u32) -> DnsRr {
+    let mut rd = BytesMut::new();
+    write_name(&mut rd, target);
+    DnsRr { name: name.to_string(), rtype: 5, class: 1, ttl, rdata: rd.to_vec() }
+}
+
 fn caa_rr(name: &str, ttl: u32) -> DnsRr {
     let mut rd = BytesMut::new();
     rd.put_u8(0); // flags
@@ -318,6 +324,59 @@ async fn bogus_nxdomain_matches_an_ipv6_prefix() {
     let reply = ask(server.addr, &query_wire("typo6.test", 28, 0x2004)).await.expect("no reply");
     assert_eq!(reply.header.rcode(), 3, "bogus wildcard AAAA must become NXDOMAIN");
     assert!(reply.answers.is_empty());
+
+    shutdown(server, upstream);
+}
+
+/// `check_for_bogus_wildcard()` "does its own caching" (`forward.c:808`), and
+/// the name it caches under is the owner of the *matching* answer RR, not the
+/// question: C's `check_bad_address()` overwrites its `name` buffer from every
+/// answer as it walks (`rfc1035.c:1332`).  Behind a CNAME that is the chain
+/// target, so a later direct query for the target is answered NXDOMAIN from the
+/// cache without a second trip upstream.
+#[tokio::test]
+async fn bogus_nxdomain_negative_entry_is_cached_under_the_matching_owner() {
+    let Some(upstream) = spawn_upstream(|q| {
+        let qname = q.questions.first()?.name.clone();
+        if qname == "typo.test" {
+            Some(reply_to(
+                q,
+                0,
+                vec![
+                    cname_rr("typo.test", "wildcard.isp.test", 300),
+                    a_rr("wildcard.isp.test", Ipv4Addr::new(64, 94, 110, 11), 300),
+                ],
+                vec![],
+            ))
+        } else {
+            // A perfectly good answer, which must never be reached: the
+            // negative entry cached under this name has to answer first.
+            answer(q, vec![a_rr("wildcard.isp.test", Ipv4Addr::new(192, 0, 2, 7), 300)])
+        }
+    })
+    .await
+    else {
+        return;
+    };
+    let Some(server) =
+        spawn_server(config_from_text("bogus-nxdomain=64.94.110.11\n", upstream.addr)).await
+    else {
+        return;
+    };
+
+    let first = ask(server.addr, &query_wire("typo.test", 1, 0x2011)).await.expect("no reply");
+    assert_eq!(first.header.rcode(), 3, "bogus wildcard behind a CNAME must become NXDOMAIN");
+    assert_eq!(upstream.seen(), 1);
+
+    let second =
+        ask(server.addr, &query_wire("wildcard.isp.test", 1, 0x2012)).await.expect("no reply");
+    assert_eq!(
+        second.header.rcode(),
+        3,
+        "the negative entry must be keyed on the offending record's owner name",
+    );
+    assert!(second.answers.is_empty());
+    assert_eq!(upstream.seen(), 1, "the cached NXDOMAIN must answer without going upstream");
 
     shutdown(server, upstream);
 }

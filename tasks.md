@@ -239,6 +239,15 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     IPv6 prefix (`option.c` case `'B'`) and `check_bad_address()` checks both — and takes the
     negative entry's TTL from the offending answer rather than `local-ttl`, which is what C
     does and why (`rfc1035.c:1406`: "there is no SOA record to get the ttl from").
+  - That negative entry goes in through `DnsCache::really_insert`, not `insert`. C reaches it
+    via `cache_insert()` (`cache.c:661-687`), which applies `--max-cache-ttl` /
+    `--min-cache-ttl` clamping and then `really_insert()`'s zero-TTL rejection; inserting
+    directly would have made both directives silent no-ops for every `--bogus-nxdomain` hit,
+    and the entry is live — `answer_locally` serves it.
+  - It is keyed on the owner name of the *matching* answer record, not the question name.
+    C's `check_bad_address()` re-extracts `name` from every answer as it walks
+    (`rfc1035.c:1332`), so the buffer the caller passed holds the offending record's owner
+    when it returns 1 — behind a CNAME that is the chain target.
   - The DNSSEC halves are gated on `--dnssec` (`OPT_DNSSEC_VALID`) exactly as C gates them.
     Without it, C neither resets the DO bit nor strips DNSSEC RRs, so neither do we.
 
