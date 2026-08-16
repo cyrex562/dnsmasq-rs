@@ -481,14 +481,22 @@ impl FrecTable {
 
     /// Find a live (non-expired) `Frec` matching `id` and flag criteria.
     ///
-    /// `id = 0xFFFF` is treated as a wildcard (match any new_id).
+    /// `id = None` matches on the flags alone — C's `id == -1`
+    /// (`forward.c:3227`).  It is deliberately *not* spelled as some reserved
+    /// 16-bit value: C's `id` argument is an `int`, and the only wire-derived
+    /// value ever passed to it is `ntohs(header->id)` (`forward.c:1173`), so
+    /// `-1` is unreachable from a packet.  A sentinel inside the ID space would
+    /// be reachable, and a forged reply carrying it would match whatever query
+    /// happened to be in flight — collapsing the transaction ID to zero bits of
+    /// the credential guarding [`ForwardEngine::validate_reply`].
+    ///
     /// A `Frec` older than `4 * FREC_TIMEOUT_SECS` is never returned.
     ///
     /// Mirrors C's `lookup_frec()`.
     pub fn lookup_frec(
         &self,
         now:       Instant,
-        id:        u16,
+        id:        Option<u16>,
         flags:     u32,
         flagmask:  u32,
     ) -> Option<usize> {
@@ -500,44 +508,13 @@ impl FrecTable {
             if (f.flags & flagmask) != flags {
                 continue;
             }
-            if id != u16::MAX && f.new_id != id {
+            if id.is_some_and(|want| f.new_id != want) {
                 continue;
             }
             if now.duration_since(f.sent_at) >= hard_timeout {
                 return None;
             }
             return Some(i);
-        }
-        None
-    }
-
-    /// Find a live `Frec` matching the given stash bytes, id, and flags.
-    ///
-    /// This variant searches by comparing stash content (first `cmp_len`
-    /// bytes), useful when the query name is encoded in the stash.
-    ///
-    /// Returns the index if found.
-    pub fn lookup_frec_by_stash(
-        &self,
-        now:      Instant,
-        stash:    &[u8],
-        cmp_len:  usize,
-        id:       u16,
-        flags:    u32,
-        flagmask: u32,
-    ) -> Option<usize> {
-        let hard_timeout = Duration::from_secs(4 * FREC_TIMEOUT_SECS);
-        for (i, f) in self.frecs.iter().enumerate() {
-            if f.sentto.is_none() { continue; }
-            if (f.flags & flagmask) != flags { continue; }
-            if id != u16::MAX && f.new_id != id { continue; }
-            if now.duration_since(f.sent_at) >= hard_timeout { continue; }
-            if let Some(saved) = &f.stash {
-                let n = cmp_len.min(saved.len()).min(stash.len());
-                if saved[..n] == stash[..n] {
-                    return Some(i);
-                }
-            }
         }
         None
     }
@@ -791,6 +768,19 @@ pub struct RandFdPool {
     finger:         usize,
 }
 
+/// The process file-descriptor ceiling, C's `sysconf(_SC_OPEN_MAX)`
+/// (`dnsmasq.c:56`).
+///
+/// C reads it once at startup and lets a negative return propagate into the
+/// arithmetic; we treat an unavailable or nonsensical answer as "no ceiling"
+/// instead, leaving the query table the only thing sizing the pool, because
+/// `sysconf` failing is not a reason to run with one source port.
+fn open_max() -> usize {
+    // SAFETY: `sysconf` reads no memory we own and returns a plain `long`.
+    let n = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    if n > 0 { n as usize } else { usize::MAX }
+}
+
 impl RandFdPool {
     /// Create an empty pool of `numrrand` slots.
     pub fn new(numrrand: usize, randport_limit: usize) -> Self {
@@ -803,10 +793,28 @@ impl RandFdPool {
     }
 
     /// Size the pool the way `dnsmasq.c:425-431` does: half the query table,
-    /// but never zero (a pool of zero slots would force every query onto the
-    /// shared/temporary path and defeat the point of the thing).
+    /// capped at a third of the process file-descriptor limit.
+    ///
+    /// Both halves matter.  Without the fd cap a large `--dns-forward-max`
+    /// sizes the pool past the number of sockets the process may open, and
+    /// every `bind()` beyond the limit fails — [`RandFdPool::allocate`] returns
+    /// `None`, the query never leaves, and the client sees a REFUSED it has no
+    /// way to explain.
     pub fn sized_for(ftabsize: usize, randport_limit: usize) -> Self {
-        Self::new((ftabsize / 2).max(1), randport_limit)
+        Self::sized_for_with_fd_limit(ftabsize, randport_limit, open_max())
+    }
+
+    /// [`RandFdPool::sized_for`] against an explicit fd limit, so the sizing
+    /// rule can be tested without depending on the host's `ulimit`.
+    ///
+    /// Unlike C this never yields zero slots: a pool of none would push every
+    /// query onto the shared/temporary path and defeat the point of the thing.
+    pub fn sized_for_with_fd_limit(
+        ftabsize:       usize,
+        randport_limit: usize,
+        max_fd:         usize,
+    ) -> Self {
+        Self::new((ftabsize / 2).min(max_fd / 3).max(1), randport_limit)
     }
 
     /// Allocate a source socket for a send to `server_idx`, recording it in the
@@ -1202,9 +1210,15 @@ impl ForwardEngine {
         if pkt.len() < 12 {
             return ForwardOutcome::Dropped;
         }
-        // C refuses to forward a query whose question it cannot read: it would
-        // have no way to recognise the answer (`forward.c:337-343`).
-        let Some(qhash) = hash_questions(pkt) else { return ForwardOutcome::Dropped };
+        // A query whose question C cannot read is not forwarded — C would have
+        // no way to recognise the answer — but it is not dropped either: it
+        // falls through to the `reply:` label with `flags = 0`, which
+        // `make_local_answer()` renders as REFUSED (`forward.c:337-343`,
+        // `domain-match.c:411-430`).  Where C's `make_local_answer()` gives up
+        // because `skip_questions()` cannot walk the question section, so does
+        // ours — `make_refused_answer` returns `None` and the caller sends
+        // nothing.
+        let Some(qhash) = hash_questions(pkt) else { return ForwardOutcome::Refused };
         let orig_id = u16::from_be_bytes([pkt[0], pkt[1]]);
         let now = Instant::now();
         // The EDNS0/DNSSEC context this query is forwarded under: two clients
@@ -1371,7 +1385,7 @@ impl ForwardEngine {
             return None;
         }
         let id  = u16::from_be_bytes([reply[0], reply[1]]);
-        let idx = self.table.lookup_frec(Instant::now(), id, 0, 0)?;
+        let idx = self.table.lookup_frec(Instant::now(), Some(id), 0, 0)?;
         let frec = self.table.get(idx)?;
         if hash_questions(reply)? != frec.question_hash {
             return None;
@@ -2099,9 +2113,14 @@ pub async fn run_forward_loop_on(
                     } else {
                         match engine.forward_query(pkt, src, idx).await {
                             // The query table (or the duplicate-client budget)
-                            // is full.  C answers REFUSED rather than dropping,
-                            // so the client fails fast instead of timing out
-                            // (`forward.c:369`, `domain-match.c:430`).
+                            // is full, or the question could not be read.  C
+                            // answers REFUSED rather than dropping, so the
+                            // client fails fast instead of timing out
+                            // (`forward.c:337-343`, `forward.c:369`,
+                            // `domain-match.c:430`).  `make_refused_answer`
+                            // returning `None` is C's `make_local_answer()`
+                            // bailing out on an unwalkable question section, in
+                            // which case nothing is sent.
                             ForwardOutcome::Refused => {
                                 if let Some(wire) =
                                     make_refused_answer(pkt, engine.config.local.edns_pktsz)
@@ -2956,6 +2975,65 @@ mod tests {
         assert_eq!(engine.accept_reply(&reply, upstream_addr(), TEST_RFD_SLOT).await, ReplyAction::Ignore);
     }
 
+    /// C's match-anything sentinel for `lookup_frec()`'s `id` argument is `-1`
+    /// on an `int` (`forward.c:3227`), and the only wire-derived value ever
+    /// passed there is `ntohs(header->id)` (`forward.c:1173`) — so nothing an
+    /// attacker can put in a packet can reach the sentinel.  Spelling the
+    /// sentinel `0xFFFF` would move it *inside* the 16-bit ID space and let a
+    /// forged reply carrying that one ID match whichever query happens to be in
+    /// flight, reducing the transaction ID to zero bits of the credential and
+    /// leaving the source port alone to defend the cache.
+    #[tokio::test]
+    async fn accept_reply_rejects_a_reply_using_the_wildcard_id() {
+        let (mut engine, query, upstream_id) = engine_with_pending("example.com", 42);
+        // Pin the query's ID away from 0xFFFF so the forgery cannot match it
+        // by luck.
+        let idx = engine
+            .table
+            .lookup_frec(Instant::now(), Some(upstream_id), 0, 0)
+            .expect("query is in flight");
+        engine.table.get_mut(idx).unwrap().new_id = 0x1234;
+
+        let forged = reply_for(&query, u16::MAX);
+        assert_eq!(
+            engine.accept_reply(&forged, upstream_addr(), TEST_RFD_SLOT).await,
+            ReplyAction::Ignore,
+            "0xFFFF is an ordinary transaction ID, not a match-anything wildcard",
+        );
+        // The query survives, so the genuine answer still lands.
+        let real = reply_for(&query, 0x1234);
+        assert!(delivered(engine.accept_reply(&real, upstream_addr(), TEST_RFD_SLOT).await).is_some());
+    }
+
+    /// The other half of the same defect: a query legitimately issued with
+    /// `new_id == 0xFFFF` — which `get_id()` produces roughly once in 65535 —
+    /// must have its own answer matched to it, not to whatever entry the table
+    /// happens to hold first.
+    #[tokio::test]
+    async fn accept_reply_matches_a_query_whose_id_is_0xffff() {
+        let (mut engine, _query, upstream_id) = engine_with_pending("example.com", 42);
+        // An unrelated query ahead of it in the table.
+        let other = make_dns_query("other.test", 1);
+        let other_idx = insert_frec(
+            &mut engine.table,
+            7,
+            client_addr(),
+            0,
+            hash_questions(&other).expect("query must hash"),
+        );
+        let idx = engine
+            .table
+            .lookup_frec(Instant::now(), Some(upstream_id), 0, 0)
+            .expect("query is in flight");
+        assert!(idx < other_idx, "the unrelated query must be scanned first");
+        engine.table.get_mut(other_idx).unwrap().new_id = u16::MAX;
+
+        let reply = reply_for(&other, u16::MAX);
+        let targets = delivered(engine.accept_reply(&reply, upstream_addr(), TEST_RFD_SLOT).await)
+            .expect("0xFFFF must identify the query that actually used it");
+        assert_eq!(targets, vec![ReplyTarget { client: client_addr(), listener: 0, orig_id: 7 }]);
+    }
+
     #[tokio::test]
     async fn accept_reply_rejects_a_reply_from_another_address() {
         let (mut engine, query, upstream_id) = engine_with_pending("example.com", 42);
@@ -3027,7 +3105,7 @@ mod tests {
         let second: SocketAddr = "127.0.0.1:4321".parse().unwrap();
         let idx = engine
             .table
-            .lookup_frec(Instant::now(), upstream_id, 0, 0)
+            .lookup_frec(Instant::now(), Some(upstream_id), 0, 0)
             .expect("query is in flight");
         assert!(engine.table.add_src(idx, src_from(second, 0xBEEF)));
 
@@ -3214,9 +3292,12 @@ mod tests {
     }
 
     /// A malformed query has no recognisable question, so C will not forward it
-    /// — it would have no way to match the answer (`forward.c:337-343`).
+    /// — it would have no way to match the answer.  It does not go quiet
+    /// either: it falls through to the `reply:` label with `flags = 0`, which
+    /// `make_local_answer()` turns into a REFUSED answer for the client
+    /// (`forward.c:337-343`, `domain-match.c:411-430`).
     #[tokio::test]
-    async fn forward_query_drops_a_question_it_cannot_read() {
+    async fn forward_query_refuses_a_question_it_cannot_read() {
         let config = ForwardConfig {
             upstreams: vec![upstream_addr()],
             ..Default::default()
@@ -3224,8 +3305,25 @@ mod tests {
         let mut engine = ForwardEngine::new(config);
         // Header-only packet: qdcount is zero, so there is no question.
         let outcome = engine.forward_query(&[0u8; 12], client_addr(), 0).await;
-        assert_eq!(outcome, ForwardOutcome::Dropped);
+        assert_eq!(outcome, ForwardOutcome::Refused);
         assert_eq!(engine.table.active_count(), 0);
+        // And the REFUSED the caller sends is well-formed.
+        let wire = make_refused_answer(&[0u8; 12], 4096)
+            .expect("a header-only query is still answerable");
+        assert_eq!(wire[3] & 0x0F, 5, "RCODE REFUSED");
+        assert_eq!(wire[2] & 0x80, 0x80, "QR set");
+    }
+
+    /// The limit of that: C's REFUSED is built by `make_local_answer()`, which
+    /// bails out when `skip_questions()` cannot walk the question section
+    /// (`domain-match.c:429-430`), and no reply is sent at all.  A question
+    /// name that runs off the end of the packet is exactly that case.
+    #[test]
+    fn make_refused_answer_declines_a_question_it_cannot_walk() {
+        let mut truncated = vec![0u8; 12];
+        truncated[5] = 1;      // qdcount = 1
+        truncated.push(9);     // a 9-byte label with no bytes behind it
+        assert_eq!(make_refused_answer(&truncated, 4096), None);
     }
 
 
@@ -3385,8 +3483,32 @@ mod tests {
     #[test]
     fn rfd_pool_is_sized_from_the_query_table() {
         // `dnsmasq.c:427` — numrrand = ftabsize / 2, never zero.
-        assert_eq!(RandFdPool::sized_for(150, 1).numrrand, 75);
-        assert_eq!(RandFdPool::sized_for(1, 1).numrrand, 1);
+        assert_eq!(RandFdPool::sized_for_with_fd_limit(150, 1, 1024).numrrand, 75);
+        assert_eq!(RandFdPool::sized_for_with_fd_limit(1, 1, 1024).numrrand, 1);
+    }
+
+    /// `dnsmasq.c:428-429` — the pool is *also* capped at a third of the
+    /// process fd limit.  Without that cap a large `--dns-forward-max` sizes
+    /// the pool past the number of sockets the process may open, and every
+    /// `bind()` past the limit fails: `allocate()` returns `None`, the send
+    /// never happens, and the client is refused for no reason it can see.
+    #[test]
+    fn rfd_pool_is_capped_by_the_fd_limit() {
+        assert_eq!(
+            RandFdPool::sized_for_with_fd_limit(10_000, 1, 90).numrrand,
+            30,
+            "max_fd/3 wins over ftabsize/2",
+        );
+        assert_eq!(
+            RandFdPool::sized_for_with_fd_limit(10, 1, 90).numrrand,
+            5,
+            "ftabsize/2 wins when it is the smaller of the two",
+        );
+        assert_eq!(
+            RandFdPool::sized_for_with_fd_limit(10_000, 1, 2).numrrand,
+            1,
+            "the pool never collapses to zero slots",
+        );
     }
 
     // ── FrecTable ─────────────────────────────────────────────────────────────
@@ -3470,7 +3592,7 @@ mod tests {
         let id = table.get_id();
         table.get_mut(idx).unwrap().sentto = Some(0);
         table.get_mut(idx).unwrap().new_id = id;
-        let found = table.lookup_frec(now, id, 0, 0);
+        let found = table.lookup_frec(now, Some(id), 0, 0);
         assert_eq!(found, Some(idx));
     }
 
@@ -3481,8 +3603,9 @@ mod tests {
         let idx = table.get_new_frec(now, 0, false).unwrap();
         table.get_mut(idx).unwrap().sentto = Some(0);
         table.get_mut(idx).unwrap().new_id = 42;
-        // u16::MAX = wildcard
-        let found = table.lookup_frec(now, u16::MAX, 0, 0);
+        // `None` is C's `id == -1`: match on the flags alone.  It is not
+        // reachable from any 16-bit value on the wire.
+        let found = table.lookup_frec(now, None, 0, 0);
         assert_eq!(found, Some(idx));
     }
 
@@ -3493,7 +3616,7 @@ mod tests {
         let idx = table.get_new_frec(long_ago, 0, false).unwrap();
         table.get_mut(idx).unwrap().sentto = Some(0);
         table.get_mut(idx).unwrap().new_id = 99;
-        let found = table.lookup_frec(Instant::now(), 99, 0, 0);
+        let found = table.lookup_frec(Instant::now(), Some(99), 0, 0);
         assert!(found.is_none(), "expired frec should not be found");
     }
 

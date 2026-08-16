@@ -475,7 +475,27 @@ Both are reference-only. Do not treat either tree as code to edit in place.
 
   A REFUSED generated here re-attaches the client's pseudo-header when the query carried
   one, as C's `reply:` path does via `add_pseudoheader()` (`forward.c:595-601`), advertising
-  our own payload size rather than echoing the client's.
+  our own payload size rather than echoing the client's. A query whose question cannot be
+  read gets that REFUSED too, rather than being dropped: C sets `flags = 0` and jumps to the
+  same `reply:` label (`forward.c:337-343`). The one case where C still says nothing is when
+  `make_local_answer()`'s `skip_questions()` cannot walk the question section
+  (`domain-match.c:429-430`); `make_refused_answer` returns `None` in exactly that case
+  (`DnsPacket::parse` fails) and the loop sends nothing.
+
+  `RandFdPool::sized_for` applies both halves of C's sizing rule — `numrrand = ftabsize/2`,
+  capped at `sysconf(_SC_OPEN_MAX)/3` (`dnsmasq.c:426-429`). Without the cap a large
+  `--dns-forward-max` would size the pool past the process fd limit and every `bind()` past
+  it would fail, turning `allocate()` into `None` and refusing the client for no visible
+  reason. Unlike C the result is floored at one slot, since a zero-slot pool would put every
+  query on the shared path.
+
+  `FrecTable::lookup_frec` takes `Option<u16>` for the transaction ID, where `None` is C's
+  `id == -1` (`forward.c:3227`). The sentinel is deliberately outside the 16-bit ID space:
+  C's argument is an `int` and the only wire-derived value passed to it is
+  `ntohs(header->id)` (`forward.c:1173`), so no packet can reach it. Spelling it `0xFFFF`
+  instead would let a forged reply carrying that one ID match whichever query was in flight,
+  and would also misroute the genuine answer to any query `get_id()` happened to issue with
+  that ID.
 
   Covered by `tests/forward_source_port_dedup.rs` (distinct source ports for concurrent
   queries, a forged reply delivered to another in-flight query's socket being ignored while
@@ -512,6 +532,16 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   - **With no upstream servers configured a query is dropped, not REFUSED.** C reaches
     `setup_reply()` with no flags and answers REFUSED for "nowhere to forward to"; the loop
     stays silent, which `tests/local_answer_integration.rs` currently pins.
+  - **Only part of C's `!gotname` test is implemented.** `extract_request`
+    (`rfc1035.c`) also rejects `qdcount != 1` and a query carrying a non-zero
+    `ancount`/`nscount`, and C answers REFUSED for both. `hash_questions` accepts them, so
+    such a query is forwarded here instead. The forwarded/dropped split above only follows C
+    for an unreadable question name.
+  - **A non-`QUERY` opcode is forwarded, where C answers NOTIMP.** C takes the
+    `OPCODE(header) != QUERY` branch to `reply:` with `flags = F_RCODE`
+    (`forward.c:329-333`), which `setup_reply()` renders as NOTIMP. `rfc1035::setup_reply`
+    already has that arm; the forward loop screens only on the QR bit, so nothing reaches
+    it.
   - **`fast_retry` (`--fast-dns-retry`) is not ported.** C's `frec->forward_delay` and
     `frec->forward_timestamp` (`forward.c:626-660`) have no counterpart on `Frec`, so a slow
     server is never re-probed before the query times out.
