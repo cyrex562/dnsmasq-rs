@@ -317,7 +317,10 @@ impl Default for Daemon {
             host_index: 0,
             pipe_to_parent: -1,
             max_procs: 0,
-            randport_limit: 0,
+            // `option.c:5986` — one source port per transaction per server, and
+            // `--port-limit` refuses anything below 1.  A zero here would make
+            // the socket pool reuse a transaction's first port for every send.
+            randport_limit: 1,
             reload_count: 0,
             dns_dirty: false,
             next_alarm: None,

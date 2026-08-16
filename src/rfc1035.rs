@@ -12,7 +12,8 @@ use crate::types::constants::UID_NONE;
 use crate::dns_protocol::{DnsHeader, RrType, HB3_AA, HB3_QR, HB3_TC, HB4_AD, HB4_CD, HB4_RA};
 use crate::types::addr::{AllAddr, CnameAddr, RrDataAddr};
 use crate::types::constants::{
-    F_CNAME, F_DNSSECOK, F_FORWARD, F_IPV4, F_IPV6, F_NEG, F_NXDOMAIN, F_RCODE, F_REVERSE, F_RR,
+    F_CNAME, F_DNSSECOK, F_FORWARD, F_IPV4, F_IPV6, F_NEG, F_NOERR, F_NXDOMAIN, F_RCODE,
+    F_REVERSE, F_RR,
 };
 use crate::types::dns_records::{BogusAddr, Cname, Doctor, HostRecord, MxSrvRecord, Naptr, PtrRecord, TxtRecord};
 
@@ -875,7 +876,9 @@ pub fn setup_reply(header: &mut DnsHeader, flags: u32) {
     header.nscount = 0;
     header.arcount = 0;
     header.ancount = 0;
-    if flags == F_NXDOMAIN {
+    if flags == F_NOERR {
+        header.set_rcode(0); // empty domain
+    } else if flags == F_NXDOMAIN {
         header.set_rcode(3);
     } else if flags == F_RCODE {
         header.set_rcode(4); // NOTIMP
@@ -883,7 +886,11 @@ pub fn setup_reply(header: &mut DnsHeader, flags: u32) {
         header.set_rcode(0);
         header.hb3 |= HB3_AA;
     } else {
-        header.set_rcode(0);
+        // "nowhere to forward to" — C's final `else` (`rfc1035.c:setup_reply`).
+        // This is the answer a query gets when the forward table is full or no
+        // server matches, so it must not be NOERROR: a client told NOERROR with
+        // an empty answer caches a negative result we never established.
+        header.set_rcode(5); // REFUSED
     }
 }
 

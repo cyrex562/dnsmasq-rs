@@ -205,14 +205,11 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   - EDNS0 beyond re-attaching the OPT record: no client option (EDE, client-subnet, cookies)
     is parsed, echoed or generated, and the advertised payload size is not used to size or
     truncate a locally generated answer.
-  - SERVFAIL failover. `ForwardEngine::handle_reply_with_failover` now runs the same
-    `validate_reply` checks as `accept_reply`, but the live loop still does not call it (nor
-    `retry_query`), so a SERVFAIL is relayed to the client instead of retried against the
-    next server.
-  - `forward::reply_query` / `process_reply` remain a second, unreached reply-handling path.
-    They carry rcode and rebind *policy* that `accept_reply` does not, but they check only
+  - `forward::process_reply` / `ProcessReplyConfig` remain an unreached reply-policy path.
+    They carry rcode and rebind decisions that `accept_reply` does not, but they check only
     the source address, not the question — anything wiring them in must add the question
-    check first or it reopens the poisoning hole `accept_reply` closes.
+    check first or it reopens the poisoning hole `accept_reply` closes. (`reply_query`, the
+    wrapper that drove them off the deleted `ForwardTable`, is gone.)
   - `bogus-addr` wildcard filtering, `--doctor` address rewriting, `rrfilter`, ipset/nftset
     population and the NXDOMAIN→NODATA conversion for locally-known names — all part of C's
     `process_reply()` around the `extract_addresses()` call, none of them ported.
@@ -355,7 +352,7 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   loopback *and* the destination is an address we serve).
 
   The forward loop takes N sockets instead of one (`poll_recv_ready` across all of them,
-  rotating to avoid starvation) and `PendingQuery` records which listener a query arrived
+  rotating to avoid starvation) and each in-flight query records which listener it arrived
   on so the reply leaves by the same socket. `run_main_loop_with` no longer has its own
   `0.0.0.0:{port}` fallback bind: when it is handed no listeners it calls `bind_listeners`,
   so there is one code path deciding what the daemon listens on.
@@ -413,6 +410,83 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   - Capability-dependent assertions in `tests/listener_binding_integration.rs` skip rather
     than fail when the sandbox has no spare loopback aliasing or refuses the bind, so a
     restricted environment reports a pass it did not actually verify.
+
+- [x] Randomise the outbound source port and unify the two pending-query implementations.
+  `run_forward_loop_on` used to bind one `0.0.0.0:0` socket at startup and send every
+  upstream query from it, so the whole daemon had a single, stable source port for its
+  lifetime. A random transaction ID alone is 16 bits; C makes an attacker guess the port
+  too by giving each in-flight query its own socket — `forward_query()` calls
+  `allocate_rfd(&forward->rfds, srv)` for every send (`forward.c:528`) and `random_sock()`
+  `bind()`s a fresh port whenever a slot in `daemon->randomsocks[]` is free
+  (`forward.c:2782`).
+
+  `RandFdPool` is now live and follows `allocate_rfd()`'s order: reuse one of *this*
+  transaction's sockets only once it is at `randport_limit`, otherwise take a free pool slot
+  and bind a new port, otherwise share a live socket for the same server, otherwise open a
+  temporary socket outside the pool (C's `refcount == 0xffff` record). `free_rfds()` closes
+  a socket as soon as its last query finishes. The pool is sized as `dnsmasq.c:427` sizes it
+  (`ftabsize / 2`) and the reply arm of the loop polls the live set rather than one fixed
+  socket, rotating the scan so a flooded port cannot starve the others.
+
+  The rival pending-query types are gone: `PendingQuery`/`ForwardTable` (single client, no
+  admission control) and the `reply_query` wrapper built on them were deleted, and
+  `ForwardEngine` now drives the faithful `Frec`/`FrecSrc`/`FrecTable` port. That brings two
+  behaviours the live path never had:
+
+  - **Per-server-group admission control.** `forward_query` calls `get_new_frec(now, srv,
+    force = false)`, so once `--dns-forward-max` queries are in flight to one group the next
+    is answered REFUSED (`forward.c:369` → `setup_reply()` with no flags). `rfc1035::
+    setup_reply` had NOERROR in that final `else`; it now sets REFUSED as
+    `domain-match.c:430` does. `--dns-forward-max`/`--port-limit` reach the engine through
+    `ForwardConfig::ftabsize`/`randport_limit`, and `Daemon::randport_limit` now defaults to
+    1 (`option.c:5986`) instead of 0.
+  - **Duplicate-client folding.** A second client asking the identical question within the
+    frec's lifetime is appended as another `FrecSrc` instead of opening a second upstream
+    transaction, and the single answer is fanned out to every waiting client under its own
+    transaction ID (`forward.c:221-323`, `forward.c:1435-1440`). The `FrecSrc` budget is the
+    same global `ftabsize` C uses, and exhausting it returns REFUSED. Queries less than two
+    seconds old are not re-forwarded, matching `forward.c:315-318`.
+
+  SERVFAIL/REFUSED failover is also wired into the live loop for the first time
+  (`forward.c:1242-1250`): `accept_reply` re-sends to the next untried server, on a new
+  source port, instead of relaying the failure. `sent_at` is deliberately not refreshed on a
+  retry, because C only ever sets `forward->time` in `get_new_frec()`.
+
+  Covered by `tests/forward_source_port_dedup.rs` (distinct source ports for concurrent
+  queries, REFUSED past `--dns-forward-max`, two clients folded onto one upstream query) and
+  unit coverage of the pool, the duplicate lookup, the `FrecSrc` budget and the failover
+  path. Each integration test was checked red against a deliberately broken implementation.
+
+  Explicitly **not** covered — upstream behavior still missing:
+
+  - **The port range is ignored.** C honours `--query-port`/`--min-port`/`--max-port` in
+    `local_bind()` and refuses to open more sockets than the range has ports
+    (`forward.c:2856-2864`, `dnsmasq.c:269`); `RandFdPool` always binds `0.0.0.0:0` and lets
+    the kernel choose. A configured port range therefore has no effect on outbound queries.
+  - **Source address and interface are ignored.** `random_sock()` binds
+    `srv->source_addr`/`srv->interface` and sets `IPV6_V6ONLY`; the pool binds the IPv4
+    wildcard, so `server=<addr>@<source>` and IPv6 upstreams cannot be reached through it.
+  - **`serv->sfd` (a server's pre-allocated fixed socket) has no equivalent**, so a server
+    configured with an explicit local port still gets a random one.
+  - **No DNS-0x20 encoding.** C scrambles query-name case and records a per-`FrecSrc`
+    bitmap so each duplicate client gets its own case pattern back (`forward.c:250-300`,
+    `flip_queryname`). `FrecSrc::encode_bitmap` exists but is always zero, so the fold-out
+    replays the same name to every client. This is the third leg of C's anti-spoofing, next
+    to the random ID and the random port.
+  - **`forwardall` / `--all-servers` and strict-order retry are not ported.** One query goes
+    to one server; `Frec::forwardall` is never set, and `next_server` round-robins rather
+    than following `filter_servers`/`master->last_server`.
+  - **A client retransmission is re-sent to the same server**, where C sets `forwardall` and
+    fans it to every server in the group (`forward.c:474-478`).
+  - **No `udp_pkt_size` per client.** C sends a truncated answer to any `frec_src` whose
+    advertised EDNS payload is smaller than the reply (`forward.c:1455-1470`); every folded
+    client here gets the full packet.
+  - **With no upstream servers configured a query is dropped, not REFUSED.** C reaches
+    `setup_reply()` with no flags and answers REFUSED for "nowhere to forward to"; the loop
+    stays silent, which `tests/local_answer_integration.rs` currently pins.
+  - **`fast_retry` (`--fast-dns-retry`) is not ported.** C's `frec->forward_delay` and
+    `frec->forward_timestamp` (`forward.c:626-660`) have no counterpart on `Frec`, so a slow
+    server is never re-probed before the query times out.
 
 - [ ] Split pure logic tests from capability-dependent socket tests.
   Source of truth: current failing tests in `network.rs`, `forward.rs`, and `dhcp_common.rs`.

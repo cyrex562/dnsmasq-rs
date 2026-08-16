@@ -1,9 +1,10 @@
 //! DNS query forwarding engine — data structures and helpers.
 //!
-//! Ported from dnsmasq's `forward.c`.  This module contains the pure
-//! data structures (`ForwardTable`, `PendingQuery`) and stateless helper
-//! functions (`patch_id`, `next_server`, `reply_matches_query`), plus
-//! the async UDP forwarding engine (`ForwardEngine`, `run_forward_loop`).
+//! Ported from dnsmasq's `forward.c`.  This module contains the in-flight query
+//! table (`Frec`, `FrecSrc`, `FrecTable` — C's `struct frec`), the random-port
+//! source-socket pool (`RandFdPool`, C's `daemon->randomsocks[]`), stateless
+//! helpers (`patch_id`, `next_server`, `reply_matches_query`), and the async UDP
+//! forwarding engine (`ForwardEngine`, `run_forward_loop`).
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -26,142 +27,6 @@ use crate::types::dns_records::{Cname, HostRecord, MxSrvRecord, Naptr, PtrRecord
 // ──────────────────────────────────────────────────────────────────────────────
 // Types
 // ──────────────────────────────────────────────────────────────────────────────
-
-/// A pending (in-flight) forwarded DNS query.
-#[derive(Debug, Clone)]
-pub struct PendingQuery {
-    /// DNS transaction ID sent upstream.
-    pub id: u16,
-    /// Original client transaction ID.
-    pub orig_id: u16,
-    /// Client socket address.
-    pub client: SocketAddr,
-    /// Index into the upstream server list.
-    pub upstream_idx: usize,
-    /// Timestamp when the query was forwarded.
-    pub sent_at: Instant,
-    /// Hash of the question section (for deduplication).
-    pub question_hash: [u8; 16],
-    /// Number of retransmission attempts so far.
-    pub retries: u8,
-    /// Index of the listening socket the query arrived on.  The reply has to go
-    /// back out the same socket, or it would leave with the wrong source
-    /// address once more than one listener is bound.
-    pub listener: usize,
-}
-
-/// Table of all in-flight queries, keyed by upstream transaction ID.
-pub struct ForwardTable {
-    queries: HashMap<u16, PendingQuery>,
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// ForwardTable implementation
-// ──────────────────────────────────────────────────────────────────────────────
-
-impl ForwardTable {
-    /// Create an empty `ForwardTable`.
-    pub fn new() -> Self {
-        Self {
-            queries: HashMap::new(),
-        }
-    }
-
-    /// Draw an unused outgoing transaction ID.
-    ///
-    /// Mirrors C's `get_id()` (`forward.c:3302`), which draws from `rand16()`.
-    /// The ID must be *unpredictable*, not merely unique: an off-path attacker
-    /// who can observe or guess one outgoing ID can otherwise compute the next
-    /// one and race the real server with a forged answer.
-    fn fresh_id(&self) -> u16 {
-        for _ in 0..64 {
-            let id = rand::random::<u16>();
-            if !self.queries.contains_key(&id) {
-                return id;
-            }
-        }
-        // The table holds a large fraction of the 65536 IDs; scan for a free
-        // one rather than clobbering a live query.
-        (0..=u16::MAX)
-            .find(|id| !self.queries.contains_key(id))
-            .unwrap_or_else(rand::random)
-    }
-
-    /// Allocate a new pending query and return the upstream transaction ID.
-    pub fn alloc_query(
-        &mut self,
-        orig_id: u16,
-        client: SocketAddr,
-        upstream_idx: usize,
-        question_hash: [u8; 16],
-    ) -> u16 {
-        let id = self.fresh_id();
-        self.queries.insert(
-            id,
-            PendingQuery {
-                id,
-                orig_id,
-                client,
-                upstream_idx,
-                sent_at: Instant::now(),
-                question_hash,
-                retries: 0,
-                listener: 0,
-            },
-        );
-        id
-    }
-
-    /// Find a pending query by upstream transaction ID.
-    pub fn lookup(&self, id: u16) -> Option<&PendingQuery> {
-        self.queries.get(&id)
-    }
-
-    /// Record which listening socket a pending query arrived on, so its reply
-    /// can be sent back out the same one.
-    pub fn set_listener(&mut self, id: u16, listener: usize) {
-        if let Some(q) = self.queries.get_mut(&id) {
-            q.listener = listener;
-        }
-    }
-
-    /// Remove a completed query, returning it.
-    pub fn remove(&mut self, id: u16) -> Option<PendingQuery> {
-        self.queries.remove(&id)
-    }
-
-    /// Look up a pending query by upstream transaction ID.
-    pub fn get_query(&self, id: u16) -> Option<&PendingQuery> {
-        self.queries.get(&id)
-    }
-
-    /// Remove a completed query by upstream transaction ID.
-    pub fn remove_query(&mut self, id: u16) -> Option<PendingQuery> {
-        self.queries.remove(&id)
-    }
-
-    /// Remove and return all queries whose `sent_at` is older than `timeout`.
-    pub fn expire_old(&mut self, timeout: Duration) -> Vec<PendingQuery> {
-        let now = Instant::now();
-        let expired_ids: Vec<u16> = self
-            .queries
-            .iter()
-            .filter(|(_, q)| now.duration_since(q.sent_at) > timeout)
-            .map(|(&id, _)| id)
-            .collect();
-
-        expired_ids
-            .into_iter()
-            .filter_map(|id| self.queries.remove(&id))
-            .collect()
-    }
-}
-
-impl Default for ForwardTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // FREC flag constants (mirrors C #define FREC_*)
@@ -242,6 +107,17 @@ pub struct Frec {
     pub sent_at:         Instant,
     /// Saved copy of the query wire bytes (for retransmit and duplicate detect).
     pub stash:           Option<Vec<u8>>,
+    /// Digest of the question section, the key both duplicate detection and
+    /// reply matching use.  C re-parses `stash` for this
+    /// (`lookup_frec`, `forward.c:3209`); the digest is the same comparison
+    /// over name, type and class, done once.
+    pub question_hash:   [u8; 16],
+    /// Pool slots (source sockets) this transaction holds — C's `frec->rfds`.
+    pub rfds:            RfdList,
+    /// Upstream servers already tried for this query.
+    pub tried:           HashSet<usize>,
+    /// Number of upstream failures this query has been retried over.
+    pub retries:         u8,
     /// DNSSEC: DNS class of the question.
     pub class:           u16,
     /// DNSSEC: per-query work budget counter.
@@ -268,6 +144,10 @@ impl Frec {
             flags:            0,
             sent_at:          Instant::now(),
             stash:            None,
+            question_hash:    [0u8; 16],
+            rfds:             RfdList::new(),
+            tried:            HashSet::new(),
+            retries:          0,
             class:            1,
             work_counter:     0,
             validate_counter: 0,
@@ -275,6 +155,15 @@ impl Frec {
             blocking_query:   None,
             dependent:        None,
         }
+    }
+
+    /// Every client waiting on this query, primary first.
+    ///
+    /// C walks `for (src = &forward->frec_src; src; src = src->next)`
+    /// (`forward.c:1435`); the primary source is embedded in the `frec` and the
+    /// duplicates are chained off it, which is why they are two fields here.
+    pub fn srcs(&self) -> impl Iterator<Item = &FrecSrc> {
+        std::iter::once(&self.frec_src).chain(self.extra_srcs.iter())
     }
 }
 
@@ -290,10 +179,20 @@ pub struct FrecTable {
     frecs:           Vec<Frec>,
     /// Maximum concurrent queries per server group (`daemon->ftabsize`).
     pub max_per_group: usize,
+    /// Total `FrecSrc` records handed out for duplicate clients across the
+    /// whole table — C's `daemon->frec_src_count`, also capped at `ftabsize`
+    /// (`forward.c:227`).  It is a global budget, not a per-query one, so one
+    /// heavily duplicated question cannot starve the rest.
+    frec_src_count:  usize,
     /// DNSSEC uid counter (monotone, local to the table).
     next_uid:        u32,
     /// Rate-limiting for `query_full` log messages.
     last_full_log:   Option<Instant>,
+    /// Pool slots freed along with their `Frec`s, waiting to be handed back to
+    /// the [`RandFdPool`].  The table does not own the pool, so it parks the
+    /// slot indices here and the pool's owner drains them with
+    /// [`FrecTable::take_released_rfds`].
+    released_rfds:   RfdList,
 }
 
 impl FrecTable {
@@ -302,9 +201,17 @@ impl FrecTable {
         Self {
             frecs: Vec::new(),
             max_per_group,
+            frec_src_count: 0,
             next_uid: 0,
             last_full_log: None,
+            released_rfds: RfdList::new(),
         }
+    }
+
+    /// Take the pool slots freed since the last call, for release into the
+    /// [`RandFdPool`] the engine owns.
+    pub fn take_released_rfds(&mut self) -> RfdList {
+        std::mem::take(&mut self.released_rfds)
     }
 
     /// Release a `Frec` back to the free pool.
@@ -323,10 +230,22 @@ impl FrecTable {
         let blocking = self.frecs[idx].blocking_query;
         let dependent = self.frecs[idx].dependent;
 
+        // Hand the source sockets back (C: `free_rfds(&f->rfds)`) and return
+        // the duplicate-client records to the global budget.
+        let rfds = std::mem::take(&mut self.frecs[idx].rfds);
+        self.released_rfds.extend(rfds);
+        self.frec_src_count = self
+            .frec_src_count
+            .saturating_sub(self.frecs[idx].extra_srcs.len());
+
         // Reset this frec.
         self.frecs[idx].sentto         = None;
         self.frecs[idx].flags          = 0;
         self.frecs[idx].stash          = None;
+        self.frecs[idx].question_hash  = [0u8; 16];
+        self.frecs[idx].tried          .clear();
+        self.frecs[idx].retries        = 0;
+        self.frecs[idx].frec_src       = FrecSrc::default();
         self.frecs[idx].extra_srcs     .clear();
         self.frecs[idx].forwardall     = false;
         self.frecs[idx].blocking_query = None;
@@ -521,15 +440,90 @@ impl FrecTable {
         if self.last_full_log.map_or(true, |t| now.duration_since(t) >= cooldown) {
             self.last_full_log = Some(now);
             match domain {
-                Some(d) if !d.is_empty() =>
-                    eprintln!("dnsmasq-rs: max concurrent DNS queries to {} reached (max: {})", d, self.max_per_group),
-                _ =>
-                    eprintln!("dnsmasq-rs: max concurrent DNS queries reached (max: {})", self.max_per_group),
+                Some(d) if !d.is_empty() => tracing::warn!(
+                    "Maximum number of concurrent DNS queries to {d} reached (max: {})",
+                    self.max_per_group,
+                ),
+                _ => tracing::warn!(
+                    "Maximum number of concurrent DNS queries reached (max: {})",
+                    self.max_per_group,
+                ),
             }
             true
         } else {
             false
         }
+    }
+
+    /// Find a live `Frec` asking the identical question.
+    ///
+    /// This is C's duplicate-detection call — `lookup_frec(now, namebuff,
+    /// rrclass, rrtype, -1, ...)` (`forward.c:194`) — which matches on the
+    /// question rather than the transaction ID so that a *second client's* query
+    /// can be folded onto an existing upstream transaction.
+    ///
+    /// The flag mask is the one C passes there: a query is only a duplicate of
+    /// another if the EDNS/DNSSEC context they were forwarded under agrees, and
+    /// DNSSEC sub-queries and uncacheable queries are never returned.
+    pub fn lookup_frec_by_question(&self, now: Instant, question_hash: [u8; 16]) -> Option<usize> {
+        const DEDUP_MASK: u32 = FREC_CHECKING_DISABLED
+            | FREC_AD_QUESTION
+            | FREC_DO_QUESTION
+            | FREC_HAS_PHEADER
+            | FREC_DNSKEY_QUERY
+            | FREC_DS_QUERY
+            | FREC_NO_CACHE;
+        let hard_timeout = Duration::from_secs(4 * FREC_TIMEOUT_SECS);
+        for (i, f) in self.frecs.iter().enumerate() {
+            if f.sentto.is_none() || f.question_hash != question_hash {
+                continue;
+            }
+            if (f.flags & DEDUP_MASK) != 0 {
+                continue;
+            }
+            if now.duration_since(f.sent_at) >= hard_timeout {
+                return None;
+            }
+            return Some(i);
+        }
+        None
+    }
+
+    /// Attach another client to an in-flight query.
+    ///
+    /// Returns `false` when the global `FrecSrc` budget (`ftabsize`) is
+    /// exhausted, which is C's "we've been spammed with many duplicates"
+    /// condition (`forward.c:232-245`) and makes the caller answer REFUSED.
+    pub fn add_src(&mut self, idx: usize, src: FrecSrc) -> bool {
+        if self.frec_src_count >= self.max_per_group {
+            return false;
+        }
+        let Some(frec) = self.frecs.get_mut(idx) else { return false };
+        frec.extra_srcs.push(src);
+        self.frec_src_count += 1;
+        true
+    }
+
+    /// Free every in-flight query older than `timeout`, returning how many.
+    ///
+    /// C has no timer for this — it garbage-collects inside `get_new_frec()`
+    /// (`forward.c:3140-3146`) — but an idle forwarder here would otherwise
+    /// hold an unanswered query's source socket open indefinitely, and that
+    /// socket is exactly the thing we are trying not to leave predictable.
+    pub fn expire_old(&mut self, timeout: Duration) -> usize {
+        let now = Instant::now();
+        let stale: Vec<usize> = self
+            .frecs
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.sentto.is_some() && now.duration_since(f.sent_at) > timeout)
+            .map(|(i, _)| i)
+            .collect();
+        let n = stale.len();
+        for idx in stale {
+            self.free_frec(idx);
+        }
+        n
     }
 
     /// Return the number of currently in-flight queries.
@@ -611,104 +605,209 @@ pub fn reply_matches_query(query_pkt: &[u8], reply_pkt: &[u8]) -> bool {
 // Random FD pool (allocate_rfd / free_rfd)
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Maximum number of cached random UDP sockets.
-pub const RANDOM_SOCKS: usize = 64;
+/// Default size of the random-socket pool (`daemon->numrrand`).
+///
+/// C derives it from the query table at startup — `daemon->numrrand =
+/// daemon->ftabsize/2`, capped at a third of the fd limit
+/// (`dnsmasq.c:425-431`) — which [`RandFdPool::sized_for`] reproduces.  This
+/// constant is the value that falls out of the default `ftabsize` of 150.
+pub const RANDOM_SOCKS: usize = 75;
+
+/// Default `daemon->randport_limit` (`option.c:5986`): one source port per
+/// transaction per server, so every send that is not a same-server repeat of an
+/// existing one gets a port of its own.
+pub const RANDPORT_LIMIT: usize = 1;
+
+/// The pool slots one in-flight query holds, mirroring C's `struct randfd_list`
+/// chain hanging off `frec->rfds`.
+///
+/// Ordered most-recently-promoted first, as C keeps it: `allocate_rfd()` moves
+/// a reused entry to the head of the list (`forward.c:2881-2887`).
+pub type RfdList = Vec<usize>;
 
 /// A cached random-port UDP socket with reference counting.
 ///
 /// Mirrors dnsmasq's `struct randfd`.  In the async Rust version we store
 /// `tokio::net::UdpSocket` instead of a raw file descriptor so the socket is
-/// owned by the pool and dropped when refcount reaches zero.
+/// owned by the pool and closed when the refcount reaches zero.
 #[derive(Debug)]
 pub struct RandomSocket {
     pub socket:     Arc<tokio::net::UdpSocket>,
-    /// How many pending queries currently share this socket.
+    /// How many in-flight queries currently share this socket.
     pub refcount:   usize,
-    /// Upstream server index this socket is "pinned" to, or `None` if free.
+    /// Upstream server index this socket is "pinned" to.
     pub server_idx: Option<usize>,
+    /// C's `refcount == 0xffff` marker: an overflow socket allocated outside
+    /// the fixed pool because every slot was taken and none could be shared
+    /// (`forward.c:2960-2990`).  It is never shared and is closed as soon as
+    /// its one owner is done with it.
+    pub temporary:  bool,
 }
 
-/// Pool of cached random-port UDP sockets.
+/// Pool of random-port UDP sockets — C's `daemon->randomsocks[]` array plus
+/// `allocate_rfd()` / `free_rfds()`.
 ///
-/// Mirrors dnsmasq's `daemon->randomsocks[]` array plus the logic in
-/// `allocate_rfd()` / `free_rfd()`.
-///
-/// The pool keeps up to `RANDOM_SOCKS` sockets open.  When a query needs an
-/// ephemeral source socket the pool tries to reuse an existing socket bound to
-/// the same upstream server.  If none exists and the pool is full, the entry
-/// with `refcount == 0` and the oldest last-used index is evicted.
+/// The point of the pool is *source-port* unpredictability.  A resolver that
+/// sends every query from one socket offers an off-path attacker a single fixed
+/// port, leaving only the 16-bit transaction ID to guess; with a socket per
+/// in-flight transaction the attacker has to hit both, and the ports in use
+/// change constantly.  So the ordering here matters: a *free* slot always wins
+/// over sharing a live socket, because a free slot means a fresh `bind()` to
+/// port 0 and therefore a fresh ephemeral port.  Sharing is the fallback that
+/// keeps the fd count bounded, exactly as it is in C.
 pub struct RandFdPool {
-    slots: Vec<Option<RandomSocket>>,
+    /// Slots `0..numrrand` are the fixed pool; anything past that is a
+    /// temporary overflow socket.
+    slots:          Vec<Option<RandomSocket>>,
+    /// Size of the fixed pool (`daemon->numrrand`).
+    numrrand:       usize,
+    /// `daemon->randport_limit`: how many source ports one transaction may hold
+    /// for the same server before it starts reusing the ones it has.
+    randport_limit: usize,
+    /// Round-robin cursor for the share-an-existing-socket path (C's
+    /// `static int finger` in `allocate_rfd()`).
+    finger:         usize,
 }
 
 impl RandFdPool {
-    /// Create an empty pool.
-    pub fn new() -> Self {
-        let mut slots = Vec::with_capacity(RANDOM_SOCKS);
-        for _ in 0..RANDOM_SOCKS {
-            slots.push(None);
+    /// Create an empty pool of `numrrand` slots.
+    pub fn new(numrrand: usize, randport_limit: usize) -> Self {
+        Self {
+            slots:          (0..numrrand).map(|_| None).collect(),
+            numrrand,
+            randport_limit: randport_limit.max(1),
+            finger:         0,
         }
-        Self { slots }
     }
 
-    /// Allocate or reuse a random UDP socket for the given upstream server.
+    /// Size the pool the way `dnsmasq.c:425-431` does: half the query table,
+    /// but never zero (a pool of zero slots would force every query onto the
+    /// shared/temporary path and defeat the point of the thing).
+    pub fn sized_for(ftabsize: usize, randport_limit: usize) -> Self {
+        Self::new((ftabsize / 2).max(1), randport_limit)
+    }
+
+    /// Allocate a source socket for a send to `server_idx`, recording it in the
+    /// calling transaction's `fdl`.
     ///
-    /// Returns an `Arc` clone of the socket on success.  The socket is bound
-    /// to `0.0.0.0:0` (OS picks an ephemeral port).
+    /// Mirrors `allocate_rfd()` (`forward.c:2843`), in the same order:
     ///
-    /// Binding is performed asynchronously; the method is `async`.
-    pub async fn allocate(&mut self, server_idx: usize) -> Option<Arc<tokio::net::UdpSocket>> {
-        // 1. Look for an existing slot pinned to this server with room.
-        for slot in self.slots.iter_mut().flatten() {
-            if slot.server_idx == Some(server_idx) {
+    /// 1. If this transaction already holds `randport_limit` sockets for this
+    ///    server, promote the last of them to the head of its list and reuse it.
+    /// 2. Otherwise take a free pool slot and `bind()` a **new** socket on an
+    ///    OS-assigned ephemeral port.
+    /// 3. Otherwise share an in-use socket for the same server that this
+    ///    transaction does not already hold.
+    /// 4. Otherwise open a temporary socket outside the pool.
+    pub async fn allocate(
+        &mut self,
+        fdl:        &mut RfdList,
+        server_idx: usize,
+    ) -> Option<Arc<tokio::net::UdpSocket>> {
+        // 1. Sockets this transaction already holds for this server.
+        let mut held = 0usize;
+        let mut last_held: Option<usize> = None;
+        for (pos, &slot) in fdl.iter().enumerate() {
+            if self.slot(slot).is_some_and(|r| r.server_idx == Some(server_idx)) {
+                held += 1;
+                last_held = Some(pos);
+            }
+        }
+        if let (Some(pos), true) = (last_held, held >= self.randport_limit) {
+            let slot = fdl.remove(pos);
+            fdl.insert(0, slot);
+            return Some(Arc::clone(&self.slot(slot)?.socket));
+        }
+
+        // 2. A free slot in the fixed pool — a fresh port.
+        if let Some(idx) = self.slots[..self.numrrand].iter().position(Option::is_none) {
+            let sock = Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok()?);
+            self.slots[idx] = Some(RandomSocket {
+                socket:     Arc::clone(&sock),
+                refcount:   1,
+                server_idx: Some(server_idx),
+                temporary:  false,
+            });
+            fdl.push(idx);
+            return Some(sock);
+        }
+
+        // 3. Pool full: piggy-back on a live socket for the same server that we
+        //    are not already using.
+        let n = self.slots.len();
+        for j in 0..n {
+            let i = (j + self.finger) % n;
+            let shareable = self.slots[i].as_ref().is_some_and(|r| {
+                !r.temporary && r.refcount > 0 && r.server_idx == Some(server_idx)
+            });
+            if shareable && !fdl.contains(&i) {
+                self.finger = i + 1;
+                let slot = self.slots[i].as_mut()?;
                 slot.refcount += 1;
+                fdl.push(i);
                 return Some(Arc::clone(&slot.socket));
             }
         }
 
-        // 2. Find a free slot (empty or refcount == 0).
-        let free_idx = self
+        // 4. Nothing to share: a temporary socket, closed on release.
+        let sock = Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok()?);
+        let idx = self
             .slots
             .iter()
-            .position(|s| s.is_none() || s.as_ref().is_some_and(|r| r.refcount == 0));
-
-        let idx = free_idx?;
-
-        // Bind a new UDP socket on an OS-assigned ephemeral port.
-        let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok()?;
-        let sock = Arc::new(sock);
+            .position(Option::is_none)
+            .unwrap_or_else(|| { self.slots.push(None); self.slots.len() - 1 });
         self.slots[idx] = Some(RandomSocket {
-            socket: Arc::clone(&sock),
-            refcount: 1,
+            socket:     Arc::clone(&sock),
+            refcount:   1,
             server_idx: Some(server_idx),
+            temporary:  true,
         });
+        fdl.push(idx);
         Some(sock)
     }
 
-    /// Release one reference to the socket used by the query with `server_idx`.
+    /// Release every socket a finished transaction held (C's `free_rfds()`,
+    /// `forward.c:3012`).
     ///
-    /// Decrements `refcount`.  When `refcount` reaches zero the slot is left
-    /// in place (the socket stays open for reuse) but flagged as available.
-    pub fn free(&mut self, server_idx: usize) {
-        for slot in self.slots.iter_mut().flatten() {
-            if slot.server_idx == Some(server_idx) && slot.refcount > 0 {
-                slot.refcount -= 1;
-                return;
+    /// Dropping the last reference closes the socket, which is deliberate: a
+    /// port that stays open past its transaction is a port an attacker has more
+    /// time to find, and C closes the fd at exactly this point.
+    pub fn free_rfds(&mut self, fdl: &mut RfdList) {
+        for &idx in fdl.iter() {
+            let Some(slot) = self.slots.get_mut(idx).and_then(Option::as_mut) else { continue };
+            slot.refcount = slot.refcount.saturating_sub(1);
+            if slot.temporary || slot.refcount == 0 {
+                self.slots[idx] = None;
             }
+        }
+        fdl.clear();
+        // Drop trailing overflow slots so the poll set does not grow forever.
+        while self.slots.len() > self.numrrand && self.slots.last().is_some_and(Option::is_none) {
+            self.slots.pop();
         }
     }
 
-    /// Return the number of occupied slots (refcount > 0).
-    pub fn active_count(&self) -> usize {
+    /// Every live socket, for the reply poll set.
+    pub fn sockets(&self) -> Vec<Arc<tokio::net::UdpSocket>> {
         self.slots
             .iter()
-            .filter(|s| s.as_ref().is_some_and(|r| r.refcount > 0))
-            .count()
+            .flatten()
+            .map(|r| Arc::clone(&r.socket))
+            .collect()
+    }
+
+    /// Return the number of sockets currently open.
+    pub fn active_count(&self) -> usize {
+        self.slots.iter().flatten().count()
+    }
+
+    fn slot(&self, idx: usize) -> Option<&RandomSocket> {
+        self.slots.get(idx).and_then(Option::as_ref)
     }
 }
 
 impl Default for RandFdPool {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self { Self::new(RANDOM_SOCKS, RANDPORT_LIMIT) }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -723,6 +822,9 @@ pub const QUERY_TIMEOUT_SECS: u64 = 10;
 
 /// Default number of cached answers, matching upstream's `CACHESIZ`.
 pub const DEFAULT_CACHE_SIZE: usize = 150;
+
+/// Default `daemon->ftabsize` — upstream's `FTABSIZ` (`config.h`).
+pub const FTABSIZE: usize = 150;
 
 /// Owned snapshot of the locally-configured DNS data (`host-record`, `cname`,
 /// `txt-record`, `mx-host`, `srv-host`, `ptr-record`, `naptr-record`, …) that
@@ -828,6 +930,13 @@ pub struct ForwardConfig {
     pub local_rebind_ok: bool,
     /// `--rebind-domain-ok`: domains exempt from the rebind check.
     pub no_rebind: Vec<RebindDomain>,
+    /// `--dns-forward-max` (`daemon->ftabsize`): the cap on queries in flight to
+    /// one server group, and on duplicate-client records overall.  Exceeding it
+    /// makes the query REFUSED rather than queued.
+    pub ftabsize: usize,
+    /// `--port-limit` (`daemon->randport_limit`): source ports one transaction
+    /// may hold per server.
+    pub randport_limit: usize,
 }
 
 impl Default for ForwardConfig {
@@ -846,6 +955,8 @@ impl Default for ForwardConfig {
             check_rebind:  false,
             local_rebind_ok: false,
             no_rebind:     Vec::new(),
+            ftabsize:      FTABSIZE,
+            randport_limit: RANDPORT_LIMIT,
         }
     }
 }
@@ -871,15 +982,59 @@ impl ForwardConfig {
     }
 }
 
+/// What [`ForwardEngine::forward_query`] did with a client query.
+///
+/// The three non-forwarding outcomes are distinct because C answers them
+/// differently: a duplicate is silently absorbed, a full table gets REFUSED
+/// (`setup_reply()` with no flags, `domain-match.c:430`), and an unparseable or
+/// unroutable query is dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardOutcome {
+    /// Sent upstream under the given transaction ID.
+    Forwarded(u16),
+    /// Folded onto an identical query already in flight; that query's reply
+    /// will be fanned out to this client too.
+    Duplicate,
+    /// No capacity — the client must be answered REFUSED.
+    Refused,
+    /// Nothing could be done with it; no reply.
+    Dropped,
+}
+
+/// One client waiting on an upstream answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplyTarget {
+    /// Address to send the answer to.
+    pub client:   SocketAddr,
+    /// Index of the listening socket the query arrived on.  The reply has to go
+    /// back out the same socket, or it would leave with the wrong source
+    /// address once more than one listener is bound.
+    pub listener: usize,
+    /// The transaction ID this client used, restored into the reply.
+    pub orig_id:  u16,
+}
+
+/// What the engine decided about an upstream datagram.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplyAction {
+    /// A good answer: deliver it to every client on the list.
+    Deliver(Vec<ReplyTarget>),
+    /// The server failed the query and it has been re-sent to another one.
+    Retried,
+    /// Not an answer to anything outstanding, or it failed validation.
+    Ignore,
+}
+
 /// Stateful DNS forwarding engine.
 ///
-/// Owns a [`ForwardTable`] and the forwarding configuration.  Used by
+/// Owns the in-flight query table ([`FrecTable`]), the source-socket pool
+/// ([`RandFdPool`]) and the forwarding configuration.  Used by
 /// `run_forward_loop` but can also be driven manually for testing.
 pub struct ForwardEngine {
     pub config:          ForwardConfig,
-    pub table:           ForwardTable,
+    pub table:           FrecTable,
     upstream_order:      Vec<usize>,
-    /// Pool of cached random-port UDP sockets for query dispatch.
+    /// Pool of random-port UDP sockets for query dispatch.
     pub rfd_pool:        RandFdPool,
 }
 
@@ -887,57 +1042,175 @@ impl ForwardEngine {
     /// Create a new engine with the given configuration.
     pub fn new(config: ForwardConfig) -> Self {
         let n = config.upstreams.len();
+        let ftabsize = config.ftabsize.max(1);
         Self {
             upstream_order: (0..n).collect(),
-            table: ForwardTable::new(),
+            table:          FrecTable::new(ftabsize),
+            rfd_pool:       RandFdPool::sized_for(ftabsize, config.randport_limit),
             config,
-            rfd_pool: RandFdPool::new(),
         }
     }
 
-    /// Forward `pkt` to an upstream server and record the pending query.
+    /// Hand any sockets freed along with a `Frec` back to the pool.
+    fn release_rfds(&mut self) {
+        let mut freed = self.table.take_released_rfds();
+        if !freed.is_empty() {
+            self.rfd_pool.free_rfds(&mut freed);
+        }
+    }
+
+    /// Forward `pkt` upstream, or fold it onto an identical query already in
+    /// flight.
     ///
-    /// Returns `Some(upstream_id)` on success, `None` if no upstream is
-    /// available or the send fails.
+    /// `listener` is the index of the socket the query arrived on, carried so
+    /// the reply leaves by the same one.
+    ///
+    /// Mirrors `forward_query()` (`forward.c:165`) for the UDP client path.
     pub async fn forward_query(
         &mut self,
-        pkt: &[u8],
-        client: SocketAddr,
-        upstream_sock: &tokio::net::UdpSocket,
-    ) -> Option<u16> {
-        if pkt.len() < 12 || self.config.upstreams.is_empty() {
-            return None;
+        pkt:      &[u8],
+        client:   SocketAddr,
+        listener: usize,
+    ) -> ForwardOutcome {
+        if pkt.len() < 12 {
+            return ForwardOutcome::Dropped;
         }
-        let tried = HashSet::new();
-        let server_idx = next_server(&self.upstream_order, &tried, usize::MAX)?;
-        let upstream_addr = self.config.upstreams[server_idx];
-
-        let qhash = hash_questions(pkt).unwrap_or([0u8; 16]);
+        // C refuses to forward a query whose question it cannot read: it would
+        // have no way to recognise the answer (`forward.c:337-343`).
+        let Some(qhash) = hash_questions(pkt) else { return ForwardOutcome::Dropped };
         let orig_id = u16::from_be_bytes([pkt[0], pkt[1]]);
-        let new_id = self.table.alloc_query(orig_id, client, server_idx, qhash);
+        let now = Instant::now();
 
-        let mut out = pkt.to_vec();
-        patch_id(&mut out, new_id);
-        match upstream_sock.send_to(&out, upstream_addr).await {
-            Ok(_) => {
-                inc_metric(Metric::DnsQueriesForwarded);
-                Some(new_id)
+        if let Some(idx) = self.table.lookup_frec_by_question(now, qhash) {
+            return self.join_in_flight(idx, now, orig_id, client, listener).await;
+        }
+
+        if self.config.upstreams.is_empty() {
+            return ForwardOutcome::Dropped;
+        }
+        let Some(server_idx) = next_server(&self.upstream_order, &HashSet::new(), usize::MAX)
+        else {
+            return ForwardOutcome::Dropped;
+        };
+
+        // Per-server-group admission control.  `force = false` is what the
+        // client path always passes; only DNSSEC sub-queries may exceed the
+        // limit, and those do not exist here yet.
+        let Some(idx) = self.table.get_new_frec(now, server_idx, false) else {
+            self.release_rfds();
+            return ForwardOutcome::Refused;
+        };
+        self.release_rfds();
+
+        let new_id = self.table.get_id();
+        {
+            let Some(frec) = self.table.get_mut(idx) else { return ForwardOutcome::Dropped };
+            frec.sentto        = Some(server_idx);
+            frec.new_id        = new_id;
+            frec.question_hash = qhash;
+            frec.stash         = Some(pkt.to_vec());
+            frec.frec_src      = FrecSrc {
+                source:  Some(client),
+                orig_id,
+                fd:      listener as i32,
+                ..FrecSrc::default()
+            };
+            frec.tried.insert(server_idx);
+        }
+
+        if !self.send_upstream(idx, server_idx).await {
+            // Nothing went out — C frees the frec and returns REFUSED with
+            // EDE_NETERR (`forward.c:583-586`).
+            self.table.free_frec(idx);
+            self.release_rfds();
+            return ForwardOutcome::Refused;
+        }
+        inc_metric(Metric::DnsQueriesForwarded);
+        ForwardOutcome::Forwarded(new_id)
+    }
+
+    /// Handle a query that matches one already in flight (`forward.c:194-323`).
+    async fn join_in_flight(
+        &mut self,
+        idx:      usize,
+        now:      Instant,
+        orig_id:  u16,
+        client:   SocketAddr,
+        listener: usize,
+    ) -> ForwardOutcome {
+        let Some(frec) = self.table.get(idx) else { return ForwardOutcome::Dropped };
+        let known_src = frec
+            .srcs()
+            .any(|s| s.orig_id == orig_id && s.source == Some(client));
+        let age    = now.duration_since(frec.sent_at);
+        let sentto = frec.sentto;
+
+        if !known_src {
+            let src = FrecSrc {
+                source:  Some(client),
+                orig_id,
+                fd:      listener as i32,
+                ..FrecSrc::default()
+            };
+            if !self.table.add_src(idx, src) {
+                // Being blasted with the same question from many sources.  C
+                // returns REFUSED, and explicitly deletes the frec once it has
+                // aged out so the state can reset (`forward.c:236-245`).
+                self.table.emit_query_full(now, None);
+                if age >= Duration::from_secs(FREC_TIMEOUT_SECS) {
+                    self.table.free_frec(idx);
+                    self.release_rfds();
+                }
+                return ForwardOutcome::Refused;
             }
-            Err(_) => {
-                self.table.remove(new_id);
-                None
+            // "Closely spaced identical queries cannot be a try and a retry, so
+            // it's safe to wait for the reply from the first without forwarding
+            // the second" (`forward.c:315-318`).
+            if age < Duration::from_secs(2) {
+                return ForwardOutcome::Duplicate;
             }
+        }
+
+        // A retry: re-send the stashed query, which picks up a source port of
+        // its own unless this transaction is already at `randport_limit`.
+        let Some(server_idx) = sentto else { return ForwardOutcome::Duplicate };
+        if self.send_upstream(idx, server_idx).await {
+            inc_metric(Metric::DnsQueriesForwarded);
+            let id = self.table.get(idx).map_or(0, |f| f.new_id);
+            ForwardOutcome::Forwarded(id)
+        } else {
+            ForwardOutcome::Duplicate
         }
     }
 
-    /// Validate an upstream reply against the pending query it claims to
-    /// answer, returning that query's transaction ID.
+    /// Send a query's stashed packet to `server_idx` from a pooled source
+    /// socket, recording that socket against the query.
+    async fn send_upstream(&mut self, idx: usize, server_idx: usize) -> bool {
+        let Some(&addr) = self.config.upstreams.get(server_idx) else { return false };
+        let Some(frec) = self.table.get(idx) else { return false };
+        let Some(mut out) = frec.stash.clone() else { return false };
+        patch_id(&mut out, frec.new_id);
+
+        // The rfd list lives on the frec; lift it out for the pool call so the
+        // table is not borrowed across the `await`.
+        let mut rfds = self.table.get_mut(idx).map(|f| std::mem::take(&mut f.rfds)).unwrap_or_default();
+        let sock = self.rfd_pool.allocate(&mut rfds, server_idx).await;
+        if let Some(frec) = self.table.get_mut(idx) {
+            frec.rfds = rfds;
+        }
+        let Some(sock) = sock else { return false };
+
+        sock.send_to(&out, addr).await.is_ok()
+    }
+
+    /// Validate an upstream reply against the query it claims to answer,
+    /// returning that query's table index.
     ///
     /// This is the set of checks C makes before a reply is allowed to affect
     /// anything (`forward.c:1164-1209`):
     ///
     /// - the packet is a well-formed response (QR set, header-complete);
-    /// - a pending query with that transaction ID exists;
+    /// - a query with that transaction ID is in flight;
     /// - the reply answers the *same question* that was sent — C gets this
     ///   from `lookup_frec()`, which matches name/class/type alongside the ID
     ///   (`forward.c:1173`);
@@ -946,107 +1219,94 @@ impl ForwardEngine {
     ///
     /// A 16-bit ID on its own is far too weak a credential to admit a packet
     /// that will be cached: matching on the ID alone turns one lucky forged
-    /// datagram into a cache entry every later client is served from.
+    /// datagram into a cache entry every later client is served from.  The
+    /// source port the query left from is the other half of that credential,
+    /// which is why each transaction gets its own — see [`RandFdPool`].
     ///
-    /// Returns `None` — leaving the pending entry in place, so the genuine
-    /// answer can still arrive — for anything that fails a check.
-    fn validate_reply(&self, reply: &[u8], from: SocketAddr) -> Option<u16> {
+    /// Returns `None` — leaving the query in flight, so the genuine answer can
+    /// still arrive — for anything that fails a check.
+    fn validate_reply(&self, reply: &[u8], from: SocketAddr) -> Option<usize> {
         if reply.len() < 12 || reply[2] & 0x80 == 0 {
             return None;
         }
-        let id = u16::from_be_bytes([reply[0], reply[1]]);
-        let pending = self.table.lookup(id)?;
-        if hash_questions(reply)? != pending.question_hash {
+        let id  = u16::from_be_bytes([reply[0], reply[1]]);
+        let idx = self.table.lookup_frec(Instant::now(), id, 0, 0)?;
+        let frec = self.table.get(idx)?;
+        if hash_questions(reply)? != frec.question_hash {
             return None;
         }
-        if self.config.upstreams.get(pending.upstream_idx) != Some(&from) {
+        if self.config.upstreams.get(frec.sentto?) != Some(&from) {
             return None;
         }
-        Some(id)
+        Some(idx)
     }
 
-    /// Validate an upstream reply and claim its pending query.
+    /// Process an upstream datagram.
     ///
-    /// See [`Self::validate_reply`] for the checks applied.  On success the
-    /// pending entry is removed and returned; the caller still has to patch
-    /// the transaction ID back to `orig_id` before sending to the client.
-    pub fn accept_reply(&mut self, reply: &[u8], from: SocketAddr) -> Option<PendingQuery> {
-        let id = self.validate_reply(reply, from)?;
-        self.table.remove(id)
-    }
+    /// A SERVFAIL or REFUSED answer is not delivered while another server is
+    /// left to ask: C re-enters `forward_query()` with the saved query in that
+    /// case (`forward.c:1242-1250`).  Anything else completes the query, frees
+    /// its source socket(s), and yields one [`ReplyTarget`] per waiting client.
+    pub async fn accept_reply(&mut self, reply: &[u8], from: SocketAddr) -> ReplyAction {
+        let Some(idx) = self.validate_reply(reply, from) else { return ReplyAction::Ignore };
 
-    /// Process an upstream reply.
-    ///
-    /// Matches the reply against the pending table.  Returns:
-    /// - `Ok(Some((client_addr, reply)))` — valid reply, restore client ID
-    /// - `Ok(None)` — no matching pending query (ignore)
-    /// - `Err(pending)` — SERVFAIL reply; caller should retry with `retry_query`
-    pub fn handle_reply_with_failover(
-        &mut self,
-        reply: &mut Vec<u8>,
-        from:  SocketAddr,
-    ) -> Result<Option<(SocketAddr, Vec<u8>)>, PendingQuery> {
-        let Some(reply_id) = self.validate_reply(reply, from) else { return Ok(None) };
-        // Peek at rcode (lower 4 bits of byte 3).
         let rcode = reply[3] & 0x0F;
-        if rcode == 2 /* SERVFAIL */ {
-            // Remove from table and return Err so caller can try next server.
-            if let Some(pending) = self.table.remove(reply_id) {
-                if pending.retries < self.config.max_retries {
-                    return Err(pending);
+        if rcode == 2 /* SERVFAIL */ || rcode == 5 /* REFUSED */ {
+            if let Some(next_idx) = self.next_untried_server(idx) {
+                if let Some(frec) = self.table.get_mut(idx) {
+                    frec.retries = frec.retries.saturating_add(1);
+                    frec.sentto  = Some(next_idx);
+                    frec.tried.insert(next_idx);
+                    // `sent_at` is deliberately not refreshed: C's
+                    // `forward->time` is only ever set by `get_new_frec()`, so
+                    // the group-occupancy count and the garbage collector stay
+                    // anchored to when the *client* asked, and a query bouncing
+                    // between broken servers still ages out.
                 }
-                // Max retries exhausted — return SERVFAIL to client.
-                patch_id(reply, pending.orig_id);
-                return Ok(Some((pending.client, reply.clone())));
-            }
-            return Ok(None);
-        }
-        // Normal reply (including NXDOMAIN etc.).
-        let pending = match self.table.remove(reply_id) {
-            Some(p) => p,
-            None => return Ok(None),
-        };
-        patch_id(reply, pending.orig_id);
-        Ok(Some((pending.client, reply.clone())))
-    }
-
-    /// Retry a query that received SERVFAIL, using the next available upstream.
-    ///
-    /// Increments `pending.retries`, picks the next server that has not yet
-    /// been tried (stored in `pending.upstream_idx`), and re-sends the
-    /// original query.  Returns `Some(new_id)` on success.
-    pub async fn retry_query(
-        &mut self,
-        mut pending: PendingQuery,
-        orig_pkt: &[u8],
-        upstream_sock: &tokio::net::UdpSocket,
-    ) -> Option<u16> {
-        let mut tried = HashSet::new();
-        tried.insert(pending.upstream_idx);
-        let next_idx = next_server(&self.upstream_order, &tried, pending.upstream_idx)?;
-        let upstream_addr = self.config.upstreams[next_idx];
-
-        pending.retries += 1;
-        pending.upstream_idx = next_idx;
-        pending.sent_at = Instant::now();
-        let new_id = self.table.alloc_query(
-            pending.orig_id, pending.client, next_idx, pending.question_hash,
-        );
-
-        let mut out = orig_pkt.to_vec();
-        patch_id(&mut out, new_id);
-        match upstream_sock.send_to(&out, upstream_addr).await {
-            Ok(_) => Some(new_id),
-            Err(_) => {
-                self.table.remove(new_id);
-                None
+                if self.send_upstream(idx, next_idx).await {
+                    inc_metric(Metric::DnsQueriesForwarded);
+                    return ReplyAction::Retried;
+                }
             }
         }
+
+        let targets: Vec<ReplyTarget> = self
+            .table
+            .get(idx)
+            .map(|f| {
+                f.srcs()
+                    .filter_map(|s| {
+                        Some(ReplyTarget {
+                            client:   s.source?,
+                            listener: if s.fd < 0 { 0 } else { s.fd as usize },
+                            orig_id:  s.orig_id,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        self.table.free_frec(idx);
+        self.release_rfds();
+        ReplyAction::Deliver(targets)
     }
 
-    /// Expire timed-out pending queries.
-    pub fn expire_queries(&mut self) -> Vec<PendingQuery> {
-        self.table.expire_old(self.config.timeout)
+    /// The next upstream server this query has not been sent to, if the retry
+    /// budget allows one.
+    fn next_untried_server(&self, idx: usize) -> Option<usize> {
+        let frec = self.table.get(idx)?;
+        if frec.retries >= self.config.max_retries {
+            return None;
+        }
+        next_server(&self.upstream_order, &frec.tried, frec.sentto?)
+    }
+
+    /// Expire timed-out queries, releasing their source sockets.  Returns how
+    /// many were dropped.
+    pub fn expire_queries(&mut self) -> usize {
+        let n = self.table.expire_old(self.config.timeout);
+        self.release_rfds();
+        n
     }
 }
 
@@ -1623,9 +1883,6 @@ pub async fn run_forward_loop_on(
     }
     let mut filter = filter;
 
-    // Ephemeral socket for upstream communication.
-    let upstream_sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-
     // Local data is owned by the loop; `LocalConfig` borrows from `local` and
     // is rebuilt per query.  The cache is shared with SIGHUP reload handling
     // (`dnsmasq::clear_cache_and_reload`), which is the only other thing that
@@ -1636,8 +1893,13 @@ pub async fn run_forward_loop_on(
     let mut upstream_buf = vec![0u8; MAX_PACKET_SIZE];
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     let mut scan_from = 0usize;
+    let mut upstream_scan_from = 0usize;
 
     loop {
+        // Outbound sockets come and go with the queries that own them, so the
+        // reply poll set is rebuilt each time round rather than fixed at start.
+        let upstream_socks = engine.rfd_pool.sockets();
+
         tokio::select! {
             // ── Incoming client query ─────────────────────────────────────────
             (idx, ready) = next_readable(&listeners, scan_from) => {
@@ -1678,35 +1940,51 @@ pub async fn run_forward_loop_on(
                         let _ = listener.sock.send_to(&wire, src).await;
                         inc_metric(Metric::DnsLocalAnswered);
                     } else {
-                        if let Some(id) = engine.forward_query(pkt, src, &upstream_sock).await {
-                            engine.table.set_listener(id, idx);
+                        match engine.forward_query(pkt, src, idx).await {
+                            // The query table (or the duplicate-client budget)
+                            // is full.  C answers REFUSED rather than dropping,
+                            // so the client fails fast instead of timing out
+                            // (`forward.c:369`, `domain-match.c:430`).
+                            ForwardOutcome::Refused => {
+                                if let Some(wire) = make_refused_answer(pkt) {
+                                    let _ = listener.sock.send_to(&wire, src).await;
+                                }
+                            }
+                            ForwardOutcome::Forwarded(_)
+                            | ForwardOutcome::Duplicate
+                            | ForwardOutcome::Dropped => {}
                         }
                     }
                 }
             }
             // ── Upstream reply ────────────────────────────────────────────────
-            result = upstream_sock.recv_from(&mut upstream_buf) => {
-                let (len, upstream_addr) = result?;
+            (sock_idx, ready) = next_upstream_readable(&upstream_socks, upstream_scan_from),
+                    if !upstream_socks.is_empty() => {
+                upstream_scan_from = sock_idx + 1;
+                // One sick outbound socket must not take the whole resolver
+                // down; the query it belongs to will simply time out.
+                if ready.is_err() { continue }
+                let (len, upstream_addr) = match upstream_socks[sock_idx]
+                    .try_recv_from(&mut upstream_buf) {
+                    Ok(v)  => v,
+                    Err(_) => continue,
+                };
                 let mut pkt = upstream_buf[..len].to_vec();
 
                 // Nothing may act on this datagram until it has proved it
                 // answers an outstanding query, from the server that query
-                // went to.  A failed check leaves the pending entry alone so
-                // the genuine answer can still be accepted.
-                let Some(pending) = engine.accept_reply(&pkt, upstream_addr) else { continue };
+                // went to.  A failed check leaves the query in flight so the
+                // genuine answer can still be accepted.
+                let targets = match engine.accept_reply(&pkt, upstream_addr).await {
+                    ReplyAction::Deliver(targets) => targets,
+                    ReplyAction::Retried | ReplyAction::Ignore => continue,
+                };
 
                 // Answer the client as a recursive resolver, whatever the
                 // upstream server claimed to be (`forward.c:776`).  This
                 // precedes both the truncation check and extraction, exactly as
                 // it does in C.
                 set_recursion_available(&mut pkt);
-
-                let reply_listener = if pending.listener < listeners.len() {
-                    pending.listener
-                } else {
-                    0
-                };
-                let client_sock = &listeners[reply_listener].sock;
 
                 // A truncated reply is relayed to the client as-is and nothing
                 // is cached from it: C logs "truncated" and skips
@@ -1719,8 +1997,17 @@ pub async fn run_forward_loop_on(
                     cache_upstream_reply(&mut pkt, &mut cache, &engine.config);
                 }
 
-                patch_id(&mut pkt, pending.orig_id);
-                let _ = client_sock.send_to(&pkt, pending.client).await;
+                // One upstream answer, one reply per waiting client, each under
+                // the ID that client used (`forward.c:1435-1440`).
+                for target in targets {
+                    let listener_idx = if target.listener < listeners.len() {
+                        target.listener
+                    } else {
+                        0
+                    };
+                    patch_id(&mut pkt, target.orig_id);
+                    let _ = listeners[listener_idx].sock.send_to(&pkt, target.client).await;
+                }
             }
             // ── Periodic expiry cleanup ───────────────────────────────────────
             _ = ticker.tick() => {
@@ -1728,6 +2015,54 @@ pub async fn run_forward_loop_on(
             }
         }
     }
+}
+
+/// Wait until one of `socks` has a datagram ready, returning its index.
+///
+/// The outbound set changes as queries start and finish, so unlike
+/// [`next_readable`] this works from a snapshot the caller takes for one pass
+/// round the loop.  `start` rotates the scan so a socket being flooded — the
+/// obvious thing to do once an attacker has found one of our ports — cannot
+/// starve the replies every other query is waiting for.
+async fn next_upstream_readable(
+    socks: &[Arc<tokio::net::UdpSocket>],
+    start: usize,
+) -> (usize, std::io::Result<()>) {
+    std::future::poll_fn(|cx| {
+        use std::task::Poll;
+        for offset in 0..socks.len() {
+            let i = (start + offset) % socks.len();
+            if let Poll::Ready(r) = socks[i].poll_recv_ready(cx) {
+                return Poll::Ready((i, r));
+            }
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+/// Build the REFUSED answer C returns when a query cannot be forwarded.
+///
+/// `setup_reply()` with no flags set (`domain-match.c:416`,
+/// `rfc1035.c:setup_reply`): question section kept, every record section
+/// dropped, QR and RA set, AA/TC/AD cleared, RCODE REFUSED.  Re-serialising
+/// rather than editing the counts in place also drops the record bytes — the
+/// OPT pseudo-header included, which C re-adds only for a query that had one.
+fn make_refused_answer(query: &[u8]) -> Option<Vec<u8>> {
+    let parsed = DnsPacket::parse(query).ok()?;
+    let mut header = parsed.header;
+    crate::rfc1035::setup_reply(&mut header, 0);
+    Some(
+        DnsPacket {
+            header,
+            questions:  parsed.questions.clone(),
+            answers:    Vec::new(),
+            authority:  Vec::new(),
+            additional: Vec::new(),
+        }
+        .write()
+        .to_vec(),
+    )
 }
 
 // ─── Reply processing helpers ─────────────────────────────────────────────────
@@ -1925,85 +2260,6 @@ pub fn process_reply(
     ProcessReplyResult::Forward { rcode }
 }
 
-/// Disposition returned by `reply_query`.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ReplyQueryResult {
-    /// Reply fully processed; send `pkt` to `client`.
-    Send {
-        /// Processed reply packet to forward to the client.
-        pkt:    Vec<u8>,
-        /// Client address.
-        client: SocketAddr,
-        /// Upstream server index that replied.
-        server_idx: usize,
-    },
-    /// Reply was discarded (spoof, parse error, etc.).
-    Discard,
-    /// All upstream servers for this query have been tried.
-    AllServersTried,
-}
-
-/// Core of the reply-handling path.
-///
-/// Given a raw `reply_pkt` received from upstream server `from_addr`, look up
-/// the matching pending query in `table`, apply `process_reply` policy, patch
-/// the transaction ID back to the client's original ID, and return a
-/// `ReplyQueryResult` describing what to do next.
-///
-/// Mirrors the key logic of `reply_query()` in `forward.c` without global
-/// daemon state.
-pub fn reply_query(
-    reply_pkt:  &[u8],
-    from_addr:  SocketAddr,
-    servers:    &[SocketAddr],
-    table:      &mut ForwardTable,
-    config:     &ProcessReplyConfig,
-    no_rebind:  &[RebindDomain],
-    query_name: &str,
-) -> ReplyQueryResult {
-    if reply_pkt.len() < 12 {
-        return ReplyQueryResult::Discard;
-    }
-
-    // Packet must be a response (QR bit set).
-    let qr_bit = (reply_pkt[2] & 0x80) != 0;
-    if !qr_bit {
-        return ReplyQueryResult::Discard;
-    }
-
-    let upstream_id = u16::from_be_bytes([reply_pkt[0], reply_pkt[1]]);
-
-    // Look up pending query by upstream transaction ID.
-    let pending = match table.get_query(upstream_id) {
-        Some(q) => q.clone(),
-        None    => return ReplyQueryResult::Discard,
-    };
-
-    // Spoof check: verify the reply came from the expected server.
-    let expected_addr = servers.get(pending.upstream_idx);
-    if expected_addr != Some(&from_addr) {
-        return ReplyQueryResult::Discard;
-    }
-
-    // Process the reply through policy filters.
-    let result = process_reply(reply_pkt, query_name, config, no_rebind);
-    if result == ProcessReplyResult::Discard {
-        table.remove_query(upstream_id);
-        return ReplyQueryResult::Discard;
-    }
-
-    // Patch the transaction ID back to the client's original.
-    let mut pkt = reply_pkt.to_vec();
-    patch_id(&mut pkt, pending.orig_id);
-
-    let server_idx = pending.upstream_idx;
-    let client     = pending.client;
-
-    table.remove_query(upstream_id);
-
-    ReplyQueryResult::Send { pkt, client, server_idx }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Pure utility functions (ported from forward.c)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2073,56 +2329,50 @@ mod tests {
         [1u8; 16]
     }
 
-    // ── ForwardTable ──────────────────────────────────────────────────────────
+    // ── FrecTable: in-flight query bookkeeping ────────────────────────────────
 
-    #[test]
-    fn alloc_query_unique_ids() {
-        let mut ft = ForwardTable::new();
-        let id1 = ft.alloc_query(100, dummy_addr(), 0, dummy_hash());
-        let id2 = ft.alloc_query(101, dummy_addr(), 0, dummy_hash());
-        let id3 = ft.alloc_query(102, dummy_addr(), 0, dummy_hash());
-        assert_ne!(id1, id2);
-        assert_ne!(id2, id3);
-        assert_ne!(id1, id3);
+    /// Put one live query into the table, the way `forward_query` does.
+    fn insert_frec(
+        ft:         &mut FrecTable,
+        orig_id:    u16,
+        client:     SocketAddr,
+        server_idx: usize,
+        qhash:      [u8; 16],
+    ) -> usize {
+        let idx = ft
+            .get_new_frec(Instant::now(), server_idx, false)
+            .expect("table must have room");
+        let new_id = ft.get_id();
+        let frec = ft.get_mut(idx).expect("just allocated");
+        frec.sentto        = Some(server_idx);
+        frec.new_id        = new_id;
+        frec.question_hash = qhash;
+        frec.stash         = Some(vec![0u8; 12]);
+        frec.frec_src      = FrecSrc {
+            source: Some(client),
+            orig_id,
+            fd: 0,
+            ..FrecSrc::default()
+        };
+        frec.tried.insert(server_idx);
+        idx
     }
 
-    #[test]
-    fn lookup_finds_inserted_query() {
-        let mut ft = ForwardTable::new();
-        let id = ft.alloc_query(42, dummy_addr(), 1, dummy_hash());
-        let q = ft.lookup(id).expect("should find query");
-        assert_eq!(q.orig_id, 42);
-        assert_eq!(q.upstream_idx, 1);
-    }
-
-    #[test]
-    fn remove_removes_query() {
-        let mut ft = ForwardTable::new();
-        let id = ft.alloc_query(7, dummy_addr(), 0, dummy_hash());
-        let removed = ft.remove(id);
-        assert!(removed.is_some());
-        assert!(ft.lookup(id).is_none());
-    }
-
-    #[test]
-    fn remove_absent_id_returns_none() {
-        let mut ft = ForwardTable::new();
-        assert!(ft.remove(9999).is_none());
+    fn src_from(client: SocketAddr, orig_id: u16) -> FrecSrc {
+        FrecSrc { source: Some(client), orig_id, fd: 0, ..FrecSrc::default() }
     }
 
     /// C draws outgoing IDs from `rand16()` (`get_id()`, `forward.c:3302`).
     /// A counter would make every ID after the first one predictable, which is
     /// half the credential a forged reply has to guess.
     #[test]
-    fn alloc_query_ids_are_not_sequential() {
-        let mut ft = ForwardTable::new();
+    fn frec_ids_are_not_sequential() {
+        let mut ft = FrecTable::new(4096);
         let ids: Vec<u16> = (0..32)
-            .map(|i| ft.alloc_query(i, dummy_addr(), 0, dummy_hash()))
+            .map(|i| { let idx = insert_frec(&mut ft, i, dummy_addr(), 0, [i as u8; 16]); ft.get(idx).unwrap().new_id })
             .collect();
 
-        let all_consecutive = ids
-            .windows(2)
-            .all(|w| w[1] == w[0].wrapping_add(1));
+        let all_consecutive = ids.windows(2).all(|w| w[1] == w[0].wrapping_add(1));
         assert!(
             !all_consecutive,
             "transaction IDs must be unpredictable, got a run of consecutive ids: {ids:?}",
@@ -2130,31 +2380,124 @@ mod tests {
     }
 
     #[test]
-    fn alloc_query_ids_stay_unique_under_load() {
-        let mut ft = ForwardTable::new();
-        let ids: HashSet<u16> = (0..1000)
-            .map(|i| ft.alloc_query(i, dummy_addr(), 0, dummy_hash()))
+    fn frec_ids_stay_unique_under_load() {
+        let mut ft = FrecTable::new(4096);
+        let ids: HashSet<u16> = (0..1000u16)
+            .map(|i| {
+                let mut qhash = [0u8; 16];
+                qhash[..2].copy_from_slice(&i.to_be_bytes());
+                let idx = insert_frec(&mut ft, i, dummy_addr(), 0, qhash);
+                ft.get(idx).unwrap().new_id
+            })
             .collect();
         assert_eq!(ids.len(), 1000, "every in-flight query needs its own id");
     }
 
     #[test]
-    fn expire_old_removes_timed_out_leaves_fresh() {
-        let mut ft = ForwardTable::new();
+    fn expire_old_frees_timed_out_and_leaves_fresh() {
+        let mut ft = FrecTable::new(64);
 
-        // Insert a query and immediately back-date its sent_at.
-        let old_id = ft.alloc_query(1, dummy_addr(), 0, dummy_hash());
-        ft.queries.get_mut(&old_id).unwrap().sent_at =
-            Instant::now() - Duration::from_secs(10);
+        let old = insert_frec(&mut ft, 1, dummy_addr(), 0, [1u8; 16]);
+        let fresh = insert_frec(&mut ft, 2, dummy_addr(), 0, [2u8; 16]);
+        // Back-dated only after both exist: `get_new_frec` recycles a slot that
+        // is already past `TIMEOUT`, so an aged entry would not survive the
+        // second allocation.
+        ft.get_mut(old).unwrap().sent_at = Instant::now() - Duration::from_secs(10);
 
-        // Insert a fresh query.
-        let fresh_id = ft.alloc_query(2, dummy_addr(), 0, dummy_hash());
+        assert_eq!(ft.expire_old(Duration::from_secs(5)), 1);
+        assert!(ft.get(old).unwrap().sentto.is_none(), "the stale query must be freed");
+        assert!(ft.get(fresh).unwrap().sentto.is_some(), "the fresh query must survive");
+    }
 
-        let expired = ft.expire_old(Duration::from_secs(5));
-        assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].id, old_id);
-        assert!(ft.lookup(fresh_id).is_some());
-        assert!(ft.lookup(old_id).is_none());
+    /// Expiring a query has to hand its source socket back, or an unanswered
+    /// query would keep a port pinned open for the life of the process.
+    #[test]
+    fn expire_old_releases_the_source_sockets() {
+        let mut ft = FrecTable::new(64);
+        let idx = insert_frec(&mut ft, 1, dummy_addr(), 0, [1u8; 16]);
+        ft.get_mut(idx).unwrap().rfds = vec![3, 7];
+        ft.get_mut(idx).unwrap().sent_at = Instant::now() - Duration::from_secs(10);
+
+        ft.expire_old(Duration::from_secs(5));
+        assert_eq!(ft.take_released_rfds(), vec![3, 7]);
+        assert!(ft.take_released_rfds().is_empty(), "released slots are handed over once");
+    }
+
+    // ── FrecTable: duplicate-question lookup ──────────────────────────────────
+
+    #[test]
+    fn lookup_frec_by_question_finds_the_identical_question() {
+        let mut ft = FrecTable::new(64);
+        let idx = insert_frec(&mut ft, 1, dummy_addr(), 0, dummy_hash());
+        assert_eq!(ft.lookup_frec_by_question(Instant::now(), dummy_hash()), Some(idx));
+    }
+
+    #[test]
+    fn lookup_frec_by_question_ignores_a_different_question() {
+        let mut ft = FrecTable::new(64);
+        insert_frec(&mut ft, 1, dummy_addr(), 0, dummy_hash());
+        assert_eq!(ft.lookup_frec_by_question(Instant::now(), [9u8; 16]), None);
+    }
+
+    #[test]
+    fn lookup_frec_by_question_ignores_a_completed_query() {
+        let mut ft = FrecTable::new(64);
+        let idx = insert_frec(&mut ft, 1, dummy_addr(), 0, dummy_hash());
+        ft.free_frec(idx);
+        assert_eq!(ft.lookup_frec_by_question(Instant::now(), dummy_hash()), None);
+    }
+
+    /// A DNSSEC sub-query or a query whose answer depends on client-specific
+    /// EDNS options must never absorb another client's question
+    /// (`forward.c:194-196`).
+    #[test]
+    fn lookup_frec_by_question_skips_context_specific_queries() {
+        let mut ft = FrecTable::new(64);
+        let idx = insert_frec(&mut ft, 1, dummy_addr(), 0, dummy_hash());
+        ft.get_mut(idx).unwrap().flags = FREC_NO_CACHE;
+        assert_eq!(ft.lookup_frec_by_question(Instant::now(), dummy_hash()), None);
+    }
+
+    // ── FrecTable: duplicate-client budget ────────────────────────────────────
+
+    #[test]
+    fn add_src_attaches_another_client() {
+        let mut ft = FrecTable::new(64);
+        let idx = insert_frec(&mut ft, 1, dummy_addr(), 0, dummy_hash());
+        let other: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        assert!(ft.add_src(idx, src_from(other, 2)));
+
+        let srcs: Vec<u16> = ft.get(idx).unwrap().srcs().map(|s| s.orig_id).collect();
+        assert_eq!(srcs, vec![1, 2], "the primary source stays first");
+    }
+
+    /// C caps `daemon->frec_src_count` at `ftabsize` across the whole table so
+    /// one spammed question cannot exhaust memory (`forward.c:227-249`).
+    #[test]
+    fn add_src_is_capped_by_the_global_budget() {
+        let mut ft = FrecTable::new(3);
+        let idx = insert_frec(&mut ft, 0, dummy_addr(), 0, dummy_hash());
+        for i in 1..=3u16 {
+            let client: SocketAddr = format!("127.0.0.1:{}", 5000 + i).parse().unwrap();
+            assert!(ft.add_src(idx, src_from(client, i)), "src {i} is within budget");
+        }
+        let client: SocketAddr = "127.0.0.1:6000".parse().unwrap();
+        assert!(!ft.add_src(idx, src_from(client, 99)), "the budget must be enforced");
+    }
+
+    #[test]
+    fn freeing_a_query_returns_its_clients_to_the_budget() {
+        let mut ft = FrecTable::new(2);
+        let first = insert_frec(&mut ft, 0, dummy_addr(), 0, [1u8; 16]);
+        let extra: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+        assert!(ft.add_src(first, src_from(extra, 1)));
+        assert!(ft.add_src(first, src_from(extra, 2)));
+
+        let second = insert_frec(&mut ft, 10, dummy_addr(), 0, [2u8; 16]);
+        assert!(!ft.add_src(second, src_from(extra, 3)), "budget is exhausted");
+
+        ft.free_frec(first);
+        assert!(ft.add_src(second, src_from(extra, 3)), "freeing must refund the budget");
     }
 
     // ── patch_id ──────────────────────────────────────────────────────────────
@@ -2273,82 +2616,123 @@ mod tests {
         reply
     }
 
-    /// An engine with one outstanding query for `qname`, plus the wire bytes of
-    /// that query and the upstream ID it was sent with.
+    fn client_addr() -> SocketAddr {
+        "127.0.0.1:1234".parse().unwrap()
+    }
+
+    /// An engine holding one outstanding query for `qname` — allocated through
+    /// the same `FrecTable` path `forward_query` uses, but without a send, so
+    /// the test needs no sockets.
     fn engine_with_pending(qname: &str, orig_id: u16) -> (ForwardEngine, Vec<u8>, u16) {
         let config = ForwardConfig {
             upstreams: vec![upstream_addr()],
             ..Default::default()
         };
         let mut engine = ForwardEngine::new(config);
-        let client: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         let mut query = make_dns_query(qname, 1);
         patch_id(&mut query, orig_id);
         let qhash = hash_questions(&query).expect("query must hash");
-        let upstream_id = engine.table.alloc_query(orig_id, client, 0, qhash);
+        let idx = insert_frec(&mut engine.table, orig_id, client_addr(), 0, qhash);
+        let upstream_id = engine.table.get(idx).unwrap().new_id;
         (engine, query, upstream_id)
     }
 
-    #[test]
-    fn accept_reply_claims_the_matching_pending_query() {
+    fn delivered(action: ReplyAction) -> Option<Vec<ReplyTarget>> {
+        match action {
+            ReplyAction::Deliver(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn accept_reply_claims_the_matching_pending_query() {
         let (mut engine, query, upstream_id) = engine_with_pending("example.com", 42);
         let reply = reply_for(&query, upstream_id);
 
-        let pending = engine
-            .accept_reply(&reply, upstream_addr())
+        let targets = delivered(engine.accept_reply(&reply, upstream_addr()).await)
             .expect("a matching reply from the right server must be accepted");
-        assert_eq!(pending.orig_id, 42);
-        assert_eq!(pending.client, "127.0.0.1:1234".parse::<SocketAddr>().unwrap());
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].orig_id, 42);
+        assert_eq!(targets[0].client, client_addr());
         // The entry is consumed, so a duplicate reply finds nothing.
-        assert!(engine.accept_reply(&reply, upstream_addr()).is_none());
+        assert_eq!(engine.accept_reply(&reply, upstream_addr()).await, ReplyAction::Ignore);
     }
 
-    #[test]
-    fn accept_reply_rejects_an_unknown_transaction_id() {
+    #[tokio::test]
+    async fn accept_reply_rejects_an_unknown_transaction_id() {
         let (mut engine, query, upstream_id) = engine_with_pending("example.com", 42);
         let mut reply = reply_for(&query, upstream_id);
         patch_id(&mut reply, upstream_id.wrapping_add(1));
-        assert!(engine.accept_reply(&reply, upstream_addr()).is_none());
+        assert_eq!(engine.accept_reply(&reply, upstream_addr()).await, ReplyAction::Ignore);
     }
 
-    #[test]
-    fn accept_reply_rejects_a_reply_from_another_address() {
+    #[tokio::test]
+    async fn accept_reply_rejects_a_reply_from_another_address() {
         let (mut engine, query, upstream_id) = engine_with_pending("example.com", 42);
         let reply = reply_for(&query, upstream_id);
         let spoofer: SocketAddr = "127.0.0.2:5353".parse().unwrap();
 
-        assert!(
-            engine.accept_reply(&reply, spoofer).is_none(),
+        assert_eq!(
+            engine.accept_reply(&reply, spoofer).await,
+            ReplyAction::Ignore,
             "a correct ID from the wrong source must not be accepted",
         );
         // The pending entry survives, so the real server can still answer.
-        assert!(engine.accept_reply(&reply, upstream_addr()).is_some());
+        assert!(delivered(engine.accept_reply(&reply, upstream_addr()).await).is_some());
     }
 
-    #[test]
-    fn accept_reply_rejects_a_reply_answering_a_different_question() {
+    #[tokio::test]
+    async fn accept_reply_rejects_a_reply_answering_a_different_question() {
         let (mut engine, _query, upstream_id) = engine_with_pending("example.com", 42);
         // Right ID, right source, wrong question — a cache-poisoning attempt.
         let forged = reply_for(&make_dns_query("victim.test", 1), upstream_id);
 
-        assert!(
-            engine.accept_reply(&forged, upstream_addr()).is_none(),
+        assert_eq!(
+            engine.accept_reply(&forged, upstream_addr()).await,
+            ReplyAction::Ignore,
             "a reply for a different name must not be accepted",
         );
     }
 
-    #[test]
-    fn accept_reply_rejects_a_packet_without_the_qr_bit() {
+    #[tokio::test]
+    async fn accept_reply_rejects_a_packet_without_the_qr_bit() {
         let (mut engine, query, upstream_id) = engine_with_pending("example.com", 42);
         let mut not_a_reply = reply_for(&query, upstream_id);
         not_a_reply[2] &= !0x80;
-        assert!(engine.accept_reply(&not_a_reply, upstream_addr()).is_none());
+        assert_eq!(
+            engine.accept_reply(&not_a_reply, upstream_addr()).await,
+            ReplyAction::Ignore,
+        );
     }
 
-    #[test]
-    fn accept_reply_rejects_a_truncated_header() {
+    #[tokio::test]
+    async fn accept_reply_rejects_a_truncated_header() {
         let (mut engine, _query, _id) = engine_with_pending("example.com", 42);
-        assert!(engine.accept_reply(&[0u8; 4], upstream_addr()).is_none());
+        assert_eq!(engine.accept_reply(&[0u8; 4], upstream_addr()).await, ReplyAction::Ignore);
+    }
+
+    /// One upstream answer, one reply target per client that asked.
+    #[tokio::test]
+    async fn accept_reply_fans_out_to_every_waiting_client() {
+        let (mut engine, query, upstream_id) = engine_with_pending("example.com", 42);
+        let second: SocketAddr = "127.0.0.1:4321".parse().unwrap();
+        let idx = engine
+            .table
+            .lookup_frec(Instant::now(), upstream_id, 0, 0)
+            .expect("query is in flight");
+        assert!(engine.table.add_src(idx, src_from(second, 0xBEEF)));
+
+        let reply = reply_for(&query, upstream_id);
+        let targets = delivered(engine.accept_reply(&reply, upstream_addr()).await)
+            .expect("reply must be delivered");
+
+        assert_eq!(
+            targets,
+            vec![
+                ReplyTarget { client: client_addr(), listener: 0, orig_id: 42 },
+                ReplyTarget { client: second,        listener: 0, orig_id: 0xBEEF },
+            ],
+        );
     }
 
     #[test]
@@ -2358,67 +2742,181 @@ mod tests {
             ..Default::default()
         };
         let mut engine = ForwardEngine::new(config);
-        let client: SocketAddr = "127.0.0.1:999".parse().unwrap();
-        engine.table.alloc_query(1, client, 0, [0u8; 16]);
+        insert_frec(&mut engine.table, 1, client_addr(), 0, [0u8; 16]);
         // Wait for timeout.
         std::thread::sleep(Duration::from_millis(5));
-        let expired = engine.expire_queries();
-        assert_eq!(expired.len(), 1);
+        assert_eq!(engine.expire_queries(), 1);
     }
 
-    // ── TCP fallback helpers ──────────────────────────────────────────────────
+    // ── Upstream failure hand-off ─────────────────────────────────────────────
 
-    #[test]
-    fn servfail_triggers_retry_path() {
+    /// C re-forwards a SERVFAIL/REFUSED answer to the next server rather than
+    /// passing the failure on (`forward.c:1242-1250`).
+    #[tokio::test]
+    async fn servfail_is_retried_against_the_next_server() {
+        let Ok(second) = tokio::net::UdpSocket::bind("127.0.0.1:0").await else { return };
+        let Ok(second_addr) = second.local_addr() else { return };
         let config = ForwardConfig {
-            upstreams: vec![
-                "127.0.0.1:5353".parse().unwrap(),
-                "127.0.0.2:5353".parse().unwrap(),
-            ],
+            upstreams:   vec![upstream_addr(), second_addr],
             max_retries: 1,
             ..Default::default()
         };
-        let client: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         let mut engine = ForwardEngine::new(config);
         let query = make_dns_query("example.com", 1);
         let qhash = hash_questions(&query).expect("query must hash");
-        let new_id = engine.table.alloc_query(42, client, 0, qhash);
+        let idx = insert_frec(&mut engine.table, 42, client_addr(), 0, qhash);
+        engine.table.get_mut(idx).unwrap().stash = Some(query.clone());
+        let first_id = engine.table.get(idx).unwrap().new_id;
 
-        // A SERVFAIL reply (rcode=2 in byte 3) from the server we asked.
-        let mut reply = reply_for(&query, new_id);
-        reply[3] = (reply[3] & 0xF0) | 0x02;
-        let result = engine.handle_reply_with_failover(&mut reply, upstream_addr());
-        // Should return Err(pending) because retries < max_retries.
-        assert!(result.is_err(), "SERVFAIL with retries left should return Err");
-        let pending = result.unwrap_err();
-        assert_eq!(pending.orig_id, 42);
-        assert_eq!(pending.retries, 0); // not yet incremented — retry_query does that
+        let mut reply = reply_for(&query, first_id);
+        reply[3] = (reply[3] & 0xF0) | 0x02; // SERVFAIL
+        assert_eq!(engine.accept_reply(&reply, upstream_addr()).await, ReplyAction::Retried);
+
+        let frec = engine.table.get(idx).expect("query stays in flight for the retry");
+        assert_eq!(frec.retries, 1);
+        assert_eq!(frec.sentto, Some(1), "the retry goes to the other server");
+
+        let mut buf = vec![0u8; 512];
+        let n = tokio::time::timeout(Duration::from_secs(1), second.recv(&mut buf))
+            .await
+            .expect("the retry must actually be sent")
+            .expect("recv must succeed");
+        assert_eq!(hash_questions(&buf[..n]), Some(qhash));
     }
 
-    #[test]
-    fn servfail_exhausted_retries_returns_reply() {
+    #[tokio::test]
+    async fn servfail_with_no_server_left_is_delivered_to_the_client() {
         let config = ForwardConfig {
-            upstreams: vec!["127.0.0.1:5353".parse().unwrap()],
-            max_retries: 0,
+            upstreams:   vec![upstream_addr()],
+            max_retries: 1,
             ..Default::default()
         };
-        let client: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         let mut engine = ForwardEngine::new(config);
         let query = make_dns_query("example.com", 1);
         let qhash = hash_questions(&query).expect("query must hash");
-        let new_id = engine.table.alloc_query(99, client, 0, qhash);
+        let idx = insert_frec(&mut engine.table, 99, client_addr(), 0, qhash);
+        let new_id = engine.table.get(idx).unwrap().new_id;
 
         let mut reply = reply_for(&query, new_id);
         reply[3] = (reply[3] & 0xF0) | 0x02; // SERVFAIL
-        let result = engine.handle_reply_with_failover(&mut reply, upstream_addr());
-        // max_retries=0 → return SERVFAIL to client.
-        assert!(result.is_ok());
-        let inner = result.unwrap();
-        assert!(inner.is_some());
-        let (addr, resp) = inner.unwrap();
-        assert_eq!(addr, client);
-        let restored = u16::from_be_bytes([resp[0], resp[1]]);
-        assert_eq!(restored, 99);
+        let targets = delivered(engine.accept_reply(&reply, upstream_addr()).await)
+            .expect("with nowhere left to retry the failure goes to the client");
+        assert_eq!(targets, vec![ReplyTarget { client: client_addr(), listener: 0, orig_id: 99 }]);
+    }
+
+    #[tokio::test]
+    async fn retries_stop_at_max_retries() {
+        let Ok(second) = tokio::net::UdpSocket::bind("127.0.0.1:0").await else { return };
+        let Ok(second_addr) = second.local_addr() else { return };
+        let config = ForwardConfig {
+            upstreams:   vec![upstream_addr(), second_addr],
+            max_retries: 0,
+            ..Default::default()
+        };
+        let mut engine = ForwardEngine::new(config);
+        let query = make_dns_query("example.com", 1);
+        let qhash = hash_questions(&query).expect("query must hash");
+        let idx = insert_frec(&mut engine.table, 7, client_addr(), 0, qhash);
+        let new_id = engine.table.get(idx).unwrap().new_id;
+
+        let mut reply = reply_for(&query, new_id);
+        reply[3] = (reply[3] & 0xF0) | 0x02; // SERVFAIL
+        assert!(
+            delivered(engine.accept_reply(&reply, upstream_addr()).await).is_some(),
+            "max_retries = 0 must not open another upstream query",
+        );
+    }
+
+    // ── forward_query admission control ───────────────────────────────────────
+
+    /// `get_new_frec()` refuses once `ftabsize` queries are in flight to one
+    /// server group, and C answers the client REFUSED (`forward.c:369`).
+    #[tokio::test]
+    async fn forward_query_refuses_once_the_group_is_full() {
+        let Ok(upstream) = tokio::net::UdpSocket::bind("127.0.0.1:0").await else { return };
+        let Ok(upstream_addr) = upstream.local_addr() else { return };
+        let config = ForwardConfig {
+            upstreams: vec![upstream_addr],
+            ftabsize:  2,
+            ..Default::default()
+        };
+        let mut engine = ForwardEngine::new(config);
+
+        for i in 0..2u16 {
+            let query = make_dns_query(&format!("q{i}.test"), 1);
+            assert!(
+                matches!(
+                    engine.forward_query(&query, client_addr(), 0).await,
+                    ForwardOutcome::Forwarded(_),
+                ),
+                "query {i} is within the limit",
+            );
+        }
+
+        let query = make_dns_query("overflow.test", 1);
+        assert_eq!(
+            engine.forward_query(&query, client_addr(), 0).await,
+            ForwardOutcome::Refused,
+            "the third concurrent query to a full group must be refused",
+        );
+    }
+
+    /// A second client asking the identical question joins the query in flight
+    /// instead of opening another one (`forward.c:221-323`).
+    #[tokio::test]
+    async fn forward_query_folds_a_duplicate_question() {
+        let Ok(upstream) = tokio::net::UdpSocket::bind("127.0.0.1:0").await else { return };
+        let Ok(upstream_addr) = upstream.local_addr() else { return };
+        let config = ForwardConfig { upstreams: vec![upstream_addr], ..Default::default() };
+        let mut engine = ForwardEngine::new(config);
+
+        let mut first = make_dns_query("shared.test", 1);
+        patch_id(&mut first, 0x1111);
+        assert!(matches!(
+            engine.forward_query(&first, client_addr(), 0).await,
+            ForwardOutcome::Forwarded(_),
+        ));
+
+        let mut second = make_dns_query("shared.test", 1);
+        patch_id(&mut second, 0x2222);
+        let other: SocketAddr = "127.0.0.1:4321".parse().unwrap();
+        assert_eq!(
+            engine.forward_query(&second, other, 1).await,
+            ForwardOutcome::Duplicate,
+        );
+
+        assert_eq!(engine.table.active_count(), 1, "still one upstream transaction");
+        let idx = engine
+            .table
+            .lookup_frec_by_question(Instant::now(), hash_questions(&first).unwrap())
+            .expect("the query is in flight");
+        let srcs: Vec<(u16, i32)> = engine
+            .table
+            .get(idx)
+            .unwrap()
+            .srcs()
+            .map(|s| (s.orig_id, s.fd))
+            .collect();
+        assert_eq!(
+            srcs,
+            vec![(0x1111, 0), (0x2222, 1)],
+            "each client keeps its own transaction ID and listener",
+        );
+    }
+
+    /// A malformed query has no recognisable question, so C will not forward it
+    /// — it would have no way to match the answer (`forward.c:337-343`).
+    #[tokio::test]
+    async fn forward_query_drops_a_question_it_cannot_read() {
+        let config = ForwardConfig {
+            upstreams: vec![upstream_addr()],
+            ..Default::default()
+        };
+        let mut engine = ForwardEngine::new(config);
+        // Header-only packet: qdcount is zero, so there is no question.
+        let outcome = engine.forward_query(&[0u8; 12], client_addr(), 0).await;
+        assert_eq!(outcome, ForwardOutcome::Dropped);
+        assert_eq!(engine.table.active_count(), 0);
     }
 
 
@@ -2474,44 +2972,112 @@ mod tests {
 
     #[tokio::test]
     async fn rfd_pool_allocate_returns_socket() {
-        let mut pool = RandFdPool::new();
-        let sock = pool.allocate(0).await;
-        assert!(sock.is_some());
+        let mut pool = RandFdPool::new(4, 1);
+        let mut fdl = RfdList::new();
+        let Some(_sock) = pool.allocate(&mut fdl, 0).await else { return };
         assert_eq!(pool.active_count(), 1);
+        assert_eq!(fdl.len(), 1, "the transaction records the slot it took");
     }
 
+    /// The whole point of the pool: two *different* transactions asking the
+    /// same server must not share a source port while both are in flight.
     #[tokio::test]
-    async fn rfd_pool_reuses_same_server_socket() {
-        let mut pool = RandFdPool::new();
-        let s1 = pool.allocate(0).await.unwrap();
-        let s2 = pool.allocate(0).await.unwrap();
-        // Both arcs should point to the same socket (same local addr).
-        assert_eq!(
-            s1.local_addr().unwrap(),
-            s2.local_addr().unwrap()
+    async fn rfd_pool_gives_each_transaction_its_own_port() {
+        let mut pool = RandFdPool::new(4, 1);
+        let (mut a, mut b) = (RfdList::new(), RfdList::new());
+        let Some(s_a) = pool.allocate(&mut a, 0).await else { return };
+        let Some(s_b) = pool.allocate(&mut b, 0).await else { return };
+        assert_ne!(
+            s_a.local_addr().unwrap(),
+            s_b.local_addr().unwrap(),
+            "concurrent queries to one server must leave from different ports",
         );
+        assert_eq!(pool.active_count(), 2);
+    }
+
+    /// Within one transaction, `randport_limit` caps the ports it holds per
+    /// server; past that it reuses the one it has (`forward.c:2881-2887`).
+    #[tokio::test]
+    async fn rfd_pool_reuses_a_transactions_own_socket_at_the_limit() {
+        let mut pool = RandFdPool::new(4, 1);
+        let mut fdl = RfdList::new();
+        let Some(first) = pool.allocate(&mut fdl, 0).await else { return };
+        let Some(again) = pool.allocate(&mut fdl, 0).await else { return };
+        assert_eq!(first.local_addr().unwrap(), again.local_addr().unwrap());
         assert_eq!(pool.active_count(), 1);
+        assert_eq!(fdl.len(), 1);
     }
 
     #[tokio::test]
-    async fn rfd_pool_free_decrements_refcount() {
-        let mut pool = RandFdPool::new();
-        pool.allocate(7).await.unwrap();
+    async fn rfd_pool_honours_a_higher_randport_limit() {
+        let mut pool = RandFdPool::new(4, 2);
+        let mut fdl = RfdList::new();
+        let Some(first) = pool.allocate(&mut fdl, 0).await else { return };
+        let Some(second) = pool.allocate(&mut fdl, 0).await else { return };
+        assert_ne!(first.local_addr().unwrap(), second.local_addr().unwrap());
+        assert_eq!(fdl.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rfd_pool_free_closes_the_transactions_sockets() {
+        let mut pool = RandFdPool::new(4, 1);
+        let mut fdl = RfdList::new();
+        if pool.allocate(&mut fdl, 7).await.is_none() { return }
         assert_eq!(pool.active_count(), 1);
-        pool.free(7);
+        pool.free_rfds(&mut fdl);
+        assert_eq!(pool.active_count(), 0);
+        assert!(fdl.is_empty());
+    }
+
+    /// A socket two transactions ended up sharing stays open until the second
+    /// one is done with it (C's refcount, `forward.c:3014`).
+    #[tokio::test]
+    async fn rfd_pool_shared_socket_survives_the_first_release() {
+        // One slot forces the second transaction onto the sharing path.
+        let mut pool = RandFdPool::new(1, 1);
+        let (mut a, mut b) = (RfdList::new(), RfdList::new());
+        let Some(s_a) = pool.allocate(&mut a, 0).await else { return };
+        let Some(s_b) = pool.allocate(&mut b, 0).await else { return };
+        assert_eq!(s_a.local_addr().unwrap(), s_b.local_addr().unwrap());
+
+        pool.free_rfds(&mut a);
+        assert_eq!(pool.active_count(), 1, "the other transaction still needs it");
+        pool.free_rfds(&mut b);
         assert_eq!(pool.active_count(), 0);
     }
 
+    /// With the pool full and nothing to share, C opens a temporary socket
+    /// outside the pool rather than failing the query (`forward.c:2960-2990`).
     #[tokio::test]
-    async fn rfd_pool_different_servers_get_different_sockets() {
-        let mut pool = RandFdPool::new();
-        let s0 = pool.allocate(0).await.unwrap();
-        let s1 = pool.allocate(1).await.unwrap();
-        assert_ne!(
-            s0.local_addr().unwrap(),
-            s1.local_addr().unwrap()
-        );
+    async fn rfd_pool_overflows_to_a_temporary_socket() {
+        let mut pool = RandFdPool::new(1, 1);
+        let (mut a, mut b) = (RfdList::new(), RfdList::new());
+        let Some(s_a) = pool.allocate(&mut a, 0).await else { return };
+        // Different server, so the one live socket cannot be shared.
+        let Some(s_b) = pool.allocate(&mut b, 1).await else { return };
+        assert_ne!(s_a.local_addr().unwrap(), s_b.local_addr().unwrap());
         assert_eq!(pool.active_count(), 2);
+
+        pool.free_rfds(&mut b);
+        assert_eq!(pool.active_count(), 1, "the overflow socket is closed at once");
+    }
+
+    #[tokio::test]
+    async fn rfd_pool_sockets_lists_the_live_set() {
+        let mut pool = RandFdPool::new(4, 1);
+        let (mut a, mut b) = (RfdList::new(), RfdList::new());
+        if pool.allocate(&mut a, 0).await.is_none() { return }
+        if pool.allocate(&mut b, 1).await.is_none() { return }
+        assert_eq!(pool.sockets().len(), 2);
+        pool.free_rfds(&mut a);
+        assert_eq!(pool.sockets().len(), 1);
+    }
+
+    #[test]
+    fn rfd_pool_is_sized_from_the_query_table() {
+        // `dnsmasq.c:427` — numrrand = ftabsize / 2, never zero.
+        assert_eq!(RandFdPool::sized_for(150, 1).numrrand, 75);
+        assert_eq!(RandFdPool::sized_for(1, 1).numrrand, 1);
     }
 
     // ── FrecTable ─────────────────────────────────────────────────────────────
@@ -2928,59 +3494,31 @@ mod tests {
         assert_eq!(result, ProcessReplyResult::Forward { rcode: 0 });
     }
 
-    // ── reply_query ───────────────────────────────────────────────────────────
+    // ── make_refused_answer ───────────────────────────────────────────────────
 
-    fn make_reply_pkt(upstream_id: u16, rcode: u8) -> Vec<u8> {
-        let mut pkt = vec![0u8; 12];
-        pkt[0] = (upstream_id >> 8) as u8;
-        pkt[1] = (upstream_id & 0xFF) as u8;
-        pkt[2] = 0x80; // QR=1
-        pkt[3] = rcode & 0x0F;
-        pkt
+    #[test]
+    fn refused_answer_keeps_the_question_and_sets_refused() {
+        let mut query = make_dns_query("full.test", 1);
+        patch_id(&mut query, 0x9876);
+
+        let wire  = make_refused_answer(&query).expect("a well-formed query must be answerable");
+        let reply = DnsPacket::parse(&wire).expect("the refusal must be well formed");
+
+        assert_eq!(reply.header.id, 0x9876, "the client's own ID comes back");
+        assert_eq!(reply.header.rcode(), 5, "REFUSED, not an empty NOERROR");
+        assert!(reply.header.is_response());
+        assert!(reply.header.is_ra(), "we are still a recursive resolver");
+        assert!(!reply.header.is_aa());
+        assert_eq!(reply.questions.len(), 1);
+        assert_eq!(reply.questions[0].name, "full.test");
+        assert!(reply.answers.is_empty());
+        assert!(reply.authority.is_empty());
+        assert!(reply.additional.is_empty());
     }
 
     #[test]
-    fn reply_query_patches_id_and_routes() {
-        let server_addr: SocketAddr = "1.2.3.4:53".parse().unwrap();
-        let client_addr: SocketAddr = "192.168.1.1:12345".parse().unwrap();
-        let mut table = ForwardTable::new();
-        let upstream_id = table.alloc_query(0xABCD, client_addr, 0, [0u8; 16]);
-        let reply = make_reply_pkt(upstream_id, 0);
-        let cfg = ProcessReplyConfig::default();
-        let result = reply_query(&reply, server_addr, &[server_addr], &mut table, &cfg, &[], "example.com");
-        match result {
-            ReplyQueryResult::Send { pkt, client, server_idx } => {
-                let patched_id = u16::from_be_bytes([pkt[0], pkt[1]]);
-                assert_eq!(patched_id, 0xABCD, "ID should be restored to original");
-                assert_eq!(client, client_addr);
-                assert_eq!(server_idx, 0);
-            }
-            other => panic!("expected Send, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn reply_query_discards_spoofed_reply() {
-        let server_addr: SocketAddr  = "1.2.3.4:53".parse().unwrap();
-        let spoofed_addr: SocketAddr = "9.9.9.9:53".parse().unwrap();
-        let client_addr: SocketAddr  = "192.168.1.1:12345".parse().unwrap();
-        let mut table = ForwardTable::new();
-        let upstream_id = table.alloc_query(0x1111, client_addr, 0, [0u8; 16]);
-        let reply = make_reply_pkt(upstream_id, 0);
-        let cfg = ProcessReplyConfig::default();
-        // Reply comes from spoofed_addr, not server_addr
-        let result = reply_query(&reply, spoofed_addr, &[server_addr], &mut table, &cfg, &[], "example.com");
-        assert_eq!(result, ReplyQueryResult::Discard);
-    }
-
-    #[test]
-    fn reply_query_discards_unknown_id() {
-        let server_addr: SocketAddr = "1.2.3.4:53".parse().unwrap();
-        let mut table = ForwardTable::new();
-        let reply = make_reply_pkt(0xFFFF, 0); // unknown upstream ID
-        let cfg = ProcessReplyConfig::default();
-        let result = reply_query(&reply, server_addr, &[server_addr], &mut table, &cfg, &[], "example.com");
-        assert_eq!(result, ReplyQueryResult::Discard);
+    fn refused_answer_declines_an_unparseable_query() {
+        assert!(make_refused_answer(&[0u8; 4]).is_none());
     }
 
     // ── xor_array ────────────────────────────────────────────────────────────

@@ -577,6 +577,12 @@ pub fn daemon_forward_config(daemon: &Daemon) -> crate::forward::ForwardConfig {
         check_rebind:  daemon.option_bool(OPT_NO_REBIND),
         local_rebind_ok: daemon.option_bool(OPT_LOCAL_REBIND),
         no_rebind:     daemon.no_rebind.clone(),
+        // `--dns-forward-max` and `--port-limit`.  Both are clamped away from
+        // zero: a zero query table would refuse every query, and a zero port
+        // limit would make `allocate_rfd()` reuse a transaction's first socket
+        // forever.  C rejects both at parse time.
+        ftabsize:       daemon.ftabsize.max(1) as usize,
+        randport_limit: daemon.randport_limit.max(1) as usize,
         ..Default::default()
     }
 }
