@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use bytes::{BufMut, BytesMut};
 
-use dnsmasq_rs::dns_protocol::{DnsHeader, HB3_QR, HB3_RD};
+use dnsmasq_rs::dns_protocol::{DnsHeader, HB3_QR, HB3_RD, HB4_CD, HB4_RA};
 use dnsmasq_rs::forward::{run_forward_loop_on, DnsListener, ForwardConfig};
 use dnsmasq_rs::option::{apply_config, parse_config_text};
 use dnsmasq_rs::rfc1035::{write_name, DnsPacket, DnsQuestion, DnsRr};
@@ -65,9 +65,13 @@ fn soa_rr(name: &str, ttl: u32, minimum: u32) -> DnsRr {
 }
 
 /// Build a reply to `query` carrying `answers` / `authority` at `rcode`.
+///
+/// `RA` is set because a recursive resolver sets it, and C refuses to commit
+/// anything to the cache from a reply that has it clear (`rfc1035.c:1124-1127`).
 fn reply_to(query: &DnsPacket, rcode: u8, answers: Vec<DnsRr>, authority: Vec<DnsRr>) -> DnsPacket {
     let mut header = query.header;
     header.hb3 |= HB3_QR;
+    header.hb4 |= HB4_RA;
     header.set_rcode(rcode);
     header.ancount = answers.len() as u16;
     header.nscount = authority.len() as u16;
@@ -606,6 +610,338 @@ async fn reply_whose_question_does_not_match_is_ignored() {
     assert!(
         upstream.misses() > before,
         "victim.test must not have been poisoned into the cache",
+    );
+
+    shutdown(server, upstream);
+}
+
+/// A locally generated answer — which is now every cache hit — must carry the
+/// OPT pseudo-header back when the client sent one.  C strips the additional
+/// section while building the answer and re-adds OPT in `receive_query()`
+/// (`forward.c:1969`), advertising `daemon->edns_pktsz` and carrying only the DO
+/// bit across (`edns0.c:204-210`).
+#[tokio::test]
+async fn cache_hit_keeps_the_client_edns_pseudoheader() {
+    let Some(upstream) = spawn_upstream(|q| {
+        Some(reply_to(q, 0, vec![a_rr("edns.test", Ipv4Addr::new(192, 0, 2, 60), 300)], vec![]))
+    })
+    .await
+    else {
+        return;
+    };
+    let Some(server) = spawn_server(config_from_text(
+        "cache-size=150\nedns-packet-max=1232\n",
+        upstream.addr,
+    ))
+    .await
+    else {
+        return;
+    };
+
+    // A query with an EDNS0 OPT advertising 4096 bytes and the DO bit set.
+    let edns_query = |id: u16| {
+        let mut pkt = DnsPacket::parse(&query_wire("edns.test", 1, id)).expect("valid query");
+        pkt.additional = vec![DnsRr {
+            name: String::new(),
+            rtype: 41,
+            class: 4096,
+            ttl: 0x8000, // DO
+            rdata: vec![],
+        }];
+        pkt.header.arcount = 1;
+        pkt.write().to_vec()
+    };
+
+    assert!(ask(server.addr, &edns_query(1)).await.is_some());
+
+    let cached = ask(server.addr, &edns_query(2))
+        .await
+        .expect("the repeat must be answered from cache");
+    assert_eq!(upstream.misses(), 1, "the repeat must not reach upstream");
+
+    let opt = cached
+        .additional
+        .iter()
+        .find(|r| r.rtype == 41)
+        .expect("a cache hit must still carry the OPT pseudo-header");
+    assert_eq!(opt.name, "", "OPT always has the root name");
+    assert_eq!(opt.class, 1232, "OPT must advertise our edns-packet-max, not the client's");
+    assert_eq!(opt.ttl, 0x8000, "the DO bit must be carried across, rcode/version zero");
+    assert!(opt.rdata.is_empty(), "the re-added OPT carries no options");
+    assert_eq!(cached.header.arcount, 1, "ARCOUNT must count the OPT record");
+
+    shutdown(server, upstream);
+}
+
+/// A cached CNAME whose target has expired must not be served on its own.
+///
+/// Upstream only sets `ans` for a CNAME when it came from config or the client
+/// actually asked for `T_CNAME` (`rfc1035.c:1704-1705`); otherwise the chain has
+/// to bottom out in something that answers, or `if (!ans) return 0`
+/// (`rfc1035.c:2295`) forwards the query.  Answering a dead-ended chain locally
+/// would return a CNAME-only NOERROR — a resolution failure — for as long as the
+/// CNAME outlives its target, which is the everyday CDN TTL pattern.
+#[tokio::test]
+async fn cname_outliving_its_target_is_re_resolved_upstream() {
+    let Some(upstream) = spawn_upstream(|q| {
+        Some(reply_to(
+            q,
+            0,
+            vec![
+                cname_rr("www.cdn.test", "edge.cdn.test", 600),
+                a_rr("edge.cdn.test", Ipv4Addr::new(192, 0, 2, 40), 1),
+            ],
+            vec![],
+        ))
+    })
+    .await
+    else {
+        return;
+    };
+    let Some(server) = spawn_server(config_from_text("cache-size=150\n", upstream.addr)).await
+    else {
+        return;
+    };
+
+    assert!(ask(server.addr, &query_wire("www.cdn.test", 1, 1)).await.is_some());
+    assert_eq!(upstream.misses(), 1);
+
+    // The A record (TTL 1) is gone; the CNAME (TTL 600) is not.
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+
+    let reply = ask(server.addr, &query_wire("www.cdn.test", 1, 2))
+        .await
+        .expect("the query must still be answered");
+    assert_eq!(
+        upstream.misses(),
+        2,
+        "a CNAME whose target expired must send the query back upstream, not answer CNAME-only",
+    );
+    assert_eq!(
+        first_a(&reply).map(|(ip, _)| ip),
+        Some(Ipv4Addr::new(192, 0, 2, 40)),
+        "the re-resolved answer must carry an address, not just the CNAME",
+    );
+
+    shutdown(server, upstream);
+}
+
+/// A client asking for the CNAME itself is answered from cache: that is the one
+/// case where upstream sets `ans` for a cached CNAME (`qtype == T_CNAME`).
+#[tokio::test]
+async fn explicit_cname_query_is_answered_from_cache() {
+    let Some(upstream) = spawn_upstream(|q| {
+        Some(reply_to(q, 0, vec![cname_rr("only.test", "elsewhere.test", 300)], vec![]))
+    })
+    .await
+    else {
+        return;
+    };
+    let Some(server) = spawn_server(config_from_text("cache-size=150\n", upstream.addr)).await
+    else {
+        return;
+    };
+
+    assert!(ask(server.addr, &query_wire("only.test", 5, 1)).await.is_some());
+
+    let cached = ask(server.addr, &query_wire("only.test", 5, 2))
+        .await
+        .expect("the repeated CNAME query must be answered");
+    assert_eq!(upstream.misses(), 1, "a CNAME query must be served from the cache");
+    assert!(
+        cached.answers.iter().any(|r| r.rtype == 5),
+        "the cached reply must carry the CNAME",
+    );
+
+    shutdown(server, upstream);
+}
+
+/// C stages every insert on `new_chain` and only commits it in
+/// `cache_end_insert()` (`rfc1035.c:1128`), which `extract_addresses()` never
+/// reaches when it bails out with the rebind code.  A blocked reply therefore
+/// leaves *nothing* behind, including the records that were processed before the
+/// offending one.
+#[tokio::test]
+async fn rebind_blocked_reply_commits_nothing_to_the_cache() {
+    let Some(upstream) = spawn_upstream(|q| {
+        Some(reply_to(
+            q,
+            0,
+            vec![
+                // A legitimate public address first, then the rebind attempt.
+                a_rr("evil.test", Ipv4Addr::new(198, 51, 100, 4), 300),
+                a_rr("evil.test", Ipv4Addr::new(192, 168, 1, 5), 300),
+            ],
+            vec![],
+        ))
+    })
+    .await
+    else {
+        return;
+    };
+    let Some(server) =
+        spawn_server(config_from_text("cache-size=150\nstop-dns-rebind\n", upstream.addr)).await
+    else {
+        return;
+    };
+
+    let first = ask(server.addr, &query_wire("evil.test", 1, 1))
+        .await
+        .expect("the stripped reply is still delivered");
+    assert!(first.answers.is_empty(), "the rebind answer must be stripped");
+
+    let second = ask(server.addr, &query_wire("evil.test", 1, 2))
+        .await
+        .expect("the repeat must be answered too");
+    assert!(second.answers.is_empty(), "the repeat must also be stripped");
+    assert_eq!(
+        upstream.misses(),
+        2,
+        "a rebind-blocked reply must leave no partial state in the cache",
+    );
+
+    shutdown(server, upstream);
+}
+
+/// A NODATA answer (NOERROR, no matching RR) is negatively cached against the
+/// *queried type*, and the repeat must be served locally.  The entry has to be
+/// stored under a key the lookup actually probes, or the negative cache is inert
+/// for everything except NXDOMAIN.
+#[tokio::test]
+async fn nodata_answer_is_negatively_cached_for_the_queried_type() {
+    let Some(upstream) = spawn_upstream(|q| {
+        Some(reply_to(q, 0, vec![], vec![soa_rr("test", 600, 300)]))
+    })
+    .await
+    else {
+        return;
+    };
+    let Some(server) = spawn_server(config_from_text("cache-size=150\n", upstream.addr)).await
+    else {
+        return;
+    };
+
+    for i in 0..2u16 {
+        let reply = ask(server.addr, &query_wire("v4only.test", 28, 0x30 + i))
+            .await
+            .unwrap_or_else(|| panic!("NODATA query {i} went unanswered"));
+        assert_eq!(reply.header.rcode(), 0, "query {i}: NODATA is NOERROR");
+        assert!(reply.answers.is_empty(), "query {i}: NODATA carries no answers");
+    }
+
+    assert_eq!(
+        upstream.misses(),
+        1,
+        "the second AAAA query must come from the NODATA negative cache",
+    );
+
+    shutdown(server, upstream);
+}
+
+/// A NODATA entry is per-type: it must not suppress a query for a type the
+/// server never said anything about.
+#[tokio::test]
+async fn nodata_for_one_type_does_not_answer_another_type() {
+    let Some(upstream) = spawn_upstream(|q| {
+        let qtype = q.questions.first().map_or(0, |q| q.qtype);
+        if qtype == 1 {
+            Some(reply_to(q, 0, vec![a_rr("mixed.test", Ipv4Addr::new(192, 0, 2, 44), 300)], vec![]))
+        } else {
+            Some(reply_to(q, 0, vec![], vec![soa_rr("test", 600, 300)]))
+        }
+    })
+    .await
+    else {
+        return;
+    };
+    let Some(server) = spawn_server(config_from_text("cache-size=150\n", upstream.addr)).await
+    else {
+        return;
+    };
+
+    assert!(ask(server.addr, &query_wire("mixed.test", 28, 1)).await.is_some());
+    let a_reply = ask(server.addr, &query_wire("mixed.test", 1, 2))
+        .await
+        .expect("the A query must be answered");
+    assert_eq!(
+        first_a(&a_reply).map(|(ip, _)| ip),
+        Some(Ipv4Addr::new(192, 0, 2, 44)),
+        "a cached AAAA NODATA must not swallow the A query",
+    );
+    assert_eq!(upstream.misses(), 2, "the A query is a different type and must be forwarded");
+
+    shutdown(server, upstream);
+}
+
+/// "Don't cache replies from non-recursive nameservers, since we may get a reply
+/// containing a CNAME but not its target, even though the target does exist."
+/// (`rfc1035.c:1121-1128`).  C skips `cache_end_insert()` entirely when `RA` is
+/// clear, so nothing from such a reply is committed.
+#[tokio::test]
+async fn reply_without_the_ra_bit_is_relayed_but_not_cached() {
+    let Some(upstream) = spawn_upstream(|q| {
+        let mut reply =
+            reply_to(q, 0, vec![a_rr("norec.test", Ipv4Addr::new(192, 0, 2, 21), 300)], vec![]);
+        reply.header.hb4 &= !HB4_RA;
+        Some(reply)
+    })
+    .await
+    else {
+        return;
+    };
+    let Some(server) = spawn_server(config_from_text("cache-size=150\n", upstream.addr)).await
+    else {
+        return;
+    };
+
+    let first = ask(server.addr, &query_wire("norec.test", 1, 1))
+        .await
+        .expect("a non-recursive reply is still relayed");
+    assert_eq!(
+        first_a(&first).map(|(ip, _)| ip),
+        Some(Ipv4Addr::new(192, 0, 2, 21)),
+        "the answer itself must reach the client untouched",
+    );
+
+    assert!(ask(server.addr, &query_wire("norec.test", 1, 2)).await.is_some());
+    assert_eq!(
+        upstream.misses(),
+        2,
+        "a reply with RA clear must not populate the cache",
+    );
+
+    shutdown(server, upstream);
+}
+
+/// `CD` set means the client is doing its own validation, so C also skips the
+/// commit (`rfc1035.c:1124`).  The bit is echoed by the upstream server, so a
+/// `CD` query produces a `CD` reply.
+#[tokio::test]
+async fn reply_with_the_cd_bit_is_relayed_but_not_cached() {
+    let Some(upstream) = spawn_upstream(|q| {
+        Some(reply_to(q, 0, vec![a_rr("checkdis.test", Ipv4Addr::new(192, 0, 2, 22), 300)], vec![]))
+    })
+    .await
+    else {
+        return;
+    };
+    let Some(server) = spawn_server(config_from_text("cache-size=150\n", upstream.addr)).await
+    else {
+        return;
+    };
+
+    let cd_query = |id: u16| {
+        let mut pkt = DnsPacket::parse(&query_wire("checkdis.test", 1, id)).expect("valid query");
+        pkt.header.hb4 |= HB4_CD;
+        pkt.write().to_vec()
+    };
+
+    assert!(ask(server.addr, &cd_query(1)).await.is_some());
+    assert!(ask(server.addr, &cd_query(2)).await.is_some());
+    assert_eq!(
+        upstream.misses(),
+        2,
+        "a reply with CD set must not populate the cache",
     );
 
     shutdown(server, upstream);

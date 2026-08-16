@@ -4,7 +4,7 @@ use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use dnsmasq_rs::cache::{cache_reply, CacheRecord, DnsCache};
-use dnsmasq_rs::dns_protocol::{DnsHeader, HB3_QR, HB3_RD};
+use dnsmasq_rs::dns_protocol::{DnsHeader, HB3_QR, HB3_RD, HB4_RA};
 use dnsmasq_rs::rfc1035::{
     answer_request, DnsPacket, DnsQuestion, DnsRr, ExtractConfig, ExtractResult, LocalConfig,
 };
@@ -163,6 +163,9 @@ fn a_reply(name: &str, ip: Ipv4Addr, ttl: u32) -> Vec<u8> {
         header: DnsHeader {
             id: 0x1234,
             hb3: HB3_QR | HB3_RD,
+            // A recursive resolver sets RA, and nothing from a reply with it
+            // clear is ever committed to the cache (`rfc1035.c:1124-1127`).
+            hb4: HB4_RA,
             qdcount: 1,
             ancount: 1,
             ..Default::default()
@@ -195,6 +198,7 @@ fn a_query(name: &str) -> DnsPacket {
 fn empty_local() -> LocalConfig<'static> {
     LocalConfig {
         local_ttl: 0,
+        edns_pktsz: 4096,
         txt_records: &[],
         rr_records: &[],
         mx_records: &[],

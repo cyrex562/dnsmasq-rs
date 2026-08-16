@@ -730,10 +730,13 @@ pub const DEFAULT_CACHE_SIZE: usize = 150;
 /// [`LocalConfig`] borrows its record slices, so it cannot be held across the
 /// loop's `.await` points; this owned form lives in [`ForwardConfig`] and a
 /// borrowed [`LocalConfig`] is rebuilt per query via [`LocalData::as_config`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct LocalData {
     /// TTL applied to answers synthesised from config data (`local-ttl`).
     pub local_ttl:     u32,
+    /// Payload size advertised in the OPT record re-attached to a locally
+    /// generated answer (`edns-packet-max`).
+    pub edns_pktsz:    u16,
     pub txt_records:   Vec<TxtRecord>,
     /// Arbitrary configured RR types (`dns-rr`); `class` holds the RR type.
     pub rr_records:    Vec<TxtRecord>,
@@ -745,11 +748,30 @@ pub struct LocalData {
     pub naptr_records: Vec<Naptr>,
 }
 
+impl Default for LocalData {
+    /// Everything empty, but `edns_pktsz` matching `Daemon::default()` — a zero
+    /// there would advertise a zero-byte UDP payload in the OPT record.
+    fn default() -> Self {
+        Self {
+            local_ttl:     0,
+            edns_pktsz:    crate::types::daemon::EDNS_PKTSZ,
+            txt_records:   Vec::new(),
+            rr_records:    Vec::new(),
+            mx_records:    Vec::new(),
+            ptr_records:   Vec::new(),
+            host_records:  Vec::new(),
+            cnames:        Vec::new(),
+            naptr_records: Vec::new(),
+        }
+    }
+}
+
 impl LocalData {
     /// Borrow this snapshot as the [`LocalConfig`] view `answer_request` takes.
     pub fn as_config(&self) -> LocalConfig<'_> {
         LocalConfig {
             local_ttl:     self.local_ttl,
+            edns_pktsz:    self.edns_pktsz,
             txt_records:   &self.txt_records,
             rr_records:    &self.rr_records,
             mx_records:    &self.mx_records,

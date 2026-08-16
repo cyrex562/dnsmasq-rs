@@ -520,6 +520,7 @@ struct DhcpDaemonRuntime {
 pub fn daemon_local_data(daemon: &Daemon) -> crate::forward::LocalData {
     crate::forward::LocalData {
         local_ttl:     daemon.local_ttl,
+        edns_pktsz:    daemon.edns_pktsz,
         txt_records:   daemon.txt.clone(),
         rr_records:    daemon.rr.clone(),
         mx_records:    daemon.mxnames.clone(),

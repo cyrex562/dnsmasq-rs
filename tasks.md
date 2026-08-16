@@ -100,7 +100,7 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   `rfc1035::extract_addresses` for every accepted, non-truncated upstream reply, mirroring
   the unconditional `extract_addresses()` call `process_reply()` makes at `forward.c:824`.
   A repeated query is answered from the cache and never reaches an upstream server.
-  Covered by `tests/forward_cache_integration.rs` (10 tests driving the real loop against a
+  Covered by `tests/forward_cache_integration.rs` (19 tests driving the real loop against a
   scripted fake upstream, counting the datagrams that actually reach it) and the round-trip
   hit/miss tests in `tests/cache_integration.rs`.
 
@@ -135,6 +135,31 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     `rand::random` rather than a counter, mirroring `get_id()` (`forward.c:3302`). A failed
     check drops the datagram and leaves the pending entry in place so the genuine answer can
     still arrive.
+  - Inserts are **staged and committed as a unit**, the way C builds `new_chain` and commits
+    it in `cache_end_insert()` (`rfc1035.c:1121-1128`). `extract_addresses` collects records
+    into a local list and `commit_staged` writes them only when the walk finishes cleanly, so
+    a reply that bails out with `RebindBlocked` or `BadPacket` leaves nothing behind — not
+    even the records processed before the offending one. The same gate drops replies with
+    `RA` clear (a non-recursive server can return a CNAME without its target) or `CD` set
+    (the client is validating for itself).
+  - A cached CNAME does **not** answer a query by itself. Upstream sets `ans` for a CNAME only
+    when the record is `F_CONFIG` or `qtype == T_CNAME` (`rfc1035.c:1704-1705`); otherwise the
+    chain has to bottom out in something that answers, or `if (!ans) return 0`
+    (`rfc1035.c:2295`) forwards the query. Serving a dead-ended chain locally would return a
+    CNAME-only NOERROR — a resolution failure — for as long as a CNAME outlives its target,
+    which is the everyday CDN TTL pattern.
+  - NODATA negative entries are reachable. C stores them with the queried type bit plus
+    `F_NEG` and finds them again because `cache_find_by_name()` matches bitwise; the Rust
+    cache is keyed on the exact type bits, so `DnsCache::lookup_forward` probes the positive
+    key and then the `| F_NEG` key, counting one hit or miss for the pair. The A/AAAA cache
+    branches of `answer_request` use it. Without this the NODATA half of negative caching is
+    written to a key nothing reads.
+  - A locally generated answer — which is now every cache hit — carries the EDNS0 OPT
+    pseudo-header back when the client sent one. C strips the additional section while
+    building the answer and re-adds OPT in `receive_query()` (`forward.c:1969`); the re-added
+    record advertises `daemon->edns_pktsz` (`edns-packet-max`, threaded through
+    `LocalData::edns_pktsz`), drops the client's options and carries only the DO bit
+    (`edns0.c:204-210`).
 
   Explicitly **not** covered — upstream behavior still missing on this path:
 
@@ -150,7 +175,12 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     can be served once before going stale.
   - Cache lookups for record types `answer_request` does not consult. Only A, AAAA, CNAME,
     NXDOMAIN and PTR are read back out of the cache, so an upstream MX/TXT/SRV answer is
-    cached as `F_RR` but re-forwarded on every query.
+    cached as `F_RR` but re-forwarded on every query. The NODATA negative entry for such a
+    query is likewise stored under `F_RR | F_NEG` and never probed — `lookup_forward` closes
+    this only for the A and AAAA types that `answer_request` actually reads.
+  - EDNS0 beyond re-attaching the OPT record: no client option (EDE, client-subnet, cookies)
+    is parsed, echoed or generated, and the advertised payload size is not used to size or
+    truncate a locally generated answer.
   - SERVFAIL failover. `ForwardEngine::handle_reply_with_failover` now runs the same
     `validate_reply` checks as `accept_reply`, but the live loop still does not call it (nor
     `retry_query`), so a SERVFAIL is relayed to the client instead of retried against the

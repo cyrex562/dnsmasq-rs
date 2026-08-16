@@ -384,6 +384,59 @@ impl DnsCache {
         }
     }
 
+    /// Look up a forward record of type `flags`, falling back to the NODATA
+    /// negative entry recorded for that same type.
+    ///
+    /// C stores a NODATA answer with the queried type bit *plus* `F_NEG`
+    /// (`rfc1035.c:1288`) and finds it again because `cache_find_by_name()`
+    /// matches with a bitwise AND — a lookup for `F_IPV4` therefore also finds
+    /// an `F_IPV4|F_NEG` record.  Here the cache is a hash map keyed on the
+    /// exact type bits, so the negative key has to be probed explicitly;
+    /// without this, every NODATA entry is written to a key nothing ever reads
+    /// and negative caching is inert for anything but NXDOMAIN.
+    ///
+    /// Counts exactly one hit or one miss, whichever key answers.
+    pub fn lookup_forward(
+        &mut self,
+        name:  &str,
+        flags: u32,
+        now:   Instant,
+    ) -> Option<&CacheRecord> {
+        let lower    = name.to_lowercase();
+        let type_bits = type_flags(flags);
+        let positive = CacheKey { name: lower.clone(), flags: type_bits };
+        let negative = CacheKey { name: lower,         flags: type_bits | F_NEG };
+
+        // Resolve which key answers before taking the `get` borrow, so the
+        // expiry eviction and the returned reference do not overlap.
+        let mut hit: Option<CacheKey> = None;
+        for key in [positive, negative] {
+            let expired = self
+                .records
+                .peek(&key)
+                .map_or(false, |r| record_is_expired(r, now));
+            if expired {
+                self.records.pop(&key);
+                continue;
+            }
+            if self.records.peek(&key).is_some() {
+                hit = Some(key);
+                break;
+            }
+        }
+
+        match hit {
+            Some(key) => {
+                self.hits += 1;
+                self.records.get(&key)
+            }
+            None => {
+                self.misses += 1;
+                None
+            }
+        }
+    }
+
     /// Reverse lookup: return a record whose `addr` matches `addr`.
     ///
     /// Performs a linear scan; intended for PTR / hostname lookups where the
@@ -1823,7 +1876,8 @@ mod tests {
         use crate::dns_protocol::DnsHeader;
         let pkt = DnsPacket {
             header: DnsHeader {
-                id: 1, hb3: 0x84, hb4: 0x00,
+                // RA set: nothing from a non-recursive reply is ever committed.
+                id: 1, hb3: 0x84, hb4: crate::dns_protocol::HB4_RA,
                 qdcount: 1, ancount: 1, nscount: 0, arcount: 0,
             },
             questions: vec![DnsQuestion {
@@ -2070,6 +2124,84 @@ mod tests {
             rdata:   None,
             uid:     UID_NONE,
         }
+    }
+
+    /// A NODATA entry is stored with the queried type bit *plus* `F_NEG`.  C
+    /// finds it again because `cache_find_by_name()` matches bitwise; here the
+    /// key is exact, so `lookup_forward` has to probe the negative key too or
+    /// every NODATA entry is written somewhere nothing ever reads.
+    fn make_nodata_record(name: &str, type_flag: u32, ttl: u32, now: Instant) -> CacheRecord {
+        CacheRecord {
+            name:    name.to_string(),
+            flags:   type_flag | F_NEG | F_FORWARD,
+            ttl,
+            expires: now + Duration::from_secs(u64::from(ttl)),
+            addr:    None,
+            rdata:   None,
+            uid:     UID_NONE,
+        }
+    }
+
+    #[test]
+    fn lookup_forward_finds_a_nodata_negative_entry() {
+        let mut cache = DnsCache::new(16);
+        let now       = Instant::now();
+        cache.insert(make_nodata_record("v4only.test", F_IPV6, 300, now));
+
+        assert!(
+            cache.lookup_by_name("v4only.test", F_IPV6, now).is_none(),
+            "the plain type key is genuinely empty — that is the bug being fixed",
+        );
+        let rec = cache
+            .lookup_forward("v4only.test", F_IPV6, now)
+            .expect("the NODATA entry must be reachable");
+        assert!(rec.flags & F_NEG != 0);
+        assert_eq!(cache.stats().hits, 1, "one probe, one hit");
+    }
+
+    #[test]
+    fn lookup_forward_prefers_the_positive_record() {
+        let mut cache = DnsCache::new(16);
+        let now       = Instant::now();
+        cache.insert(make_nodata_record("both.test", F_IPV4, 300, now));
+        cache.insert(make_dns_record("both.test", Ipv4Addr::new(9, 9, 9, 9), 300, now));
+
+        let rec = cache
+            .lookup_forward("both.test", F_IPV4, now)
+            .expect("the positive record must win");
+        assert_eq!(rec.flags & F_NEG, 0);
+        assert_eq!(rec.addr.as_ref().and_then(|a| a.as_ipv4()), Some(Ipv4Addr::new(9, 9, 9, 9)));
+    }
+
+    #[test]
+    fn lookup_forward_is_per_type() {
+        let mut cache = DnsCache::new(16);
+        let now       = Instant::now();
+        cache.insert(make_nodata_record("mixed.test", F_IPV6, 300, now));
+
+        assert!(
+            cache.lookup_forward("mixed.test", F_IPV4, now).is_none(),
+            "an AAAA NODATA entry must not answer an A lookup",
+        );
+    }
+
+    #[test]
+    fn lookup_forward_counts_one_miss_on_an_empty_cache() {
+        let mut cache = DnsCache::new(16);
+        let now       = Instant::now();
+        assert!(cache.lookup_forward("nothing.test", F_IPV4, now).is_none());
+        assert_eq!(cache.stats().misses, 1, "both probes together are a single miss");
+    }
+
+    #[test]
+    fn lookup_forward_evicts_an_expired_negative_entry() {
+        let mut cache = DnsCache::new(16);
+        let now       = Instant::now();
+        cache.insert(make_nodata_record("gone.test", F_IPV4, 10, now));
+
+        let later = now + Duration::from_secs(11);
+        assert!(cache.lookup_forward("gone.test", F_IPV4, later).is_none());
+        assert_eq!(cache.stats().size, 0, "the expired negative entry must be dropped");
     }
 
     #[test]
