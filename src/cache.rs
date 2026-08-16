@@ -113,6 +113,12 @@ pub enum InsertOutcome {
     /// A config/hosts/DHCP record with a *different* address exists; the
     /// incoming record was refused to avoid overwriting static config.
     BlockedConflict,
+    /// The cache has no storage at all (`cache-size=0`), so nothing was kept.
+    /// Mirrors C's `really_insert()` finding no free `crec` when
+    /// `daemon->cachesize` is zero — the record is dropped, but everything the
+    /// caller does *around* the insert (rebind checks, section clearing) still
+    /// runs.
+    CachingDisabled,
 }
 
 pub struct DnsCache {
@@ -172,11 +178,13 @@ pub fn non_terminal_names(name: &str) -> Vec<String> {
 impl DnsCache {
     /// Create a new cache with the given maximum number of entries.
     ///
-    /// # Panics
-    /// Panics if `max_size` is zero.
+    /// `max_size == 0` is upstream's `cache-size=0`: the cache stores nothing
+    /// and every lookup misses.  The backing LRU still needs a non-zero
+    /// capacity, so [`Self::insert`] refuses instead — the same observable
+    /// behaviour C gets from `really_insert()` never finding a free `crec`.
     pub fn new(max_size: usize) -> Self {
-        let capacity = NonZeroUsize::new(max_size)
-            .expect("DnsCache max_size must be non-zero");
+        let capacity = NonZeroUsize::new(max_size.max(1))
+            .expect("max(1) is never zero");
         Self {
             max_size,
             records: LruCache::new(capacity),
@@ -206,6 +214,9 @@ impl DnsCache {
     /// The LRU crate evicts the least-recently-used entry automatically when
     /// the cache is full; we track that as an eviction.
     pub fn insert(&mut self, rec: CacheRecord) {
+        if self.max_size == 0 {
+            return;
+        }
         let key = CacheKey {
             name:  rec.name.to_lowercase(),
             flags: type_flags(rec.flags),
@@ -288,8 +299,31 @@ impl DnsCache {
             }
         }
 
+        if self.max_size == 0 {
+            return InsertOutcome::CachingDisabled;
+        }
+
         self.insert(rec);
         InsertOutcome::Inserted
+    }
+
+    /// Remaining lifetime of `rec`, in seconds, as it should be served to a
+    /// client.
+    ///
+    /// Port of `crec_ttl()` (`rfc1035.c:1570`).  Immortal entries (config,
+    /// `/etc/hosts`, DHCP) hold their configured TTL in the TTL field and are
+    /// served with it verbatim; a cached DNS answer is served with
+    /// `ttd - now`, so a client never sees a longer lifetime than the record
+    /// actually has left.  Replaying the stored TTL instead would give the
+    /// record up to twice its upstream lifetime downstream.
+    pub fn crec_ttl(rec: &CacheRecord, now: Instant) -> u32 {
+        if rec.flags & F_IMMORTAL != 0 {
+            return rec.ttl;
+        }
+        rec.expires
+            .saturating_duration_since(now)
+            .as_secs()
+            .min(u64::from(u32::MAX)) as u32
     }
 
     /// Remove all expired records from the cache and return the count removed.
@@ -347,6 +381,59 @@ impl DnsCache {
         } else {
             self.misses += 1;
             None
+        }
+    }
+
+    /// Look up a forward record of type `flags`, falling back to the NODATA
+    /// negative entry recorded for that same type.
+    ///
+    /// C stores a NODATA answer with the queried type bit *plus* `F_NEG`
+    /// (`rfc1035.c:1288`) and finds it again because `cache_find_by_name()`
+    /// matches with a bitwise AND — a lookup for `F_IPV4` therefore also finds
+    /// an `F_IPV4|F_NEG` record.  Here the cache is a hash map keyed on the
+    /// exact type bits, so the negative key has to be probed explicitly;
+    /// without this, every NODATA entry is written to a key nothing ever reads
+    /// and negative caching is inert for anything but NXDOMAIN.
+    ///
+    /// Counts exactly one hit or one miss, whichever key answers.
+    pub fn lookup_forward(
+        &mut self,
+        name:  &str,
+        flags: u32,
+        now:   Instant,
+    ) -> Option<&CacheRecord> {
+        let lower    = name.to_lowercase();
+        let type_bits = type_flags(flags);
+        let positive = CacheKey { name: lower.clone(), flags: type_bits };
+        let negative = CacheKey { name: lower,         flags: type_bits | F_NEG };
+
+        // Resolve which key answers before taking the `get` borrow, so the
+        // expiry eviction and the returned reference do not overlap.
+        let mut hit: Option<CacheKey> = None;
+        for key in [positive, negative] {
+            let expired = self
+                .records
+                .peek(&key)
+                .map_or(false, |r| record_is_expired(r, now));
+            if expired {
+                self.records.pop(&key);
+                continue;
+            }
+            if self.records.peek(&key).is_some() {
+                hit = Some(key);
+                break;
+            }
+        }
+
+        match hit {
+            Some(key) => {
+                self.hits += 1;
+                self.records.get(&key)
+            }
+            None => {
+                self.misses += 1;
+                None
+            }
         }
     }
 
@@ -968,29 +1055,28 @@ pub fn dump_cache(cache: &DnsCache, now: Instant) -> Vec<String> {
 /// 1. Parsing the wire-format packet.
 /// 2. Calling [`crate::rfc1035::extract_addresses`] to populate `cache`.
 ///
-/// Returns `true` if the packet was successfully processed (even if nothing
-/// was cached), `false` if the packet is malformed.
+/// Returns the [`ExtractResult`](crate::rfc1035::ExtractResult) so the caller
+/// can act on it the way C's `process_reply()` acts on `extract_addresses()`'s
+/// return code (`forward.c:824-841`): a non-zero code clears the RR sections,
+/// `1` (rebind) is logged, `2` (bad packet) also becomes SERVFAIL.
 ///
-/// This is the primary integration point between the forwarding engine and
-/// the DNS cache.  Call this every time an upstream reply is received.
+/// This is the integration point between the forwarding engine and the DNS
+/// cache; `forward::cache_upstream_reply` calls it for every accepted upstream
+/// reply.
 pub fn cache_reply(
     wire: &[u8],
     cache: &mut DnsCache,
     config: &crate::rfc1035::ExtractConfig,
-) -> bool {
+) -> crate::rfc1035::ExtractResult {
     use std::time::Instant;
     use crate::rfc1035::{extract_addresses, ExtractResult, DnsPacket};
 
     let packet = match DnsPacket::parse(wire) {
         Ok(p) => p,
-        Err(_) => return false,
+        Err(_) => return ExtractResult::BadPacket,
     };
 
-    let now = Instant::now();
-    match extract_addresses(&packet, cache, now, config) {
-        ExtractResult::BadPacket => false,
-        _ => true,
-    }
+    extract_addresses(&packet, cache, Instant::now(), config)
 }
 
 // ---------------------------------------------------------------------------
@@ -1790,7 +1876,9 @@ mod tests {
         use crate::dns_protocol::DnsHeader;
         let pkt = DnsPacket {
             header: DnsHeader {
-                id: 1, hb3: 0x84, hb4: 0x00,
+                // RA set, as the forwarding path sets it before extraction
+                // (`forward.c:776`); `commit_staged` tests the bit.
+                id: 1, hb3: 0x84, hb4: crate::dns_protocol::HB4_RA,
                 qdcount: 1, ancount: 1, nscount: 0, arcount: 0,
             },
             questions: vec![DnsQuestion {
@@ -1812,17 +1900,56 @@ mod tests {
         let mut cache = DnsCache::new(100);
         let wire = make_a_reply("example.com", "1.2.3.4".parse().unwrap());
         let cfg = crate::rfc1035::ExtractConfig::default();
-        let ok = cache_reply(&wire, &mut cache, &cfg);
-        assert!(ok);
+        assert_eq!(
+            cache_reply(&wire, &mut cache, &cfg),
+            crate::rfc1035::ExtractResult::Cached,
+        );
         let now = Instant::now();
         assert!(cache.lookup_by_name("example.com", F_IPV4, now).is_some());
     }
 
     #[test]
-    fn cache_reply_bad_packet_returns_false() {
+    fn cache_reply_bad_packet_reports_bad_packet() {
         let mut cache = DnsCache::new(100);
         let cfg = crate::rfc1035::ExtractConfig::default();
-        assert!(!cache_reply(&[0u8; 3], &mut cache, &cfg));
+        assert_eq!(
+            cache_reply(&[0u8; 3], &mut cache, &cfg),
+            crate::rfc1035::ExtractResult::BadPacket,
+        );
+    }
+
+    /// `cache-size=0` must keep the cache empty without breaking anything that
+    /// runs around the insert — C reaches `really_insert()` and merely finds no
+    /// free `crec`.
+    #[test]
+    fn cache_reply_with_caching_disabled_stores_nothing() {
+        let mut cache = DnsCache::new(0);
+        let wire = make_a_reply("example.com", "1.2.3.4".parse().unwrap());
+        let cfg = crate::rfc1035::ExtractConfig::default();
+        assert_eq!(
+            cache_reply(&wire, &mut cache, &cfg),
+            crate::rfc1035::ExtractResult::Cached,
+            "a disabled cache must not turn a good reply into a bad one",
+        );
+        assert_eq!(cache.len(), 0);
+        assert!(cache.lookup_by_name("example.com", F_IPV4, Instant::now()).is_none());
+    }
+
+    /// A rebind-blocked answer must be reported as such whether or not the
+    /// cache has room for it: the check lives in `extract_addresses`, which C
+    /// calls unconditionally (`forward.c:824`).
+    #[test]
+    fn cache_reply_reports_rebind_even_with_caching_disabled() {
+        let wire = make_a_reply("evil.test", "192.168.1.5".parse().unwrap());
+        let cfg = crate::rfc1035::ExtractConfig { check_rebind: true, ..Default::default() };
+        for size in [0usize, 100] {
+            let mut cache = DnsCache::new(size);
+            assert_eq!(
+                cache_reply(&wire, &mut cache, &cfg),
+                crate::rfc1035::ExtractResult::RebindBlocked,
+                "cache-size={size} must not change the rebind verdict",
+            );
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2000,6 +2127,84 @@ mod tests {
         }
     }
 
+    /// A NODATA entry is stored with the queried type bit *plus* `F_NEG`.  C
+    /// finds it again because `cache_find_by_name()` matches bitwise; here the
+    /// key is exact, so `lookup_forward` has to probe the negative key too or
+    /// every NODATA entry is written somewhere nothing ever reads.
+    fn make_nodata_record(name: &str, type_flag: u32, ttl: u32, now: Instant) -> CacheRecord {
+        CacheRecord {
+            name:    name.to_string(),
+            flags:   type_flag | F_NEG | F_FORWARD,
+            ttl,
+            expires: now + Duration::from_secs(u64::from(ttl)),
+            addr:    None,
+            rdata:   None,
+            uid:     UID_NONE,
+        }
+    }
+
+    #[test]
+    fn lookup_forward_finds_a_nodata_negative_entry() {
+        let mut cache = DnsCache::new(16);
+        let now       = Instant::now();
+        cache.insert(make_nodata_record("v4only.test", F_IPV6, 300, now));
+
+        assert!(
+            cache.lookup_by_name("v4only.test", F_IPV6, now).is_none(),
+            "the plain type key is genuinely empty — that is the bug being fixed",
+        );
+        let rec = cache
+            .lookup_forward("v4only.test", F_IPV6, now)
+            .expect("the NODATA entry must be reachable");
+        assert!(rec.flags & F_NEG != 0);
+        assert_eq!(cache.stats().hits, 1, "one probe, one hit");
+    }
+
+    #[test]
+    fn lookup_forward_prefers_the_positive_record() {
+        let mut cache = DnsCache::new(16);
+        let now       = Instant::now();
+        cache.insert(make_nodata_record("both.test", F_IPV4, 300, now));
+        cache.insert(make_dns_record("both.test", Ipv4Addr::new(9, 9, 9, 9), 300, now));
+
+        let rec = cache
+            .lookup_forward("both.test", F_IPV4, now)
+            .expect("the positive record must win");
+        assert_eq!(rec.flags & F_NEG, 0);
+        assert_eq!(rec.addr.as_ref().and_then(|a| a.as_ipv4()), Some(Ipv4Addr::new(9, 9, 9, 9)));
+    }
+
+    #[test]
+    fn lookup_forward_is_per_type() {
+        let mut cache = DnsCache::new(16);
+        let now       = Instant::now();
+        cache.insert(make_nodata_record("mixed.test", F_IPV6, 300, now));
+
+        assert!(
+            cache.lookup_forward("mixed.test", F_IPV4, now).is_none(),
+            "an AAAA NODATA entry must not answer an A lookup",
+        );
+    }
+
+    #[test]
+    fn lookup_forward_counts_one_miss_on_an_empty_cache() {
+        let mut cache = DnsCache::new(16);
+        let now       = Instant::now();
+        assert!(cache.lookup_forward("nothing.test", F_IPV4, now).is_none());
+        assert_eq!(cache.stats().misses, 1, "both probes together are a single miss");
+    }
+
+    #[test]
+    fn lookup_forward_evicts_an_expired_negative_entry() {
+        let mut cache = DnsCache::new(16);
+        let now       = Instant::now();
+        cache.insert(make_nodata_record("gone.test", F_IPV4, 10, now));
+
+        let later = now + Duration::from_secs(11);
+        assert!(cache.lookup_forward("gone.test", F_IPV4, later).is_none());
+        assert_eq!(cache.stats().size, 0, "the expired negative entry must be dropped");
+    }
+
     #[test]
     fn really_insert_basic_inserts_record() {
         let mut cache = DnsCache::new(16);
@@ -2008,6 +2213,51 @@ mod tests {
         let outcome   = cache.really_insert(rec, now);
         assert_eq!(outcome, InsertOutcome::Inserted);
         assert!(cache.lookup_by_name("a.test", F_IPV4, now).is_some());
+    }
+
+    /// `crec_ttl()` (`rfc1035.c:1570`) serves `ttd - now`, so a client never
+    /// sees more lifetime than the record actually has left.
+    #[test]
+    fn crec_ttl_counts_down_for_dns_answers() {
+        let now = Instant::now();
+        let rec = make_dns_record("countdown.test", Ipv4Addr::new(1, 1, 1, 1), 300, now);
+
+        assert_eq!(DnsCache::crec_ttl(&rec, now), 300, "fresh record serves its full TTL");
+        assert_eq!(
+            DnsCache::crec_ttl(&rec, now + Duration::from_secs(120)),
+            180,
+            "after 120s of a 300s TTL, 180s remain",
+        );
+        assert_eq!(
+            DnsCache::crec_ttl(&rec, now + Duration::from_secs(500)),
+            0,
+            "an expired record must never report a negative or wrapped TTL",
+        );
+    }
+
+    /// Immortal entries (config / hosts / DHCP) hold their configured TTL in
+    /// the TTL field and are served with it verbatim — they do not count down.
+    #[test]
+    fn crec_ttl_is_constant_for_immortal_records() {
+        let now = Instant::now();
+        let mut rec = make_dns_record("static.test", Ipv4Addr::new(1, 1, 1, 1), 60, now);
+        rec.flags |= F_IMMORTAL | F_HOSTS;
+
+        assert_eq!(DnsCache::crec_ttl(&rec, now), 60);
+        assert_eq!(DnsCache::crec_ttl(&rec, now + Duration::from_secs(9999)), 60);
+    }
+
+    /// `cache-size=0` keeps the cache empty, but the insert path still runs to
+    /// completion so its callers' side effects are unaffected.
+    #[test]
+    fn really_insert_with_zero_size_stores_nothing() {
+        let mut cache = DnsCache::new(0);
+        let now = Instant::now();
+        let rec = make_dns_record("nowhere.test", Ipv4Addr::new(3, 3, 3, 3), 300, now);
+
+        assert_eq!(cache.really_insert(rec, now), InsertOutcome::CachingDisabled);
+        assert!(cache.is_empty());
+        assert!(cache.lookup_by_name("nowhere.test", F_IPV4, now).is_none());
     }
 
     #[test]

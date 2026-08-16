@@ -520,6 +520,7 @@ struct DhcpDaemonRuntime {
 pub fn daemon_local_data(daemon: &Daemon) -> crate::forward::LocalData {
     crate::forward::LocalData {
         local_ttl:     daemon.local_ttl,
+        edns_pktsz:    daemon.edns_pktsz,
         txt_records:   daemon.txt.clone(),
         rr_records:    daemon.rr.clone(),
         mx_records:    daemon.mxnames.clone(),
@@ -538,6 +539,36 @@ pub fn daemon_cache_size(daemon: &Daemon) -> usize {
         crate::forward::DEFAULT_CACHE_SIZE
     } else {
         daemon.cachesize as usize
+    }
+}
+
+/// Build the [`ForwardConfig`](crate::forward::ForwardConfig) the forwarding
+/// loop runs with from a resolved [`Daemon`].
+///
+/// Every knob that reaches the cache or the reply path is copied here.  A field
+/// left at its default is a directive that silently does nothing at run time,
+/// so anything added to `ForwardConfig` has to be threaded through this
+/// function as well.
+pub fn daemon_forward_config(daemon: &Daemon) -> crate::forward::ForwardConfig {
+    use crate::types::constants::{OPT_LOCAL_REBIND, OPT_NO_NEG, OPT_NO_REBIND};
+
+    crate::forward::ForwardConfig {
+        upstreams: daemon
+            .servers
+            .iter()
+            .map(|s| SocketAddr::from(s.addr.clone()))
+            .collect(),
+        local:         daemon_local_data(daemon),
+        cache_size:    daemon_cache_size(daemon),
+        min_cache_ttl: daemon.min_cache_ttl,
+        max_cache_ttl: daemon.max_cache_ttl,
+        max_ttl:       daemon.max_ttl,
+        neg_ttl:       daemon.neg_ttl,
+        no_neg_cache:  daemon.option_bool(OPT_NO_NEG),
+        check_rebind:  daemon.option_bool(OPT_NO_REBIND),
+        local_rebind_ok: daemon.option_bool(OPT_LOCAL_REBIND),
+        no_rebind:     daemon.no_rebind.clone(),
+        ..Default::default()
     }
 }
 
@@ -943,25 +974,19 @@ pub async fn run_main_loop_with(
     use tokio::signal::unix::{signal, SignalKind};
     use tracing::{error, info};
 
-    use crate::forward::{DnsListener, ForwardConfig, run_forward_loop_on};
+    use crate::forward::{DnsListener, run_forward_loop_on};
     #[cfg(feature = "dhcp")]
     use crate::dhcp::{DhcpLoopOptions, run_dhcp_loop};
 
     // ── Resolve configuration ────────────────────────────────────────────────
-    let (upstreams, local_data, cache_size, dhcp_runtime) = {
+    let (fwd_config, dhcp_runtime) = {
         let d = daemon_handle.read().await;
-        let ups: Vec<_> = d
-            .servers
-            .iter()
-            .map(|s| SocketAddr::from(s.addr.clone()))
-            .collect();
-        let local_data = daemon_local_data(&d);
-        let cache_size = daemon_cache_size(&d);
+        let fwd_config = daemon_forward_config(&d);
         #[cfg(feature = "dhcp")]
         let dhcp_runtime = daemon_dhcp_runtime(&d);
         #[cfg(not(feature = "dhcp"))]
         let dhcp_runtime = ();
-        (ups, local_data, cache_size, dhcp_runtime)
+        (fwd_config, dhcp_runtime)
     };
 
     // ── Adopt sockets bound before the fork, or bind them now ────────────────
@@ -1007,12 +1032,6 @@ pub async fn run_main_loop_with(
     }
 
     // ── Spawn the forwarding engine ──────────────────────────────────────────
-    let fwd_config = ForwardConfig {
-        upstreams,
-        local: local_data,
-        cache_size,
-        ..Default::default()
-    };
     let fwd_task = tokio::spawn(async move {
         if let Err(e) = run_forward_loop_on(dns_listeners, arrival_filter, fwd_config).await {
             error!("forward loop exited: {e}");

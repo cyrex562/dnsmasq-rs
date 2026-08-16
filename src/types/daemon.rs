@@ -14,6 +14,10 @@ use crate::types::server::*;
 #[cfg(feature = "dhcp")]
 use crate::types::dhcp::*;
 
+/// Default advertised EDNS0 UDP payload size (`EDNS_PKTSZ` in `dnsmasq.h`),
+/// overridable with `edns-packet-max`.
+pub const EDNS_PKTSZ: u16 = 4096;
+
 /// The global dnsmasq daemon configuration and runtime state.
 ///
 /// Fields are organized to mirror the C `struct daemon` layout.
@@ -279,7 +283,7 @@ impl Default for Daemon {
             cache_max_expiry: -1,
             fast_retry_time: 0,
             fast_retry_timeout: 0,
-            edns_pktsz: 4096,
+            edns_pktsz: EDNS_PKTSZ,
             log_fac: -1,
             log_file: None,
             max_logs: 5,

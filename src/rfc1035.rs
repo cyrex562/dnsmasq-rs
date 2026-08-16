@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::cache::{CacheRecord, DnsCache};
 use crate::types::constants::UID_NONE;
-use crate::dns_protocol::{DnsHeader, RrType, HB3_AA, HB3_QR, HB3_TC, HB4_AD, HB4_RA};
+use crate::dns_protocol::{DnsHeader, RrType, HB3_AA, HB3_QR, HB3_TC, HB4_AD, HB4_CD, HB4_RA};
 use crate::types::addr::{AllAddr, CnameAddr, RrDataAddr};
 use crate::types::constants::{
     F_CNAME, F_DNSSECOK, F_FORWARD, F_IPV4, F_IPV6, F_NEG, F_NXDOMAIN, F_RCODE, F_REVERSE, F_RR,
@@ -556,6 +556,10 @@ pub struct ExtractConfig {
     /// Reject DNS replies containing RFC 1918 / private IPv4 or
     /// ULA / link-local IPv6 addresses (DNS rebind protection).
     pub check_rebind: bool,
+    /// `--rebind-localhost-ok` (`OPT_LOCAL_REBIND`): exempt `127.0.0.0/8` and
+    /// `::1` from the rebind check.  C passes the negation of this option as
+    /// `private_net()`'s `ban_localhost` argument (`rfc1035.c:997,1001`).
+    pub local_rebind_ok: bool,
     /// Suppress negative caching entirely.
     pub no_neg_cache: bool,
     /// The reply was DNSSEC-validated; set `F_DNSSECOK` on cached records.
@@ -568,6 +572,7 @@ impl Default for ExtractConfig {
             max_ttl: 0,
             neg_ttl: 0,
             check_rebind: false,
+            local_rebind_ok: false,
             no_neg_cache: false,
             secure: false,
         }
@@ -618,18 +623,62 @@ fn find_soa_minimum_ttl(authority: &[DnsRr]) -> Option<u32> {
     None
 }
 
+/// Commit the records staged by [`extract_addresses`], the way C commits its
+/// `new_chain` list in `cache_end_insert()` (`rfc1035.c:1121-1128`).
+///
+/// Two header bits are tested there, and they behave very differently in
+/// practice:
+///
+/// * `CD` set — the client asked to do its own validation, so the answer is not
+///   ours to keep.  This is a live gate: the bit is the client's, echoed by the
+///   upstream server.
+/// * `RA` clear — "don't cache replies from non-recursive nameservers, since we
+///   may get a reply containing a CNAME but not its target, even though the
+///   target does exist".  This one is vestigial on the forwarding path, because
+///   `process_reply()` sets `HB4_RA` on the reply (`forward.c:776`) before it
+///   calls `extract_addresses()` (`forward.c:824`) — see
+///   `forward::set_recursion_available`.  The test is kept here so this function
+///   stays a faithful port for any caller that has *not* been through that step;
+///   it is deliberately not what stops a non-recursive server's answers from
+///   being cached, because upstream does cache them.
+///
+/// Staging is also what makes a bail-out leave *nothing* behind: C never reaches
+/// `cache_end_insert()` when `extract_addresses()` returns 1 (rebind) or 2 (bad
+/// packet), so the records it processed before the offending one are discarded
+/// with it.
+fn commit_staged(
+    cache: &mut DnsCache,
+    staged: Vec<CacheRecord>,
+    header: &DnsHeader,
+    now: Instant,
+) {
+    if header.hb4 & HB4_CD != 0 || header.hb4 & HB4_RA == 0 {
+        return;
+    }
+    for rec in staged {
+        cache.really_insert(rec, now);
+    }
+}
+
 /// Extract DNS records from a parsed reply and insert them into `cache`.
 ///
 /// This is the Rust port of `extract_addresses()` from `rfc1035.c`.
 ///
 /// Handles A, AAAA, CNAME, PTR, and arbitrary RR types.
 /// Performs negative caching for `NXDOMAIN` and `NODATA` replies.
+///
+/// Records are staged and only committed once the whole reply has been walked
+/// successfully — see [`commit_staged`].
 pub fn extract_addresses(
     packet: &DnsPacket,
     cache: &mut DnsCache,
     now: Instant,
     config: &ExtractConfig,
 ) -> ExtractResult {
+    // Staged inserts, committed together at the end.  C builds the same list in
+    // `new_chain` and commits it in `cache_end_insert()` (`rfc1035.c:1128`).
+    let mut staged: Vec<CacheRecord> = Vec::new();
+
     // Only process replies with exactly one question.
     if packet.questions.len() != 1 {
         return ExtractResult::BadPacket;
@@ -639,6 +688,7 @@ pub fn extract_addresses(
     if q.qclass != 1 {
         return ExtractResult::Cached;
     }
+    let header = &packet.header;
 
     let qname_lower = q.name.to_lowercase();
     let qtype       = q.qtype;
@@ -664,7 +714,7 @@ pub fn extract_addresses(
                     Err(_) => return ExtractResult::BadPacket,
                 };
                 let ttl = clamp_ttl(rr.ttl, config.max_ttl);
-                cache.insert(CacheRecord {
+                staged.push(CacheRecord {
                     name:    target,
                     flags:   addr_flag | F_REVERSE | secflag,
                     ttl,
@@ -676,6 +726,7 @@ pub fn extract_addresses(
                 found = true;
             }
             if found {
+                commit_staged(cache, staged, header, now);
                 return ExtractResult::Cached;
             }
         }
@@ -708,7 +759,7 @@ pub fn extract_addresses(
                     Ok(t)  => t.to_lowercase(),
                     Err(_) => return ExtractResult::BadPacket,
                 };
-                cache.insert(CacheRecord {
+                staged.push(CacheRecord {
                     name:    current_name.clone(),
                     flags:   F_CNAME | F_FORWARD | secflag,
                     ttl,
@@ -734,7 +785,7 @@ pub fn extract_addresses(
                     let ip = Ipv4Addr::new(
                         rr.rdata[0], rr.rdata[1], rr.rdata[2], rr.rdata[3],
                     );
-                    if config.check_rebind && private_net(ip, true) {
+                    if config.check_rebind && private_net(ip, !config.local_rebind_ok) {
                         return ExtractResult::RebindBlocked;
                     }
                     AllAddr::Addr4(ip)
@@ -744,7 +795,7 @@ pub fn extract_addresses(
                     let mut b = [0u8; 16];
                     b.copy_from_slice(&rr.rdata[..16]);
                     let ip = Ipv6Addr::from(b);
-                    if config.check_rebind && private_net6(&ip, true) {
+                    if config.check_rebind && private_net6(&ip, !config.local_rebind_ok) {
                         return ExtractResult::RebindBlocked;
                     }
                     AllAddr::Addr6(ip)
@@ -754,7 +805,7 @@ pub fn extract_addresses(
                     data:   rr.rdata.clone(),
                 }),
             };
-            cache.insert(CacheRecord {
+            staged.push(CacheRecord {
                 name:    current_name.clone(),
                 flags:   addr_flag | F_FORWARD | secflag,
                 ttl,
@@ -763,6 +814,9 @@ pub fn extract_addresses(
                 rdata:   None,
                 uid:     UID_NONE,
             });
+            // C sets `found` from the answer section, not from whether the
+            // insert committed (`rfc1035.c:1036`): a refused or dropped insert
+            // must not turn a real answer into a negative-cache entry.
             found = true;
         }
         break 'cname_loop;
@@ -779,7 +833,7 @@ pub fn extract_addresses(
             } else {
                 addr_flag | F_NEG | F_FORWARD | secflag
             };
-            cache.insert(CacheRecord {
+            staged.push(CacheRecord {
                 name:    qname_lower,
                 flags:   neg_flags,
                 ttl,
@@ -791,6 +845,7 @@ pub fn extract_addresses(
         }
     }
 
+    commit_staged(cache, staged, header, now);
     ExtractResult::Cached
 }
 
@@ -801,6 +856,9 @@ pub fn extract_addresses(
 /// Configuration for answering DNS queries from local data and cache.
 pub struct LocalConfig<'a> {
     pub local_ttl:     u32,
+    /// Advertised EDNS0 UDP payload size (`daemon->edns_pktsz`).  Used only to
+    /// re-attach the OPT pseudo-header to a locally generated answer.
+    pub edns_pktsz:    u16,
     pub txt_records:   &'a [TxtRecord],
     pub rr_records:    &'a [TxtRecord],   // arbitrary cached-RR types (class field = rrtype)
     pub mx_records:    &'a [MxSrvRecord],
@@ -895,8 +953,18 @@ pub fn answer_request(
     let ttl          = config.local_ttl;
 
     // 5a. CNAME chain (max 16 hops).
+    //
+    // `ans` is what decides, at the end, whether this query is answered locally
+    // or forwarded.  A CNAME on its own only sets it when the record came from
+    // config or the client asked for `T_CNAME` (`rfc1035.c:1704-1705`); a
+    // cached, upstream-derived CNAME leaves `ans` alone, so the chain has to
+    // bottom out in something that actually answers.  Otherwise a cached CNAME
+    // whose target has expired — the everyday CDN TTL pattern — would be served
+    // as a CNAME-only NOERROR, which is a resolution failure, instead of being
+    // re-resolved upstream.
     for _ in 0..16 {
-        // Config CNAMEs first.
+        // Config CNAMEs first.  These are C's `F_CONFIG` cache entries, and
+        // they do answer the question on their own.
         if let Some(c) = config.cnames.iter().find(|c| c.alias.to_lowercase() == name) {
             let target = c.target.clone();
             let mut rd = BytesMut::new();
@@ -904,25 +972,35 @@ pub fn answer_request(
             answers.push(DnsRr { name: name.clone(), rtype: 5, class: 1, ttl, rdata: rd.to_vec() });
             name = target.to_lowercase();
             ans  = true;
+            if qtype == 5 /* CNAME */ {
+                break;
+            }
             continue;
         }
 
-        // Cached CNAME.
-        let cname_target: Option<String> = cache
+        // Cached CNAME.  It carries its own TTL — `ttl` here is `local-ttl`,
+        // a static-record default that says nothing about an upstream answer.
+        let cname_target: Option<(String, u32)> = cache
             .lookup_by_name(&name, F_CNAME, now)
             .and_then(|r| {
                 if let Some(AllAddr::Cname(ref c)) = r.addr {
-                    c.target_name.clone()
+                    c.target_name.clone().map(|t| (t, DnsCache::crec_ttl(r, now)))
                 } else {
                     None
                 }
             });
-        if let Some(target) = cname_target {
+        if let Some((target, cname_ttl)) = cname_target {
             let mut rd = BytesMut::new();
             write_name(&mut rd, &target);
-            answers.push(DnsRr { name: name.clone(), rtype: 5, class: 1, ttl, rdata: rd.to_vec() });
+            answers.push(DnsRr {
+                name: name.clone(), rtype: 5, class: 1, ttl: cname_ttl, rdata: rd.to_vec(),
+            });
             name = target.to_lowercase();
-            ans  = true;
+            if qtype == 5 /* CNAME */ {
+                // The CNAME *is* the answer the client asked for.
+                ans = true;
+                break;
+            }
             continue;
         }
 
@@ -988,8 +1066,8 @@ pub fn answer_request(
                     // Try cache reverse lookup.
                     let cached = cache
                         .lookup_by_addr(&addr, now)
-                        .map(|r| (r.name.clone(), r.flags));
-                    if let Some((hostname, flags)) = cached {
+                        .map(|r| (r.name.clone(), r.flags, DnsCache::crec_ttl(r, now)));
+                    if let Some((hostname, flags, cached_ttl)) = cached {
                         if flags & F_NXDOMAIN != 0 {
                             nxdomain = true;
                             ans      = true;
@@ -997,7 +1075,8 @@ pub fn answer_request(
                             let mut rd = BytesMut::new();
                             write_name(&mut rd, &hostname);
                             answers.push(DnsRr {
-                                name: name.clone(), rtype: 12, class: 1, ttl, rdata: rd.to_vec(),
+                                name: name.clone(), rtype: 12, class: 1,
+                                ttl: cached_ttl, rdata: rd.to_vec(),
                             });
                             ans = true;
                         }
@@ -1042,8 +1121,8 @@ pub fn answer_request(
         if !found_in_host {
             if want_a {
                 let cached = cache
-                    .lookup_by_name(&name, F_IPV4, now)
-                    .map(|r| (r.addr.clone(), r.flags, r.ttl));
+                    .lookup_forward(&name, F_IPV4, now)
+                    .map(|r| (r.addr.clone(), r.flags, DnsCache::crec_ttl(r, now)));
                 if let Some((addr, flags, cached_ttl)) = cached {
                     if flags & F_NEG != 0 {
                         if flags & F_NXDOMAIN != 0 {
@@ -1061,8 +1140,8 @@ pub fn answer_request(
             }
             if want_aaaa {
                 let cached = cache
-                    .lookup_by_name(&name, F_IPV6, now)
-                    .map(|r| (r.addr.clone(), r.flags, r.ttl));
+                    .lookup_forward(&name, F_IPV6, now)
+                    .map(|r| (r.addr.clone(), r.flags, DnsCache::crec_ttl(r, now)));
                 if let Some((addr, flags, cached_ttl)) = cached {
                     if flags & F_NEG != 0 {
                         if flags & F_NXDOMAIN != 0 {
@@ -1137,9 +1216,30 @@ pub fn answer_request(
         return None;
     }
 
+    // 6a. Re-attach the EDNS0 pseudo-header when the query carried one.
+    //
+    // C strips the whole additional section while building the answer and then
+    // calls `add_pseudoheader()` again in `receive_query()` (`forward.c:1969`)
+    // if `FREC_HAS_PHEADER` was set.  The re-added OPT advertises *our* payload
+    // size (`daemon->edns_pktsz`, `edns0.c:207`) rather than the client's, drops
+    // whatever options the client sent, and carries only the DO bit forward.
+    // Without this, every locally answered query — which is now every cache hit
+    // — comes back looking as though this server does not speak EDNS0 at all.
+    if let Some(opt) = query.additional.iter().find(|rr| rr.rtype == 41) {
+        const EDNS_DO: u32 = 0x8000;
+        response.additional.push(DnsRr {
+            name:  String::new(), // root: OPT always has an empty name
+            rtype: 41,            // T_OPT
+            class: config.edns_pktsz,
+            ttl:   opt.ttl & EDNS_DO, // extended rcode 0, version 0, DO copied
+            rdata: Vec::new(),
+        });
+    }
+
     // 7. Finalise response header.
     response.answers        = answers;
     response.header.ancount = response.answers.len() as u16;
+    response.header.arcount = response.additional.len() as u16;
     if nxdomain {
         response.header.set_rcode(3);
         response.header.hb3 &= !HB3_AA;
@@ -1778,10 +1878,13 @@ mod tests {
     use crate::types::constants::{F_FORWARD, F_IPV4, F_IPV6, F_CNAME, F_NEG, F_NXDOMAIN, F_REVERSE};
 
     /// Build a minimal DNS reply header (12 bytes) with the given rcode.
+    ///
+    /// `RA` is set: a recursive resolver sets it, and nothing from a reply with
+    /// it clear is ever committed to the cache (`rfc1035.c:1124-1127`).
     fn reply_header(id: u16, qd: u16, an: u16, ns: u16, rcode: u8) -> Vec<u8> {
         let mut v = vec![
             (id >> 8) as u8, id as u8,
-            0x84, rcode, // QR=1, AA=1, rcode
+            0x84, HB4_RA | rcode, // QR=1, AA=1, RA=1, rcode
             (qd >> 8) as u8, qd as u8,
             (an >> 8) as u8, an as u8,
             (ns >> 8) as u8, ns as u8,
@@ -1919,7 +2022,7 @@ mod tests {
         // Header: QR=1, AA=1, RCODE=3 (NXDOMAIN), QDCOUNT=1, NSCOUNT=1
         let mut pkt = vec![
             0x00, 0x05,       // ID
-            0x84, 0x03,       // QR=1, AA=1, RCODE=NXDOMAIN
+            0x84, 0x83,       // QR=1, AA=1, RA=1, RCODE=NXDOMAIN
             0x00, 0x01,       // QDCOUNT=1
             0x00, 0x00,       // ANCOUNT=0
             0x00, 0x01,       // NSCOUNT=1
@@ -1957,6 +2060,132 @@ mod tests {
         );
         // Nothing should be cached.
         assert_eq!(cache.inserts, 0);
+    }
+
+    /// `rebind-localhost-ok` is C's `private_net(addr, !option_bool(OPT_LOCAL_REBIND))`
+    /// (`rfc1035.c:997`): loopback stops counting as private, everything else
+    /// still does.
+    #[test]
+    fn extract_rebind_localhost_ok_exempts_loopback_only() {
+        let cfg = ExtractConfig { check_rebind: true, local_rebind_ok: true, ..Default::default() };
+
+        let mut pkt = reply_header(22, 1, 1, 0, 0);
+        push_question(&mut pkt, "lo.example.com", 1);
+        push_rr(&mut pkt, "lo.example.com", 1, 300, &[127, 0, 0, 1]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        assert_eq!(extract_addresses(&dp, &mut cache, now, &cfg), ExtractResult::Cached);
+        assert!(cache.lookup_by_name("lo.example.com", F_IPV4, now).is_some());
+
+        // ::1 likewise, via private_net6().
+        let mut v6 = reply_header(23, 1, 1, 0, 0);
+        push_question(&mut v6, "lo6.example.com", 28);
+        push_rr(&mut v6, "lo6.example.com", 28, 300, &Ipv6Addr::LOCALHOST.octets());
+        let dp6 = DnsPacket::parse(&v6).unwrap();
+        assert_eq!(extract_addresses(&dp6, &mut cache, now, &cfg), ExtractResult::Cached);
+        assert!(cache.lookup_by_name("lo6.example.com", F_IPV6, now).is_some());
+
+        // RFC1918 space is still blocked: the option narrows the check, it does
+        // not disable it.
+        let mut priv4 = reply_header(24, 1, 1, 0, 0);
+        push_question(&mut priv4, "evil.example.com", 1);
+        push_rr(&mut priv4, "evil.example.com", 1, 300, &[10, 1, 2, 3]);
+        let dp4 = DnsPacket::parse(&priv4).unwrap();
+        assert_eq!(
+            extract_addresses(&dp4, &mut cache, now, &cfg),
+            ExtractResult::RebindBlocked
+        );
+    }
+
+    /// Without the option, loopback is private — the default `ban_localhost`
+    /// argument is `true`.
+    #[test]
+    fn extract_rebind_blocks_loopback_by_default() {
+        let mut pkt = reply_header(25, 1, 1, 0, 0);
+        push_question(&mut pkt, "lo.example.com", 1);
+        push_rr(&mut pkt, "lo.example.com", 1, 300, &[127, 0, 0, 1]);
+
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        let mut cache = DnsCache::new(100);
+        let cfg = ExtractConfig { check_rebind: true, ..Default::default() };
+        assert_eq!(
+            extract_addresses(&dp, &mut cache, Instant::now(), &cfg),
+            ExtractResult::RebindBlocked
+        );
+    }
+
+    /// C never reaches `cache_end_insert()` when `extract_addresses()` bails out
+    /// with the rebind code, so the records it walked *before* the offending one
+    /// are discarded with it.  Committing record-by-record would leave the
+    /// public A (and any CNAME) behind, and the client would then be served a
+    /// stripped answer while the cache quietly held half of a blocked reply.
+    #[test]
+    fn rebind_bailout_discards_the_records_staged_before_it() {
+        let mut cname_rdata = BytesMut::new();
+        write_name(&mut cname_rdata, "hidden.example.com");
+
+        let mut pkt = reply_header(20, 1, 3, 0, 0);
+        push_question(&mut pkt, "evil.example.com", 1);
+        push_rr(&mut pkt, "evil.example.com", 5, 300, &cname_rdata);      // CNAME
+        push_rr(&mut pkt, "hidden.example.com", 1, 300, &[198, 51, 100, 1]); // public A
+        push_rr(&mut pkt, "hidden.example.com", 1, 300, &[192, 168, 1, 5]);  // rebind
+
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        let cfg = ExtractConfig { check_rebind: true, ..Default::default() };
+        assert_eq!(
+            extract_addresses(&dp, &mut cache, now, &cfg),
+            ExtractResult::RebindBlocked
+        );
+        assert_eq!(cache.inserts, 0, "a blocked reply must leave no partial state");
+        assert!(cache.lookup_by_name("evil.example.com", F_CNAME, now).is_none());
+        assert!(cache.lookup_by_name("hidden.example.com", F_IPV4, now).is_none());
+    }
+
+    /// "Don't cache replies from non-recursive nameservers, since we may get a
+    /// reply containing a CNAME but not its target, even though the target does
+    /// exist." (`rfc1035.c:1121-1127`).
+    ///
+    /// This tests the gate at *this* layer only.  The forwarding path sets `RA`
+    /// on every reply before extraction (`forward.c:776`), so a real
+    /// non-recursive answer is cached — see
+    /// `tests/forward_cache_integration.rs::reply_without_the_ra_bit_is_cached_and_relayed_with_ra_set`.
+    #[test]
+    fn reply_without_ra_is_parsed_but_not_committed() {
+        let mut pkt = reply_header(21, 1, 1, 0, 0);
+        pkt[3] &= !HB4_RA;
+        push_question(&mut pkt, "norec.example.com", 1);
+        push_rr(&mut pkt, "norec.example.com", 1, 300, &[1, 2, 3, 4]);
+
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        assert_eq!(
+            extract_addresses(&dp, &mut cache, now, &ExtractConfig::default()),
+            ExtractResult::Cached
+        );
+        assert_eq!(cache.inserts, 0, "RA clear means nothing is committed");
+    }
+
+    /// `CD` set means the client validates for itself, so the answer is not
+    /// ours to keep (`rfc1035.c:1124`).
+    #[test]
+    fn reply_with_cd_is_parsed_but_not_committed() {
+        let mut pkt = reply_header(22, 1, 1, 0, 0);
+        pkt[3] |= HB4_CD;
+        push_question(&mut pkt, "cd.example.com", 1);
+        push_rr(&mut pkt, "cd.example.com", 1, 300, &[1, 2, 3, 4]);
+
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        assert_eq!(
+            extract_addresses(&dp, &mut cache, now, &ExtractConfig::default()),
+            ExtractResult::Cached
+        );
+        assert_eq!(cache.inserts, 0, "CD set means nothing is committed");
     }
 
     #[test]
@@ -2012,6 +2241,7 @@ mod tests {
     fn empty_config<'a>() -> LocalConfig<'a> {
         LocalConfig {
             local_ttl:    60,
+            edns_pktsz:   4096,
             txt_records:  &[],
             rr_records:   &[],
             mx_records:   &[],
@@ -2020,6 +2250,82 @@ mod tests {
             cnames:       &[],
             naptr_records: &[],
         }
+    }
+
+    /// Seed `cache` with an upstream-derived CNAME (no `F_CONFIG`).
+    fn cache_cname(cache: &mut DnsCache, alias: &str, target: &str, ttl: u32, now: Instant) {
+        cache.insert(CacheRecord {
+            name:    alias.to_string(),
+            flags:   F_CNAME | F_FORWARD,
+            ttl,
+            expires: now + Duration::from_secs(u64::from(ttl)),
+            addr:    Some(AllAddr::Cname(CnameAddr {
+                is_name_ptr: true,
+                target_name: Some(target.to_string()),
+                uid:         0,
+            })),
+            rdata: None,
+            uid:   UID_NONE,
+        });
+    }
+
+    /// A cached CNAME does not answer an A query on its own: upstream only sets
+    /// `ans` for `F_CONFIG` CNAMEs or `qtype == T_CNAME` (`rfc1035.c:1704-1705`),
+    /// so a chain that dead-ends is forwarded rather than returned as a
+    /// CNAME-only NOERROR.
+    #[test]
+    fn cached_cname_without_a_resolvable_target_is_not_an_answer() {
+        let now = Instant::now();
+        let mut cache = DnsCache::new(100);
+        cache_cname(&mut cache, "www.example.com", "edge.example.com", 3600, now);
+
+        let query = make_query("www.example.com", 1);
+        assert!(
+            answer_request(&query, &mut cache, now, &empty_config()).is_none(),
+            "a dangling cached CNAME must send the query upstream",
+        );
+    }
+
+    /// …but once the target resolves, the chain answers and the CNAME rides
+    /// along in the answer section.
+    #[test]
+    fn cached_cname_answers_once_its_target_is_cached() {
+        let now = Instant::now();
+        let mut cache = DnsCache::new(100);
+        cache_cname(&mut cache, "www.example.com", "edge.example.com", 3600, now);
+        cache.insert(CacheRecord {
+            name:    "edge.example.com".into(),
+            flags:   F_IPV4 | F_FORWARD,
+            ttl:     60,
+            expires: now + Duration::from_secs(60),
+            addr:    Some(AllAddr::Addr4(Ipv4Addr::new(203, 0, 113, 5))),
+            rdata:   None,
+            uid:     UID_NONE,
+        });
+
+        let query = make_query("www.example.com", 1);
+        let resp = answer_request(&query, &mut cache, now, &empty_config())
+            .expect("a resolvable chain must be answered from cache");
+        assert_eq!(resp.answers.len(), 2, "CNAME + A");
+        assert_eq!(resp.answers[0].rtype, 5);
+        assert_eq!(resp.answers[1].rtype, 1);
+        assert_eq!(resp.answers[1].rdata, vec![203, 0, 113, 5]);
+    }
+
+    /// `qtype == T_CNAME` is the one case where a cached CNAME answers by
+    /// itself, and the chain stops there rather than being followed.
+    #[test]
+    fn explicit_cname_query_is_answered_by_the_cached_cname() {
+        let now = Instant::now();
+        let mut cache = DnsCache::new(100);
+        cache_cname(&mut cache, "www.example.com", "edge.example.com", 3600, now);
+        cache_cname(&mut cache, "edge.example.com", "deep.example.com", 3600, now);
+
+        let query = make_query("www.example.com", 5);
+        let resp = answer_request(&query, &mut cache, now, &empty_config())
+            .expect("a CNAME query must be answered from cache");
+        assert_eq!(resp.answers.len(), 1, "the chain must not be followed past the first hop");
+        assert_eq!(resp.answers[0].rtype, 5);
     }
 
     #[test]
