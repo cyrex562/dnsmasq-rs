@@ -54,8 +54,13 @@ def render(stage, **kw):
 
 
 def run_stage(stage, model, cwd, prompt, read_only=False, timeout=5400):
+    # The prompt goes in on stdin, never as an argv element. Linux caps a
+    # single argument at MAX_ARG_STRLEN (131072 bytes), and judge prompts embed
+    # the full diff: a 136969-byte diff killed a cycle at the judge stage with
+    # "Argument list too long" after the work was already done and gate-clean.
+    # ARG_MAX (2MB) is not the binding limit here — the per-argument one is.
     cmd = [
-        "claude", "-p", prompt,
+        "claude", "-p",
         "--model", model,
         "--output-format", "json",
         "--add-dir", cwd,
@@ -67,7 +72,8 @@ def run_stage(stage, model, cwd, prompt, read_only=False, timeout=5400):
     else:
         cmd += ["--allowedTools", WRITE_TOOLS, "--permission-mode", "acceptEdits"]
 
-    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    proc = subprocess.run(cmd, input=prompt, cwd=cwd,
+                          capture_output=True, text=True, timeout=timeout)
     if proc.returncode != 0:
         raise StageError(f"{stage} exited {proc.returncode}: {proc.stderr[-1000:]}")
 
