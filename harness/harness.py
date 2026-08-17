@@ -6,9 +6,12 @@
   ./harness/harness.py next
 """
 import argparse
+import datetime
 import os
 import subprocess
 import sys
+import threading
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -29,9 +32,43 @@ REPO = os.path.dirname(HERE)
 MAX_GATE_RETRIES = 2
 MAX_JUDGE_RETRIES = 2
 
+# One stable path, independent of any particular run or cycle, so it can be
+# tailed once (`tail -f harness/state/harness.log`) and left open indefinitely
+# instead of asking the operator to locate a fresh path per invocation.
+# harness/state/ is already gitignored.
+LOG_FILE = os.path.join(HERE, "state", "harness.log")
+
+# How often a long stage announces it is still alive. Stages regularly ran
+# 10-30+ minutes with zero output, which reads identically to a hang from
+# outside — the difference was only visible by checking process liveness.
+HEARTBEAT_SECS = 60
+
 
 def log(msg):
-    print(f"[harness] {msg}", flush=True)
+    line = f"[harness] {msg}"
+    print(line, flush=True)
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        with open(LOG_FILE, "a") as f:
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"{ts} {line}\n")
+    except OSError:
+        pass  # the stdout line above is the primary record; this is a convenience
+
+
+def _heartbeat(label):
+    """Returns a stop function. Logs a liveness line every HEARTBEAT_SECS
+    until stopped, so a long-running stage doesn't look identical to a hang."""
+    stop = threading.Event()
+    start = time.monotonic()
+
+    def beat():
+        while not stop.wait(HEARTBEAT_SECS):
+            log(f"    ...{label} still running ({int(time.monotonic() - start)}s)")
+
+    thread = threading.Thread(target=beat, daemon=True)
+    thread.start()
+    return stop.set
 
 
 # Stage outputs are stored so a cycle can be audited after the fact — whether
@@ -85,11 +122,14 @@ def summarize_gate(result):
 
 def _record_stage(record, name, model, fn):
     log(f"  {name} ({model})")
+    stop_heartbeat = _heartbeat(name)
     try:
         out = fn()
     except Exception as e:  # noqa: BLE001 — recorded, then re-raised
         record.stages.append({"stage": name, "model": model, "ok": False, "error": str(e)})
         raise
+    finally:
+        stop_heartbeat()
     text = out if isinstance(out, str) else str(out)
     record.stages.append({
         "stage": name,
@@ -101,12 +141,28 @@ def _record_stage(record, name, model, fn):
     return out
 
 
+class NoChangesNeeded(Exception):
+    """The implementer concluded the issue's gap no longer exists in the tree.
+
+    Distinct from a generic failure: this is a claim worth surfacing for human
+    review, not an error to bury. Issue #12 hit this after #3/#7/#8 rewrote the
+    surrounding code and incidentally fixed the described bug; a bare
+    RuntimeError left no trace on the issue at all.
+    """
+
+    def __init__(self, output):
+        self.output = output
+        super().__init__("implement stage produced no changes")
+
+
 def _implement_until_gate_passes(meta, record, worktree, common, research,
                                  objections, base_attempt):
     """Run implement/gate until the gate is clean or the budget is spent.
 
     Returns (GateResult, gate_output) on success, or (None, gate_output) if the
     retry budget was exhausted.
+
+    Raises NoChangesNeeded if the implementer made no edits at all.
     """
     gate_output = ""
     for gate_attempt in range(MAX_GATE_RETRIES + 1):
@@ -114,16 +170,20 @@ def _implement_until_gate_passes(meta, record, worktree, common, research,
         prompt = claude_runner.render(
             "implement", research=research, gate_output=gate_output,
             objections=objections, **common)
-        _record_stage(
+        implement_output = _record_stage(
             record, f"implement.j{base_attempt}.g{gate_attempt}", model,
             lambda p=prompt, m=model: claude_runner.run_stage("implement", m, worktree, p))
 
         if not gitops.has_changes(worktree):
-            raise RuntimeError("implement stage produced no changes")
+            raise NoChangesNeeded(implement_output)
         gitops.commit_all(worktree, f"{meta.title}\n\nCloses #{meta.number}")
 
         log("  gate")
-        result = run_gate(worktree, parity=meta.wants_parity)
+        stop_heartbeat = _heartbeat("gate")
+        try:
+            result = run_gate(worktree, parity=meta.wants_parity)
+        finally:
+            stop_heartbeat()
         record.gate_failures = result.failures
         gate_output = summarize_gate(result)
         if result.ok:
@@ -157,7 +217,11 @@ def _verify_or_revert(meta, record):
     """
     gitops.sync_master(REPO)
     log("  post-merge gate")
-    post = run_gate(REPO, parity=meta.wants_parity)
+    stop_heartbeat = _heartbeat("post-merge gate")
+    try:
+        post = run_gate(REPO, parity=meta.wants_parity)
+    finally:
+        stop_heartbeat()
     if post.ok:
         record.outcome = "merged"
         log("  merged and verified")
@@ -246,6 +310,10 @@ def run_cycle(meta, dry_run=False):
                         + f"Last judge objections:\n{record.objections or 'none'}\n\n"
                         + "Last gate failures:\n"
                         + ("\n".join(record.gate_failures) or "none"))
+    except NoChangesNeeded as e:
+        record.outcome = "no-changes-needed"
+        log("  implementer found no gap to fix — flagging for human verification")
+        _flag_no_changes(meta, e.output)
     except Exception as e:  # noqa: BLE001
         record.outcome = f"error: {e}"
         log(f"  ERROR {e}")
@@ -272,11 +340,24 @@ def run_cycle(meta, dry_run=False):
     return record
 
 
-def _park(meta, comment):
+def _park(meta, comment, label="needs-human"):
     subprocess.run(["gh", "issue", "comment", str(meta.number),
                     "--repo", gitops.REPO_SLUG, "--body", comment], check=False)
     subprocess.run(["gh", "issue", "edit", str(meta.number),
-                    "--repo", gitops.REPO_SLUG, "--add-label", "needs-human"], check=False)
+                    "--repo", gitops.REPO_SLUG, "--add-label", label], check=False)
+
+
+def _flag_no_changes(meta, implement_output):
+    """Surface a no-changes claim for human review. Never closes the issue —
+    the implementer's belief that nothing is needed must be checked against
+    the actual code before anyone acts on it, the same way a human would."""
+    comment = (
+        "The harness concluded no code change is needed for this issue and "
+        "made none. This claim is unverified by the harness — check it against "
+        f"current `{gitops.REPO_SLUG}` master before closing.\n\n"
+        "## Implementer's reasoning\n\n" + implement_output
+    )
+    _park(meta, comment, label="verify-and-close")
 
 
 def cmd_next(_args):
