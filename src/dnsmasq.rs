@@ -584,6 +584,7 @@ pub fn daemon_forward_config(daemon: &Daemon) -> crate::forward::ForwardConfig {
         bogus_addr:    daemon.bogus_addr.clone(),
         ignore_addr:   daemon.ignore_addr.clone(),
         filter_rr:     daemon.rrlist_filter.iter().map(|rr| rr.rr).collect(),
+        cache_rr:      daemon.rrlist_cache.iter().map(|rr| rr.rr).collect(),
         dnssec_valid:  daemon.option_bool(OPT_DNSSEC_VALID),
         dnssec_proxy:  daemon.option_bool(OPT_DNSSEC_PROXY),
         // `--dns-forward-max` and `--port-limit`.  Both are clamped away from

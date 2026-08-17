@@ -1076,6 +1076,10 @@ pub struct ForwardConfig {
     /// `--filter-rr` / `--filter-a` / `--filter-aaaa`: RR types elided from an
     /// answer on its way back to the client.
     pub filter_rr: Vec<u16>,
+    /// `--cache-rr` (`daemon->cache_rr`): RR types, beyond the always-cached
+    /// `T_SRV`/`T_PTR`, that `extract_addresses` may cache via `F_RR`.  A
+    /// `T_ANY` (255) entry means "cache every RR type" (`rfc1035.c:801`).
+    pub cache_rr: Vec<u16>,
     /// `--dnssec` (`OPT_DNSSEC_VALID`).  Validation itself is not implemented —
     /// see `tasks.md` — but the option still gates the reply-side DNSSEC
     /// handling C puts behind it: clearing a DO bit the client did not set, and
@@ -1112,6 +1116,7 @@ impl Default for ForwardConfig {
             bogus_addr:    Vec::new(),
             ignore_addr:   Vec::new(),
             filter_rr:     Vec::new(),
+            cache_rr:      Vec::new(),
             dnssec_valid:  false,
             dnssec_proxy:  false,
             ftabsize:      FTABSIZE,
@@ -1137,6 +1142,7 @@ impl ForwardConfig {
             // DNSSEC validation is not wired into the forward path yet, so no
             // reply is ever marked authenticated.  See `tasks.md`.
             secure:       false,
+            cache_rr:     self.cache_rr.clone(),
         }
     }
 }
