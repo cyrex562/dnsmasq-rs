@@ -565,6 +565,10 @@ pub struct ExtractConfig {
     pub no_neg_cache: bool,
     /// The reply was DNSSEC-validated; set `F_DNSSECOK` on cached records.
     pub secure: bool,
+    /// `--cache-rr` (`daemon->cache_rr`): RR types, beyond the always-cached
+    /// `T_SRV`/`T_PTR`, that may be cached via the `F_RR` fallback.  A `T_ANY`
+    /// (255) entry on this list means "cache every RR type" (`rfc1035.c:801`).
+    pub cache_rr: Vec<u16>,
 }
 
 impl Default for ExtractConfig {
@@ -576,6 +580,7 @@ impl Default for ExtractConfig {
             local_rebind_ok: false,
             no_neg_cache: false,
             secure: false,
+            cache_rr: Vec::new(),
         }
     }
 }
@@ -736,10 +741,23 @@ pub fn extract_addresses(
     }
 
     // ── Forward lookup (A, AAAA, or arbitrary RR) ─────────────────────────────
-    let addr_flag = match qtype {
-        1  /* A    */ => F_IPV4,
-        28 /* AAAA */ => F_IPV6,
-        _             => F_RR,
+    // `insert` mirrors C's local of the same name (`rfc1035.c:788-804`): A and
+    // AAAA are always cacheable, SRV/PTR/an explicit `cache_rr` entry (or a
+    // `T_ANY` wildcard entry) make an arbitrary RR type cacheable via `F_RR`,
+    // and everything else — explicitly including a `T_CNAME` query — caches
+    // nothing at all, not even the CNAME hops leading to it.
+    let (addr_flag, insert) = match qtype {
+        1  /* A    */ => (F_IPV4, true),
+        28 /* AAAA */ => (F_IPV6, true),
+        _ if qtype != 5 /* CNAME */
+            && (qtype == 33 /* SRV */
+                || qtype == 12 /* PTR */
+                || config.cache_rr.contains(&qtype)
+                || config.cache_rr.contains(&255) /* ANY wildcard */) =>
+        {
+            (F_RR, true)
+        }
+        _ => (0, false),
     };
 
     // Follow the CNAME chain beginning at the question name.
@@ -760,21 +778,31 @@ pub fn extract_addresses(
                     Ok(t)  => t.to_lowercase(),
                     Err(_) => return ExtractResult::BadPacket,
                 };
-                staged.push(CacheRecord {
-                    name:    current_name.clone(),
-                    flags:   F_CNAME | F_FORWARD | secflag,
-                    ttl,
-                    expires: now + Duration::from_secs(u64::from(ttl)),
-                    addr:    Some(AllAddr::Cname(CnameAddr {
-                        is_name_ptr:  true,
-                        target_name:  Some(target.clone()),
-                        uid:          0,
-                    })),
-                    rdata: None,
-                    uid:   UID_NONE,
-                });
+                if insert {
+                    staged.push(CacheRecord {
+                        name:    current_name.clone(),
+                        flags:   F_CNAME | F_FORWARD | secflag,
+                        ttl,
+                        expires: now + Duration::from_secs(u64::from(ttl)),
+                        addr:    Some(AllAddr::Cname(CnameAddr {
+                            is_name_ptr:  true,
+                            target_name:  Some(target.clone()),
+                            uid:          0,
+                        })),
+                        rdata: None,
+                        uid:   UID_NONE,
+                    });
+                }
                 cname_hops += 1;
                 current_name = target;
+                // A query for the CNAME itself does not chase the chain
+                // further (`rfc1035.c:879-882`) — it stops here with `found`
+                // set, so the missing target does not fall through to a
+                // spurious negative-cache entry.
+                if qtype == 5 /* CNAME */ {
+                    found = true;
+                    break 'cname_loop;
+                }
                 continue 'cname_loop; // restart loop for the CNAME target
             }
 
@@ -806,15 +834,17 @@ pub fn extract_addresses(
                     data:   rr.rdata.clone(),
                 }),
             };
-            staged.push(CacheRecord {
-                name:    current_name.clone(),
-                flags:   addr_flag | F_FORWARD | secflag,
-                ttl,
-                expires: now + Duration::from_secs(u64::from(ttl)),
-                addr:    Some(addr),
-                rdata:   None,
-                uid:     UID_NONE,
-            });
+            if insert {
+                staged.push(CacheRecord {
+                    name:    current_name.clone(),
+                    flags:   addr_flag | F_FORWARD | secflag,
+                    ttl,
+                    expires: now + Duration::from_secs(u64::from(ttl)),
+                    addr:    Some(addr),
+                    rdata:   None,
+                    uid:     UID_NONE,
+                });
+            }
             // C sets `found` from the answer section, not from whether the
             // insert committed (`rfc1035.c:1036`): a refused or dropped insert
             // must not turn a real answer into a negative-cache entry.
@@ -824,7 +854,10 @@ pub fn extract_addresses(
     }
 
     // ── Negative caching ──────────────────────────────────────────────────────
-    if !found && !config.no_neg_cache {
+    // Gated on `insert` too, except NXDOMAIN overrides it: "Can store NXDOMAIN
+    // reply for any qtype" (`rfc1035.c:1074-1076`) — a NODATA answer to an
+    // uncacheable qtype is not negatively cached, but a true NXDOMAIN is.
+    if !found && !config.no_neg_cache && (insert || is_nxdomain) {
         let neg_ttl = find_soa_minimum_ttl(&packet.authority)
             .map(|t| clamp_ttl(t, config.max_ttl))
             .or_else(|| if config.neg_ttl > 0 { Some(config.neg_ttl) } else { None });
@@ -1999,6 +2032,100 @@ mod tests {
         assert_eq!(rec.addr.as_ref().unwrap().as_ipv4(), Some(Ipv4Addr::new(1, 2, 3, 4)));
     }
 
+    /// Upstream only caches `T_SRV`, `T_PTR`, or a type explicitly on
+    /// `daemon->cache_rr` (`rr_on_list`, `rfc1035.c:800-804`); everything else
+    /// falls into `insert = 0` and nothing is staged.
+    #[test]
+    fn extract_unlisted_rr_type_is_not_cached() {
+        let mut pkt = reply_header(30, 1, 1, 0, 0);
+        push_question(&mut pkt, "example.com", 16 /* TXT */);
+        push_rr(&mut pkt, "example.com", 16, 300, b"\x05hello");
+
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        assert_eq!(
+            extract_addresses(&dp, &mut cache, now, &ExtractConfig::default()),
+            ExtractResult::Cached
+        );
+        assert_eq!(cache.inserts, 0, "TXT is not on any allowlist by default");
+    }
+
+    /// `--cache-rr=TXT` puts TXT on `daemon->cache_rr`, so a TXT reply to a
+    /// TXT query is now cached via the `F_RR` fallback.
+    #[test]
+    fn extract_cache_rr_allowlist_enables_caching() {
+        let mut pkt = reply_header(31, 1, 1, 0, 0);
+        push_question(&mut pkt, "example.com", 16 /* TXT */);
+        push_rr(&mut pkt, "example.com", 16, 300, b"\x05hello");
+
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        let cfg = ExtractConfig { cache_rr: vec![16], ..Default::default() };
+        assert_eq!(extract_addresses(&dp, &mut cache, now, &cfg), ExtractResult::Cached);
+        assert_eq!(cache.inserts, 1);
+    }
+
+    /// A `T_ANY` (255) entry on `cache_rr` is a wildcard: cache every RR type,
+    /// not just the type literally named `ANY` (`rfc1035.c:801`).
+    #[test]
+    fn extract_cache_rr_any_wildcard_enables_caching() {
+        let mut pkt = reply_header(32, 1, 1, 0, 0);
+        push_question(&mut pkt, "example.com", 16 /* TXT */);
+        push_rr(&mut pkt, "example.com", 16, 300, b"\x05hello");
+
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        let cfg = ExtractConfig { cache_rr: vec![255], ..Default::default() };
+        assert_eq!(extract_addresses(&dp, &mut cache, now, &cfg), ExtractResult::Cached);
+        assert_eq!(cache.inserts, 1);
+    }
+
+    /// `T_SRV` and `T_PTR`-as-forward-type are cached unconditionally, with no
+    /// `cache_rr` entry required (`rfc1035.c:801`).
+    #[test]
+    fn extract_srv_is_cached_without_allowlist() {
+        let mut pkt = reply_header(33, 1, 1, 0, 0);
+        push_question(&mut pkt, "_svc._tcp.example.com", 33 /* SRV */);
+        push_rr(&mut pkt, "_svc._tcp.example.com", 33, 300, &[0, 1, 0, 1, 0, 80, 0]);
+
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        assert_eq!(
+            extract_addresses(&dp, &mut cache, now, &ExtractConfig::default()),
+            ExtractResult::Cached
+        );
+        assert_eq!(cache.inserts, 1);
+    }
+
+    /// Upstream never caches the answer to a `T_CNAME` query, including the
+    /// literal CNAME record itself: `insert = 0` for `qtype == T_CNAME`
+    /// (`rfc1035.c:800-804`), and it stops chasing the chain rather than
+    /// falling through to negative caching (`rfc1035.c:879-882`).
+    #[test]
+    fn extract_cname_query_is_not_cached() {
+        let mut cname_rdata = BytesMut::new();
+        write_name(&mut cname_rdata, "target.example.com");
+
+        let mut pkt = reply_header(34, 1, 1, 0, 0);
+        push_question(&mut pkt, "alias.example.com", 5 /* CNAME */);
+        push_rr(&mut pkt, "alias.example.com", 5, 300, &cname_rdata);
+
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        assert_eq!(
+            extract_addresses(&dp, &mut cache, now, &ExtractConfig::default()),
+            ExtractResult::Cached
+        );
+        assert_eq!(cache.inserts, 0, "a CNAME query's own answer must not be cached");
+        assert!(cache.lookup_by_name("alias.example.com", F_CNAME, now).is_none());
+        assert!(cache.lookup_by_name("alias.example.com", F_NEG, now).is_none());
+    }
+
     #[test]
     fn extract_ptr_record() {
         // 34.216.184.93.in-addr.arpa PTR → example.com
@@ -2162,6 +2289,31 @@ mod tests {
         assert_eq!(cache.inserts, 0, "a blocked reply must leave no partial state");
         assert!(cache.lookup_by_name("evil.example.com", F_CNAME, now).is_none());
         assert!(cache.lookup_by_name("hidden.example.com", F_IPV4, now).is_none());
+    }
+
+    /// A malformed reply must leave nothing behind, exactly like the rebind
+    /// bailout above: a truncated A record mid-CNAME-chain returns `BadPacket`
+    /// before `commit_staged` is ever reached, so the CNAME staged before it
+    /// is discarded too.
+    #[test]
+    fn bad_packet_leaves_cache_unchanged() {
+        let mut cname_rdata = BytesMut::new();
+        write_name(&mut cname_rdata, "target.example.com");
+
+        let mut pkt = reply_header(26, 1, 2, 0, 0);
+        push_question(&mut pkt, "alias.example.com", 1);
+        push_rr(&mut pkt, "alias.example.com", 5, 300, &cname_rdata); // CNAME
+        push_rr(&mut pkt, "target.example.com", 1, 300, &[1, 2]);     // truncated A (< 4 bytes)
+
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        assert_eq!(
+            extract_addresses(&dp, &mut cache, now, &ExtractConfig::default()),
+            ExtractResult::BadPacket
+        );
+        assert_eq!(cache.inserts, 0, "a bad packet must leave no partial state");
+        assert!(cache.lookup_by_name("alias.example.com", F_CNAME, now).is_none());
     }
 
     /// "Don't cache replies from non-recursive nameservers, since we may get a

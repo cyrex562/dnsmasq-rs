@@ -843,7 +843,10 @@ async fn cname_outliving_its_target_is_re_resolved_upstream() {
 /// A client asking for the CNAME itself is answered from cache: that is the one
 /// case where upstream sets `ans` for a cached CNAME (`qtype == T_CNAME`).
 #[tokio::test]
-async fn explicit_cname_query_is_answered_from_cache() {
+async fn explicit_cname_query_is_never_cached() {
+    // "do not cache data from CNAME queries" (rfc1035.c:804): `insert` is 0
+    // for a `T_CNAME` query, so the answer never lands in the cache and a
+    // repeated query must go back to the upstream every time.
     let Some(upstream) = spawn_upstream(|q| {
         Some(reply_to(q, 0, vec![cname_rr("only.test", "elsewhere.test", 300)], vec![]))
     })
@@ -856,16 +859,16 @@ async fn explicit_cname_query_is_answered_from_cache() {
         return;
     };
 
-    assert!(ask(server.addr, &query_wire("only.test", 5, 1)).await.is_some());
+    let first = ask(server.addr, &query_wire("only.test", 5, 1))
+        .await
+        .expect("the CNAME query must be answered");
+    assert!(first.answers.iter().any(|r| r.rtype == 5), "the reply must carry the CNAME");
 
-    let cached = ask(server.addr, &query_wire("only.test", 5, 2))
+    let second = ask(server.addr, &query_wire("only.test", 5, 2))
         .await
         .expect("the repeated CNAME query must be answered");
-    assert_eq!(upstream.misses(), 1, "a CNAME query must be served from the cache");
-    assert!(
-        cached.answers.iter().any(|r| r.rtype == 5),
-        "the cached reply must carry the CNAME",
-    );
+    assert!(second.answers.iter().any(|r| r.rtype == 5), "the reply must carry the CNAME");
+    assert_eq!(upstream.misses(), 2, "a CNAME query must never be served from the cache");
 
     shutdown(server, upstream);
 }

@@ -170,6 +170,17 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     key and then the `| F_NEG` key, counting one hit or miss for the pair. The A/AAAA cache
     branches of `answer_request` use it. Without this the NODATA half of negative caching is
     written to a key nothing reads.
+  - `--cache-rr` is now wired end to end (`daemon.rrlist_cache` → `ForwardConfig::cache_rr` →
+    `ExtractConfig::cache_rr`, `dnsmasq.rs`/`forward.rs`). It was previously parsed by
+    `option.rs` into `Daemon` and never read again — a silent no-op. `extract_addresses`
+    ports C's `insert` gate (`rfc1035.c:788-804`): only `T_A`/`T_AAAA`, `T_SRV`, `T_PTR`, and
+    any type on `cache_rr` (or a `T_ANY` wildcard entry on `cache_rr`) are cached; every other
+    RR type — previously caught by an unconditional `_ => F_RR` fallthrough — is not, and
+    neither is a `T_CNAME` query's own answer ("do not cache data from CNAME queries",
+    `rfc1035.c:804`). The `insert` gate also covers NODATA negative caching (a NODATA answer
+    to an uncacheable type is not cached either), but not NXDOMAIN, which C always allows to
+    cache regardless of qtype (`rfc1035.c:1074-1076`). Rollback-on-`BadPacket` was already
+    correct (staged inserts, see above); this closes the other half of Issue #13.
   - A locally generated answer — which is now every cache hit — carries the EDNS0 OPT
     pseudo-header back when the client sent one. C strips the additional section while
     building the answer and re-adds OPT in `receive_query()` (`forward.c:1969`); the re-added
