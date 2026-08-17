@@ -508,6 +508,7 @@ dependencies = [
  "rand 0.8.5",
  "ring",
  "rsa",
+ "sha1",
  "sha2",
  "socket2",
  "tempfile",

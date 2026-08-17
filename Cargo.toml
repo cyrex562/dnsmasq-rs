@@ -61,6 +61,7 @@ libc = "0.2"
 ring = { version = "0.17", optional = false }
 rsa = { version = "0.9", features = ["sha2"], optional = false }
 sha2 = "0.10"
+sha1 = { version = "0.10", features = ["oid"] }
 p256 = { version = "0.13", optional = false }
 p384 = { version = "0.13", optional = false }
 ed25519-dalek = { version = "2", features = ["rand_core"], optional = false }

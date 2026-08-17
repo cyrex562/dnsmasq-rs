@@ -13,6 +13,7 @@ use rsa::{
     signature::Verifier as _,
     BigUint, RsaPublicKey,
 };
+use sha1::Sha1;
 
 // ─── Algorithm IDs ────────────────────────────────────────────────────────────
 
@@ -116,9 +117,10 @@ fn parse_rsa_key(key_data: &[u8]) -> Result<RsaPublicKey, CryptoError> {
 pub fn parse_dnskey(algorithm: u8, key_data: &[u8]) -> Result<DnssecPublicKey, CryptoError> {
     match DnssecAlgorithm::try_from(algorithm)? {
         DnssecAlgorithm::RsaSha1 => {
-            // RSA/SHA-1 shares the same key format; we surface it as
-            // RsaSha256 storage since SHA-1 verification is handled by
-            // algorithm ID at verify time. Kept for completeness.
+            // RSA/SHA-1 (algorithm 5) shares the same RFC 3110 key wire
+            // format as RSA/SHA-256, so it reuses the RsaSha256 storage
+            // variant. verify_sig dispatches on the algorithm ID (not the
+            // key variant) to pick SHA-1 vs SHA-256 as the signature hash.
             let key = parse_rsa_key(key_data)?;
             Ok(DnssecPublicKey::RsaSha256(key))
         }
@@ -179,9 +181,16 @@ pub fn verify_sig(
     algorithm: DnssecAlgorithm,
 ) -> Result<bool, CryptoError> {
     match (key, algorithm) {
-        (DnssecPublicKey::RsaSha256(rsa_key), DnssecAlgorithm::RsaSha256)
-        | (DnssecPublicKey::RsaSha256(rsa_key), DnssecAlgorithm::RsaSha1) => {
+        (DnssecPublicKey::RsaSha256(rsa_key), DnssecAlgorithm::RsaSha256) => {
             let vk: RsaVerifyingKey<Sha256> = RsaVerifyingKey::new(rsa_key.clone());
+            vk.verify(data, &rsa::pkcs1v15::Signature::try_from(sig).map_err(|_| CryptoError::InvalidSignature)?)
+                .map(|_| true)
+                .map_err(|_| CryptoError::VerificationFailed)
+        }
+        (DnssecPublicKey::RsaSha256(rsa_key), DnssecAlgorithm::RsaSha1) => {
+            // Algorithm 5 (RSA/SHA-1) hashes with SHA-1, per crypto.c:192-200 —
+            // it shares the same wire key format as RsaSha256 but not the hash.
+            let vk: RsaVerifyingKey<Sha1> = RsaVerifyingKey::new(rsa_key.clone());
             vk.verify(data, &rsa::pkcs1v15::Signature::try_from(sig).map_err(|_| CryptoError::InvalidSignature)?)
                 .map(|_| true)
                 .map_err(|_| CryptoError::VerificationFailed)
@@ -262,7 +271,12 @@ pub fn algo_digest_name(algo: u8) -> Option<&'static str> {
         13 => Some("sha256"),   // ECDSAP256SHA256
         14 => Some("sha384"),   // ECDSAP384SHA384
         15 => Some("null_hash"), // ED25519
-        16 => Some("null_hash"), // ED448
+        // ED448 is unimplemented here (parse_dnskey/verify_sig both reject
+        // algorithm 16), so it must not be advertised as supported — unlike
+        // upstream crypto.c:456, which lists it under MIN_VERSION(3,6).
+        16 => None,
+        // GOST R 34.10-2001 (algorithm 12, upstream crypto.c:279-317, also
+        // gated MIN_VERSION(3,6)) is unimplemented and falls through to `_`.
         _ => None,
     }
 }
@@ -538,6 +552,100 @@ mod tests {
         }
     }
 
+    // ── RSA/SHA-1 (algorithm 5) must hash with SHA-1, not SHA-256 ──
+
+    fn make_rsa_signing_key() -> rsa::RsaPrivateKey {
+        use rand::rngs::OsRng;
+        rsa::RsaPrivateKey::new(&mut OsRng, 2048).expect("failed to generate RSA key")
+    }
+
+    fn rsa_dnskey_wire(public: &RsaPublicKey) -> Vec<u8> {
+        use rsa::traits::PublicKeyParts;
+        let e_bytes = public.e().to_bytes_be();
+        let n_bytes = public.n().to_bytes_be();
+        let mut wire = Vec::new();
+        if e_bytes.len() < 256 {
+            wire.push(e_bytes.len() as u8);
+        } else {
+            wire.push(0);
+            wire.extend_from_slice(&(e_bytes.len() as u16).to_be_bytes());
+        }
+        wire.extend_from_slice(&e_bytes);
+        wire.extend_from_slice(&n_bytes);
+        wire
+    }
+
+    #[test]
+    fn rsa_sha1_good_signature_verifies() {
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::signature::{RandomizedSigner, SignatureEncoding};
+
+        let private = make_rsa_signing_key();
+        let public = RsaPublicKey::from(&private);
+        let signing_key: SigningKey<sha1::Sha1> = SigningKey::new(private);
+
+        let data = b"RSA/SHA-1 DNSSEC test data";
+        let signature = signing_key.sign_with_rng(&mut rand::rngs::OsRng, data);
+
+        let dnskey = DnssecPublicKey::RsaSha256(public);
+        let result = verify_sig(
+            data,
+            signature.to_bytes().as_ref(),
+            &dnskey,
+            DnssecAlgorithm::RsaSha1,
+        );
+        assert!(matches!(result, Ok(true)), "expected Ok(true), got {result:?}");
+    }
+
+    #[test]
+    fn rsa_sha1_signature_does_not_verify_as_sha256() {
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::signature::{RandomizedSigner, SignatureEncoding};
+
+        let private = make_rsa_signing_key();
+        let public = RsaPublicKey::from(&private);
+        let signing_key: SigningKey<sha1::Sha1> = SigningKey::new(private);
+
+        let data = b"RSA/SHA-1 DNSSEC test data";
+        let signature = signing_key.sign_with_rng(&mut rand::rngs::OsRng, data);
+
+        let dnskey = DnssecPublicKey::RsaSha256(public);
+        let result = verify_sig(
+            data,
+            signature.to_bytes().as_ref(),
+            &dnskey,
+            DnssecAlgorithm::RsaSha256,
+        );
+        assert!(
+            matches!(result, Err(CryptoError::VerificationFailed)),
+            "SHA-1 signature must not verify under the SHA-256 arm, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_dnskey_and_verify_rsa_sha1_roundtrip() {
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::signature::{RandomizedSigner, SignatureEncoding};
+
+        let private = make_rsa_signing_key();
+        let public = RsaPublicKey::from(&private);
+        let wire = rsa_dnskey_wire(&public);
+        let signing_key: SigningKey<sha1::Sha1> = SigningKey::new(private);
+
+        let dnskey = parse_dnskey(5, &wire).expect("parse_dnskey(5, ..) failed");
+
+        let data = b"round-trip RSA/SHA-1 data";
+        let signature = signing_key.sign_with_rng(&mut rand::rngs::OsRng, data);
+
+        let result = verify_sig(
+            data,
+            signature.to_bytes().as_ref(),
+            &dnskey,
+            DnssecAlgorithm::RsaSha1,
+        );
+        assert!(matches!(result, Ok(true)), "expected Ok(true), got {result:?}");
+    }
+
     // ── ds_digest_name ───────────────────────────────────────────────────────
 
     #[test]
@@ -583,6 +691,13 @@ mod tests {
     }
 
     #[test]
+    fn algo_digest_name_ed448_matches_parse_dnskey_rejection() {
+        // parse_dnskey(16, ..) rejects Ed448 as unsupported, so algo_digest_name
+        // must not advertise it as supported either.
+        assert_eq!(algo_digest_name(16), None);
+    }
+
+    #[test]
     fn algo_digest_name_rsa_md5_not_impl() {
         assert_eq!(algo_digest_name(1), None);
     }
@@ -613,6 +728,12 @@ mod tests {
         assert!(algo_supported(15)); // ED25519
         assert!(!algo_supported(1)); // RSA/MD5 (not implemented)
         assert!(!algo_supported(99));
+    }
+
+    #[test]
+    fn algo_supported_ed448_matches_parse_dnskey() {
+        // parse_dnskey(16, ..) fails closed, so algo_supported must agree.
+        assert!(!algo_supported(16));
     }
 
     #[test]
