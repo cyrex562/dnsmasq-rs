@@ -755,6 +755,15 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   Source of truth: `src/dnssec.rs`, `src/crypto.rs`, existing TODO notes, parity outcomes.
   Required tests: validation-path tests, malformed input tests, upstream comparison for supported DNSSEC scenarios.
   Done when: docs and behavior agree on what DNSSEC support is real versus partial.
+  Update (Issue #10 / T1-1): `validate_rrset` now calls `crypto::verify_sig` and
+  returns `Bogus` on any failed/forged/wrong-key signature instead of an
+  unconditional `Secure`. Supported algorithms: 5 (RSA/SHA1), 8 (RSA/SHA256),
+  10 (RSA/SHA512), 13 (ECDSA P-256), 14 (ECDSA P-384), 15 (Ed25519) — matching
+  `crypto::DnssecAlgorithm`. Algorithm 7 (RSASHA1-NSEC3-SHA1) and 16 (Ed448)
+  are explicitly unsupported and skipped (RRSIG tried, then falls through to
+  the next signature/`Bogus`), same as any other unknown algorithm ID.
+  Still open: `validate_rrset` has no live caller anywhere in `src/` — wiring
+  it into the actual resolution/reply path is separate, untouched work.
 
 - [ ] Treat DBus, UBus, BPF, ipset, nftset, and similar integrations as feature-gated completion tracks.
   Required tests: feature-gated compile checks, targeted integration tests, parity scenarios only when implementation is real.

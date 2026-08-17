@@ -450,13 +450,17 @@ pub enum RrsetValidation {
 /// 1. Sort the RRset into canonical order (`sort_rrset`).
 /// 2. For each RRSIG, check validity window (using provided `now_ts`).
 /// 3. Build the signed data (type code, original TTL, owner name, RDATA).
-/// 4. Verify the cryptographic signature using SHA-256 (alg 8 / RSA-SHA256).
-///    Other algorithms return `Bogus("unsupported algorithm")` — they can be
-///    added when the underlying crypto crates are wired in.
+/// 4. Verify the cryptographic signature via `crypto::verify_sig`, trying
+///    RSA-SHA1/256/512, ECDSA P-256/P-384, and Ed25519 (algorithms 5, 8, 10,
+///    13, 14, 15 — matching `crypto::DnssecAlgorithm`). Algorithms 7
+///    (RSASHA1-NSEC3-SHA1) and 16 (Ed448), and anything else, are
+///    unsupported and skipped.
 ///
-/// Note: full signature verification requires the `ring` or `rsa` crate.  This
-/// implementation builds the signed material and validates time windows; the
-/// actual asymmetric-key verification is stubbed with a compile-time note.
+/// An unsupported algorithm, a parse failure, or a signature that fails to
+/// verify all `continue` to the next candidate RRSIG rather than failing the
+/// whole call outright, mirroring `hash_find()`'s skip-on-unsupported and the
+/// per-signature `verify()` gate in `dnssec.c:479-703`. Only after every
+/// RRSIG has been tried does the call return `Bogus`.
 ///
 /// Mirrors `validate_rrset()` in `dnssec.c`.
 pub fn validate_rrset(
@@ -507,11 +511,14 @@ pub fn validate_rrset(
         }
 
         let key = dnskey_rdata.unwrap();
-        // Only support algorithm 8 (RSA/SHA-256) and 13 (ECDSA/P-256) for
-        // now; others are flagged as unsupported.
-        if algo != 8 && algo != 13 {
-            return RrsetValidation::Bogus(format!("unsupported algorithm {algo}"));
-        }
+        // Skip (don't fail outright) unsupported algorithms, mirroring
+        // upstream's `hash_find(algo_digest_name(algo))` skip at
+        // dnssec.c:522-523: try the next RRSIG/key combination instead of
+        // aborting the whole validation.
+        let algorithm = match crate::crypto::DnssecAlgorithm::try_from(algo) {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
 
         // Build the signed data per RFC 4034 §6.2.
         // signed_data = RRSIG_RDATA[0..18] + wire(signer_name) + for each RR: wire(owner) + type + class + orig_ttl + rdlen + rdata
@@ -561,26 +568,26 @@ pub fn validate_rrset(
         if sig_start >= rdata.len() { continue; }
         let signature = &rdata[sig_start..];
 
-        // Verify: we compute the SHA-256 digest of signed_data and compare
-        // against what would be checked with the RSA public key.
-        // Full RSA/ECDSA verification requires an asymmetric-crypto crate;
-        // for now we validate the digest structurally and note the limitation.
-        // TODO: wire in ring/rsa/p256 crate for actual signature verification.
-        let _digest: Vec<u8> = {
-            let mut hasher = Sha256::new();
-            hasher.update(&signed_data);
-            hasher.finalize().to_vec()
-        };
-        let _signature = signature; // would be passed to RSA/ECDSA verify
+        // Parse the DNSKEY RDATA (flags/protocol/algorithm header + raw key
+        // material) and verify the signature against the reconstructed
+        // signed-data blob. Any parse or verification failure means this
+        // RRSIG/key combination does not validate; try the next signature
+        // rather than failing the whole RRset outright (dnssec.c:673-697).
+        let Ok(dnskey) = parse_dnskey_rdata(key) else { continue };
+        let Ok(pubkey) = crate::crypto::parse_dnskey(algo, &dnskey.public_key) else { continue };
 
-        // Compute effective TTL (RFC 4035 §5.3.3).
-        let remaining = sig_expiry.saturating_sub(now_ts);
-        let ttl = rr_ttl(&sorted)
-            .min(orig_ttl)
-            .min(remaining);
+        match crate::crypto::verify_sig(&signed_data, signature, &pubkey, algorithm) {
+            Ok(true) => {
+                // Compute effective TTL (RFC 4035 §5.3.3).
+                let remaining = sig_expiry.saturating_sub(now_ts);
+                let ttl = rr_ttl(&sorted)
+                    .min(orig_ttl)
+                    .min(remaining);
 
-        // Structural validation passed (crypto stub).
-        return RrsetValidation::Secure { ttl, key_tag };
+                return RrsetValidation::Secure { ttl, key_tag };
+            }
+            _ => continue,
+        }
     }
 
     RrsetValidation::Bogus("no valid signatures found".to_string())
@@ -1301,6 +1308,173 @@ mod tests {
         );
         // expired → all sigs fail → Bogus
         assert!(matches!(result, RrsetValidation::Bogus(_)));
+    }
+
+    #[test]
+    fn validate_rrset_not_yet_valid_signature_is_bogus() {
+        let mut rdata = rrsig_rdata_for(1, "example.com");
+        // Overwrite sig_inception (bytes 12..16) to be far in the future (> now=1000).
+        rdata[12..16].copy_from_slice(&2_000_000u32.to_be_bytes());
+        let rrsig_rr = make_typed_rr("example.com", 46, &rdata);
+        let rrset = vec![make_rr(&[1, 2, 3, 4])];
+        let mut counter = 100i32;
+        let fake_key = vec![0u8; 4];
+        let result = validate_rrset(
+            &rrset, &[&rrsig_rr], "example.com", 1, 1,
+            /* now */ 1000, Some(&fake_key), &mut counter,
+        );
+        // not yet valid → all sigs fail → Bogus
+        assert!(matches!(result, RrsetValidation::Bogus(_)));
+    }
+
+    // ─── validate_rrset: real cryptographic verification ──────────────────
+    //
+    // Uses ECDSA P-256 (algorithm 13), which was already in the pre-fix
+    // hardcoded allow-list (`algo != 8 && algo != 13`). That matters: it
+    // proves these tests exercise actual signature verification rather than
+    // merely hitting the "unsupported algorithm" path.
+
+    /// Build a self-consistent (rrset, RRSIG RR) pair, signed with
+    /// `signing_key` over exactly the bytes `validate_rrset` will
+    /// reconstruct internally (RFC 4034 §6.2 signed-data blob).
+    fn build_ecdsa_p256_scenario(
+        signing_key: &p256::ecdsa::SigningKey,
+        sig_inception: u32,
+        sig_expiry: u32,
+    ) -> (Vec<crate::rfc1035::DnsRr>, crate::rfc1035::DnsRr) {
+        use p256::ecdsa::signature::Signer;
+
+        const ALGO: u8 = 13; // ECDSA P-256/SHA-256
+        let name = "example.com";
+        let rrtype: u16 = 1;
+        let rrclass: u16 = 1;
+        let orig_ttl: u32 = 300;
+        let key_tag: u16 = 1234;
+        let labels: u8 = 2;
+
+        let rr = make_rr(&[1, 2, 3, 4]);
+
+        let mut header = Vec::new();
+        header.extend_from_slice(&rrtype.to_be_bytes());
+        header.push(ALGO);
+        header.push(labels);
+        header.extend_from_slice(&orig_ttl.to_be_bytes());
+        header.extend_from_slice(&sig_expiry.to_be_bytes());
+        header.extend_from_slice(&sig_inception.to_be_bytes());
+        header.extend_from_slice(&key_tag.to_be_bytes());
+
+        let wire_name = name_to_wire(name).unwrap();
+
+        let mut signed_data = Vec::new();
+        signed_data.extend_from_slice(&header);
+        signed_data.extend_from_slice(&wire_name); // signer name
+        signed_data.extend_from_slice(&wire_name); // owner name (== signer, no wildcard)
+        signed_data.extend_from_slice(&rrtype.to_be_bytes());
+        signed_data.extend_from_slice(&rrclass.to_be_bytes());
+        signed_data.extend_from_slice(&orig_ttl.to_be_bytes());
+        let rdlen = rr.rdata.len() as u16;
+        signed_data.extend_from_slice(&rdlen.to_be_bytes());
+        signed_data.extend_from_slice(&rr.rdata);
+
+        let signature: p256::ecdsa::Signature = signing_key.sign(&signed_data);
+        let sig_bytes = signature.to_bytes().to_vec(); // fixed 64-byte r||s
+
+        let mut rrsig_rdata = header.clone();
+        rrsig_rdata.extend_from_slice(&wire_name);
+        rrsig_rdata.extend_from_slice(&sig_bytes);
+
+        let rrsig_rr = make_typed_rr(name, 46, &rrsig_rdata);
+
+        (vec![rr], rrsig_rr)
+    }
+
+    fn dnskey_rdata_for_ecdsa_p256(verifying_key: &p256::ecdsa::VerifyingKey) -> Vec<u8> {
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+        let point = verifying_key.to_encoded_point(false); // 0x04 || x(32) || y(32)
+        let uncompressed = point.as_bytes();
+
+        let mut dnskey_rdata = Vec::new();
+        dnskey_rdata.extend_from_slice(&0x0100u16.to_be_bytes()); // zone key flag
+        dnskey_rdata.push(3); // protocol
+        dnskey_rdata.push(13); // algorithm: ECDSA P-256
+        dnskey_rdata.extend_from_slice(&uncompressed[1..]); // strip 0x04 prefix
+        dnskey_rdata
+    }
+
+    #[test]
+    fn validate_rrset_valid_ecdsa_signature_is_secure() {
+        use p256::ecdsa::SigningKey;
+        use rand::rngs::OsRng;
+
+        let signing_key = SigningKey::random(&mut OsRng);
+        let (rrset, rrsig_rr) = build_ecdsa_p256_scenario(&signing_key, 0, u32::MAX);
+        let dnskey_rdata = dnskey_rdata_for_ecdsa_p256(signing_key.verifying_key());
+
+        let mut counter = 100i32;
+        let result = validate_rrset(
+            &rrset, &[&rrsig_rr], "example.com", 1, 1,
+            /* now */ 500_000, Some(&dnskey_rdata), &mut counter,
+        );
+        assert!(matches!(result, RrsetValidation::Secure { .. }), "expected Secure, got {result:?}");
+    }
+
+    #[test]
+    fn validate_rrset_corrupted_signature_is_bogus() {
+        use p256::ecdsa::SigningKey;
+        use rand::rngs::OsRng;
+
+        let signing_key = SigningKey::random(&mut OsRng);
+        let (rrset, mut rrsig_rr) = build_ecdsa_p256_scenario(&signing_key, 0, u32::MAX);
+        let dnskey_rdata = dnskey_rdata_for_ecdsa_p256(signing_key.verifying_key());
+
+        // Corrupt the last byte of the signature (end of RRSIG RDATA).
+        let last = rrsig_rr.rdata.len() - 1;
+        rrsig_rr.rdata[last] ^= 0xff;
+
+        let mut counter = 100i32;
+        let result = validate_rrset(
+            &rrset, &[&rrsig_rr], "example.com", 1, 1,
+            /* now */ 500_000, Some(&dnskey_rdata), &mut counter,
+        );
+        assert!(matches!(result, RrsetValidation::Bogus(_)), "corrupted signature must not validate, got {result:?}");
+    }
+
+    #[test]
+    fn validate_rrset_wrong_key_is_bogus() {
+        use p256::ecdsa::SigningKey;
+        use rand::rngs::OsRng;
+
+        let signing_key = SigningKey::random(&mut OsRng);
+        let (rrset, rrsig_rr) = build_ecdsa_p256_scenario(&signing_key, 0, u32::MAX);
+
+        // Present a DNSKEY belonging to an unrelated key pair.
+        let wrong_key = SigningKey::random(&mut OsRng);
+        let dnskey_rdata = dnskey_rdata_for_ecdsa_p256(wrong_key.verifying_key());
+
+        let mut counter = 100i32;
+        let result = validate_rrset(
+            &rrset, &[&rrsig_rr], "example.com", 1, 1,
+            /* now */ 500_000, Some(&dnskey_rdata), &mut counter,
+        );
+        assert!(matches!(result, RrsetValidation::Bogus(_)), "wrong key must not validate, got {result:?}");
+    }
+
+    #[test]
+    fn validate_rrset_unsupported_algorithm_is_bogus() {
+        // Algorithm 1 (RSA/MD5) is explicitly unsupported (RFC 6944 Must Not
+        // Implement) and must not be treated as valid.
+        let mut rdata = rrsig_rdata_for(1, "example.com");
+        rdata[2] = 1; // algorithm byte
+        let rrsig_rr = make_typed_rr("example.com", 46, &rdata);
+        let rrset = vec![make_rr(&[1, 2, 3, 4])];
+        let mut counter = 100i32;
+        let fake_key = vec![0u8; 4];
+        let result = validate_rrset(
+            &rrset, &[&rrsig_rr], "example.com", 1, 1,
+            /* now */ 500_000, Some(&fake_key), &mut counter,
+        );
+        assert!(matches!(result, RrsetValidation::Bogus(_)), "unsupported algorithm must not validate, got {result:?}");
     }
 
     // ─── hostname_cmp ────────────────────────────────────────────────────────
