@@ -764,6 +764,21 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   the next signature/`Bogus`), same as any other unknown algorithm ID.
   Still open: `validate_rrset` has no live caller anywhere in `src/` — wiring
   it into the actual resolution/reply path is separate, untouched work.
+  Update (Issue #11 / T1-2): fixed a real correctness bug — algorithm 5
+  (RSA/SHA1) was being verified with `RsaVerifyingKey<Sha256>`, so every
+  algorithm-5 signature failed closed (never a forgery risk, but every
+  legitimately-signed algorithm-5 RRset was rejected as `Bogus`).
+  `verify_sig` now splits the RSA match arm so algorithm 5 hashes with
+  SHA-1 (`sha1` crate, matching upstream `crypto.c:192-200`) while
+  algorithm 8 keeps SHA-256; both share the same RFC 3110 key wire format
+  and `RsaSha256` storage variant. Also fixed an internal inconsistency:
+  `algo_digest_name(16)` (Ed448) previously returned `Some("null_hash")`
+  while `parse_dnskey`/`verify_sig` both reject it — it now returns `None`
+  so `algo_supported(16)` agrees with the actual rejection path. GOST
+  (algorithm 12, upstream `crypto.c:279-317`, gated `MIN_VERSION(3,6)`) and
+  Ed448 (algorithm 16, `crypto.c:320-362`) remain unimplemented — both are
+  explicitly rejected (`DnssecAlgorithm::try_from` fails closed for 12;
+  `parse_dnskey`/`verify_sig` fail closed for 16), not silently ignored.
 
 - [ ] Treat DBus, UBus, BPF, ipset, nftset, and similar integrations as feature-gated completion tracks.
   Required tests: feature-gated compile checks, targeted integration tests, parity scenarios only when implementation is real.
