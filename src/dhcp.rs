@@ -46,7 +46,7 @@ pub struct DhcpServerConfig {
     pub max_packet: usize,
     /// Static/selector DHCP config entries from parsed `dhcp-host`/`dhcp-ignore`.
     pub configs: Vec<crate::types::dhcp::DhcpConfig>,
-    /// Vendor-class tag rules from parsed `dhcp-vendor`.
+    /// Vendor-class tag rules from parsed `dhcp-vendorclass`.
     pub vendor_rules: Vec<crate::types::dhcp::DhcpVendorRule>,
     /// User-class tag rules from parsed `dhcp-userclass`.
     pub user_class_rules: Vec<crate::types::dhcp::DhcpUserClassRule>,
