@@ -814,6 +814,15 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   Required tests: unit coverage plus parity fixture exchanges.
   Done when: supported DHCPv6 and RA scenarios are behaviorally aligned with upstream.
 
+- [ ] Wire `radv::calc_interval` / `radv::calc_lifetime` (radv.rs) into real RA scheduling and packet
+  construction, matching upstream call sites `calc_interval(find_iface_param(iface_name))` /
+  `calc_lifetime(find_iface_param(iface_name))` at radv.c:281, 293, 422, 981. Both functions now
+  reproduce upstream clamp semantics exactly (Issue #16) but have no production callers — `new_timeout`
+  and RA packet building still use ad hoc interval/lifetime values instead of these helpers.
+  Required tests: call-site tests proving RA scheduling and the router-lifetime wire field reflect
+  per-interface `ra-param` config (interval, lifetime, including the lifetime=0 "no default route" case).
+  Done when: RA interval/lifetime are actually derived from `RaInterfaceParam` at every upstream call site.
+
 - [ ] Reassess DNSSEC claims against actual implementation status.
   Source of truth: `src/dnssec.rs`, `src/crypto.rs`, existing TODO notes, parity outcomes.
   Required tests: validation-path tests, malformed input tests, upstream comparison for supported DNSSEC scenarios.
