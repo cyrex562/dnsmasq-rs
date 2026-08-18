@@ -275,27 +275,6 @@ impl RaSchedule {
     }
 }
 
-/// Calculate the RA lifetime value in seconds from optional configuration.
-/// Clamps to the valid range [0, 65535] (fits in a u16 on the wire).
-#[cfg(feature = "dhcp6")]
-pub fn calc_lifetime(configured: Option<u32>, default_secs: u32) -> u32 {
-    let val = configured.unwrap_or(default_secs);
-    val.min(65535)
-}
-
-/// Calculate the min/max RA interval pair, enforcing RFC constraints:
-///   - min >= 3
-///   - min >= max * 0.33 (rounded up)
-///
-/// Returns `(min, max)` in seconds.
-#[cfg(feature = "dhcp6")]
-pub fn calc_interval(min: Option<u32>, max: Option<u32>) -> (u32, u32) {
-    let max_val = max.unwrap_or(600);
-    let min_floor = ((max_val as f64) * 0.33).ceil() as u32;
-    let min_val = min.unwrap_or(min_floor).max(min_floor).max(3);
-    (min_val, max_val)
-}
-
 /// Convert an [`RaPriority`] to the wire-format byte used in the RA flags field
 /// (RFC 4191 §2.2, bits 3–4 of the flags byte).
 ///   Low    → 0x18  (11 in prf bits)
@@ -330,6 +309,57 @@ pub struct RaInterfaceParam {
 // ─────────────────────────────────────────────────────────────────────────────
 // Pure helper functions (ported from radv.c:973-1037)
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Calculate the RA interval (MaxRtrAdvInterval) in seconds.
+///
+/// Defaults to 600. If `ra` is set and its `interval` is non-zero, that value
+/// is used, clamped to `[4, 1800]`.
+///
+/// Port of `calc_interval()` from radv.c:997-1011.
+#[cfg(feature = "dhcp6")]
+pub fn calc_interval(ra: Option<&RaInterfaceParam>) -> u32 {
+    let mut interval: i32 = 600;
+
+    if let Some(p) = ra {
+        if p.interval != 0 {
+            interval = p.interval as i32;
+            if interval > 1800 {
+                interval = 1800;
+            } else if interval < 4 {
+                interval = 4;
+            }
+        }
+    }
+
+    interval as u32
+}
+
+/// Calculate the RA router lifetime in seconds.
+///
+/// Defaults to `3 * interval` when `ra` is absent or `lifetime == -1`
+/// ("not specified"). Otherwise uses `ra.lifetime`, raised to `interval` if
+/// smaller (unless it is `0`, meaning "no default route"), and clamped to a
+/// maximum of `9000`.
+///
+/// Port of `calc_lifetime()` from radv.c:1013-1029.
+#[cfg(feature = "dhcp6")]
+pub fn calc_lifetime(ra: Option<&RaInterfaceParam>) -> u32 {
+    let interval = calc_interval(ra) as i32;
+    let mut lifetime: i32;
+
+    if ra.is_none() || ra.map(|p| p.lifetime) == Some(-1) {
+        lifetime = 3 * interval;
+    } else {
+        lifetime = ra.unwrap().lifetime;
+        if lifetime < interval && lifetime != 0 {
+            lifetime = interval;
+        } else if lifetime > 9000 {
+            lifetime = 9000;
+        }
+    }
+
+    lifetime as u32
+}
 
 /// Extract priority value from RA interface config.
 ///
@@ -539,60 +569,84 @@ mod tests {
         assert!(sched.is_due());
     }
 
-    // --- calc_lifetime tests ---
+    // --- calc_interval tests (radv.c:997-1011) ---
 
-    #[test]
-    fn calc_lifetime_uses_default() {
-        assert_eq!(calc_lifetime(None, 1800), 1800);
+    fn ra_with(interval: u32, lifetime: i32) -> RaInterfaceParam {
+        RaInterfaceParam { name: "eth0".to_string(), interval, lifetime, prio: 0, mtu: 0 }
     }
 
     #[test]
-    fn calc_lifetime_uses_configured() {
-        assert_eq!(calc_lifetime(Some(900), 1800), 900);
+    fn calc_interval_none_defaults_to_600() {
+        assert_eq!(calc_interval(None), 600);
     }
 
     #[test]
-    fn calc_lifetime_clamps_to_max() {
-        assert_eq!(calc_lifetime(Some(100_000), 1800), 65535);
+    fn calc_interval_zero_means_unset_defaults_to_600() {
+        assert_eq!(calc_interval(Some(&ra_with(0, -1))), 600);
     }
 
     #[test]
-    fn calc_lifetime_zero_is_valid() {
-        assert_eq!(calc_lifetime(Some(0), 1800), 0);
-    }
-
-    // --- calc_interval tests ---
-
-    #[test]
-    fn calc_interval_defaults() {
-        let (min, max) = calc_interval(None, None);
-        assert_eq!(max, 600);
-        // min should be at least ceil(600 * 0.33) = 198
-        assert!(min >= 198);
-        assert!(min >= 3);
+    fn calc_interval_clamps_below_min_to_4() {
+        assert_eq!(calc_interval(Some(&ra_with(2, -1))), 4);
     }
 
     #[test]
-    fn calc_interval_enforces_min_ge_max_times_033() {
-        // If min is set too low, it should be raised.
-        let (min, max) = calc_interval(Some(1), Some(300));
-        assert_eq!(max, 300);
-        let floor = ((300.0_f64) * 0.33).ceil() as u32;
-        assert!(min >= floor);
+    fn calc_interval_clamps_above_max_to_1800() {
+        assert_eq!(calc_interval(Some(&ra_with(5000, -1))), 1800);
     }
 
     #[test]
-    fn calc_interval_enforces_min_ge_3() {
-        let (min, _max) = calc_interval(Some(1), Some(5));
-        assert!(min >= 3);
+    fn calc_interval_boundary_4_passes_through() {
+        assert_eq!(calc_interval(Some(&ra_with(4, -1))), 4);
     }
 
     #[test]
-    fn calc_interval_respects_valid_min() {
-        // If min is already valid and above the floor, use it.
-        let (min, max) = calc_interval(Some(250), Some(600));
-        assert_eq!(max, 600);
-        assert_eq!(min, 250);
+    fn calc_interval_boundary_1800_passes_through() {
+        assert_eq!(calc_interval(Some(&ra_with(1800, -1))), 1800);
+    }
+
+    #[test]
+    fn calc_interval_valid_value_passes_through() {
+        assert_eq!(calc_interval(Some(&ra_with(250, -1))), 250);
+    }
+
+    // --- calc_lifetime tests (radv.c:1013-1029) ---
+
+    #[test]
+    fn calc_lifetime_none_defaults_to_3x_interval() {
+        assert_eq!(calc_lifetime(None), 1800); // 3 * 600
+    }
+
+    #[test]
+    fn calc_lifetime_unspecified_defaults_to_3x_interval() {
+        // lifetime == -1 means "not specified"; interval is clamped first.
+        assert_eq!(calc_lifetime(Some(&ra_with(100, -1))), 300); // 3 * 100
+    }
+
+    #[test]
+    fn calc_lifetime_zero_means_no_default_route_and_is_preserved() {
+        assert_eq!(calc_lifetime(Some(&ra_with(600, 0))), 0);
+    }
+
+    #[test]
+    fn calc_lifetime_below_interval_is_raised_to_interval() {
+        assert_eq!(calc_lifetime(Some(&ra_with(600, 2))), 600);
+    }
+
+    #[test]
+    fn calc_lifetime_above_9000_is_clamped() {
+        assert_eq!(calc_lifetime(Some(&ra_with(600, 20_000))), 9000);
+    }
+
+    #[test]
+    fn calc_lifetime_boundary_9000_passes_through() {
+        assert_eq!(calc_lifetime(Some(&ra_with(600, 9000))), 9000);
+    }
+
+    #[test]
+    fn calc_lifetime_equal_to_interval_is_not_raised() {
+        // lifetime < interval is false at equality, so it passes through unchanged.
+        assert_eq!(calc_lifetime(Some(&ra_with(600, 600))), 600);
     }
 
     // --- priority_byte tests ---
