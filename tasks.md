@@ -88,6 +88,34 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   - `no-cache`/`do-bit`/`CD` handling, and the auth (`--auth-zone`) and conntrack
     allowlist branches of `udp_request()`, which have no Rust call site at all.
   - TCP DNS service. Only the UDP listener consults local data; there is no TCP listener.
+
+- [x] `src/conntrack.rs` issues an nfnetlink `IPCTNL_MSG_CT_GET` query (was
+  building an unsent `IPCTNL_MSG_CT_NEW` set-message with no caller — the
+  semantic opposite of upstream `get_incoming_mark()`, `conntrack.c:27-73`).
+  `get_incoming_mark()` opens a `NETLINK_NETFILTER` socket, sends the query,
+  and parses `CTA_MARK` out of the response, mirroring `callback()`
+  (`conntrack.c:75-83`); it is `None`-returning and panic-free when
+  unprivileged or when no entry matches. Wired into the UDP client forward
+  path: `ForwardEngine::forward_query` now threads the arrival destination
+  address into `FrecSrc::dest`, and `send_upstream` calls
+  `conntrack_mark_for`/`apply_conntrack_mark` (gated on `--conntrack` /
+  `OPT_CONNTRACK`) to copy the mark onto the outbound socket via the existing
+  `set_outgoing_mark`, mirroring `set_outgoing_mark()` + the `OPT_CONNTRACK`
+  check at `forward.c:531-535`.
+
+  Still not ported (left for a future conntrack/ubus pass):
+
+  - The TCP path (`tcp_request()`/`tcp_talk()`, `forward.c:2384-2395`,
+    `forward.c:2079-2082`) — there is no Rust TCP DNS listener yet (see the
+    "TCP DNS service" gap above), so `istcp = 1` queries are unreachable.
+  - The DNSSEC-retry mark copy (`forward.c:1072-1074`) — the DNSSEC
+    sub-query retry path in `forward_query`'s C equivalent has no Rust
+    counterpart yet.
+  - The `HAVE_UBUS`-gated connmark-allowlist branches (`forward.c:605-613`,
+    `1441-1447`, `1902-1997`, `2546-2555`) that call `get_incoming_mark()` to
+    decide `report_addresses()`/`is_query_allowed_for_mark()` — these need
+    the (non-default) `ubus` feature and its own call sites, not just
+    `conntrack`.
   - Reload staleness (partially fixed). SIGHUP reload (`dnsmasq::on_sighup` /
     `clear_cache_and_reload`) now flushes and rebuilds the *live* `DnsCache` — it is a
     `cache::SharedDnsCache` threaded into `run_forward_loop_on` rather than a task-local
