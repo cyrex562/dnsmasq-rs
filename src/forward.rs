@@ -986,6 +986,8 @@ pub struct LocalData {
     pub host_records:  Vec<HostRecord>,
     pub cnames:        Vec<Cname>,
     pub naptr_records: Vec<Naptr>,
+    /// `--domain-needed` (`OPT_NODOTS_LOCAL`).
+    pub nodots_local:  bool,
 }
 
 impl Default for LocalData {
@@ -1002,6 +1004,7 @@ impl Default for LocalData {
             host_records:  Vec::new(),
             cnames:        Vec::new(),
             naptr_records: Vec::new(),
+            nodots_local:  false,
         }
     }
 }
@@ -1019,6 +1022,7 @@ impl LocalData {
             host_records:  &self.host_records,
             cnames:        &self.cnames,
             naptr_records: &self.naptr_records,
+            nodots_local:  self.nodots_local,
         }
     }
 

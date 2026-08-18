@@ -16,7 +16,7 @@ use crate::types::dns_records::{
     InterfaceName, MxSrvRecord, Naptr, PtrRecord, RrList, TxtRecord, ADDRLIST_IPV6,
     ADDRLIST_LITERAL, IN4, IN6, INP4, INP6,
 };
-use crate::types::network::{DynDir, HostsFile, Iname, Ipsets, MySubnet, AH_DHCP_HST, AH_DHCP_OPT, AH_HOSTS, INAME_4, INAME_6};
+use crate::types::network::{Allowlist, DynDir, HostsFile, Iname, Ipsets, MySubnet, AH_DHCP_HST, AH_DHCP_OPT, AH_HOSTS, INAME_4, INAME_6};
 use crate::types::server::{Server, SERV_4ADDR, SERV_6ADDR, SERV_LITERAL_ADDRESS};
 #[cfg(feature = "dhcp")]
 use crate::types::dhcp::{
@@ -821,17 +821,39 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             daemon.set_option(OPT_SINGLE_PORT);
         }
         "client-subnet"     => daemon.set_option(OPT_CLIENT_SUBNET),
-        "loop-detect"       => daemon.set_option(OPT_LOOP_DETECT),
+        // `dns-loop-detect` (option.c:387) is the real upstream name for the
+        // bit already reachable via the pre-existing `loop-detect` alias.
+        "loop-detect" | "dns-loop-detect" => daemon.set_option(OPT_LOOP_DETECT),
         "script-arp"        => daemon.set_option(OPT_SCRIPT_ARP),
         "script-on-renewal" => daemon.set_option(OPT_LEASE_RENEW),
-        "rapid-commit"      => daemon.set_option(OPT_RAPID_COMMIT),
+        // `dhcp-rapid-commit` (option.c:391) is the real upstream name for the
+        // bit already reachable via the pre-existing `rapid-commit` alias.
+        "rapid-commit" | "dhcp-rapid-commit" => daemon.set_option(OPT_RAPID_COMMIT),
         "log-debug"         => daemon.set_option(OPT_LOG_DEBUG),
         "quiet-tftp"        => daemon.set_option(OPT_QUIET_TFTP),
         "no-ident"          => daemon.set_option(OPT_NO_IDENT),
         "no-0x20-encode"    => daemon.set_option(OPT_NO_0X20),
         "do-0x20-encode"    => daemon.set_option(OPT_DO_0X20),
         "log-malloc"        => daemon.set_option(OPT_LOG_MALLOC),
-        "ubus"              => daemon.set_option(OPT_UBUS),
+        // `ubus` is a pre-existing alias for the real upstream directive
+        // `enable-ubus` (option.c:285); upstream also stores an optional
+        // service-name argument in `daemon->ubus_name`, but that field is
+        // gated behind the (non-default) `ubus` cargo feature, so it is left
+        // unset here, matching the existing `enable-dbus` precedent below.
+        "ubus" | "enable-ubus" => daemon.set_option(OPT_UBUS),
+        // `--domain-needed` / `-D` (option.c:268, `OPT_NODOTS_LOCAL`): suppress
+        // forwarding of single-label A/AAAA queries.  See `forward.c:355-361`
+        // and `answer_request()` in `rfc1035.rs` for the runtime behavior.
+        "domain-needed" => daemon.set_option(OPT_NODOTS_LOCAL),
+        // `--clear-on-reload` (option.c:295) is the real upstream name for the
+        // bit already reachable via the pre-existing `reload-acl` alias below.
+        "clear-on-reload" => daemon.set_option(OPT_RELOAD),
+        // `--umbrella` (option.c:2808): sets the main bit unconditionally, as
+        // upstream does regardless of whether sub-options are present.  The
+        // `deviceid:`/`orgid:`/`assetid:`/`userid:` sub-option parsing itself
+        // is not implemented (no corresponding `Daemon` fields yet) — see
+        // tasks.md.
+        "umbrella" => daemon.set_option(OPT_UMBRELLA),
         "local-ttl" if cl.value.is_none() => {} // value required; handled below
 
         // ── Numeric / string options ────────────────────────────────────────
@@ -1376,6 +1398,40 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             daemon.dhcp_except.push(Iname { name: Some(v.to_string()), addr: None, flags: 0 });
         }
 
+        // `--no-dhcpv4-interface` / `--no-dhcpv6-interface` (option.c:2898,
+        // LOPT_NO_DHCP4/6) share `daemon->dhcp_except` with `no-dhcp-interface`
+        // above; each record's `flags` says which family it excludes
+        // (`option.c:2905-2914`).
+        "no-dhcpv4-interface" => {
+            let v = require_value("no-dhcpv4-interface")?;
+            daemon.dhcp_except.push(Iname { name: Some(v.to_string()), addr: None, flags: INAME_4 });
+        }
+
+        "no-dhcpv6-interface" => {
+            let v = require_value("no-dhcpv6-interface")?;
+            daemon.dhcp_except.push(Iname { name: Some(v.to_string()), addr: None, flags: INAME_6 });
+        }
+
+        // `--dhcp-duid` (option.c:4857): `enterprise-number,hex-id`.
+        "dhcp-duid" => {
+            let v = require_value("dhcp-duid")?;
+            let parts = split_csv(v);
+            if parts.len() != 2 {
+                return Err(invalid_value_for(cl, "dhcp-duid", v, "expected enterprise-number,hex-id"));
+            }
+            let enterprise = parse_u32_token(parts[0], "dhcp-duid", cl, "DUID enterprise number")?;
+            let id = parse_hex_bytes(parts[1], "dhcp-duid", cl, "DUID")?;
+            #[cfg(feature = "dhcp6")]
+            {
+                daemon.duid_enterprise = enterprise;
+                daemon.duid = Some(id);
+            }
+            #[cfg(not(feature = "dhcp6"))]
+            {
+                let _ = (enterprise, id);
+            }
+        }
+
         // ── DNS record stubs ────────────────────────────────────────────────
         "mx-host" => {
             let v = require_value("mx-host")?;
@@ -1612,12 +1668,6 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             }
         }
 
-        // ── log-rotate ────────────────────────────────────────────────────
-        "log-rotate" => {
-            let _ = require_value("log-rotate")?;
-            return Err(invalid("", "log-rotate is not implemented yet"));
-        }
-
         // ── DNS rebind protection ─────────────────────────────────────────
         "stop-dns-rebind" => {
             daemon.set_option(OPT_NO_REBIND);
@@ -1654,8 +1704,114 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             daemon.set_option(OPT_CLEVERBIND);
         }
 
-        "no-hosts6" => {
-            return Err(invalid("", "no-hosts6 is not implemented yet"));
+        // `--connmark-allowlist-enable` (option.c:3284, `OPT_CMARK_ALST_EN`):
+        // optional mask, defaulting to "match every bit" like upstream's
+        // `mask = UINT32_MAX` before the optional-arg override. Upstream
+        // hard-errors this directive without HAVE_CONNTRACK (option.c:3283-3286)
+        // rather than silently ignoring it; do the same for the `conntrack`
+        // feature. Runtime consumption of `allowlist_mask`/`allowlists`
+        // (forward.c's mark-based bypass, not yet ported) is tracked in
+        // tasks.md under "Issue #18 remaining DHCP/PXE directives".
+        "connmark-allowlist-enable" => {
+            #[cfg(not(feature = "conntrack"))]
+            {
+                return Err(invalid_value_for(
+                    cl, "connmark-allowlist-enable", cl.value.as_deref().unwrap_or(""),
+                    "recompile with the conntrack feature enabled to use connmark-allowlist directives",
+                ));
+            }
+            #[cfg(feature = "conntrack")]
+            {
+                daemon.set_option(OPT_CMARK_ALST_EN);
+                daemon.allowlist_mask = match cl.value.as_deref() {
+                    None => u32::MAX,
+                    Some(v) => {
+                        let mask = parse_u32_token(v, "connmark-allowlist-enable", cl, "allowlist mask")?;
+                        if mask < 1 {
+                            return Err(invalid_value_for(cl, "connmark-allowlist-enable", v, "mask must be at least 1"));
+                        }
+                        mask
+                    }
+                };
+            }
+        }
+
+        // `--connmark-allowlist` (option.c:3302): `mark[/mask][,pattern...]`.
+        // Same HAVE_CONNTRACK gate as above.
+        "connmark-allowlist" => {
+            #[cfg(not(feature = "conntrack"))]
+            {
+                return Err(invalid_value_for(
+                    cl, "connmark-allowlist", cl.value.as_deref().unwrap_or(""),
+                    "recompile with the conntrack feature enabled to use connmark-allowlist directives",
+                ));
+            }
+            #[cfg(feature = "conntrack")]
+            {
+                let v = require_value("connmark-allowlist")?;
+                let parts = split_csv(v);
+                if parts.is_empty() {
+                    return Err(invalid_value_for(cl, "connmark-allowlist", v, "expected mark[/mask][,pattern...]"));
+                }
+                let (mark_str, mask_str) = match parts[0].split_once('/') {
+                    Some((m, k)) => (m, Some(k)),
+                    None => (parts[0], None),
+                };
+                let mark = parse_u32_token(mark_str, "connmark-allowlist", cl, "connmark mark")?;
+                if mark < 1 {
+                    return Err(invalid_value_for(cl, "connmark-allowlist", v, "mark must be at least 1"));
+                }
+                let mask = match mask_str {
+                    Some(m) => {
+                        let mask = parse_u32_token(m, "connmark-allowlist", cl, "connmark mask")?;
+                        if mask < 1 {
+                            return Err(invalid_value_for(cl, "connmark-allowlist", v, "mask must be at least 1"));
+                        }
+                        mask
+                    }
+                    None => u32::MAX,
+                };
+                if mark & !mask != 0 {
+                    return Err(invalid_value_for(cl, "connmark-allowlist", v, "mark must be a subset of mask"));
+                }
+                let patterns: Vec<String> = parts[1..].iter().map(|p| p.to_string()).collect();
+                daemon.allowlists.push(Allowlist { mark, mask, patterns });
+            }
+        }
+
+        // ── DHCP/PXE directives accepted for config-parity but not yet wired
+        // to DHCP runtime behavior (tracked in tasks.md: "Issue #18 remaining
+        // DHCP/PXE directives").  Each still records that it saw the
+        // directive by consuming its value; none of them silently invents
+        // behavior it does not have.
+        "dhcp-broadcast" | "dhcp-generate-names" | "dhcp-ignore-names" | "bootp-dynamic" => {
+            let _ = cl.value.as_deref();
+        }
+
+        "dhcp-proxy" => {
+            let _ = cl.value.as_deref();
+        }
+
+        "dhcp-pxe-vendor" => {
+            let _ = require_value("dhcp-pxe-vendor")?;
+        }
+
+        "pxe-prompt" => {
+            let _ = require_value("pxe-prompt")?;
+        }
+
+        "pxe-service" => {
+            let _ = require_value("pxe-service")?;
+        }
+
+        // `--conf-script` (option.c:2068): upstream executes the referenced
+        // file and reads config lines back from its output.  Running an
+        // external program as part of config parsing is a deliberate
+        // capability this port does not implement (see tasks.md); the
+        // directive is accepted so a config that carries it does not abort
+        // startup, but the script itself is never executed or read.
+        "conf-script" => {
+            let _ = require_value("conf-script")?;
         }
 
         "filter-A" => {
@@ -4174,6 +4330,190 @@ mod tests {
         assert!(d.option_bool(OPT_LOG_MALLOC));
     }
 
+    // ── domain-needed / Issue #18 directives ────────────────────────────────
+
+    /// `--domain-needed` (`-D`, `OPT_NODOTS_LOCAL`) must be recognized and set
+    /// the bit; previously this aborted startup with `UnknownOption`.
+    #[test]
+    fn apply_domain_needed_sets_opt_nodots_local() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("domain-needed", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_NODOTS_LOCAL));
+    }
+
+    /// `--dhcp-rapid-commit` and `--dns-loop-detect` are the real upstream
+    /// directive names for the bits already reachable via the pre-existing
+    /// `rapid-commit`/`loop-detect` aliases.
+    #[test]
+    fn apply_dhcp_rapid_commit_and_dns_loop_detect() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-rapid-commit\ndns-loop-detect", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_RAPID_COMMIT));
+        assert!(d.option_bool(OPT_LOOP_DETECT));
+    }
+
+    /// `--clear-on-reload` is the real upstream name sharing `OPT_RELOAD` with
+    /// the existing `reload-acl` alias.
+    #[test]
+    fn apply_clear_on_reload_sets_opt_reload() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("clear-on-reload", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_RELOAD));
+    }
+
+    /// `--enable-ubus` is the real upstream name sharing `OPT_UBUS` with the
+    /// existing `ubus` alias.
+    #[test]
+    fn apply_enable_ubus_sets_opt_ubus() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("enable-ubus", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_UBUS));
+    }
+
+    /// `--umbrella` sets `OPT_UMBRELLA`; per-key sub-options (deviceid, orgid,
+    /// assetid, userid) are not parsed (see tasks.md).
+    #[test]
+    fn apply_umbrella_sets_opt_umbrella() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("umbrella", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_UMBRELLA));
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp6")]
+    fn apply_dhcp_duid_parses_enterprise_and_hex_id() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-duid=9,00010203", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.duid_enterprise, 9);
+        assert_eq!(d.duid.as_deref(), Some(&[0x00, 0x01, 0x02, 0x03][..]));
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp6")]
+    fn apply_dhcp_duid_rejects_bad_hex() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-duid=9,zz", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "dhcp-duid"));
+    }
+
+    #[test]
+    fn apply_no_dhcpv4_interface_and_no_dhcpv6_interface() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("no-dhcpv4-interface=eth0\nno-dhcpv6-interface=eth1", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.dhcp_except.len(), 2);
+        assert_eq!(d.dhcp_except[0].name.as_deref(), Some("eth0"));
+        assert_eq!(d.dhcp_except[0].flags, INAME_4);
+        assert_eq!(d.dhcp_except[1].name.as_deref(), Some("eth1"));
+        assert_eq!(d.dhcp_except[1].flags, INAME_6);
+    }
+
+    // connmark-allowlist{,-enable} mirror upstream's `#ifndef HAVE_CONNTRACK`
+    // hard error (option.c:3283-3286): without the `conntrack` feature they
+    // must fail clearly, not parse successfully or silently no-op.
+    #[test]
+    #[cfg(not(feature = "conntrack"))]
+    fn apply_connmark_allowlist_enable_without_conntrack_feature_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("connmark-allowlist-enable=255", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "connmark-allowlist-enable"));
+    }
+
+    #[test]
+    #[cfg(not(feature = "conntrack"))]
+    fn apply_connmark_allowlist_without_conntrack_feature_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("connmark-allowlist=6,*.example.com", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "connmark-allowlist"));
+    }
+
+    #[test]
+    #[cfg(feature = "conntrack")]
+    fn apply_connmark_allowlist_enable_sets_mask_and_bit() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("connmark-allowlist-enable=255", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_CMARK_ALST_EN));
+        assert_eq!(d.allowlist_mask, 255);
+    }
+
+    #[test]
+    #[cfg(feature = "conntrack")]
+    fn apply_connmark_allowlist_enable_defaults_mask_to_all_bits() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("connmark-allowlist-enable", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_CMARK_ALST_EN));
+        assert_eq!(d.allowlist_mask, u32::MAX);
+    }
+
+    #[test]
+    #[cfg(feature = "conntrack")]
+    fn apply_connmark_allowlist_parses_mark_mask_and_patterns() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("connmark-allowlist=6/14,*.example.com,*.example.org", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.allowlists.len(), 1);
+        assert_eq!(d.allowlists[0].mark, 6);
+        assert_eq!(d.allowlists[0].mask, 14);
+        assert_eq!(d.allowlists[0].patterns, vec!["*.example.com", "*.example.org"]);
+    }
+
+    #[test]
+    #[cfg(feature = "conntrack")]
+    fn apply_connmark_allowlist_without_mask_defaults_to_all_bits() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("connmark-allowlist=6,*.example.com", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.allowlists[0].mark, 6);
+        assert_eq!(d.allowlists[0].mask, u32::MAX);
+    }
+
+    #[test]
+    #[cfg(feature = "conntrack")]
+    fn apply_connmark_allowlist_rejects_mark_outside_mask() {
+        let mut d = Daemon::default();
+        // mark 8 (0b1000) is not a subset of mask 3 (0b0011).
+        let lines = parse_config_text("connmark-allowlist=8/3,*.example.com", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "connmark-allowlist"));
+    }
+
+    /// Directives that are recognized and accepted, but whose full runtime
+    /// behavior is not yet wired (tracked in tasks.md), must not abort
+    /// startup — that is exactly the bug this issue fixes.
+    #[test]
+    fn apply_documented_unsupported_directives_do_not_abort_startup() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text(
+            "dhcp-broadcast\n\
+             dhcp-broadcast=tag:foo\n\
+             dhcp-generate-names\n\
+             dhcp-generate-names=tag:foo\n\
+             dhcp-ignore-names\n\
+             dhcp-ignore-names=tag:foo\n\
+             bootp-dynamic\n\
+             bootp-dynamic=tag:foo\n\
+             dhcp-proxy\n\
+             dhcp-proxy=192.168.0.1\n\
+             dhcp-pxe-vendor=PXEClient\n\
+             pxe-prompt=Boot from network\n\
+             pxe-service=x86PC,Boot,pxelinux\n\
+             conf-script=/etc/dnsmasq-script.conf",
+            "test",
+        ).unwrap();
+        apply_config(&mut d, &lines).unwrap();
+    }
+
     #[test]
     fn apply_dhcp_authoritative_and_read_ethers_flags() {
         let mut d = Daemon::default();
@@ -5629,12 +5969,19 @@ mod tests {
         assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "dhcp-option"));
     }
 
+    /// `no-hosts6` and `log-rotate` are not real upstream directives (no
+    /// entry in `option.c`'s option table) and must not be recognized.
     #[test]
-    fn apply_no_hosts6_is_explicitly_unsupported() {
+    fn synthetic_non_upstream_keys_are_removed() {
         let mut d = Daemon::default();
+
         let lines = parse_config_text("no-hosts6", "test").unwrap();
         let err = apply_config(&mut d, &lines).unwrap_err();
-        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "no-hosts6"));
+        assert!(matches!(err, ConfigError::UnknownOption(ref k, _, _) if k == "no-hosts6"));
+
+        let lines = parse_config_text("log-rotate=/var/log/dnsmasq.log", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::UnknownOption(ref k, _, _) if k == "log-rotate"));
     }
 
     #[test]

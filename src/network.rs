@@ -1,4 +1,5 @@
 use std::net::{Ipv4Addr, Ipv6Addr, IpAddr};
+use crate::types::network::{INAME_4, INAME_6};
 
 /// `IFF_LOOPBACK` — the one interface flag this module needs from `SIOCGIFFLAGS`.
 pub const IFACE_LOOPBACK: u32 = 0x8;
@@ -1269,8 +1270,10 @@ impl Default for IfaceRecord {
 pub struct IfaceAllowedConfig {
     /// Interface name / pattern allowlist (empty = accept all).
     pub if_names:      Vec<String>,
-    /// Interface name / pattern denylist.
-    pub dhcp_except:   Vec<String>,
+    /// Interface name / pattern denylist, paired with the `INAME_4`/`INAME_6`
+    /// family bits it applies to (mirrors `struct iname.flags` in
+    /// `dnsmasq.h`). TFTP is disabled on any name match regardless of family.
+    pub dhcp_except:   Vec<(String, u32)>,
     /// If non-empty, only these interfaces get TFTP service.
     pub tftp_ifaces:   Vec<String>,
 }
@@ -1334,16 +1337,23 @@ pub fn iface_allowed_v4(
     let mut dhcp4_ok = !loopback;
     let tftp_ok_base = !loopback;
 
-    // Apply dhcp_except deny list.
-    for pat in &config.dhcp_except {
+    // Apply dhcp_except deny list. Matches upstream network.c:538-546: any
+    // name match disables TFTP; the family bit gates whether DHCP for this
+    // family is also disabled.
+    let mut tftp_denied = false;
+    for (pat, flags) in &config.dhcp_except {
         if iface_name_matches(name, pat) {
-            dhcp4_ok = false;
-            break;
+            tftp_denied = true;
+            if flags & INAME_4 != 0 {
+                dhcp4_ok = false;
+            }
         }
     }
 
     // TFTP: if a dedicated list is given, only those interfaces get TFTP.
-    let tftp_ok = if config.tftp_ifaces.is_empty() {
+    let tftp_ok = if tftp_denied {
+        false
+    } else if config.tftp_ifaces.is_empty() {
         tftp_ok_base
     } else {
         config.tftp_ifaces.iter().any(|p| iface_name_matches(name, p))
@@ -1399,14 +1409,19 @@ pub fn iface_allowed_v6(
 
     let mut dhcp6_ok = !loopback;
 
-    for pat in &config.dhcp_except {
+    let mut tftp_denied = false;
+    for (pat, flags) in &config.dhcp_except {
         if iface_name_matches(name, pat) {
-            dhcp6_ok = false;
-            break;
+            tftp_denied = true;
+            if flags & INAME_6 != 0 {
+                dhcp6_ok = false;
+            }
         }
     }
 
-    let tftp_ok = if config.tftp_ifaces.is_empty() {
+    let tftp_ok = if tftp_denied {
+        false
+    } else if config.tftp_ifaces.is_empty() {
         !loopback
     } else {
         config.tftp_ifaces.iter().any(|p| iface_name_matches(name, p))
@@ -2490,7 +2505,7 @@ mod tests {
     #[test]
     fn iface_allowed_v4_dhcp_except_disables_dhcp() {
         let cfg = IfaceAllowedConfig {
-            dhcp_except: vec!["eth0".to_string()],
+            dhcp_except: vec![("eth0".to_string(), INAME_4 | INAME_6)],
             ..Default::default()
         };
         let rec = iface_allowed_v4(
@@ -2501,6 +2516,57 @@ mod tests {
             &cfg, &default_check_cfg(), &mut IfaceCheckUsed::default(),
         ).unwrap();
         assert!(!rec.dhcp4_ok, "dhcp_except should disable dhcp");
+        assert!(!rec.tftp_ok, "dhcp_except should disable tftp regardless of family");
+    }
+
+    #[test]
+    fn iface_allowed_v4_no_dhcpv6_interface_leaves_v4_enabled() {
+        // `no-dhcpv6-interface=eth0` stores only INAME_6 — v4 must stay on.
+        let cfg = IfaceAllowedConfig {
+            dhcp_except: vec![("eth0".to_string(), INAME_6)],
+            ..Default::default()
+        };
+        let rec = iface_allowed_v4(
+            "eth0", None, 2,
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(255, 255, 255, 0),
+            false,
+            &cfg, &default_check_cfg(), &mut IfaceCheckUsed::default(),
+        ).unwrap();
+        assert!(rec.dhcp4_ok, "no-dhcpv6-interface must not disable dhcp4");
+    }
+
+    #[test]
+    fn iface_allowed_v6_no_dhcpv4_interface_leaves_v6_enabled() {
+        // `no-dhcpv4-interface=eth0` stores only INAME_4 — v6 must stay on.
+        let cfg = IfaceAllowedConfig {
+            dhcp_except: vec![("eth0".to_string(), INAME_4)],
+            ..Default::default()
+        };
+        let rec = iface_allowed_v6(
+            "eth0", 2,
+            "fe80::1".parse().unwrap(),
+            64,
+            false,
+            &cfg, &default_check_cfg(), &mut IfaceCheckUsed::default(),
+        ).unwrap();
+        assert!(rec.dhcp6_ok, "no-dhcpv4-interface must not disable dhcp6");
+    }
+
+    #[test]
+    fn iface_allowed_v6_no_dhcpv6_interface_disables_v6() {
+        let cfg = IfaceAllowedConfig {
+            dhcp_except: vec![("eth0".to_string(), INAME_6)],
+            ..Default::default()
+        };
+        let rec = iface_allowed_v6(
+            "eth0", 2,
+            "fe80::1".parse().unwrap(),
+            64,
+            false,
+            &cfg, &default_check_cfg(), &mut IfaceCheckUsed::default(),
+        ).unwrap();
+        assert!(!rec.dhcp6_ok, "no-dhcpv6-interface should disable dhcp6");
     }
 
     #[test]

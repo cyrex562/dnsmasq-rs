@@ -528,6 +528,7 @@ pub fn daemon_local_data(daemon: &Daemon) -> crate::forward::LocalData {
         host_records:  daemon.host_records.clone(),
         cnames:        daemon.cnames.clone(),
         naptr_records: daemon.naptr.clone(),
+        nodots_local:  daemon.option_bool(crate::types::constants::OPT_NODOTS_LOCAL),
     }
 }
 
@@ -740,8 +741,9 @@ fn iface_allowed_config(daemon: &Daemon) -> crate::network::IfaceAllowedConfig {
     let mut config = crate::network::IfaceAllowedConfig::default();
     #[cfg(feature = "dhcp")]
     {
-        config.dhcp_except =
-            daemon.dhcp_except.iter().filter_map(|i| i.name.clone()).collect();
+        config.dhcp_except = daemon.dhcp_except.iter()
+            .filter_map(|i| i.name.clone().map(|n| (n, i.flags)))
+            .collect();
     }
     #[cfg(feature = "tftp")]
     {
