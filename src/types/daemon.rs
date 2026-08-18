@@ -147,6 +147,20 @@ pub struct Daemon {
     pub dhcp_reply_delays: Vec<DhcpReplyDelay>,
     #[cfg(feature = "dhcp")]
     pub boot_config:     Vec<DhcpBoot>,
+    /// Conditional tag-setting rules from `tag-if` (`struct tag_if`).
+    #[cfg(feature = "dhcp")]
+    pub tag_if:          Vec<crate::dhcp_common::TagIf>,
+    /// Option-substring classifier rules from `dhcp-match` (`daemon->dhcp_match`).
+    #[cfg(feature = "dhcp")]
+    pub dhcp_match:      Vec<DhcpOpt>,
+    /// DHCPv6 counterpart of `dhcp_match` (`daemon->dhcp_match6`). Always empty
+    /// today: the config parser rejects `option6:` inside `dhcp-match`, so
+    /// nothing ever populates it — see tasks.md.
+    #[cfg(feature = "dhcp")]
+    pub dhcp_match6:     Vec<DhcpOpt>,
+    /// Client-hostname classifier rules from `dhcp-name-match`.
+    #[cfg(feature = "dhcp")]
+    pub dhcp_name_match: Vec<DhcpMatchName>,
     #[cfg(feature = "dhcp")]
     pub dhcp_ttl:        u32,
     #[cfg(feature = "dhcp")]
@@ -345,6 +359,14 @@ impl Default for Daemon {
             dhcp_reply_delays: vec![],
             #[cfg(feature = "dhcp")]
             boot_config: vec![],
+            #[cfg(feature = "dhcp")]
+            tag_if: vec![],
+            #[cfg(feature = "dhcp")]
+            dhcp_match: vec![],
+            #[cfg(feature = "dhcp")]
+            dhcp_match6: vec![],
+            #[cfg(feature = "dhcp")]
+            dhcp_name_match: vec![],
             #[cfg(feature = "dhcp")]
             dhcp_ttl: 0,
             #[cfg(feature = "dhcp")]

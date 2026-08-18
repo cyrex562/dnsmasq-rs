@@ -857,6 +857,38 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   Done when: `dhcp-vendorclass=set:tag,enterprise:N,data` parses and `DhcpVendorRule` carries
   the enterprise number through to DHCP packet matching.
 
+- [ ] Issue #19 `tag-if`/`dhcp-match`/`dhcp-name-match`: parsed into
+  `Daemon::tag_if`/`dhcp_match`/`dhcp_name_match` and wired into
+  `dhcp.rs::derived_tags` (dhcp-match/dhcp-name-match) and
+  `dhcp.rs::decorate_reply`'s `option_filter` call (`tag-if`, via
+  `dhcp_common::run_tag_if`), so a client matched by `dhcp-match` and
+  conditionally re-tagged by `tag-if` gets the tag-conditional
+  `dhcp-option`/`dhcp-boot`. Known narrowings, left deliberate for this pass:
+  - `run_tag_if` is applied exactly once, inside `option_filter` at reply-option
+    time. Upstream calls it at ~12 points through `rfc2131.c` (context
+    selection, `dhcp-host`/`dhcp-ignore` selection, range selection, lease
+    creation, boot-file selection) so tag-if-derived tags there feed those
+    decisions too. Here, `dispatch_dhcp_with_meta`'s `find_config`/context/
+    ignore checks all run against the raw `derived_tags()` output (vendor/
+    user-class/mac/relay-id/dhcp-match/dhcp-name-match tags) *before*
+    `tag-if` expansion — a `tag-if` rule cannot itself gate config/context
+    selection or `dhcp-ignore`, only which already-tagged options are sent.
+  - `dhcp-match`'s RFC3925 vendor-identifying-class special case
+    (`vi-encap:`/`DHOPT_RFC3925`, rfc2131.c:437-462, matching option
+    124/125 sub-TLVs by IANA enterprise number) is not implemented;
+    `derived_tags` only matches a `dhcp-match` rule against a single raw
+    option code via `match_bytes`.
+  - `option6:` inside `dhcp-match` (and `dhcp-option` generally) is rejected
+    by the parser, so `Daemon::dhcp_match6` exists for structural parity but
+    is never populated; DHCPv6 client classification via `dhcp-match` is
+    unsupported.
+  Required tests: once addressed, add a test where a `tag-if` condition
+  itself depends on a tag-if-derived tag feeding context/config selection
+  (not just option filtering), an RFC3925 vendor-class match test, and a
+  `dhcp-match=option6:...` parser test.
+  Done when: `run_tag_if` participates in the same decision points as
+  upstream, or the narrowing above is still accurate and current.
+
 ## P3 Feature-Specific Completion
 
 - [ ] Finish behavior-critical gaps in DNS forwarding and cache interaction.
