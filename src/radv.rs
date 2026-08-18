@@ -318,20 +318,10 @@ pub struct RaInterfaceParam {
 /// Port of `calc_interval()` from radv.c:997-1011.
 #[cfg(feature = "dhcp6")]
 pub fn calc_interval(ra: Option<&RaInterfaceParam>) -> u32 {
-    let mut interval: i32 = 600;
-
-    if let Some(p) = ra {
-        if p.interval != 0 {
-            interval = p.interval as i32;
-            if interval > 1800 {
-                interval = 1800;
-            } else if interval < 4 {
-                interval = 4;
-            }
-        }
+    match ra.map(|p| p.interval).filter(|&i| i != 0) {
+        Some(i) => i.clamp(4, 1800),
+        None => 600,
     }
-
-    interval as u32
 }
 
 /// Calculate the RA router lifetime in seconds.
@@ -345,18 +335,19 @@ pub fn calc_interval(ra: Option<&RaInterfaceParam>) -> u32 {
 #[cfg(feature = "dhcp6")]
 pub fn calc_lifetime(ra: Option<&RaInterfaceParam>) -> u32 {
     let interval = calc_interval(ra) as i32;
-    let mut lifetime: i32;
 
-    if ra.is_none() || ra.map(|p| p.lifetime) == Some(-1) {
-        lifetime = 3 * interval;
-    } else {
-        lifetime = ra.unwrap().lifetime;
-        if lifetime < interval && lifetime != 0 {
-            lifetime = interval;
-        } else if lifetime > 9000 {
-            lifetime = 9000;
+    let lifetime = match ra {
+        Some(p) if p.lifetime != -1 => {
+            let mut lifetime = p.lifetime;
+            if lifetime < interval && lifetime != 0 {
+                lifetime = interval;
+            } else if lifetime > 9000 {
+                lifetime = 9000;
+            }
+            lifetime
         }
-    }
+        _ => 3 * interval,
+    };
 
     lifetime as u32
 }
