@@ -741,8 +741,9 @@ fn iface_allowed_config(daemon: &Daemon) -> crate::network::IfaceAllowedConfig {
     let mut config = crate::network::IfaceAllowedConfig::default();
     #[cfg(feature = "dhcp")]
     {
-        config.dhcp_except =
-            daemon.dhcp_except.iter().filter_map(|i| i.name.clone()).collect();
+        config.dhcp_except = daemon.dhcp_except.iter()
+            .filter_map(|i| i.name.clone().map(|n| (n, i.flags)))
+            .collect();
     }
     #[cfg(feature = "tftp")]
     {

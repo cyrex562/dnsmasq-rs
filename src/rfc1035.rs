@@ -1257,7 +1257,10 @@ pub fn answer_request(
 
     // 6. No answer found: don't forward simple (dot-free) A/AAAA names when
     // `--domain-needed` is set, except the empty name (`forward.c:355-361`).
-    if !ans && config.nodots_local && (qtype == 1 || qtype == 28) && !name.contains('.') && !name.is_empty() {
+    // Upstream's `extract_request()` returns `F_IPV4|F_IPV6` for a `T_ANY`
+    // (255) query too, so ANY is covered by the same `gotname & (F_IPV4|F_IPV6)`
+    // gate (rfc1035.c:1223) — include it here alongside A/AAAA.
+    if !ans && config.nodots_local && (qtype == 1 || qtype == 28 || qtype == 255) && !name.contains('.') && !name.is_empty() {
         ans = true;
         nxdomain = !check_for_local_domain(&name, config);
     }
@@ -2699,6 +2702,21 @@ mod tests {
         let cfg = LocalConfig { nodots_local: true, ..empty_config() };
 
         assert!(answer_request(&query, &mut cache, now, &cfg).is_none());
+    }
+
+    /// A single-label `T_ANY` (255) query is covered too: upstream's
+    /// `extract_request()` reports `F_IPV4|F_IPV6` for ANY, so it hits the
+    /// same `gotname & (F_IPV4|F_IPV6)` gate as A/AAAA (rfc1035.c:1223,
+    /// forward.c:355-361) rather than being forwarded.
+    #[test]
+    fn nodots_local_answers_unmatched_single_label_any_query_nxdomain() {
+        let now = Instant::now();
+        let mut cache = DnsCache::new(100);
+        let query = make_query("foo", 255); // ANY, no dot
+        let cfg = LocalConfig { nodots_local: true, ..empty_config() };
+
+        let resp = answer_request(&query, &mut cache, now, &cfg).expect("should answer locally");
+        assert_eq!(resp.header.rcode(), 3); // NXDOMAIN
     }
 
     /// Without `nodots_local` set, an unmatched single-label query is still

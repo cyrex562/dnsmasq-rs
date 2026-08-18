@@ -828,6 +828,25 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   Done when: each directive above either updates real `Daemon` state consumed
   by the DHCP/PXE runtime path, or remains explicitly listed here.
 
+- [ ] `connmark-allowlist` / `connmark-allowlist-enable` (option.c:3283-3330,
+  `OPT_CMARK_ALST_EN`): parsing is gated on the `conntrack` feature (mirroring
+  upstream's `#ifndef HAVE_CONNTRACK` hard error — the directive is rejected
+  with `InvalidValue` when the feature is off, not silently accepted), and
+  `daemon.allowlist_mask`/`daemon.allowlists` are populated correctly when it
+  is on. But nothing reads those fields at runtime: upstream checks
+  `option_bool(OPT_CMARK_ALST_EN)` plus the connection mark against
+  `daemon->allowlists` at six call sites in `forward.c` (605-613, 1442-1446,
+  1529-1557, 1822, 1906, 2386, 2546, 2743) and in `rfc1035.c:1153-1212` to
+  decide whether a query bypasses the allowlist (answered only if a pattern
+  matches) — none of that decision logic exists in `src/forward.rs` or
+  `src/rfc1035.rs`, and `src/conntrack.rs` only reads the incoming mark, never
+  compares it against `allowlists`.
+  Required tests: once the mark-comparison path exists in `forward.rs`, add a
+  test that a query whose connmark fails every allowlist pattern is refused
+  rather than answered.
+  Done when: `OPT_CMARK_ALST_EN` actually gates query handling per the
+  upstream call sites above, not just config parsing.
+
 - [ ] `dhcp-vendorclass` (`src/option.rs::parse_dhcp_vendor`) only supports the 2-field
   `tag,vendor-class` form. Upstream's shared `'U'`/`'j'`/circuit/remote/subscriber case
   (option.c:4564-4634) also accepts a `tag,enterprise:N,vendor-class` 3-field form unique to

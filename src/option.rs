@@ -1706,51 +1706,77 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
 
         // `--connmark-allowlist-enable` (option.c:3284, `OPT_CMARK_ALST_EN`):
         // optional mask, defaulting to "match every bit" like upstream's
-        // `mask = UINT32_MAX` before the optional-arg override.
+        // `mask = UINT32_MAX` before the optional-arg override. Upstream
+        // hard-errors this directive without HAVE_CONNTRACK (option.c:3283-3286)
+        // rather than silently ignoring it; do the same for the `conntrack`
+        // feature. Runtime consumption of `allowlist_mask`/`allowlists`
+        // (forward.c's mark-based bypass, not yet ported) is tracked in
+        // tasks.md under "Issue #18 remaining DHCP/PXE directives".
         "connmark-allowlist-enable" => {
-            daemon.set_option(OPT_CMARK_ALST_EN);
-            daemon.allowlist_mask = match cl.value.as_deref() {
-                None => u32::MAX,
-                Some(v) => {
-                    let mask = parse_u32_token(v, "connmark-allowlist-enable", cl, "allowlist mask")?;
-                    if mask < 1 {
-                        return Err(invalid_value_for(cl, "connmark-allowlist-enable", v, "mask must be at least 1"));
+            #[cfg(not(feature = "conntrack"))]
+            {
+                return Err(invalid_value_for(
+                    cl, "connmark-allowlist-enable", cl.value.as_deref().unwrap_or(""),
+                    "recompile with the conntrack feature enabled to use connmark-allowlist directives",
+                ));
+            }
+            #[cfg(feature = "conntrack")]
+            {
+                daemon.set_option(OPT_CMARK_ALST_EN);
+                daemon.allowlist_mask = match cl.value.as_deref() {
+                    None => u32::MAX,
+                    Some(v) => {
+                        let mask = parse_u32_token(v, "connmark-allowlist-enable", cl, "allowlist mask")?;
+                        if mask < 1 {
+                            return Err(invalid_value_for(cl, "connmark-allowlist-enable", v, "mask must be at least 1"));
+                        }
+                        mask
                     }
-                    mask
-                }
-            };
+                };
+            }
         }
 
         // `--connmark-allowlist` (option.c:3302): `mark[/mask][,pattern...]`.
+        // Same HAVE_CONNTRACK gate as above.
         "connmark-allowlist" => {
-            let v = require_value("connmark-allowlist")?;
-            let parts = split_csv(v);
-            if parts.is_empty() {
-                return Err(invalid_value_for(cl, "connmark-allowlist", v, "expected mark[/mask][,pattern...]"));
+            #[cfg(not(feature = "conntrack"))]
+            {
+                return Err(invalid_value_for(
+                    cl, "connmark-allowlist", cl.value.as_deref().unwrap_or(""),
+                    "recompile with the conntrack feature enabled to use connmark-allowlist directives",
+                ));
             }
-            let (mark_str, mask_str) = match parts[0].split_once('/') {
-                Some((m, k)) => (m, Some(k)),
-                None => (parts[0], None),
-            };
-            let mark = parse_u32_token(mark_str, "connmark-allowlist", cl, "connmark mark")?;
-            if mark < 1 {
-                return Err(invalid_value_for(cl, "connmark-allowlist", v, "mark must be at least 1"));
-            }
-            let mask = match mask_str {
-                Some(m) => {
-                    let mask = parse_u32_token(m, "connmark-allowlist", cl, "connmark mask")?;
-                    if mask < 1 {
-                        return Err(invalid_value_for(cl, "connmark-allowlist", v, "mask must be at least 1"));
-                    }
-                    mask
+            #[cfg(feature = "conntrack")]
+            {
+                let v = require_value("connmark-allowlist")?;
+                let parts = split_csv(v);
+                if parts.is_empty() {
+                    return Err(invalid_value_for(cl, "connmark-allowlist", v, "expected mark[/mask][,pattern...]"));
                 }
-                None => u32::MAX,
-            };
-            if mark & !mask != 0 {
-                return Err(invalid_value_for(cl, "connmark-allowlist", v, "mark must be a subset of mask"));
+                let (mark_str, mask_str) = match parts[0].split_once('/') {
+                    Some((m, k)) => (m, Some(k)),
+                    None => (parts[0], None),
+                };
+                let mark = parse_u32_token(mark_str, "connmark-allowlist", cl, "connmark mark")?;
+                if mark < 1 {
+                    return Err(invalid_value_for(cl, "connmark-allowlist", v, "mark must be at least 1"));
+                }
+                let mask = match mask_str {
+                    Some(m) => {
+                        let mask = parse_u32_token(m, "connmark-allowlist", cl, "connmark mask")?;
+                        if mask < 1 {
+                            return Err(invalid_value_for(cl, "connmark-allowlist", v, "mask must be at least 1"));
+                        }
+                        mask
+                    }
+                    None => u32::MAX,
+                };
+                if mark & !mask != 0 {
+                    return Err(invalid_value_for(cl, "connmark-allowlist", v, "mark must be a subset of mask"));
+                }
+                let patterns: Vec<String> = parts[1..].iter().map(|p| p.to_string()).collect();
+                daemon.allowlists.push(Allowlist { mark, mask, patterns });
             }
-            let patterns: Vec<String> = parts[1..].iter().map(|p| p.to_string()).collect();
-            daemon.allowlists.push(Allowlist { mark, mask, patterns });
         }
 
         // ── DHCP/PXE directives accepted for config-parity but not yet wired
@@ -4389,7 +4415,29 @@ mod tests {
         assert_eq!(d.dhcp_except[1].flags, INAME_6);
     }
 
+    // connmark-allowlist{,-enable} mirror upstream's `#ifndef HAVE_CONNTRACK`
+    // hard error (option.c:3283-3286): without the `conntrack` feature they
+    // must fail clearly, not parse successfully or silently no-op.
     #[test]
+    #[cfg(not(feature = "conntrack"))]
+    fn apply_connmark_allowlist_enable_without_conntrack_feature_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("connmark-allowlist-enable=255", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "connmark-allowlist-enable"));
+    }
+
+    #[test]
+    #[cfg(not(feature = "conntrack"))]
+    fn apply_connmark_allowlist_without_conntrack_feature_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("connmark-allowlist=6,*.example.com", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "connmark-allowlist"));
+    }
+
+    #[test]
+    #[cfg(feature = "conntrack")]
     fn apply_connmark_allowlist_enable_sets_mask_and_bit() {
         let mut d = Daemon::default();
         let lines = parse_config_text("connmark-allowlist-enable=255", "test").unwrap();
@@ -4399,6 +4447,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "conntrack")]
     fn apply_connmark_allowlist_enable_defaults_mask_to_all_bits() {
         let mut d = Daemon::default();
         let lines = parse_config_text("connmark-allowlist-enable", "test").unwrap();
@@ -4408,6 +4457,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "conntrack")]
     fn apply_connmark_allowlist_parses_mark_mask_and_patterns() {
         let mut d = Daemon::default();
         let lines = parse_config_text("connmark-allowlist=6/14,*.example.com,*.example.org", "test").unwrap();
@@ -4419,6 +4469,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "conntrack")]
     fn apply_connmark_allowlist_without_mask_defaults_to_all_bits() {
         let mut d = Daemon::default();
         let lines = parse_config_text("connmark-allowlist=6,*.example.com", "test").unwrap();
@@ -4428,6 +4479,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "conntrack")]
     fn apply_connmark_allowlist_rejects_mark_outside_mask() {
         let mut d = Daemon::default();
         // mark 8 (0b1000) is not a subset of mask 3 (0b0011).
