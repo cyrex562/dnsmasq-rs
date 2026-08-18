@@ -1321,6 +1321,42 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             }
         }
 
+        "tag-if" => {
+            let v = require_value("tag-if")?;
+            #[cfg(feature = "dhcp")]
+            {
+                daemon.tag_if.push(parse_tag_if(v, cl)?);
+            }
+            #[cfg(not(feature = "dhcp"))]
+            {
+                let _ = v;
+            }
+        }
+
+        "dhcp-match" => {
+            let v = require_value("dhcp-match")?;
+            #[cfg(feature = "dhcp")]
+            {
+                daemon.dhcp_match.push(parse_dhcp_match(v, cl)?);
+            }
+            #[cfg(not(feature = "dhcp"))]
+            {
+                let _ = v;
+            }
+        }
+
+        "dhcp-name-match" => {
+            let v = require_value("dhcp-name-match")?;
+            #[cfg(feature = "dhcp")]
+            {
+                daemon.dhcp_name_match.push(parse_dhcp_name_match(v, cl)?);
+            }
+            #[cfg(not(feature = "dhcp"))]
+            {
+                let _ = v;
+            }
+        }
+
         "dhcp-userclass" => {
             let v = require_value("dhcp-userclass")?;
             #[cfg(feature = "dhcp")]
@@ -3290,6 +3326,92 @@ fn parse_dhcp_vendor(value: &str, cl: &ConfigLine) -> Result<DhcpVendorRule, Con
     })
 }
 
+/// Parse a `tag-if` directive into a [`TagIf`](crate::dhcp_common::TagIf) rule.
+///
+/// Mirrors `LOPT_TAG_IF` (option.c:4242-4307): each token must be `tag:<name>`
+/// (a condition) or `set:<name>` (a tag to inject); anything else, or a
+/// directive with no `set:` token at all, is `"bad tag-if"`. Upstream prepends
+/// each recognized token onto its respective list, so both lists end up in
+/// reverse order of appearance.
+#[cfg(feature = "dhcp")]
+fn parse_tag_if(value: &str, cl: &ConfigLine) -> Result<crate::dhcp_common::TagIf, ConfigError> {
+    let parts = split_csv(value);
+    let mut tag: Vec<DhcpNetid> = vec![];
+    let mut set: Vec<DhcpNetid> = vec![];
+
+    for part in &parts {
+        // Upstream treats any token shorter than "tag:X"/"set:X" (5 chars) as
+        // a parse failure (option.c:4266-4268).
+        if part.len() < 5 {
+            return Err(invalid_value_for(cl, "tag-if", value, "bad tag-if"));
+        }
+        if let Some(name) = part.strip_prefix("set:") {
+            set.insert(0, DhcpNetid { net: name.to_string() });
+        } else if let Some(name) = part.strip_prefix("tag:") {
+            tag.insert(0, DhcpNetid { net: name.to_string() });
+        } else {
+            return Err(invalid_value_for(cl, "tag-if", value, "bad tag-if"));
+        }
+    }
+
+    if set.is_empty() {
+        return Err(invalid_value_for(cl, "tag-if", value, "bad tag-if"));
+    }
+
+    Ok(crate::dhcp_common::TagIf { tag, set })
+}
+
+/// Parse a `dhcp-match` directive into a `DhcpOpt` classifier rule.
+///
+/// Upstream reuses `parse_dhcp_opt()` with `flags = DHOPT_MATCH`
+/// (option.c:4314-4319), then requires exactly one netid and rejects
+/// `encap:`/`vendor:` combinations as `"illegal dhcp-match"` (option.c:1966-1969).
+#[cfg(feature = "dhcp")]
+fn parse_dhcp_match(value: &str, cl: &ConfigLine) -> Result<DhcpOpt, ConfigError> {
+    use crate::types::dhcp::{DHOPT_ENCAPSULATE, DHOPT_MATCH, DHOPT_VENDOR};
+
+    let opt = parse_dhcp_option(value, cl, "dhcp-match", DHOPT_MATCH)?;
+    if opt.flags & (DHOPT_ENCAPSULATE | DHOPT_VENDOR) != 0 || opt.netid.len() != 1 {
+        return Err(invalid_value_for(cl, "dhcp-match", value, "illegal dhcp-match"));
+    }
+    Ok(opt)
+}
+
+/// Parse a `dhcp-name-match` directive into a client-hostname classifier rule.
+///
+/// Mirrors `LOPT_NAME_MATCH` (option.c:4321-4345): `set:<tag>,<string>[*]`,
+/// where a trailing `*` marks the match as a wildcard (prefix) match.
+#[cfg(feature = "dhcp")]
+fn parse_dhcp_name_match(value: &str, cl: &ConfigLine) -> Result<crate::types::dhcp::DhcpMatchName, ConfigError> {
+    let parts = split_csv(value);
+    if parts.len() != 2 {
+        return Err(invalid_value_for(cl, "dhcp-name-match", value, "expected tag,name"));
+    }
+
+    let tag = parts[0]
+        .strip_prefix("set:")
+        .or_else(|| parts[0].strip_prefix("tag:"))
+        .unwrap_or(parts[0])
+        .trim();
+    if tag.is_empty() {
+        return Err(invalid_value_for(cl, "dhcp-name-match", parts[0], "expected a tag name"));
+    }
+    if parts[1].is_empty() {
+        return Err(invalid_value_for(cl, "dhcp-name-match", value, "expected a match string"));
+    }
+
+    let (name, wildcard) = match parts[1].strip_suffix('*') {
+        Some(stripped) => (stripped.to_string(), true),
+        None => (parts[1].to_string(), false),
+    };
+
+    Ok(crate::types::dhcp::DhcpMatchName {
+        netid: DhcpNetid { net: tag.to_string() },
+        name,
+        wildcard,
+    })
+}
+
 #[cfg(feature = "dhcp")]
 fn parse_dhcp_userclass(value: &str, cl: &ConfigLine) -> Result<DhcpUserClassRule, ConfigError> {
     let parts = split_csv(value);
@@ -3514,6 +3636,7 @@ fn parse_dhcp_option(
         if let Some(tag) = part
             .strip_prefix("tag:")
             .or_else(|| part.strip_prefix("net:"))
+            .or_else(|| part.strip_prefix("set:"))
         {
             if tag.is_empty() {
                 return Err(invalid_value_for(cl, key, part, "expected tag name"));
@@ -6557,6 +6680,78 @@ mod tests {
         let lines = parse_config_text("dhcp-mac=set:printer,00:60:8C:**", "test").unwrap();
         let err = apply_config(&mut d, &lines).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "dhcp-mac"));
+    }
+
+    #[test]
+    fn apply_tag_if_rule() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("tag-if=tag:b,tag:c,set:a", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        #[cfg(feature = "dhcp")]
+        {
+            assert_eq!(d.tag_if.len(), 1);
+            let rule = &d.tag_if[0];
+            assert_eq!(rule.tag.iter().map(|n| n.net.as_str()).collect::<Vec<_>>(), vec!["c", "b"]);
+            assert_eq!(rule.set.iter().map(|n| n.net.as_str()).collect::<Vec<_>>(), vec!["a"]);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn apply_tag_if_missing_set_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("tag-if=tag:b,tag:c", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "tag-if"));
+    }
+
+    #[test]
+    fn apply_dhcp_match_rule() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-match=set:efi-x86_64,60,PXEClient:Arch:00007", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        #[cfg(feature = "dhcp")]
+        {
+            assert_eq!(d.dhcp_match.len(), 1);
+            let rule = &d.dhcp_match[0];
+            assert_eq!(rule.opt, 60);
+            assert_eq!(rule.netid.len(), 1);
+            assert_eq!(rule.netid[0].net, "efi-x86_64");
+            assert_eq!(rule.val.as_deref(), Some(&b"PXEClient:Arch:00007"[..]));
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn apply_dhcp_match_requires_single_netid_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-match=set:a,set:b,60,PXEClient", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "dhcp-match"));
+    }
+
+    #[test]
+    fn apply_dhcp_name_match_rule() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-name-match=set:printer,HP*", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        #[cfg(feature = "dhcp")]
+        {
+            assert_eq!(d.dhcp_name_match.len(), 1);
+            let rule = &d.dhcp_name_match[0];
+            assert_eq!(rule.netid.net, "printer");
+            assert_eq!(rule.name, "HP");
+            assert!(rule.wildcard);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn apply_dhcp_name_match_missing_string_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-name-match=set:printer", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "dhcp-name-match"));
     }
 
     #[test]

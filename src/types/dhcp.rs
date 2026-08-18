@@ -237,6 +237,16 @@ pub struct DhcpRelayIdRule {
     pub data:    Vec<u8>,
 }
 
+/// Client-hostname classifier rule assigning a tag on exact or prefix match.
+///
+/// Mirrors `struct dhcp_match_name` (`dnsmasq.h`), populated by `--dhcp-name-match`.
+#[derive(Debug, Clone)]
+pub struct DhcpMatchName {
+    pub netid:    DhcpNetid,
+    pub name:     String,
+    pub wildcard: bool,
+}
+
 /// Delay policy for DHCP replies, optionally scoped to a matching tag.
 #[derive(Debug, Clone)]
 pub struct DhcpReplyDelay {

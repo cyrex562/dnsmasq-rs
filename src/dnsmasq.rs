@@ -656,6 +656,9 @@ fn daemon_dhcp_runtime(daemon: &Daemon) -> Option<DhcpDaemonRuntime> {
             boot_configs: daemon.boot_config.clone(),
             domain_suffix: daemon.domain_suffix.clone(),
             lease_file: daemon.lease_file.clone(),
+            match_rules: daemon.dhcp_match.clone(),
+            name_match_rules: daemon.dhcp_name_match.clone(),
+            tag_rules: daemon.tag_if.clone(),
         },
         loop_opts: crate::dhcp::DhcpLoopOptions {
             reply_port_override: (client_port != 68).then_some(client_port),

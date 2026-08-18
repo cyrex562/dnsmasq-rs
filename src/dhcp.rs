@@ -66,6 +66,12 @@ pub struct DhcpServerConfig {
     pub domain_suffix: Option<String>,
     /// Path to persist the lease database to (`--dhcp-leasefile`).
     pub lease_file: Option<String>,
+    /// Option-substring classifier rules from parsed `dhcp-match`.
+    pub match_rules: Vec<crate::types::dhcp::DhcpOpt>,
+    /// Client-hostname classifier rules from parsed `dhcp-name-match`.
+    pub name_match_rules: Vec<crate::types::dhcp::DhcpMatchName>,
+    /// Conditional tag-setting rules from parsed `tag-if`.
+    pub tag_rules: Vec<crate::dhcp_common::TagIf>,
 }
 
 impl Default for DhcpServerConfig {
@@ -86,6 +92,9 @@ impl Default for DhcpServerConfig {
             boot_configs: Vec::new(),
             domain_suffix: None,
             lease_file: None,
+            match_rules: Vec::new(),
+            name_match_rules: Vec::new(),
+            tag_rules: Vec::new(),
         }
     }
 }
@@ -118,7 +127,11 @@ fn rfc3004_user_classes(raw: &[u8]) -> Option<Vec<&[u8]>> {
     Some(classes)
 }
 
-fn derived_tags(pkt: &DhcpPacket, cfg: &DhcpServerConfig) -> Vec<crate::types::dhcp::DhcpNetid> {
+fn derived_tags(
+    pkt: &DhcpPacket,
+    cfg: &DhcpServerConfig,
+    hostname: Option<&str>,
+) -> Vec<crate::types::dhcp::DhcpNetid> {
     let vendor = find_option(&pkt.options, OPTION_VENDOR_ID);
     let mut tags: Vec<_> = cfg
         .vendor_rules
@@ -170,6 +183,36 @@ fn derived_tags(pkt: &DhcpPacket, cfg: &DhcpServerConfig) -> Vec<crate::types::d
                 if crate::rfc2131::option_val_at(agent_info, idx) == rule.data.as_slice() {
                     tags.push(rule.netid.clone());
                 }
+            }
+        }
+    }
+
+    // dhcp-match: substring/array match against a raw DHCP option
+    // (rfc2131.c:437-477). The RFC3925 vendor-identifying-class (option 124/125)
+    // special case is not implemented — see tasks.md.
+    for rule in &cfg.match_rules {
+        if let Ok(opt_code) = u8::try_from(rule.opt) {
+            if let Some(data) = find_option(&pkt.options, opt_code) {
+                if crate::dhcp_common::match_bytes(rule, data) {
+                    tags.extend(rule.netid.iter().cloned());
+                }
+            }
+        }
+    }
+
+    // dhcp-name-match: exact or prefix match against the client hostname
+    // (rfc2131.c:766-793).
+    if let Some(name) = hostname {
+        for rule in &cfg.name_match_rules {
+            let matched = match name.len().cmp(&rule.name.len()) {
+                std::cmp::Ordering::Less => false,
+                std::cmp::Ordering::Equal => crate::util::hostname_isequal(name, &rule.name),
+                std::cmp::Ordering::Greater => {
+                    rule.wildcard && crate::util::hostname_isequal(&name[..rule.name.len()], &rule.name)
+                }
+            };
+            if matched {
+                tags.push(rule.netid.clone());
             }
         }
     }
@@ -244,7 +287,7 @@ fn decorate_reply(
         } else {
             0
         },
-        &[],
+        &cfg.tag_rules,
     );
 
     let boot = filtered_tags
@@ -471,7 +514,7 @@ pub fn dispatch_dhcp_with_meta(
     let hostname = find_option(&pkt.options, OPTION_HOSTNAME)
         .and_then(|raw| std::str::from_utf8(raw).ok());
     let hw_len = usize::from(pkt.hlen).min(DHCP_CHADDR_MAX);
-    let tags = derived_tags(pkt, cfg);
+    let tags = derived_tags(pkt, cfg, hostname);
     let tag_disable = cfg.configs.iter().any(|c| {
         (c.flags & crate::types::dhcp::CONFIG_DISABLE) != 0
             && !c.filter.is_empty()
@@ -982,6 +1025,9 @@ mod tests {
             boot_configs: vec![],
             domain_suffix: None,
             lease_file: None,
+            match_rules: vec![],
+            name_match_rules: vec![],
+            tag_rules: vec![],
         }
     }
 
@@ -1839,6 +1885,53 @@ mod tests {
         assert_eq!(
             find_option(&dispatched.reply.options, crate::dhcp_protocol::OPTION_DOMAINNAME),
             Some(&b"lab.example"[..])
+        );
+    }
+
+    #[test]
+    fn discover_dhcp_match_and_tag_if_select_tagged_option() {
+        use crate::types::dhcp::{DhcpNetid, DhcpOpt};
+
+        let mut pkt = base_packet();
+        pkt.options = vec![
+            OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Discover as u8,
+            OPTION_VENDOR_ID, 21,
+            b'P', b'X', b'E', b'C', b'l', b'i', b'e', b'n', b't', b':',
+            b'A', b'r', b'c', b'h', b':', b'0', b'0', b'0', b'0', b'7',
+            OPTION_REQUESTED_OPTIONS, 1, crate::dhcp_protocol::OPTION_DOMAINNAME,
+            OPTION_END,
+        ];
+
+        let mut cfg = default_cfg();
+        // dhcp-match=set:pxe,60,PXEClient
+        cfg.match_rules.push(DhcpOpt {
+            opt: crate::dhcp_protocol::OPTION_VENDOR_ID as i32,
+            flags: crate::types::dhcp::DHOPT_STRING | crate::types::dhcp::DHOPT_MATCH,
+            val: Some(b"PXEClient".to_vec()),
+            netid: vec![DhcpNetid { net: "pxe".into() }],
+            encap: 0,
+            vendor_class: None,
+        });
+        // tag-if=tag:pxe,set:pxeboot
+        cfg.tag_rules.push(crate::dhcp_common::TagIf {
+            tag: vec![DhcpNetid { net: "pxe".into() }],
+            set: vec![DhcpNetid { net: "pxeboot".into() }],
+        });
+        // dhcp-option=tag:pxeboot,15,"boot.example"
+        cfg.dhcp_opts.push(DhcpOpt {
+            opt: crate::dhcp_protocol::OPTION_DOMAINNAME as i32,
+            flags: crate::types::dhcp::DHOPT_STRING,
+            val: Some(b"boot.example".to_vec()),
+            netid: vec![DhcpNetid { net: "pxeboot".into() }],
+            encap: 0,
+            vendor_class: None,
+        });
+
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new())
+            .expect("discover should produce an offer");
+        assert_eq!(
+            find_option(&dispatched.reply.options, crate::dhcp_protocol::OPTION_DOMAINNAME),
+            Some(&b"boot.example"[..])
         );
     }
 
