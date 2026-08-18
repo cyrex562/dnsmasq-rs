@@ -560,7 +560,8 @@ pub async fn build_shared_cache(daemon_handle: &DaemonHandle) -> crate::cache::S
 /// function as well.
 pub fn daemon_forward_config(daemon: &Daemon) -> crate::forward::ForwardConfig {
     use crate::types::constants::{
-        OPT_DNSSEC_PROXY, OPT_DNSSEC_VALID, OPT_LOCAL_REBIND, OPT_NO_NEG, OPT_NO_REBIND,
+        OPT_CONNTRACK, OPT_DNSSEC_PROXY, OPT_DNSSEC_VALID, OPT_LOCAL_REBIND, OPT_NO_NEG,
+        OPT_NO_REBIND,
     };
 
     crate::forward::ForwardConfig {
@@ -593,6 +594,8 @@ pub fn daemon_forward_config(daemon: &Daemon) -> crate::forward::ForwardConfig {
         // forever.  C rejects both at parse time.
         ftabsize:       daemon.ftabsize.max(1) as usize,
         randport_limit: daemon.randport_limit.max(1) as usize,
+        port:           daemon.port,
+        conntrack:      daemon.option_bool(OPT_CONNTRACK),
         ..Default::default()
     }
 }

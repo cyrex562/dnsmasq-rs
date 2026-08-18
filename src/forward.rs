@@ -1095,6 +1095,14 @@ pub struct ForwardConfig {
     /// `--port-limit` (`daemon->randport_limit`): source ports one transaction
     /// may hold per server.
     pub randport_limit: usize,
+    /// The port this resolver listens on (`daemon->port`), used as the
+    /// destination port when looking up a client connection's firewall mark
+    /// (`conntrack.c:37`).
+    pub port: u16,
+    /// `--conntrack` (`OPT_CONNTRACK`): copy the firewall mark of the
+    /// incoming client connection onto the outgoing upstream socket
+    /// (`forward.c:531-535`).
+    pub conntrack: bool,
 }
 
 impl Default for ForwardConfig {
@@ -1121,6 +1129,8 @@ impl Default for ForwardConfig {
             dnssec_proxy:  false,
             ftabsize:      FTABSIZE,
             randport_limit: RANDPORT_LIMIT,
+            port:          53,
+            conntrack:     false,
         }
     }
 }
@@ -1235,7 +1245,9 @@ impl ForwardEngine {
     /// flight.
     ///
     /// `listener` is the index of the socket the query arrived on, carried so
-    /// the reply leaves by the same one.
+    /// the reply leaves by the same one. `dest` is the local address the
+    /// query arrived on, when known — C's `local_addr` (`forward.c:2388-2393`),
+    /// used only to look up the connection's firewall mark via conntrack.
     ///
     /// Mirrors `forward_query()` (`forward.c:165`) for the UDP client path.
     pub async fn forward_query(
@@ -1243,6 +1255,7 @@ impl ForwardEngine {
         pkt:      &[u8],
         client:   SocketAddr,
         listener: usize,
+        dest:     Option<IpAddr>,
     ) -> ForwardOutcome {
         if pkt.len() < 12 {
             return ForwardOutcome::Dropped;
@@ -1294,6 +1307,7 @@ impl ForwardEngine {
             frec.stash         = Some(pkt.to_vec());
             frec.frec_src      = FrecSrc {
                 source:  Some(client),
+                dest,
                 orig_id,
                 fd:      listener as i32,
                 ..FrecSrc::default()
@@ -1373,6 +1387,7 @@ impl ForwardEngine {
         let Some(frec) = self.table.get(idx) else { return false };
         let Some(mut out) = frec.stash.clone() else { return false };
         patch_id(&mut out, frec.new_id);
+        let frec_src = frec.frec_src.clone();
 
         // The rfd list lives on the frec; lift it out for the pool call so the
         // table is not borrowed across the `await`.
@@ -1382,6 +1397,12 @@ impl ForwardEngine {
             frec.rfds = rfds;
         }
         let Some(sock) = sock else { return false };
+
+        // Copy the connection mark of the incoming query onto the outgoing
+        // socket (`forward.c:531-535`).
+        if self.config.conntrack {
+            apply_conntrack_mark(&sock, &frec_src, self.config.port);
+        }
 
         sock.send_to(&out, addr).await.is_ok()
     }
@@ -1776,6 +1797,34 @@ pub fn set_outgoing_mark(
 pub fn set_outgoing_mark(_fd: i32, _mark: u32) -> std::io::Result<()> {
     Ok(())
 }
+
+/// Look up the firewall mark of the client connection recorded in `frec_src`,
+/// via an nfnetlink `CT_GET` query.
+///
+/// Mirrors `set_outgoing_mark()`'s call into `get_incoming_mark()`
+/// (`forward.c:112-118`): both the client's source address and the local
+/// address the query arrived on must be known, or there is no tuple to query.
+#[cfg(all(feature = "conntrack", unix))]
+fn conntrack_mark_for(frec_src: &FrecSrc, daemon_port: u16, istcp: bool) -> Option<u32> {
+    let peer = frec_src.source?;
+    let local = frec_src.dest?;
+    crate::conntrack::get_incoming_mark(peer, local, istcp, daemon_port)
+}
+
+/// Copy the connection mark of the incoming query onto `sock`, if one can be
+/// found. Mirrors `set_outgoing_mark()` (`forward.c:112-118`).
+#[cfg(all(feature = "conntrack", unix))]
+fn apply_conntrack_mark(sock: &tokio::net::UdpSocket, frec_src: &FrecSrc, daemon_port: u16) {
+    if let Some(mark) = conntrack_mark_for(frec_src, daemon_port, false) {
+        use std::os::unix::io::AsRawFd;
+        let _ = set_outgoing_mark(sock.as_raw_fd(), mark);
+    }
+}
+
+/// No-op stub when built without the `conntrack` feature, or on non-Unix
+/// targets where there is no raw fd to attach `SO_MARK` to.
+#[cfg(not(all(feature = "conntrack", unix)))]
+fn apply_conntrack_mark(_sock: &tokio::net::UdpSocket, _frec_src: &FrecSrc, _daemon_port: u16) {}
 
 /// Format a query log line from a socket address, mirroring
 /// `log_query_mysockaddr()` from `forward.c`.
@@ -2176,6 +2225,11 @@ pub async fn run_forward_loop_on(
                 }
                 let (len, src) = (meta.len, meta.src);
                 let pkt = &client_buf[..len];
+                // The local address the query arrived on: `IP_PKTINFO` gives
+                // it per-datagram in wildcard mode; an address-bound listener
+                // has no need of that control message, so its own bound
+                // address is the answer (`forward.c:2388-2393`).
+                let dest = meta.dest.or_else(|| listener.sock.local_addr().ok().map(|a| a.ip()));
                 // Only forward DNS queries (QR bit == 0).
                 if pkt.len() >= 12 && pkt[2] & 0x80 == 0 {
                     // Local data and cache first — exactly as upstream does.
@@ -2190,7 +2244,7 @@ pub async fn run_forward_loop_on(
                         let _ = listener.sock.send_to(&wire, src).await;
                         inc_metric(Metric::DnsLocalAnswered);
                     } else {
-                        match engine.forward_query(pkt, src, idx).await {
+                        match engine.forward_query(pkt, src, idx, dest).await {
                             // The query table (or the duplicate-client budget)
                             // is full, or the question could not be read.  C
                             // answers REFUSED rather than dropping, so the
@@ -3379,6 +3433,30 @@ mod tests {
 
     // ── forward_query admission control ───────────────────────────────────────
 
+    /// The local address a query arrived on must reach the frec, or a
+    /// conntrack mark lookup (`forward.c:2388-2393`) would have nothing to
+    /// query against.
+    #[tokio::test]
+    async fn forward_query_records_the_arrival_destination_address() {
+        let Ok(upstream) = tokio::net::UdpSocket::bind("127.0.0.1:0").await else { return };
+        let Ok(upstream_addr) = upstream.local_addr() else { return };
+        let config = ForwardConfig { upstreams: vec![upstream_addr], ..Default::default() };
+        let mut engine = ForwardEngine::new(config);
+        let query = make_dns_query("example.com", 1);
+        let dest = Some(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+
+        let ForwardOutcome::Forwarded(new_id) =
+            engine.forward_query(&query, client_addr(), 0, dest).await
+        else {
+            panic!("expected the query to forward");
+        };
+        let idx = engine
+            .table
+            .lookup_frec(Instant::now(), Some(new_id), 0, 0)
+            .expect("query is in flight");
+        assert_eq!(engine.table.get(idx).unwrap().frec_src.dest, dest);
+    }
+
     /// `get_new_frec()` refuses once `ftabsize` queries are in flight to one
     /// server group, and C answers the client REFUSED (`forward.c:369`).
     #[tokio::test]
@@ -3396,7 +3474,7 @@ mod tests {
             let query = make_dns_query(&format!("q{i}.test"), 1);
             assert!(
                 matches!(
-                    engine.forward_query(&query, client_addr(), 0).await,
+                    engine.forward_query(&query, client_addr(), 0, None).await,
                     ForwardOutcome::Forwarded(_),
                 ),
                 "query {i} is within the limit",
@@ -3405,7 +3483,7 @@ mod tests {
 
         let query = make_dns_query("overflow.test", 1);
         assert_eq!(
-            engine.forward_query(&query, client_addr(), 0).await,
+            engine.forward_query(&query, client_addr(), 0, None).await,
             ForwardOutcome::Refused,
             "the third concurrent query to a full group must be refused",
         );
@@ -3423,7 +3501,7 @@ mod tests {
         let mut first = make_dns_query("shared.test", 1);
         patch_id(&mut first, 0x1111);
         assert!(matches!(
-            engine.forward_query(&first, client_addr(), 0).await,
+            engine.forward_query(&first, client_addr(), 0, None).await,
             ForwardOutcome::Forwarded(_),
         ));
 
@@ -3431,7 +3509,7 @@ mod tests {
         patch_id(&mut second, 0x2222);
         let other: SocketAddr = "127.0.0.1:4321".parse().unwrap();
         assert_eq!(
-            engine.forward_query(&second, other, 1).await,
+            engine.forward_query(&second, other, 1, None).await,
             ForwardOutcome::Duplicate,
         );
 
@@ -3467,7 +3545,7 @@ mod tests {
         };
         let mut engine = ForwardEngine::new(config);
         // Header-only packet: qdcount is zero, so there is no question.
-        let outcome = engine.forward_query(&[0u8; 12], client_addr(), 0).await;
+        let outcome = engine.forward_query(&[0u8; 12], client_addr(), 0, None).await;
         assert_eq!(outcome, ForwardOutcome::Refused);
         assert_eq!(engine.table.active_count(), 0);
         // And the REFUSED the caller sends is well-formed.
@@ -3846,6 +3924,39 @@ mod tests {
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
             Err(e) => panic!("unexpected error: {e}"),
         }
+    }
+
+    // ── conntrack_mark_for ───────────────────────────────────────────────────
+
+    #[cfg(all(feature = "conntrack", unix))]
+    #[test]
+    fn conntrack_mark_for_returns_none_without_a_source() {
+        let frec_src = FrecSrc {
+            dest: Some(IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 6))),
+            ..FrecSrc::default()
+        };
+        assert_eq!(conntrack_mark_for(&frec_src, 53, false), None);
+    }
+
+    #[cfg(all(feature = "conntrack", unix))]
+    #[test]
+    fn conntrack_mark_for_returns_none_without_a_dest() {
+        let frec_src = FrecSrc { source: Some(client_addr()), ..FrecSrc::default() };
+        assert_eq!(conntrack_mark_for(&frec_src, 53, false), None);
+    }
+
+    /// A GET query for a flow the kernel has never seen finds no entry — the
+    /// same "no match" path upstream leaves `gotit == 0` for
+    /// (`conntrack.c:32`). This must not panic even without CAP_NET_ADMIN.
+    #[cfg(all(feature = "conntrack", unix))]
+    #[test]
+    fn conntrack_mark_for_returns_none_for_an_unmatched_flow() {
+        let frec_src = FrecSrc {
+            source: Some("203.0.113.9:4321".parse().unwrap()),
+            dest:   Some(IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 6))),
+            ..FrecSrc::default()
+        };
+        assert_eq!(conntrack_mark_for(&frec_src, 53, false), None);
     }
 
     // ── server_send ───────────────────────────────────────────────────────────
