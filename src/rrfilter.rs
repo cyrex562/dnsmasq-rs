@@ -215,12 +215,17 @@ where
 {
     let hdr = DnsHeader::from_bytes(pkt).ok_or(DnsError::PacketTooShort)?;
 
+    // C refuses to touch a packet that doesn't have exactly one question
+    // (`rrfilter.c:173-175`) rather than try to reason about which question a
+    // multi-question or question-less packet's answers belong to.
+    if hdr.qdcount != 1 {
+        return Ok((pkt.to_vec(), 0));
+    }
+
     let mut pos = 12usize;
     skip_questions_to(pkt, &mut pos, hdr.qdcount)?;
 
-    // The first question drives the DNSSEC and RFC 8482 decisions; a packet
-    // with no question section has neither.
-    let question = if hdr.qdcount >= 1 {
+    let question = {
         let mut qpos = 12usize;
         skip_name(pkt, &mut qpos)?;
         if qpos + 4 > pkt.len() {
@@ -230,8 +235,6 @@ where
             qtype:  u16::from_be_bytes([pkt[qpos],     pkt[qpos + 1]]),
             qclass: u16::from_be_bytes([pkt[qpos + 2], pkt[qpos + 3]]),
         }
-    } else {
-        Question { qtype: 0, qclass: 0 }
     };
 
     let an = usize::from(hdr.ancount);
@@ -331,6 +334,11 @@ where
 ///
 /// This is how the reply path performs C's `RRFILTER_EDNS0` — stripping the
 /// OPT pseudo-RR from a reply whose client never sent one (`forward.c:738`).
+///
+/// Only the **additional** section is considered, matching C's
+/// `i < ancount+nscount || type != T_OPT` skip (`rrfilter.c:200-205`): a record
+/// of a "removed" type sitting in the answer or authority section is left
+/// alone, since a real OPT RR never appears there.
 pub fn filter_rr_types(pkt: &[u8], remove_types: &[u16]) -> Result<Vec<u8>, DnsError> {
     if pkt.len() < 12 {
         return Err(DnsError::PacketTooShort);
@@ -338,8 +346,14 @@ pub fn filter_rr_types(pkt: &[u8], remove_types: &[u16]) -> Result<Vec<u8>, DnsE
     if remove_types.is_empty() {
         return Ok(pkt.to_vec());
     }
-    filter_with(pkt, |_, rtype, _, _| {
-        if remove_types.contains(&rtype) { Verdict::Remove } else { Verdict::Keep }
+    let hdr = DnsHeader::from_bytes(pkt).ok_or(DnsError::PacketTooShort)?;
+    let additional_start = usize::from(hdr.ancount) + usize::from(hdr.nscount);
+    filter_with(pkt, |i, rtype, _, _| {
+        if i < additional_start || !remove_types.contains(&rtype) {
+            Verdict::Keep
+        } else {
+            Verdict::Remove
+        }
     })
     .map(|(out, _)| out)
 }
@@ -477,27 +491,52 @@ mod tests {
         pkt
     }
 
+    /// Build a response whose QDCOUNT does not match the number of questions
+    /// actually present, for exercising C's `qdcount != 1` bailout
+    /// (`rrfilter.c:173-175`).
+    fn response_with_qdcount(answers: &[Vec<u8>], qdcount: u16) -> Vec<u8> {
+        let mut pkt = vec![
+            0x00, 0x01, // ID
+            0x81, 0x80, // flags: QR+RD+RA
+        ];
+        pkt.extend_from_slice(&qdcount.to_be_bytes());
+        pkt.extend_from_slice(&(answers.len() as u16).to_be_bytes()); // ANCOUNT
+        pkt.extend_from_slice(&[0x00, 0x00]); // NSCOUNT
+        pkt.extend_from_slice(&[0x00, 0x00]); // ARCOUNT
+        for _ in 0..qdcount {
+            pkt.extend_from_slice(b"\x07example\x03com\x00");
+            pkt.extend_from_slice(&[0x00, 0x01]); // QTYPE=A
+            pkt.extend_from_slice(&[0x00, 0x01]); // QCLASS=IN
+        }
+        for rr in answers {
+            pkt.extend_from_slice(rr);
+        }
+        pkt
+    }
+
     // ── filter_rr_types ───────────────────────────────────────────────────────
 
     #[test]
     fn filter_removes_matching_rr() {
+        // filter_rr_types mirrors C's EDNS0 mode, which only ever inspects the
+        // additional section (rrfilter.c:200-205).
         let a_rr   = make_rr("example.com", RrType::A as u16, &[1, 2, 3, 4]);
         let txt_rr = make_rr("example.com", RrType::TXT as u16, b"\x05hello");
-        let pkt = response_with_answers(&[a_rr, txt_rr]);
+        let pkt = response_with(&[a_rr], &[], &[txt_rr], 1);
 
         let hdr_before = DnsHeader::from_bytes(&pkt).unwrap();
-        assert_eq!(hdr_before.ancount, 2);
+        assert_eq!(hdr_before.arcount, 1);
 
         let filtered = filter_rr_types(&pkt, &[RrType::TXT as u16]).unwrap();
         let hdr_after = DnsHeader::from_bytes(&filtered).unwrap();
-        assert_eq!(hdr_after.ancount, 1);
+        assert_eq!(hdr_after.arcount, 0);
     }
 
     #[test]
     fn filter_is_idempotent() {
         let a_rr   = make_rr("example.com", RrType::A as u16, &[1, 2, 3, 4]);
         let txt_rr = make_rr("example.com", RrType::TXT as u16, b"\x05hello");
-        let pkt = response_with_answers(&[a_rr, txt_rr]);
+        let pkt = response_with(&[a_rr], &[], &[txt_rr], 1);
 
         let once  = filter_rr_types(&pkt, &[RrType::TXT as u16]).unwrap();
         let twice = filter_rr_types(&once, &[RrType::TXT as u16]).unwrap();
@@ -526,6 +565,21 @@ mod tests {
         assert!(filter_rr_types(&[0u8; 4], &[1]).is_err());
     }
 
+    /// C's EDNS0 mode only ever looks at the additional section
+    /// (`rrfilter.c:200-205`: `i < ancount+nscount || type != T_OPT` is skipped).
+    /// A record of the "removed" type sitting in the answer section — malformed
+    /// or adversarial, since real OPT RRs only ever live in additional — must
+    /// survive untouched.
+    #[test]
+    fn filter_rr_types_only_touches_the_additional_section() {
+        let a      = make_rr("example.com", RrType::A as u16, &[1, 2, 3, 4]);
+        let rogue  = make_rr("example.com", 41, &[]); // type 41 in the ANSWER section
+        let pkt = response_with_answers(&[a, rogue]);
+
+        let filtered = filter_rr_types(&pkt, &[41]).unwrap();
+        assert_eq!(filtered, pkt, "EDNS0 stripping must not touch the answer section");
+    }
+
     // ── compression-pointer safety ────────────────────────────────────────────
 
     /// The four-pass dance exists for this case: a record that survives carries
@@ -533,16 +587,18 @@ mod tests {
     /// the pointer has to be rewritten or the answer is corrupt.
     #[test]
     fn a_surviving_pointer_past_an_elided_record_is_rewritten() {
-        // Answer 1: TXT (to be removed) — its owner name is a literal.
+        // Additional record 1: TXT (to be removed) — its owner name is a literal.
+        // (filter_rr_types mirrors C's EDNS0 mode, which only ever looks at the
+        // additional section, so the elided record has to live there.)
         let txt = make_rr("example.com", RrType::TXT as u16, b"\x05hello");
-        // Answer 2: NS whose *name* is a literal at a known offset, and whose
-        // RDATA is a pointer back to that name.
+        // Additional record 2: NS whose *name* is a literal at a known offset,
+        // and whose RDATA is a pointer back to that name.
         let ns_name_offset = 12 + 17 + txt.len(); // header + question + TXT
         let mut ns_rdata = BytesMut::new();
         ns_rdata.extend_from_slice(&[0xC0 | (ns_name_offset >> 8) as u8, (ns_name_offset & 0xFF) as u8]);
         let ns = make_rr("ns.example.com", RrType::NS as u16, &ns_rdata);
 
-        let pkt = response_with_answers(&[txt, ns]);
+        let pkt = response_with(&[], &[], &[txt, ns], 1);
         let filtered = filter_rr_types(&pkt, &[RrType::TXT as u16]).unwrap();
 
         // The NS record must still parse, and its RDATA pointer must resolve to
@@ -550,9 +606,9 @@ mod tests {
         // still *looks* like a pointer — it just addresses the wrong bytes —
         // so the assertion has to be on the name it resolves to.
         let parsed = crate::rfc1035::DnsPacket::parse(&filtered).expect("filtered packet must parse");
-        assert_eq!(parsed.answers.len(), 1);
+        assert_eq!(parsed.additional.len(), 1);
         let mut pos = 0usize;
-        let target = crate::rfc1035::extract_name(&parsed.answers[0].rdata, &mut pos)
+        let target = crate::rfc1035::extract_name(&parsed.additional[0].rdata, &mut pos)
             .expect("NS rdata must decode");
         assert_eq!(target, "ns.example.com", "pointer must be rescaled to the moved record");
     }
@@ -571,7 +627,7 @@ mod tests {
         ]);
         let ns = make_rr("ns.example.com", RrType::NS as u16, &ns_rdata);
 
-        let pkt = response_with_answers(&[txt, ns]);
+        let pkt = response_with(&[], &[], &[txt, ns], 1);
         let filtered = filter_rr_types(&pkt, &[RrType::TXT as u16]).unwrap();
         assert_eq!(filtered, pkt, "the answer must be left exactly as it arrived");
     }
@@ -732,6 +788,28 @@ mod tests {
         let pkt = response_with_answers(&[a]);
         let (out, n) = filter_configured_rr_types(&pkt, &[]).unwrap();
         assert_eq!(n, 0);
+        assert_eq!(out, pkt);
+    }
+
+    /// C bails out of the whole filter — no elision, no error, unchanged bytes
+    /// back — unless there is exactly one question (`rrfilter.c:173-175`).
+    #[test]
+    fn conf_filter_leaves_packet_unchanged_when_there_is_no_question() {
+        let caa = make_rr("example.com", RrType::CAA as u16, b"\x00\x05issue");
+        let pkt = response_with_qdcount(&[caa], 0);
+
+        let (out, n) = filter_configured_rr_types(&pkt, &[RrType::CAA as u16]).unwrap();
+        assert_eq!(n, 0, "a packet with no question must not be filtered");
+        assert_eq!(out, pkt);
+    }
+
+    #[test]
+    fn conf_filter_leaves_packet_unchanged_when_there_are_two_questions() {
+        let caa = make_rr("example.com", RrType::CAA as u16, b"\x00\x05issue");
+        let pkt = response_with_qdcount(&[caa], 2);
+
+        let (out, n) = filter_configured_rr_types(&pkt, &[RrType::CAA as u16]).unwrap();
+        assert_eq!(n, 0, "a packet with more than one question must not be filtered");
         assert_eq!(out, pkt);
     }
 
