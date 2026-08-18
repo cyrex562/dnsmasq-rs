@@ -261,6 +261,30 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     when it returns 1 — behind a CNAME that is the chain target.
   - The DNSSEC halves are gated on `--dnssec` (`OPT_DNSSEC_VALID`) exactly as C gates them.
     Without it, C neither resets the DO bit nor strips DNSSEC RRs, so neither do we.
+  - `rrfilter()` bails out untouched unless the packet has exactly one question
+    (`rrfilter.c:173-175`); `filter_with` now matches (`hdr.qdcount != 1` short-circuits before
+    any elision decision), rather than generalizing to arbitrary question counts.
+  - `filter_rr_types` (the EDNS0-mode entry point, used to strip a self-added OPT record) now
+    only considers the additional section, matching `i < ancount+nscount || type != T_OPT`
+    (`rrfilter.c:200-205`); it previously matched by TYPE alone across all three sections, which
+    only differs from upstream if an adversarial/malformed upstream reply places a type-41 RR
+    in the answer or authority section.
+  - `tests/proptest_rrfilter.rs` covers the "filtering never corrupts a surviving compression
+    pointer" property across all three entry points. Note for future property tests on this
+    module: `DnsPacket::parse(..).is_ok()` alone is too weak an oracle — `parse_rr` swallows a
+    bad in-RDATA pointer and falls back to the raw (still-corrupt) bytes instead of erroring, so
+    a mis-rescaled pointer can still "parse". The property has to decode the surviving pointer
+    and check it resolves to the right name, not just that parsing succeeds.
+
+  Left as a **literal**, not behavioral, parity gap:
+
+  - Upstream's `to_wire()`/`from_wire()` (`rrfilter.c:356-412`) convert between presentation and
+    wire name forms and are used for DNSSEC canonicalization (`dnssec.c`) and for
+    `daemon->workspacename` handling (`rfc1035.c:578,952`). `rrfilter.rs` has no equivalent
+    function — `dnssec.rs` has its own independent `name_to_wire` that covers the DNSSEC
+    canonicalization use, so there is no live behavioral gap from `rrfilter()`'s side, but
+    nothing in `rfc1035.rs` covers the `workspacename` use, and no upstream-hosted
+    `to_wire`/`from_wire` pair exists in this crate.
 
   Explicitly **not** covered on this path:
 
