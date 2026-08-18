@@ -797,6 +797,16 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   Required tests: unsupported directives must fail clearly unless intentionally no-op and documented.
   Done when: the parser never gives a false impression that a feature works when it does not.
 
+- [ ] `dhcp-vendorclass` (`src/option.rs::parse_dhcp_vendor`) only supports the 2-field
+  `tag,vendor-class` form. Upstream's shared `'U'`/`'j'`/circuit/remote/subscriber case
+  (option.c:4564-4634) also accepts a `tag,enterprise:N,vendor-class` 3-field form unique to
+  `-U`, which scopes the match to an RFC 3925 enterprise number, and auto-hex-decodes the
+  class string when it looks like a colon-separated hex blob (matching `dhcp-mac`-style
+  input) for all directives in that shared case except `-U`/`-j`. Neither is implemented here.
+  Required tests: parser tests for the 3-field enterprise form and the hex-decode path.
+  Done when: `dhcp-vendorclass=set:tag,enterprise:N,data` parses and `DhcpVendorRule` carries
+  the enterprise number through to DHCP packet matching.
+
 ## P3 Feature-Specific Completion
 
 - [ ] Finish behavior-critical gaps in DNS forwarding and cache interaction.

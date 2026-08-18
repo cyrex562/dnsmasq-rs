@@ -1287,8 +1287,8 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             }
         }
 
-        "dhcp-vendor" => {
-            let v = require_value("dhcp-vendor")?;
+        "dhcp-vendorclass" => {
+            let v = require_value("dhcp-vendorclass")?;
             #[cfg(feature = "dhcp")]
             {
                 daemon.dhcp_vendors.push(parse_dhcp_vendor(v, cl)?);
@@ -3113,7 +3113,7 @@ fn parse_dhcp_config_matchers(
 fn parse_dhcp_vendor(value: &str, cl: &ConfigLine) -> Result<DhcpVendorRule, ConfigError> {
     let parts = split_csv(value);
     if parts.len() != 2 {
-        return Err(invalid_value_for(cl, "dhcp-vendor", value, "expected tag,vendor-class"));
+        return Err(invalid_value_for(cl, "dhcp-vendorclass", value, "expected tag,vendor-class"));
     }
 
     let tag = parts[0]
@@ -3122,10 +3122,10 @@ fn parse_dhcp_vendor(value: &str, cl: &ConfigLine) -> Result<DhcpVendorRule, Con
         .unwrap_or(parts[0])
         .trim();
     if tag.is_empty() {
-        return Err(invalid_value_for(cl, "dhcp-vendor", parts[0], "expected a tag name"));
+        return Err(invalid_value_for(cl, "dhcp-vendorclass", parts[0], "expected a tag name"));
     }
     if parts[1].is_empty() {
-        return Err(invalid_value_for(cl, "dhcp-vendor", value, "expected a vendor-class match string"));
+        return Err(invalid_value_for(cl, "dhcp-vendorclass", value, "expected a vendor-class match string"));
     }
 
     Ok(DhcpVendorRule {
@@ -6130,9 +6130,9 @@ mod tests {
     }
 
     #[test]
-    fn apply_dhcp_vendor_rule() {
+    fn apply_dhcp_vendorclass_rule() {
         let mut d = Daemon::default();
-        let lines = parse_config_text("dhcp-vendor=set:pxe,PXEClient", "test").unwrap();
+        let lines = parse_config_text("dhcp-vendorclass=set:pxe,PXEClient", "test").unwrap();
         apply_config(&mut d, &lines).unwrap();
         #[cfg(feature = "dhcp")]
         {
@@ -6140,6 +6140,14 @@ mod tests {
             assert_eq!(d.dhcp_vendors[0].netid.net, "pxe");
             assert_eq!(d.dhcp_vendors[0].vendor_class, b"PXEClient".to_vec());
         }
+    }
+
+    #[test]
+    fn dhcp_vendor_invented_key_is_rejected() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-vendor=set:pxe,PXEClient", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::UnknownOption(ref k, _, _) if k == "dhcp-vendor"));
     }
 
     #[test]
