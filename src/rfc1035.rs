@@ -900,6 +900,10 @@ pub struct LocalConfig<'a> {
     pub host_records:  &'a [HostRecord],
     pub cnames:        &'a [Cname],
     pub naptr_records: &'a [Naptr],
+    /// `--domain-needed` (`OPT_NODOTS_LOCAL`): don't forward A/AAAA queries
+    /// for single-label names — answer them locally as NXDOMAIN, or NOERR if
+    /// the name matches other local config (`forward.c:355-361`).
+    pub nodots_local:  bool,
 }
 
 /// Port of C's `setup_reply()`.  Sets standard response flags on a DnsHeader.
@@ -1251,7 +1255,13 @@ pub fn answer_request(
         }
     }
 
-    // 6. No answer found → forward upstream.
+    // 6. No answer found: don't forward simple (dot-free) A/AAAA names when
+    // `--domain-needed` is set, except the empty name (`forward.c:355-361`).
+    if !ans && config.nodots_local && (qtype == 1 || qtype == 28) && !name.contains('.') && !name.is_empty() {
+        ans = true;
+        nxdomain = !check_for_local_domain(&name, config);
+    }
+
     if !ans {
         return None;
     }
@@ -2421,6 +2431,7 @@ mod tests {
             host_records: &[],
             cnames:       &[],
             naptr_records: &[],
+            nodots_local: false,
         }
     }
 
@@ -2637,6 +2648,69 @@ mod tests {
         assert!(check_for_local_domain("myhost.local", &cfg));
         assert!(check_for_local_domain("sub.myhost.local", &cfg));
         assert!(!check_for_local_domain("other.example.com", &cfg));
+    }
+
+    // ── domain-needed / OPT_NODOTS_LOCAL (forward.c:355-361) ────────────────
+
+    /// A single-label A query with no local match becomes a synthesised
+    /// NXDOMAIN instead of `None` (forwarded) when `nodots_local` is set.
+    #[test]
+    fn nodots_local_answers_unmatched_single_label_a_query_nxdomain() {
+        let now = Instant::now();
+        let mut cache = DnsCache::new(100);
+        let query = make_query("foo", 1); // A, no dot
+        let cfg = LocalConfig { nodots_local: true, ..empty_config() };
+
+        let resp = answer_request(&query, &mut cache, now, &cfg).expect("should answer locally");
+        assert_eq!(resp.header.rcode(), 3); // NXDOMAIN
+        assert!(resp.header.hb3 & HB3_QR != 0);
+        assert!(resp.header.hb3 & HB3_AA == 0);
+    }
+
+    /// Same as above but the name matches locally configured data: the
+    /// synthesised reply is F_NOERR (empty NOERROR), not NXDOMAIN.
+    #[test]
+    fn nodots_local_answers_unmatched_single_label_a_query_noerr_when_locally_known() {
+        let now = Instant::now();
+        let mut cache = DnsCache::new(100);
+        let query = make_query("foo", 1); // A, no dot
+        let mx = MxSrvRecord {
+            name: "foo".into(), target: "mail.example.com".into(),
+            priority: 10, is_srv: false, weight: 0, srv_port: 0, offset: 0,
+        };
+        let cfg = LocalConfig {
+            nodots_local: true,
+            mx_records: std::slice::from_ref(&mx),
+            ..empty_config()
+        };
+
+        let resp = answer_request(&query, &mut cache, now, &cfg).expect("should answer locally");
+        assert_eq!(resp.header.rcode(), 0); // NOERROR
+        assert_eq!(resp.header.ancount, 0);
+    }
+
+    /// A dotted name is unaffected: still forwarded (`None`) even with
+    /// `nodots_local` set, matching upstream's `!strchr(name, '.')` guard.
+    #[test]
+    fn nodots_local_does_not_affect_dotted_names() {
+        let now = Instant::now();
+        let mut cache = DnsCache::new(100);
+        let query = make_query("foo.example.com", 1);
+        let cfg = LocalConfig { nodots_local: true, ..empty_config() };
+
+        assert!(answer_request(&query, &mut cache, now, &cfg).is_none());
+    }
+
+    /// Without `nodots_local` set, an unmatched single-label query is still
+    /// forwarded — the default, upstream-compatible behaviour.
+    #[test]
+    fn without_nodots_local_single_label_query_is_forwarded() {
+        let now = Instant::now();
+        let mut cache = DnsCache::new(100);
+        let query = make_query("foo", 1);
+        let cfg = LocalConfig { nodots_local: false, ..empty_config() };
+
+        assert!(answer_request(&query, &mut cache, now, &cfg).is_none());
     }
 
     #[test]

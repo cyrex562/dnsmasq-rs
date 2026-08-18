@@ -528,6 +528,7 @@ pub fn daemon_local_data(daemon: &Daemon) -> crate::forward::LocalData {
         host_records:  daemon.host_records.clone(),
         cnames:        daemon.cnames.clone(),
         naptr_records: daemon.naptr.clone(),
+        nodots_local:  daemon.option_bool(crate::types::constants::OPT_NODOTS_LOCAL),
     }
 }
 

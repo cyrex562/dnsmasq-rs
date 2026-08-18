@@ -788,7 +788,7 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   Done when: config-defined local DNS data produces upstream-compatible answers.
 
 - [ ] Complete remaining network and policy directives needed for production-like configs.
-  Examples: rebind controls, ipset/nftset hooks, filter variants, port-limit, no-hosts6, logging-related directives.
+  Examples: rebind controls, ipset/nftset hooks, filter variants, port-limit, logging-related directives.
   Required tests: parser tests and feature-gated integration tests.
   Done when: supported config files do not silently ignore implemented features.
 
@@ -796,6 +796,37 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   Source of truth: current TODO branches in `apply_line`.
   Required tests: unsupported directives must fail clearly unless intentionally no-op and documented.
   Done when: the parser never gives a false impression that a feature works when it does not.
+
+- [ ] Issue #18 remaining DHCP/PXE directives: recognized and accepted by
+  `apply_line` (`src/option.rs`) so a config carrying them no longer aborts
+  startup, but their runtime behavior is not wired:
+  - `dhcp-broadcast`, `dhcp-generate-names`, `dhcp-ignore-names`,
+    `bootp-dynamic` (option.c:4660-4700, shared `dhcp_netid_list` case): the
+    value is parsed and discarded. Upstream stores a tag-matched list
+    (`daemon->force_broadcast`/`dhcp_gen_names`/`dhcp_ignore_names`/
+    `bootp_dynamic`) consulted by the DHCPv4 reply path in `rfc2131.c`; none
+    of those lists or their `dhcp.rs`/`rfc2131.rs` consumers exist yet.
+  - `dhcp-proxy` (option.c:4703): value discarded. Upstream sets
+    `daemon->override = 1` and collects `override_relays` IPv4 addresses;
+    neither field exists on `Daemon`.
+  - `dhcp-pxe-vendor` (option.c:4716): value discarded. Upstream builds a
+    `dhcp_pxe_vendor` list matched against PXE client-vendor options.
+  - `pxe-prompt` / `pxe-service` (option.c:4423,4461): value discarded.
+    Upstream builds `dhcp_opt`/`pxe_service` entries that drive the PXE menu
+    the DHCP/TFTP path serves; no PXE menu support exists in this port.
+  - `conf-script` (option.c:2068): value discarded, and deliberately never
+    executed. Upstream runs the referenced file as a program and reads config
+    directives back from its stdout (`one_file(file, LOPT_CONF_SCRIPT)`).
+    Executing an arbitrary external program from config parsing is a
+    capability this port intentionally does not implement.
+  - `umbrella` (option.c:2808): only the top-level `OPT_UMBRELLA` bit is set.
+    The `deviceid:`/`orgid:`/`assetid:`/`userid:` sub-options are not parsed;
+    `Daemon` has no `umbrella_device`/`umbrella_org`/`umbrella_asset`/
+    `umbrella_user` fields yet.
+  Required tests: once each backing field/list exists, add parser tests plus
+  a `dhcp.rs`/`rfc2131.rs` consumer test.
+  Done when: each directive above either updates real `Daemon` state consumed
+  by the DHCP/PXE runtime path, or remains explicitly listed here.
 
 - [ ] `dhcp-vendorclass` (`src/option.rs::parse_dhcp_vendor`) only supports the 2-field
   `tag,vendor-class` form. Upstream's shared `'U'`/`'j'`/circuit/remote/subscriber case
