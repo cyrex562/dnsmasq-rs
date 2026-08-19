@@ -1147,6 +1147,15 @@ pub struct ForwardConfig {
     pub allowlists: Vec<crate::types::network::Allowlist>,
     /// `--connmark-allowlist-enable`'s mask argument (`daemon->allowlist_mask`).
     pub allowlist_mask: u32,
+    /// `OPT_CLIENT_SUBNET` (`--add-subnet`): gates `check_source()` reply
+    /// verification (`forward.c:727-731`) — a reply whose ECS echo doesn't
+    /// match what we would have sent is discarded rather than delivered.
+    pub client_subnet: bool,
+    /// `--add-subnet` (IPv4 half): mask, and optional constant address
+    /// override, consulted by [`crate::edns0::calc_subnet_opt`].
+    pub add_subnet4: Option<crate::edns0::AddSubnetOpt>,
+    /// `--add-subnet` (IPv6 half). See [`ForwardConfig::add_subnet4`].
+    pub add_subnet6: Option<crate::edns0::AddSubnetOpt>,
 }
 
 impl Default for ForwardConfig {
@@ -1180,6 +1189,9 @@ impl Default for ForwardConfig {
             cmark_alst_en: false,
             allowlists:    Vec::new(),
             allowlist_mask: 0,
+            client_subnet: false,
+            add_subnet4:   None,
+            add_subnet6:   None,
         }
     }
 }
@@ -2481,15 +2493,20 @@ pub async fn run_forward_loop_on(
                 // before it is handed to the waiting clients: EDNS0 fix-up,
                 // rebind and bogus-wildcard blocking, caching, RR filtering,
                 // the DNSSEC strip and the EDE option (`forward.c:696-889`).
-                {
+                //
+                // `query_source` is the *primary* client's address (`targets[0]`,
+                // C's `frec->frec_src.source`) — what `check_source()` recomputes
+                // the expected ECS option against (`forward.c:1431`).
+                let deliver = {
                     let mut cache = cache.lock().await;
-                    process_reply(
-                        &mut pkt,
-                        &mut cache,
-                        Instant::now(),
-                        &engine.config,
-                        ReplyContext::from_flags(flags),
-                    );
+                    let ctx = ReplyContext {
+                        query_source: targets.first().map(|t| t.client.ip()),
+                        ..ReplyContext::from_flags(flags)
+                    };
+                    process_reply(&mut pkt, &mut cache, Instant::now(), &engine.config, ctx)
+                };
+                if !deliver {
+                    continue;
                 }
 
                 // One upstream answer, one reply per waiting client, each under
@@ -2746,6 +2763,11 @@ pub struct ReplyContext {
     pub do_question:       bool,
     /// `FREC_CHECKING_DISABLED`: the client set CD in its query.
     pub checking_disabled: bool,
+    /// The original client's address (`frec_src.source`) — C's `query_source`
+    /// (`forward.c:1431`), the `peer` `check_source()` recomputes the expected
+    /// ECS option against. `None` when the query had no waiting client left to
+    /// take it from (should not happen in practice; treated as "no check").
+    pub query_source: Option<std::net::IpAddr>,
 }
 
 impl ReplyContext {
@@ -2756,6 +2778,7 @@ impl ReplyContext {
             ad_question:       flags & FREC_AD_QUESTION != 0,
             do_question:       flags & FREC_DO_QUESTION != 0,
             checking_disabled: flags & FREC_CHECKING_DISABLED != 0,
+            query_source:      None,
         }
     }
 }
@@ -2807,9 +2830,10 @@ fn attach_ede(pkt: &[u8], ede: Ede) -> Option<Vec<u8>> {
 ///
 /// 1. restore the CD bit the client sent — C does this in its caller
 ///    (`forward.c:1418-1422`), but it belongs to the same reply rewrite;
-/// 2. EDNS0: strip the OPT record entirely when the client never sent one,
-///    otherwise advertise *our* payload size and clear a DO bit the client did
-///    not ask for;
+/// 2. EDNS0: verify a `--add-subnet` ECS echo against `check_source()` and
+///    discard the whole reply on mismatch; otherwise strip the OPT record
+///    entirely when the client never sent one, or advertise *our* payload
+///    size and clear a DO bit the client did not ask for;
 /// 3. clear AD unless `--proxy-dnssec` (RFC 4035 sect 4.6 para 3), and set RA,
 ///    because we are the recursive resolver whatever upstream claimed to be;
 /// 4. pass non-QUERY opcodes and non-NOERROR/NXDOMAIN rcodes straight through;
@@ -2821,18 +2845,23 @@ fn attach_ede(pkt: &[u8], ede: Ede) -> Option<Vec<u8>> {
 /// Not yet ported, and tracked in `tasks.md`: DNSSEC validation itself (so C's
 /// `bogusanswer`/`cache_secure` are always false here and the AD bit is never
 /// *set*), `--alias` address rewriting (`do_doctor`), the NXDOMAIN→NODATA
-/// conversion for locally-known names, `--add-subnet` reply verification, and
-/// actually sending a matched `--ipset` address to the kernel (the matching
-/// itself now happens in `extract_addresses` — see `cache_upstream_reply`).
+/// conversion for locally-known names, and actually sending a matched
+/// `--ipset` address to the kernel (the matching itself now happens in
+/// `extract_addresses` — see `cache_upstream_reply`).
+///
+/// Returns `false` when the reply must be discarded outright rather than
+/// delivered — currently only `check_source()`'s ECS-mismatch case
+/// (`forward.c:727-731`), C's `return 0`. The caller must not send `*pkt` to
+/// any client when this returns `false`.
 pub fn process_reply(
     pkt:    &mut Vec<u8>,
     cache:  &mut DnsCache,
     now:    Instant,
     config: &ForwardConfig,
     ctx:    ReplyContext,
-) {
+) -> bool {
     if pkt.len() < DNS_HEADER_LEN {
-        return;
+        return true;
     }
 
     // ── Restore the CD bit to the value in the query (`forward.c:1418-1422`) ─
@@ -2851,6 +2880,23 @@ pub fn process_reply(
     let mut ext_rcode   = 0u8;
     if let Some(info) = crate::edns0::find_pseudoheader(pkt) {
         ext_rcode = info.ext_rcode;
+
+        // `--add-subnet` reply verification (`check_source()`, `forward.c:727-731`):
+        // reject a reply whose ECS echo doesn't match what we would have sent
+        // for this client — a spoofed/mismatched echo is not something the
+        // cache should ever remember.
+        if config.client_subnet
+            && !crate::edns0::check_source(
+                pkt,
+                ctx.query_source,
+                config.add_subnet4.as_ref(),
+                config.add_subnet6.as_ref(),
+            )
+        {
+            tracing::warn!("discarding DNS reply: subnet option mismatch");
+            return false;
+        }
+
         if !ctx.has_pheader {
             // The client didn't send EDNS0, so it must not get an OPT record
             // back — C strips the one it added itself on the way upstream.
@@ -2885,7 +2931,7 @@ pub fn process_reply(
     // Non-QUERY opcodes, and errors other than NXDOMAIN, carry nothing worth
     // inspecting (`forward.c:778-789`).
     if opcode != 0 || (rcode != 0 && rcode != 3) {
-        return;
+        return true;
     }
 
     let mut ede = Ede::Unset;
@@ -2930,6 +2976,8 @@ pub fn process_reply(
             *pkt = with_ede;
         }
     }
+
+    true
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4507,10 +4555,14 @@ mod tests {
     /// Run `process_reply` over `pkt` with a throwaway cache, returning the
     /// rewritten packet parsed back out.
     fn run_process_reply(pkt: &[u8], config: &ForwardConfig, ctx: ReplyContext) -> Vec<u8> {
+        run_process_reply_deliver(pkt, config, ctx).0
+    }
+
+    fn run_process_reply_deliver(pkt: &[u8], config: &ForwardConfig, ctx: ReplyContext) -> (Vec<u8>, bool) {
         let mut cache = DnsCache::new(100);
         let mut wire  = pkt.to_vec();
-        process_reply(&mut wire, &mut cache, Instant::now(), config, ctx);
-        wire
+        let deliver = process_reply(&mut wire, &mut cache, Instant::now(), config, ctx);
+        (wire, deliver)
     }
 
     fn bogus_v4(octets: [u8; 4], prefix: i32) -> BogusAddr {
@@ -4636,6 +4688,64 @@ mod tests {
         assert_ne!(out[3] & HB4_AD, 0, "--proxy-dnssec relays the upstream AD bit");
     }
 
+    /// `check_source()` (`edns0.c:445-488`, wired at `forward.c:727-731`): a
+    /// reply whose ECS echo doesn't match what we'd have sent for this client
+    /// must be discarded outright, not delivered to the client.
+    #[test]
+    fn process_reply_rejects_mismatched_ecs_echo() {
+        let client = IpAddr::V4("10.0.0.1".parse().unwrap());
+        let other  = IpAddr::V4("192.168.0.1".parse().unwrap());
+        let pkt = crate::edns0::add_source_addr(&minimal_reply(0, true, 0, false), other, 24)
+            .expect("add_source_addr");
+        let config = ForwardConfig {
+            client_subnet: true,
+            add_subnet4: Some(crate::edns0::AddSubnetOpt { mask: 24, const_addr: None }),
+            ..ForwardConfig::default()
+        };
+        let ctx = ReplyContext { query_source: Some(client), ..ReplyContext::default() };
+        let (_out, deliver) = run_process_reply_deliver(&pkt, &config, ctx);
+        assert!(!deliver, "a mismatched ECS echo must be discarded");
+    }
+
+    /// The matching counterpart of `process_reply_rejects_mismatched_ecs_echo`:
+    /// a reply whose ECS echo matches what we'd have sent is delivered as usual.
+    #[test]
+    fn process_reply_accepts_matching_ecs_echo() {
+        let client = IpAddr::V4("10.0.0.1".parse().unwrap());
+        let pkt = crate::edns0::add_source_addr(&minimal_reply(0, true, 0, false), client, 24)
+            .expect("add_source_addr");
+        let config = ForwardConfig {
+            client_subnet: true,
+            add_subnet4: Some(crate::edns0::AddSubnetOpt { mask: 24, const_addr: None }),
+            ..ForwardConfig::default()
+        };
+        let ctx = ReplyContext {
+            query_source: Some(client),
+            has_pheader: true,
+            ..ReplyContext::default()
+        };
+        let (_out, deliver) = run_process_reply_deliver(&pkt, &config, ctx);
+        assert!(deliver, "a matching ECS echo must be delivered");
+    }
+
+    /// Without `--add-subnet` configured, ECS echoes are not checked at all —
+    /// `check_source()` is gated on `option_bool(OPT_CLIENT_SUBNET)` in C
+    /// (`forward.c:727`).
+    #[test]
+    fn process_reply_ignores_ecs_when_client_subnet_not_configured() {
+        let client = IpAddr::V4("10.0.0.1".parse().unwrap());
+        let other  = IpAddr::V4("192.168.0.1".parse().unwrap());
+        let pkt = crate::edns0::add_source_addr(&minimal_reply(0, true, 0, false), other, 24)
+            .expect("add_source_addr");
+        let ctx = ReplyContext {
+            query_source: Some(client),
+            has_pheader: true,
+            ..ReplyContext::default()
+        };
+        let (_out, deliver) = run_process_reply_deliver(&pkt, &ForwardConfig::default(), ctx);
+        assert!(deliver, "no --add-subnet configured means no ECS verification");
+    }
+
     #[test]
     fn process_reply_sets_recursion_available() {
         let pkt = minimal_reply(0, true, 0, false);
@@ -4655,6 +4765,7 @@ mod tests {
                 ad_question: true,
                 do_question: true,
                 checking_disabled: true,
+                query_source: None,
             }
         );
         assert_eq!(ReplyContext::from_flags(0), ReplyContext::default());
