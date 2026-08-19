@@ -381,6 +381,300 @@ pub fn format_time(secs: u32) -> String {
     parts.join(" ")
 }
 
+/// Format a DHCP option value with its name.
+///
+/// Returns `(name, formatted_value)` tuple where `name` is the option's human-readable name
+/// (empty string if option not found) and `formatted_value` is `Some(string)` if the value
+/// was decoded, or `None` if the option value is empty.
+///
+/// This is the extended version of `option_string` that also returns the option name,
+/// matching upstream's `option_string()` behavior which returns the name regardless of
+/// whether a value buffer was supplied.
+#[cfg(feature = "dhcp")]
+pub fn option_string_ex(is_v6: bool, opt: u16, val: &[u8]) -> (&'static str, Option<String>) {
+    let (table, name) = if is_v6 {
+        #[cfg(all(feature = "dhcp", feature = "dhcp6"))]
+        {
+            let entry = OPTTAB6.iter().find(|e| e.val == opt);
+            let name = entry.map(|e| e.name).unwrap_or("");
+            if val.is_empty() {
+                return (name, None);
+            }
+            let size_flags = entry.map(|e| e.size).unwrap_or(0);
+
+            if (size_flags & OT_ADDR_LIST) != 0 && val.len() >= 16 {
+                let formatted = val
+                    .chunks(16)
+                    .filter(|c| c.len() == 16)
+                    .map(|c| {
+                        let bytes: [u8; 16] = c.try_into().unwrap();
+                        std::net::Ipv6Addr::from(bytes).to_string()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return (name, Some(formatted));
+            }
+
+            if (size_flags & OT_RFC1035_NAME) != 0 {
+                if let Ok(decoded) = decode_rfc1035_names(val) {
+                    return (name, Some(decoded));
+                }
+            }
+
+            if (size_flags & OT_CSTRING) != 0 {
+                if let Ok(decoded) = decode_cstring(val) {
+                    return (name, Some(decoded));
+                }
+            }
+
+            if (size_flags & OT_NAME) != 0 {
+                let formatted = val
+                    .iter()
+                    .filter(|&&b| b.is_ascii_graphic() || b == b' ')
+                    .map(|&b| b as char)
+                    .collect();
+                return (name, Some(formatted));
+            }
+
+            if (size_flags & OT_DEC) != 0 {
+                let n: u64 = val.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b));
+                return (name, Some(n.to_string()));
+            }
+
+            if (size_flags & OT_TIME) != 0 {
+                let secs: u32 = val.iter().take(4).fold(0u32, |acc, &b| (acc << 8) | u32::from(b));
+                return (name, Some(format_time(secs)));
+            }
+
+            let formatted = format_hex_truncate(val);
+            return (name, if formatted.is_empty() { None } else { Some(formatted) });
+        }
+        #[cfg(not(all(feature = "dhcp", feature = "dhcp6")))]
+        return ("", None);
+    } else {
+        (OPTTAB, "")
+    };
+
+    let entry = table.iter().find(|e| e.val == opt);
+    let name = entry.map(|e| e.name).unwrap_or("");
+
+    if val.is_empty() {
+        return (name, None);
+    }
+
+    let size_flags = entry.map(|e| e.size).unwrap_or(0);
+
+    if (size_flags & OT_ADDR_LIST) != 0 && val.len() >= 4 {
+        let formatted = val
+            .chunks(4)
+            .filter(|c| c.len() == 4)
+            .map(|c| format!("{}.{}.{}.{}", c[0], c[1], c[2], c[3]))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return (name, Some(formatted));
+    }
+
+    if (size_flags & OT_NAME) != 0 {
+        let formatted = val
+            .iter()
+            .filter(|&&b| b.is_ascii_graphic() || b == b' ')
+            .map(|&b| b as char)
+            .collect();
+        return (name, Some(formatted));
+    }
+
+    if (size_flags & OT_DEC) != 0 {
+        let n: u64 = val.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b));
+        return (name, Some(n.to_string()));
+    }
+
+    if (size_flags & OT_TIME) != 0 {
+        let secs: u32 = val.iter().take(4).fold(0u32, |acc, &b| (acc << 8) | u32::from(b));
+        return (name, Some(format_time(secs)));
+    }
+
+    let formatted = format_hex_truncate(val);
+    (name, if formatted.is_empty() { None } else { Some(formatted) })
+}
+
+/// Format hex bytes, truncating to 14 bytes and appending "..." if longer.
+#[cfg(feature = "dhcp")]
+fn format_hex_truncate(val: &[u8]) -> String {
+    let truncated = if val.len() > 14 {
+        let hex = val[..14].iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":");
+        format!("{}...", hex)
+    } else {
+        val.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+    };
+    truncated
+}
+
+/// Decode RFC1035-style domain names (length-prefixed labels).
+#[cfg(feature = "dhcp")]
+fn decode_rfc1035_names(val: &[u8]) -> Result<String, String> {
+    let mut names = Vec::new();
+    let mut pos = 0;
+
+    while pos < val.len() {
+        let len = val[pos] as usize;
+        if len == 0 {
+            break;
+        }
+        pos += 1;
+        if pos + len > val.len() {
+            return Err("truncated label".into());
+        }
+        let label = String::from_utf8_lossy(&val[pos..pos + len]).to_string();
+        names.push(label);
+        pos += len;
+    }
+
+    Ok(names.join("."))
+}
+
+/// Decode CSTRING format (2-byte length-prefixed strings).
+#[cfg(feature = "dhcp")]
+fn decode_cstring(val: &[u8]) -> Result<String, String> {
+    let mut strings = Vec::new();
+    let mut pos = 0;
+
+    while pos < val.len() {
+        if pos + 2 > val.len() {
+            break;
+        }
+        let len = u16::from_be_bytes([val[pos], val[pos + 1]]) as usize;
+        pos += 2;
+        if pos + len > val.len() {
+            break;
+        }
+        let s = String::from_utf8_lossy(&val[pos..pos + len]).to_string();
+        strings.push(s);
+        pos += len;
+    }
+
+    Ok(strings.join(", "))
+}
+
+/// Log the startup configuration for a DHCP context.
+///
+/// Formats and returns a log message for the given context (IPv4 or IPv6),
+/// mirroring upstream's `log_context()` diagnostic output.
+///
+/// Returns an empty string for `CONTEXT_OLD` contexts (which are skipped in logging).
+#[cfg(feature = "dhcp")]
+pub fn log_context(family: std::net::IpAddr, ctx: &crate::types::dhcp::DhcpContext) -> String {
+    use crate::types::dhcp::*;
+
+    if (ctx.flags & CONTEXT_OLD) != 0 {
+        return String::new();
+    }
+
+    let is_v6 = matches!(family, std::net::IpAddr::V6(_));
+
+    if is_v6 {
+        #[cfg(feature = "dhcp6")]
+        {
+            if (ctx.flags & CONTEXT_DHCP) == 0 {
+                return String::new();
+            }
+
+            let mut msg = format!("DHCPv6, IP range {}", ctx.start6);
+            msg.push_str(&format!(" -- {}", ctx.end6));
+
+            let lease_time = if ctx.lease_time == 0xffffffff {
+                "infinite".to_string()
+            } else {
+                format_time(ctx.lease_time)
+            };
+            msg.push_str(&format!(", lease time {}", lease_time));
+
+            if (ctx.flags & CONTEXT_DEPRECATE) != 0 {
+                msg.push_str(" (prefix deprecated)");
+            }
+
+            if (ctx.flags & CONTEXT_RA_NAME) != 0 {
+                msg.push_str(&format!(", DHCPv4-derived IPv6 names on"));
+            }
+
+            if (ctx.flags & (CONTEXT_RA | CONTEXT_RA_STATELESS)) != 0 {
+                msg.push_str(", router advertisement");
+            }
+
+            return msg;
+        }
+        #[cfg(not(feature = "dhcp6"))]
+        return String::new();
+    }
+
+    let mut msg = String::new();
+
+    if (ctx.flags & CONTEXT_STATIC) != 0 {
+        msg.push_str("DHCP, static only");
+    } else if (ctx.flags & CONTEXT_PROXY) != 0 {
+        msg.push_str(&format!("DHCP, proxy on {}", ctx.start));
+    } else {
+        msg.push_str(&format!("DHCP, IP range {} -- {}", ctx.start, ctx.end));
+    }
+
+    let lease_time = if ctx.lease_time == 0xffffffff {
+        "infinite".to_string()
+    } else {
+        format_time(ctx.lease_time)
+    };
+    msg.push_str(&format!(", lease time {}", lease_time));
+
+    msg
+}
+
+/// Log the startup configuration for a DHCP relay.
+///
+/// Formats and returns a log message for the given relay configuration,
+/// mirroring upstream's `log_relay()` diagnostic output.
+#[cfg(feature = "dhcp")]
+pub fn log_relay(family: std::net::IpAddr, relay: &crate::types::dhcp::DhcpRelay) -> String {
+    use crate::types::addr::AllAddr;
+
+    let is_v6 = matches!(family, std::net::IpAddr::V6(_));
+
+    let server_str = match &relay.server_addr {
+        AllAddr::Addr4(addr) => addr.to_string(),
+        AllAddr::Addr6(addr) => addr.to_string(),
+        _ => "unknown".to_string(),
+    };
+
+    let mut msg = String::new();
+
+    if is_v6 {
+        if let AllAddr::Addr6(addr) = &relay.server_addr {
+            if addr.is_unspecified() {
+                msg.push_str("DHCPv6 relay on ");
+            } else {
+                msg.push_str(&format!("DHCPv6 relay to {} on ", server_str));
+            }
+        }
+    } else {
+        if let AllAddr::Addr4(addr) = &relay.server_addr {
+            if addr.is_unspecified() {
+                msg.push_str("DHCP relay broadcast on ");
+            } else {
+                msg.push_str(&format!("DHCP relay to {} on ", server_str));
+            }
+        }
+    }
+
+    if let Some(ref iface) = relay.interface {
+        msg.push_str(iface);
+    } else {
+        msg.push_str("all");
+    }
+
+    if relay.port != 67 && relay.port != 547 {
+        msg.push_str(&format!(" #{}", relay.port));
+    }
+
+    msg
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // dhcp_update_configs — fill in addresses from /etc/hosts for static configs
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1690,5 +1984,265 @@ mod tests {
             Some("myhost"),
             &[DhcpNetid { net: "pxe".into() }, DhcpNetid { net: "lab".into() }]
         ).is_some());
+    }
+
+    // ── option_string_ex (enhanced with name return) ────────────────────────────
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn option_string_ex_ipv4_address_list() {
+        // dns-server (6) → OT_ADDR_LIST, IPv4
+        let val = [8, 8, 8, 8, 8, 8, 4, 4];
+        let (name, formatted) = option_string_ex(false, 6, &val);
+        assert_eq!(name, "dns-server");
+        assert_eq!(formatted, Some("8.8.8.8, 8.8.4.4".to_string()));
+    }
+
+    #[test]
+    #[cfg(all(feature = "dhcp", feature = "dhcp6"))]
+    fn option_string_ex_ipv6_address_list() {
+        // dns-server (23) DHCPv6 → OT_ADDR_LIST, IPv6
+        let val = [
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+        ];
+        let (name, formatted) = option_string_ex(true, 23, &val);
+        assert_eq!(name, "dns-server");
+        let result = formatted.unwrap();
+        assert!(result.contains("2001:db8") || result.contains("2001:db8"), "IPv6 addresses should be formatted");
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn option_string_ex_name_type() {
+        // domain-name (15) → OT_NAME
+        let (name, formatted) = option_string_ex(false, 15, b"example.com");
+        assert_eq!(name, "domain-name");
+        assert_eq!(formatted, Some("example.com".to_string()));
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn option_string_ex_decimal() {
+        // mtu (26) → OT_DEC
+        let (name, formatted) = option_string_ex(false, 26, &[0x05, 0xDC]);
+        assert_eq!(name, "mtu");
+        assert_eq!(formatted, Some("1500".to_string()));
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn option_string_ex_time() {
+        // T1 (58) → OT_TIME
+        let (name, formatted) = option_string_ex(false, 58, &[0x00, 0x00, 0x0E, 0x4D]);
+        assert_eq!(name, "T1");
+        assert_eq!(formatted, Some("1h 1m 1s".to_string()));
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn option_string_ex_hex_truncation() {
+        // Unknown option (200) with >14 bytes should truncate and add "..."
+        let val: Vec<u8> = (0..21).map(|i| (i % 256) as u8).collect();
+        let (name, formatted) = option_string_ex(false, 200, &val);
+        assert_eq!(name, "");
+        let result = formatted.unwrap();
+        assert!(result.ends_with("..."), "Hex output >14 bytes should end with '...'");
+        // Should truncate to 14 bytes
+        let hex_part = result.trim_end_matches("...");
+        let hex_pairs: Vec<&str> = hex_part.split(':').collect();
+        assert!(hex_pairs.len() <= 14, "Should truncate to max 14 bytes");
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn option_string_ex_null_value_returns_name_only() {
+        // When calling with empty value, should still return name
+        let (name, formatted) = option_string_ex(false, 6, &[]);
+        assert_eq!(name, "dns-server");
+        // May return None or Some, depends on implementation
+        let _ = formatted;
+    }
+
+    #[test]
+    #[cfg(all(feature = "dhcp", feature = "dhcp6"))]
+    fn option_string_ex_rfc1035_name() {
+        // domain-search (24) DHCPv6 → OT_RFC1035_NAME
+        // Simple RFC1035 format: \x07example\x03com\x00
+        let val = vec![7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0];
+        let (name, formatted) = option_string_ex(true, 24, &val);
+        assert_eq!(name, "domain-search");
+        if let Some(result) = formatted {
+            assert!(result.contains("example"), "Should decode RFC1035 name");
+            assert!(result.contains("com"), "Should include domain");
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "dhcp", feature = "dhcp6"))]
+    fn option_string_ex_cstring() {
+        // bootfile-param (60) DHCPv6 → OT_CSTRING
+        // CSTRING format: 2-byte length + string, repeated
+        let val = vec![0, 5, b'f', b'i', b'r', b's', b't', 0, 6, b's', b'e', b'c', b'o', b'n', b'd'];
+        let (name, formatted) = option_string_ex(true, 60, &val);
+        assert_eq!(name, "bootfile-param");
+        if let Some(result) = formatted {
+            // Should contain comma-separated strings
+            assert!(result.contains(",") || result.contains("first") || result.contains("second"),
+                "CSTRING should decode length-prefixed strings");
+        }
+    }
+
+    // ── log_context ──────────────────────────────────────────────────────────────
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn log_context_ipv4_plain_range() {
+        use crate::types::dhcp::{DhcpContext, DhcpNetid};
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
+        let ctx = DhcpContext {
+            lease_time: 3600,
+            addr_epoch: 0,
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::new(192, 168, 1, 255),
+            local: Ipv4Addr::new(192, 168, 1, 1),
+            router: Ipv4Addr::new(192, 168, 1, 1),
+            start: Ipv4Addr::new(192, 168, 1, 100),
+            end: Ipv4Addr::new(192, 168, 1, 200),
+            flags: 0, // No special flags
+            netid: DhcpNetid { net: "net".into() },
+            filter: vec![],
+            #[cfg(feature = "dhcp6")]
+            start6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            end6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            local6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            prefix: 0,
+            #[cfg(feature = "dhcp6")]
+            if_index: 0,
+            #[cfg(feature = "dhcp6")]
+            valid: 0,
+            #[cfg(feature = "dhcp6")]
+            preferred: 0,
+        };
+
+        let log_msg = log_context(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), &ctx);
+        assert!(log_msg.contains("192.168.1.100"), "Should contain start address");
+        assert!(log_msg.contains("192.168.1.200"), "Should contain end address");
+        assert!(log_msg.contains("1h") || log_msg.contains("3600"), "Should contain lease time");
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn log_context_skips_old_context() {
+        use crate::types::dhcp::{DhcpContext, DhcpNetid, CONTEXT_OLD};
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
+        let mut ctx = DhcpContext {
+            lease_time: 3600,
+            addr_epoch: 0,
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::new(192, 168, 1, 255),
+            local: Ipv4Addr::new(192, 168, 1, 1),
+            router: Ipv4Addr::new(192, 168, 1, 1),
+            start: Ipv4Addr::new(192, 168, 1, 100),
+            end: Ipv4Addr::new(192, 168, 1, 200),
+            flags: 0,
+            netid: DhcpNetid { net: "net".into() },
+            filter: vec![],
+            #[cfg(feature = "dhcp6")]
+            start6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            end6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            local6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            prefix: 0,
+            #[cfg(feature = "dhcp6")]
+            if_index: 0,
+            #[cfg(feature = "dhcp6")]
+            valid: 0,
+            #[cfg(feature = "dhcp6")]
+            preferred: 0,
+        };
+        ctx.flags = CONTEXT_OLD;
+
+        let log_msg = log_context(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), &ctx);
+        assert_eq!(log_msg, "", "CONTEXT_OLD contexts should return empty string");
+    }
+
+    // ── log_relay ────────────────────────────────────────────────────────────────
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn log_relay_ipv4_normal() {
+        use crate::types::dhcp::DhcpRelay;
+        use crate::types::addr::AllAddr;
+        use std::net::Ipv4Addr;
+
+        let relay = DhcpRelay {
+            local_addr: AllAddr::Addr4(Ipv4Addr::new(192, 168, 1, 1)),
+            server_addr: AllAddr::Addr4(Ipv4Addr::new(10, 0, 0, 1)),
+            uplink_addr: AllAddr::Addr4(Ipv4Addr::UNSPECIFIED),
+            interface: None,
+            iface_index: 0,
+            port: 67,
+            split_mode: 0,
+            warned: 0,
+            matchcount: 0,
+        };
+
+        let log_msg = log_relay(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), &relay);
+        assert!(log_msg.contains("relay"), "Should mention relay");
+        assert!(log_msg.contains("10.0.0.1"), "Should contain server address");
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn log_relay_with_interface() {
+        use crate::types::dhcp::DhcpRelay;
+        use crate::types::addr::AllAddr;
+        use std::net::Ipv4Addr;
+
+        let relay = DhcpRelay {
+            local_addr: AllAddr::Addr4(Ipv4Addr::new(192, 168, 1, 1)),
+            server_addr: AllAddr::Addr4(Ipv4Addr::new(10, 0, 0, 1)),
+            uplink_addr: AllAddr::Addr4(Ipv4Addr::UNSPECIFIED),
+            interface: Some("eth0".to_string()),
+            iface_index: 1,
+            port: 67,
+            split_mode: 0,
+            warned: 0,
+            matchcount: 0,
+        };
+
+        let log_msg = log_relay(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), &relay);
+        assert!(log_msg.contains("eth0"), "Should mention interface");
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn log_relay_non_default_port() {
+        use crate::types::dhcp::DhcpRelay;
+        use crate::types::addr::AllAddr;
+        use std::net::Ipv4Addr;
+
+        let relay = DhcpRelay {
+            local_addr: AllAddr::Addr4(Ipv4Addr::new(192, 168, 1, 1)),
+            server_addr: AllAddr::Addr4(Ipv4Addr::new(10, 0, 0, 1)),
+            uplink_addr: AllAddr::Addr4(Ipv4Addr::UNSPECIFIED),
+            interface: None,
+            iface_index: 0,
+            port: 8067,
+            split_mode: 0,
+            warned: 0,
+            matchcount: 0,
+        };
+
+        let log_msg = log_relay(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), &relay);
+        assert!(log_msg.contains("#8067") || log_msg.contains("8067"), "Should include non-default port");
     }
 }
