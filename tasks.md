@@ -369,9 +369,27 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     `check_for_local_domain` plus a `lookup_domain(F_CONFIG)` equivalent.
   - `is_sign`. C leaves the pseudoheader and the `AD` bit alone when the reply carries a
     TSIG/SIG(0) record; there is no TSIG support here, so the check is unconditional.
-  - `--add-subnet` reply verification (`check_source()`, `forward.c:727-731`) and the
-    `FREC_NO_CACHE` handling that goes with it. `edns0::check_source_subnet` and
-    `verify_ecs_reply` exist and are still uncalled.
+  - `--add-subnet` reply verification (`check_source()`, `forward.c:727-731`) is now wired:
+    `edns0::check_source` (a faithful two-mode port, replacing the old ad hoc
+    `verify_ecs_reply`) is called from `forward::process_reply`, gated on the new
+    `ForwardConfig::client_subnet`/`add_subnet4`/`add_subnet6` (threaded from `Daemon` in
+    `dnsmasq::daemon_forward_config`), against `ReplyContext::query_source` (the primary
+    client's address, C's `frec->frec_src.source`). `process_reply` now returns `bool`
+    (`false` = discard outright) and the reply loop in `run_forward_loop` skips delivery
+    when it does. `edns0::calc_subnet_opt` (port of `edns0.c:350-407`, including the
+    `add_subnet4`/`add_subnet6` constant-address override and its cacheability rule) backs
+    both `check_source` and the query-construction side. Still not wired: the *outgoing*
+    side. `edns0::add_edns0_config`/`add_client_subnet`/`add_mac`/`add_dns_client`/
+    `add_umbrella_opt`/`edns0_needs_mac` are ported (pure functions, fully unit-tested
+    against upstream's field-by-field wire format and cacheability rules) but nothing calls
+    them yet — there is no call site in the forward path that builds an outgoing query's
+    EDNS0 options at all (`--add-subnet`, `--add-mac`, `--mac-base64`/`--mac-hex`,
+    `--add-cpe-id`, `--umbrella` all remain no-ops on the request side), so `FREC_NO_CACHE`
+    is still never set. `Daemon` also has no `umbrella_org`/`umbrella_asset`/
+    `umbrella_device` fields yet (see the `umbrella` entry under "Unrecognized/no-op
+    directives" below) — `add_umbrella_opt` takes them as plain parameters so it doesn't
+    need those fields to be portable, but a real caller will need them threaded through
+    once the outgoing-query path exists.
   - ipset kernel population is now wired end to end: `rfc1035::extract_addresses` matches the
     query name against `ExtractConfig::ipsets` (a local `domain_find_sets`, duplicating
     `forward::domain_find_sets`/`IpSet` — nothing constructs an `IpSet` from parsed config,
@@ -756,9 +774,11 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     reason code whenever it has one (`forward.c:597-599`); this path has none of C's `ede`
     plumbing, so the OPT record it re-attaches is always empty.
   - **`FREC_NO_CACHE` is never set**, because `add_edns0_config` (`--add-subnet`,
-    `--add-mac`, `--add-cpe-id`) is not ported at all — no client-specific EDNS option is
-    ever added, so no query is contingent on one (`forward.c:1934-1939`). If those
-    directives land, the flag has to be set with them or such queries become eligible for
+    `--add-mac`, `--add-cpe-id`) has no call site on the outgoing-query path — `edns0::
+    add_edns0_config` itself is now ported (see the `edns0.c` entry above), but no
+    client-specific EDNS option is ever actually added to a forwarded query, so no query is
+    contingent on one (`forward.c:1934-1939`). If those directives land, the flag has to be
+    set with them or such queries become eligible for
     duplicate folding, which C forbids.
   - **`Frec::flags` carries only the four `fwd_flags` bits.** `FREC_NOREBIND`,
     `FREC_GONE_TO_TCP`, `FREC_ANSWER` and the DNSSEC sub-query flags are defined but never
@@ -914,7 +934,12 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   - `umbrella` (option.c:2808): only the top-level `OPT_UMBRELLA` bit is set.
     The `deviceid:`/`orgid:`/`assetid:`/`userid:` sub-options are not parsed;
     `Daemon` has no `umbrella_device`/`umbrella_org`/`umbrella_asset`/
-    `umbrella_user` fields yet.
+    `umbrella_user` fields yet. The option-payload side (`add_umbrella_opt`,
+    `edns0.c:517-574`) is now ported as `edns0::add_umbrella_opt`/
+    `add_edns0_config`, parameterized directly rather than reading `Daemon`, so
+    parsing these sub-options and threading them through is the only work left
+    to make `--umbrella orgid=...` etc. actually take effect — see the
+    `edns0.c` entry above for what's already wired vs. not.
   Required tests: once each backing field/list exists, add parser tests plus
   a `dhcp.rs`/`rfc2131.rs` consumer test.
   Done when: each directive above either updates real `Daemon` state consumed

@@ -583,8 +583,13 @@ pub async fn build_shared_cache(daemon_handle: &DaemonHandle) -> crate::cache::S
 /// function as well.
 pub fn daemon_forward_config(daemon: &Daemon) -> crate::forward::ForwardConfig {
     use crate::types::constants::{
-        OPT_CMARK_ALST_EN, OPT_CONNTRACK, OPT_DNSSEC_PROXY, OPT_DNSSEC_VALID, OPT_LOCAL_REBIND,
-        OPT_NO_NEG, OPT_NO_REBIND,
+        OPT_CLIENT_SUBNET, OPT_CMARK_ALST_EN, OPT_CONNTRACK, OPT_DNSSEC_PROXY, OPT_DNSSEC_VALID,
+        OPT_LOCAL_REBIND, OPT_NO_NEG, OPT_NO_REBIND,
+    };
+
+    let to_add_subnet_opt = |s: &crate::types::network::MySubnet| crate::edns0::AddSubnetOpt {
+        mask: s.mask.clamp(0, 255) as u8,
+        const_addr: s.addr_used.then(|| s.addr.ip()),
     };
 
     // `SERV_LITERAL_ADDRESS` entries (`local=/domain/` with no address,
@@ -633,6 +638,12 @@ pub fn daemon_forward_config(daemon: &Daemon) -> crate::forward::ForwardConfig {
         cmark_alst_en:  daemon.option_bool(OPT_CMARK_ALST_EN),
         allowlists:     daemon.allowlists.clone(),
         allowlist_mask: daemon.allowlist_mask,
+        // `--add-subnet`: gates `check_source()` reply verification
+        // (`forward.c:727`) and the constant-address override `calc_subnet_opt()`
+        // consults when building the ECS option to compare against.
+        client_subnet:  daemon.option_bool(OPT_CLIENT_SUBNET),
+        add_subnet4:    daemon.add_subnet4.as_ref().map(&to_add_subnet_opt),
+        add_subnet6:    daemon.add_subnet6.as_ref().map(&to_add_subnet_opt),
         ..Default::default()
     }
 }
