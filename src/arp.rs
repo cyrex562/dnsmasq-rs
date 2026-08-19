@@ -287,6 +287,27 @@ where
     None
 }
 
+/// Refresh the cache from the kernel if (and only if) it's stale, without
+/// looking anything up.
+///
+/// Mirrors upstream's `find_mac(NULL, NULL, 0, now)` (`arp.c:119-120,152-181`
+/// with `addr == NULL`): the main select loop calls this once per
+/// housekeeping tick when `OPT_SCRIPT_ARP` is set, purely to keep the cache
+/// — and thus the `old` deletion queue [`ArpCache::do_arp_script_run`]
+/// drains — current even when nothing is actively being looked up. A fresh
+/// cache is a no-op and never touches `enumerate`.
+pub fn refresh_if_stale<E>(cache: &mut ArpCache, now: u64, mut enumerate: E)
+where
+    E: FnMut(&mut ArpCache),
+{
+    if !cache.is_stale(now) {
+        return;
+    }
+    cache.begin_refresh(now);
+    enumerate(cache);
+    cache.finish_refresh();
+}
+
 /// The ARP cache plus its persistent kernel socket, bundled so runtime paths
 /// that don't carry a full `Daemon` (the forwarding loop only sees a
 /// `ForwardConfig` snapshot — see `dnsmasq::daemon_forward_config`) can still
@@ -313,6 +334,38 @@ pub fn new_shared_arp_state() -> SharedArpState {
     std::sync::Arc::new(std::sync::Mutex::new(ArpRuntimeState::default()))
 }
 
+/// Open the persistent netlink socket if it isn't already, mirroring
+/// `netlink_init()` populating `daemon->netlinkfd` once at startup
+/// (`netlink.c:60-92`). Returns the `(fd, pid)` handle to enumerate with, or
+/// `None` if no socket is open and none could be opened.
+#[cfg(target_os = "linux")]
+fn ensure_netlink_open(netlink: &mut Option<crate::netlink::NetlinkSocket>) -> Option<(i32, u32)> {
+    if netlink.is_none() {
+        match crate::netlink::open_netlink_socket() {
+            Ok(sock) => *netlink = Some(sock),
+            Err(e) => {
+                tracing::warn!("failed to open netlink socket for ARP cache: {e}");
+            }
+        }
+    }
+    netlink.as_ref().map(|s| (s.fd, s.pid))
+}
+
+/// Enumerate the kernel neighbour table into `cache` via `(fd, pid)`.
+/// Equivalent to `iface_enumerate(AF_UNSPEC, NULL, filter_mac)` (`arp.c:163`).
+#[cfg(target_os = "linux")]
+fn kernel_enumerate_into(cache: &mut ArpCache, fd: i32, pid: u32) {
+    // AF_UNSPEC (0) requests the neighbour table.
+    let _ = crate::netlink::iface_enumerate(fd, pid, 0, &mut |rec| {
+        if let crate::netlink::IfaceRecord::Arp { family, ip, mac } = rec {
+            if let Some(ip_addr) = crate::netlink::parse_ip(&ip, family) {
+                cache.filter_mac(ip_addr, &mac);
+            }
+        }
+        true
+    });
+}
+
 /// Real, Linux-backed [`find_mac`]: opens the persistent netlink socket on
 /// first use (mirroring `netlink_init()` populating `daemon->netlinkfd` once
 /// at startup, `netlink.c:60-92`) and drives a refresh via
@@ -333,30 +386,12 @@ fn find_mac_kernel_backed(
     lazy: bool,
     now: u64,
 ) -> Option<Vec<u8>> {
-    if netlink.is_none() {
-        match crate::netlink::open_netlink_socket() {
-            Ok(sock) => *netlink = Some(sock),
-            Err(e) => {
-                tracing::warn!("failed to open netlink socket for ARP cache: {e}");
-            }
-        }
-    }
-
-    let handle = netlink.as_ref().map(|s| (s.fd, s.pid));
+    let handle = ensure_netlink_open(netlink);
     let can_query_kernel = handle.is_some();
 
     find_mac(cache, addr, lazy, now, can_query_kernel, |cache| {
         let Some((fd, pid)) = handle else { return };
-        // AF_UNSPEC (0) requests the neighbour table, matching
-        // `iface_enumerate(AF_UNSPEC, NULL, filter_mac)` (`arp.c:163`).
-        let _ = crate::netlink::iface_enumerate(fd, pid, 0, &mut |rec| {
-            if let crate::netlink::IfaceRecord::Arp { family, ip, mac } = rec {
-                if let Some(ip_addr) = crate::netlink::parse_ip(&ip, family) {
-                    cache.filter_mac(ip_addr, &mac);
-                }
-            }
-            true
-        });
+        kernel_enumerate_into(cache, fd, pid);
     })
 }
 
@@ -398,6 +433,29 @@ pub fn find_mac_shared(state: &SharedArpState, addr: IpAddr, lazy: bool, now: u6
 pub fn find_mac_shared(_state: &SharedArpState, _addr: IpAddr, _lazy: bool, _now: u64) -> Option<Vec<u8>> {
     None
 }
+
+/// Kernel-backed [`refresh_if_stale`] against a [`SharedArpState`].
+///
+/// Mirrors upstream's periodic `if (option_bool(OPT_SCRIPT_ARP)) find_mac(NULL, NULL, 0, now);`
+/// (`dnsmasq.c:1173`), called by the daemon's housekeeping tick
+/// ([`crate::dnsmasq::spawn_arp_housekeeping_task`]) so the cache — and the
+/// `old` deletion queue [`ArpCache::do_arp_script_run`] drains from — stays
+/// current even when no lookup is in flight.
+#[cfg(target_os = "linux")]
+pub fn refresh_arp_cache_shared(state: &SharedArpState, now: u64) {
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    let ArpRuntimeState { cache, netlink } = &mut *guard;
+    if !cache.is_stale(now) {
+        return;
+    }
+    let Some((fd, pid)) = ensure_netlink_open(netlink) else { return };
+    refresh_if_stale(cache, now, |cache| kernel_enumerate_into(cache, fd, pid));
+}
+
+/// Non-Linux fallback for [`refresh_arp_cache_shared`]: no netlink support in
+/// this port, so there is nothing to refresh from.
+#[cfg(not(target_os = "linux"))]
+pub fn refresh_arp_cache_shared(_state: &SharedArpState, _now: u64) {}
 
 impl ArpCache {
     // ── Script notification ───────────────────────────────────────────────────
@@ -818,6 +876,72 @@ mod tests {
             daemon.arp_state.lock().unwrap().netlink.is_some(),
             "netlink socket should have been opened"
         );
+    }
+
+    // ── refresh_if_stale ──────────────────────────────────────────────────────
+
+    #[test]
+    fn refresh_if_stale_enumerates_when_stale() {
+        let mut cache = ArpCache::new(); // last_refresh = 0
+        let mut calls = 0;
+        refresh_if_stale(&mut cache, REFRESH_INTERVAL, |c| {
+            calls += 1;
+            c.filter_mac(v4(10, 0, 0, 1), MAC1);
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(cache.find_mac_cached(v4(10, 0, 0, 1), false), Some(MAC1));
+        assert_eq!(cache.last_refresh, REFRESH_INTERVAL);
+    }
+
+    #[test]
+    fn refresh_if_stale_does_nothing_when_fresh() {
+        let mut cache = ArpCache::new();
+        cache.begin_refresh(1000);
+        let mut called = false;
+        refresh_if_stale(&mut cache, 1000 + REFRESH_INTERVAL - 1, |_| called = true);
+        assert!(!called, "a fresh cache must not trigger a kernel refresh");
+    }
+
+    #[test]
+    fn refresh_if_stale_moves_unconfirmed_entries_to_old() {
+        // Mirrors `find_mac(NULL, NULL, 0, now)` (`arp.c:119-120,152-181`):
+        // a stale-triggered refresh with no matching kernel entries still
+        // expires unconfirmed entries to `old`, feeding `do_arp_script_run`'s
+        // deletion queue even though nothing was being looked up.
+        let mut cache = ArpCache::new();
+        cache.begin_refresh(0);
+        cache.filter_mac(v4(10, 0, 0, 1), MAC1);
+        cache.finish_refresh();
+
+        refresh_if_stale(&mut cache, REFRESH_INTERVAL, |_c| { /* kernel: no entries */ });
+
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.old_len(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refresh_arp_cache_shared_opens_socket_and_does_not_panic() {
+        let state = new_shared_arp_state();
+        assert!(state.lock().unwrap().netlink.is_none());
+        // now = REFRESH_INTERVAL against a fresh (last_refresh = 0) cache is
+        // stale, so this must touch the kernel.
+        refresh_arp_cache_shared(&state, REFRESH_INTERVAL);
+        assert!(
+            state.lock().unwrap().netlink.is_some(),
+            "netlink socket should have been opened by a stale refresh"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refresh_arp_cache_shared_does_not_open_socket_when_fresh() {
+        let state = new_shared_arp_state();
+        // now = 0 against a fresh (last_refresh = 0) cache is not stale, so
+        // this must not touch the kernel at all — matches upstream's
+        // `find_mac(NULL, ...)` returning immediately on a fresh cache.
+        refresh_arp_cache_shared(&state, 0);
+        assert!(state.lock().unwrap().netlink.is_none());
     }
 
     #[cfg(target_os = "linux")]

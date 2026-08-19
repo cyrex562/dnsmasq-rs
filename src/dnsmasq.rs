@@ -1634,11 +1634,22 @@ pub async fn run_main_loop_with(
     let inotify_task = spawn_inotify_watch_task(daemon_handle.clone(), cache.clone());
 
     // ── Spawn the forwarding engine ──────────────────────────────────────────
+    let arp_housekeeping_state = arp_state.clone();
     let fwd_task = tokio::spawn(async move {
         if let Err(e) = run_forward_loop_on(dns_listeners, arrival_filter, fwd_config, cache, arp_state).await {
             error!("forward loop exited: {e}");
         }
     });
+
+    // ── Spawn ARP-cache housekeeping ─────────────────────────────────────────
+    // Mirrors the two calls the upstream select loop makes every iteration
+    // (`dnsmasq.c:1172-1174`): keep the cache current and drain the
+    // add/delete script queue — see `spawn_arp_housekeeping_task` below.
+    let arp_task = spawn_arp_housekeeping_task(
+        daemon_handle.clone(),
+        arp_housekeeping_state,
+        std::time::Duration::from_secs(1),
+    );
 
     #[cfg(feature = "dhcp")]
     let (dhcp_task, dhcp_shutdown_tx) = if let Some(mut dhcp_runtime) = dhcp_runtime {
@@ -1661,6 +1672,7 @@ pub async fn run_main_loop_with(
             Err(e) => {
                 error!("failed to bind DHCP socket on {bind_addr}: {e}");
                 fwd_task.abort();
+                arp_task.abort();
                 return RunResult::IoError;
             }
         };
@@ -1673,6 +1685,7 @@ pub async fn run_main_loop_with(
                 if let Err(e) = bind_dhcp_socket_to_device(dhcp_sock.as_ref(), device) {
                     error!("failed to bind DHCP socket to interface {device}: {e}");
                     fwd_task.abort();
+                    arp_task.abort();
                     return RunResult::IoError;
                 }
             }
@@ -1782,6 +1795,7 @@ pub async fn run_main_loop_with(
                 task.abort();
             }
             fwd_task.abort();
+            arp_task.abort();
             return RunResult::IoError;
         }
     };
@@ -1816,6 +1830,7 @@ pub async fn run_main_loop_with(
                 task.abort();
             }
             fwd_task.abort();
+            arp_task.abort();
             return RunResult::IoError;
         }
     };
@@ -1849,6 +1864,7 @@ pub async fn run_main_loop_with(
     if let Some(task) = dbus_task {
         task.abort();
     }
+    arp_task.abort();
     #[cfg(feature = "dhcp")]
     {
         if let Some(tx) = dhcp_shutdown_tx {
@@ -1939,6 +1955,74 @@ pub fn spawn_alarm_task(
         loop {
             ticker.tick().await;
             on_alarm(&daemon_handle).await;
+        }
+    })
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ARP cache housekeeping
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// One tick of ARP-cache housekeeping.
+///
+/// Mirrors the two calls upstream's main select loop makes every iteration
+/// (`dnsmasq.c:1172-1174`):
+///
+/// ```c
+/// if (option_bool(OPT_SCRIPT_ARP))
+///   find_mac(NULL, NULL, 0, now);
+/// while (helper_buf_empty() && do_arp_script_run());
+/// ```
+///
+/// i.e. keep the cache current — via [`crate::arp::refresh_arp_cache_shared`]
+/// — even when nothing is actively being looked up, gated on `--script-arp`
+/// exactly like the kernel refresh is upstream, then always drain the
+/// add/delete queue via [`crate::arp::drain_arp_script_events`] (feature
+/// `dhcp`) so cache state (`Mark` → `old`, `New` → `Found`) advances
+/// regardless of whether the option is set — matching `do_arp_script_run`
+/// always popping/advancing while only `queue_arp()` is gated.
+///
+/// Drained events are logged rather than handed to a script helper: per
+/// `tasks.md`, nothing forks the privilege-dropped helper process from the
+/// main startup path yet, so there is no live `HelperHandle` to send them
+/// to. Wiring that up only needs to replace the log call below with
+/// `helper.send(&event)`.
+async fn arp_housekeeping_tick(daemon_handle: &DaemonHandle, arp_state: &crate::arp::SharedArpState) {
+    use crate::types::constants::OPT_SCRIPT_ARP;
+    use tracing::debug;
+
+    let script_arp = daemon_handle.read().await.option_bool(OPT_SCRIPT_ARP);
+    let now = crate::util::dnsmasq_time();
+
+    if script_arp {
+        crate::arp::refresh_arp_cache_shared(arp_state, now);
+    }
+
+    let mut guard = arp_state.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "dhcp")]
+    {
+        for event in crate::arp::drain_arp_script_events(&mut guard.cache, script_arp) {
+            debug!(?event, "ARP script event (no helper process forked yet — see tasks.md)");
+        }
+    }
+    #[cfg(not(feature = "dhcp"))]
+    {
+        while guard.cache.do_arp_script_run().is_some() {}
+    }
+}
+
+/// Spawn a background tokio task that calls [`arp_housekeeping_tick`] every
+/// `interval`. Returns a `JoinHandle` that can be aborted to stop it.
+pub fn spawn_arp_housekeeping_task(
+    daemon_handle: DaemonHandle,
+    arp_state: crate::arp::SharedArpState,
+    interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            arp_housekeeping_tick(&daemon_handle, &arp_state).await;
         }
     })
 }
@@ -3369,6 +3453,53 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         task.abort();
         // After abort, joining returns an error (cancelled).
+        assert!(task.await.is_err());
+    }
+
+    // ── ARP cache housekeeping ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn arp_housekeeping_tick_drains_the_script_queue() {
+        // Real, non-test-only proof that `do_arp_script_run` fires from
+        // production code (Issue #33 gap): seed a New entry directly, run one
+        // tick, then confirm the queue is already empty — the tick, not the
+        // test, must have been the thing that drained it.
+        let handle = init_daemon();
+        let arp_state = crate::arp::new_shared_arp_state();
+        {
+            let mut guard = arp_state.lock().unwrap();
+            guard.cache.begin_refresh(0);
+            guard.cache.filter_mac(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+                &[1, 2, 3, 4, 5, 6],
+            );
+            guard.cache.finish_refresh();
+        }
+
+        arp_housekeeping_tick(&handle, &arp_state).await;
+
+        let mut guard = arp_state.lock().unwrap();
+        assert_eq!(
+            guard.cache.do_arp_script_run(),
+            None,
+            "the tick should already have drained the New entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn arp_housekeeping_tick_does_not_panic_on_a_fresh_cache() {
+        let handle = init_daemon();
+        let arp_state = crate::arp::new_shared_arp_state();
+        arp_housekeeping_tick(&handle, &arp_state).await;
+    }
+
+    #[tokio::test]
+    async fn spawn_arp_housekeeping_task_can_be_aborted() {
+        let handle = init_daemon();
+        let arp_state = crate::arp::new_shared_arp_state();
+        let task = spawn_arp_housekeeping_task(handle, arp_state, std::time::Duration::from_millis(10));
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        task.abort();
         assert!(task.await.is_err());
     }
 
