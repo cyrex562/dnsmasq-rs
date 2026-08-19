@@ -1132,6 +1132,15 @@ pub struct ForwardConfig {
     pub conntrack: bool,
     /// `--ipset` (`daemon->ipsets`). See [`ExtractConfig::ipsets`].
     pub ipsets: Vec<Ipsets>,
+    /// `--connmark-allowlist-enable` (`OPT_CMARK_ALST_EN`): look up the
+    /// client connection's firewall mark on reply and, if it is allow-listed
+    /// for this query's answer, broadcast the resolved name(s) via ubus
+    /// (`report_addresses`, `rfc1035.c:1148-1218`).
+    pub cmark_alst_en: bool,
+    /// `--connmark-allowlist` entries (`daemon->allowlists`).
+    pub allowlists: Vec<crate::types::network::Allowlist>,
+    /// `--connmark-allowlist-enable`'s mask argument (`daemon->allowlist_mask`).
+    pub allowlist_mask: u32,
 }
 
 impl Default for ForwardConfig {
@@ -1162,6 +1171,9 @@ impl Default for ForwardConfig {
             port:          53,
             conntrack:     false,
             ipsets:        Vec::new(),
+            cmark_alst_en: false,
+            allowlists:    Vec::new(),
+            allowlist_mask: 0,
         }
     }
 }
@@ -1219,6 +1231,10 @@ pub struct ReplyTarget {
     pub listener: usize,
     /// The transaction ID this client used, restored into the reply.
     pub orig_id:  u16,
+    /// Destination address the original query arrived on (`frec_src.dest`).
+    /// Needed alongside `client` to look up this connection's firewall mark
+    /// for `--connmark-allowlist-enable` (`conntrack.c:37`, `forward.c:1439`).
+    pub dest:     Option<std::net::IpAddr>,
 }
 
 /// What the engine decided about an upstream datagram.
@@ -1558,6 +1574,7 @@ impl ForwardEngine {
                             client:   s.source?,
                             listener: if s.fd < 0 { 0 } else { s.fd as usize },
                             orig_id:  s.orig_id,
+                            dest:     s.dest,
                         })
                     })
                     .collect();
@@ -2198,12 +2215,24 @@ fn cache_upstream_reply(
     }
 
     let outcome = crate::cache::cache_reply(pkt, cache, &config.extract_config(&qname));
-    // Actually sending these to the kernel ipset/nftset is not yet
-    // implemented (raw netlink I/O) — see `tasks.md`. Logging them keeps the
-    // match observable and mirrors upstream's `log_query(F_IPSET, ...)`
-    // (`rfc1035.c:1017`), which fires on every successful add.
+    // Push each match into the kernel ipset, mirroring `add_to_ipset()`
+    // (`ipset.c:177-193`) being called from the `F_IPV4`/`F_IPV6` branch of
+    // `extract_addresses()` (`rfc1035.c:1016`). `nftset=` config parsing is
+    // explicitly rejected today (see `tasks.md`), so there is never an nftset
+    // hit to deliver here yet.
     for hit in &outcome.ipset_hits {
-        tracing::debug!(set = %hit.set_name, addr = %hit.addr, "matched configured ipset/nftset");
+        #[cfg(all(feature = "ipset", target_os = "linux"))]
+        {
+            if let Err(e) = crate::ipset::add_to_ipset(&hit.set_name, hit.addr, false) {
+                tracing::warn!(set = %hit.set_name, addr = %hit.addr, error = %e, "failed to update ipset");
+            } else {
+                tracing::debug!(set = %hit.set_name, addr = %hit.addr, "added to ipset");
+            }
+        }
+        #[cfg(not(all(feature = "ipset", target_os = "linux")))]
+        {
+            tracing::debug!(set = %hit.set_name, addr = %hit.addr, "matched configured ipset (ipset feature/platform not enabled)");
+        }
     }
     match outcome.result {
         ExtractResult::Cached => Ede::Unset,
@@ -2401,6 +2430,17 @@ pub async fn run_forward_loop_on(
 
                 // One upstream answer, one reply per waiting client, each under
                 // the ID that client used (`forward.c:1435-1440`).
+                //
+                // Parsed once, outside the per-client loop, purely for
+                // `report_addresses` (`forward.c:1439-1444`) — the answer
+                // section is identical for every target, only the wire
+                // transaction ID changes per client below.
+                #[cfg(all(feature = "conntrack", feature = "ubus"))]
+                let parsed_for_report = if engine.config.cmark_alst_en {
+                    crate::rfc1035::DnsPacket::parse(&pkt).ok()
+                } else {
+                    None
+                };
                 for target in targets {
                     let listener_idx = if target.listener < listeners.len() {
                         target.listener
@@ -2408,6 +2448,39 @@ pub async fn run_forward_loop_on(
                         0
                     };
                     patch_id(&mut pkt, target.orig_id);
+
+                    // `--connmark-allowlist-enable`: look up this client
+                    // connection's firewall mark and, if allow-listed,
+                    // broadcast the resolved names via ubus
+                    // (`forward.c:1439-1444`).
+                    #[cfg(all(feature = "conntrack", feature = "ubus"))]
+                    if engine.config.cmark_alst_en {
+                        if let (Some(dest), Some(parsed)) = (target.dest, parsed_for_report.as_ref()) {
+                            if let Some(mark) = crate::conntrack::get_incoming_mark(
+                                target.client,
+                                dest,
+                                /* istcp: */ false,
+                                engine.config.port,
+                            ) {
+                                if mark & engine.config.allowlist_mask != 0 {
+                                    for reported in crate::rfc1035::report_addresses(
+                                        parsed,
+                                        mark,
+                                        &engine.config.allowlists,
+                                        engine.config.allowlist_mask,
+                                    ) {
+                                        crate::ubus::ubus_event_bcast_connmark_allowlist_resolved(
+                                            mark,
+                                            &reported.name,
+                                            &reported.resolved,
+                                            reported.ttl,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let _ = listeners[listener_idx].sock.send_to(&pkt, target.client).await;
                 }
             }
@@ -3430,7 +3503,7 @@ mod tests {
         let reply = reply_for(&other, u16::MAX);
         let targets = delivered(engine.accept_reply(&reply, upstream_addr(), TEST_RFD_SLOT).await)
             .expect("0xFFFF must identify the query that actually used it");
-        assert_eq!(targets, vec![ReplyTarget { client: client_addr(), listener: 0, orig_id: 7 }]);
+        assert_eq!(targets, vec![ReplyTarget { client: client_addr(), listener: 0, orig_id: 7, dest: None }]);
     }
 
     #[tokio::test]
@@ -3515,8 +3588,8 @@ mod tests {
         assert_eq!(
             targets,
             vec![
-                ReplyTarget { client: client_addr(), listener: 0, orig_id: 42 },
-                ReplyTarget { client: second,        listener: 0, orig_id: 0xBEEF },
+                ReplyTarget { client: client_addr(), listener: 0, orig_id: 42, dest: None },
+                ReplyTarget { client: second,        listener: 0, orig_id: 0xBEEF, dest: None },
             ],
         );
     }
@@ -3587,7 +3660,7 @@ mod tests {
         reply[3] = (reply[3] & 0xF0) | 0x02; // SERVFAIL
         let targets = delivered(engine.accept_reply(&reply, upstream_addr(), TEST_RFD_SLOT).await)
             .expect("with nowhere left to retry the failure goes to the client");
-        assert_eq!(targets, vec![ReplyTarget { client: client_addr(), listener: 0, orig_id: 99 }]);
+        assert_eq!(targets, vec![ReplyTarget { client: client_addr(), listener: 0, orig_id: 99, dest: None }]);
     }
 
     #[tokio::test]

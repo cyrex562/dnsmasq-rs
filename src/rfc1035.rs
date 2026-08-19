@@ -1875,6 +1875,98 @@ pub fn log_txt(name: &str, rdata: &[u8]) -> bool {
     }
 }
 
+/// One CNAME/A/AAAA answer `report_addresses` decided is reportable: an owner
+/// name paired with its resolved target (a CNAME's target name, or a
+/// stringified A/AAAA address) and that record's TTL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportedAddress {
+    pub name:     String,
+    pub resolved: String,
+    pub ttl:      u32,
+}
+
+/// Decide which CNAME/A/AAAA answers in `packet` should be broadcast to ubus
+/// as connmark-allowlist-resolved events, for a client connection whose
+/// firewall mark is `mark`. Port of `report_addresses()`
+/// (`rfc1035.c:1148-1218`), driven from the reply-send path behind
+/// `--connmark-allowlist-enable` (`forward.c:604-611`, and the three
+/// analogous call sites at `forward.c:1447,1983,2744`).
+///
+/// Pure and always compiled — mirrors how `extract_addresses` reports
+/// `ipset_hits` for the caller to act on rather than reaching into the
+/// kernel itself. The actual ubus broadcast (`ubus_event_bcast_
+/// connmark_allowlist_resolved()`) is a caller concern, gated on the
+/// `conntrack`+`ubus` features the way upstream gates the whole function on
+/// `#if defined(HAVE_CONNTRACK) && defined(HAVE_UBUS)` (`rfc1035.c:1219`).
+///
+/// A wildcard (`"*"`) pattern in any allowlist entry whose `mark`/`mask`
+/// match this connection's mark suppresses the whole report
+/// (`rfc1035.c:1159-1163`) — that allowlist already permits everything, so
+/// there is nothing selective left to report.
+///
+/// Matches upstream's abort-on-malformed-record behavior: a CNAME whose
+/// rdata does not decode to a name, or an A/AAAA record whose rdata is not
+/// exactly 4/16 bytes, stops processing the rest of the answer section
+/// (`rfc1035.c:1172,1199,1208` all `return` rather than skip just that
+/// record).
+pub fn report_addresses(
+    packet: &DnsPacket,
+    mark: u32,
+    allowlists: &[crate::types::network::Allowlist],
+    allowlist_mask: u32,
+) -> Vec<ReportedAddress> {
+    let mut out = Vec::new();
+
+    if packet.header.rcode() != 0 /* NOERROR */ {
+        return out;
+    }
+
+    for al in allowlists {
+        if al.mark == (mark & allowlist_mask & al.mask) && al.patterns.iter().any(|p| p == "*") {
+            return out;
+        }
+    }
+
+    for rr in &packet.answers {
+        if rr.class != 1 /* C_IN */ {
+            continue;
+        }
+        match rr.rtype {
+            5 /* CNAME */ => match extract_name(&rr.rdata, &mut 0) {
+                Ok(target) => {
+                    if safe_name(&rr.name) && safe_name(&target) {
+                        out.push(ReportedAddress { name: rr.name.clone(), resolved: target, ttl: rr.ttl });
+                    }
+                }
+                Err(_) => return out,
+            },
+            1 /* A */ => {
+                if rr.rdata.len() != 4 {
+                    return out;
+                }
+                let addr = Ipv4Addr::new(rr.rdata[0], rr.rdata[1], rr.rdata[2], rr.rdata[3]);
+                if safe_name(&rr.name) {
+                    out.push(ReportedAddress { name: rr.name.clone(), resolved: addr.to_string(), ttl: rr.ttl });
+                }
+            }
+            28 /* AAAA */ => {
+                if rr.rdata.len() != 16 {
+                    return out;
+                }
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&rr.rdata);
+                let addr = Ipv6Addr::from(octets);
+                if safe_name(&rr.name) {
+                    out.push(ReportedAddress { name: rr.name.clone(), resolved: addr.to_string(), ttl: rr.ttl });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out
+}
+
 /// Check if a cache record is stale (TTL expired).
 ///
 /// Returns true if the record is not immortal and its TTD is in the past.
@@ -3613,6 +3705,162 @@ mod tests {
     fn log_txt_returns_false_for_malformed_payload() {
         let data = [10, b'x'];
         assert!(!log_txt("example.com", &data));
+    }
+
+    // ── report_addresses ────────────────────────────────────────────────────
+
+    use crate::types::network::Allowlist;
+
+    fn cname_rdata(target: &str) -> Vec<u8> {
+        let mut bm = BytesMut::new();
+        write_name(&mut bm, target);
+        bm.to_vec()
+    }
+
+    #[test]
+    fn report_addresses_returns_empty_for_non_noerror_rcode() {
+        let mut pkt = reply_header(1, 1, 1, 0, 2 /* SERVFAIL */);
+        push_question(&mut pkt, "example.com", 1);
+        push_rr(&mut pkt, "example.com", 1, 300, &[1, 2, 3, 4]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        assert!(report_addresses(&dp, 6, &[], 0).is_empty());
+    }
+
+    #[test]
+    fn report_addresses_reports_an_a_record() {
+        let mut pkt = reply_header(1, 1, 1, 0, 0);
+        push_question(&mut pkt, "example.com", 1);
+        push_rr(&mut pkt, "example.com", 1, 300, &[93, 184, 216, 34]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        let out = report_addresses(&dp, 6, &[], 0);
+        assert_eq!(
+            out,
+            vec![ReportedAddress {
+                name:     "example.com".to_string(),
+                resolved: "93.184.216.34".to_string(),
+                ttl:      300,
+            }]
+        );
+    }
+
+    #[test]
+    fn report_addresses_reports_an_aaaa_record() {
+        let ip6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let mut pkt = reply_header(1, 1, 1, 0, 0);
+        push_question(&mut pkt, "example.com", 28);
+        push_rr(&mut pkt, "example.com", 28, 300, &ip6.octets());
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        let out = report_addresses(&dp, 6, &[], 0);
+        assert_eq!(out, vec![ReportedAddress {
+            name:     "example.com".to_string(),
+            resolved: "2001:db8::1".to_string(),
+            ttl:      300,
+        }]);
+    }
+
+    #[test]
+    fn report_addresses_reports_a_cname_target() {
+        let mut pkt = reply_header(1, 1, 1, 0, 0);
+        push_question(&mut pkt, "alias.example.com", 5);
+        push_rr(&mut pkt, "alias.example.com", 5, 300, &cname_rdata("target.example.com"));
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        let out = report_addresses(&dp, 6, &[], 0);
+        assert_eq!(out, vec![ReportedAddress {
+            name:     "alias.example.com".to_string(),
+            resolved: "target.example.com".to_string(),
+            ttl:      300,
+        }]);
+    }
+
+    #[test]
+    fn report_addresses_wildcard_allowlist_suppresses_the_whole_report() {
+        let mut pkt = reply_header(1, 1, 1, 0, 0);
+        push_question(&mut pkt, "example.com", 1);
+        push_rr(&mut pkt, "example.com", 1, 300, &[1, 2, 3, 4]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        let allowlists = vec![Allowlist { mark: 6, mask: 0xff, patterns: vec!["*".to_string()] }];
+        assert!(report_addresses(&dp, 6, &allowlists, 0xff).is_empty());
+    }
+
+    #[test]
+    fn report_addresses_non_wildcard_allowlist_does_not_suppress() {
+        let mut pkt = reply_header(1, 1, 1, 0, 0);
+        push_question(&mut pkt, "example.com", 1);
+        push_rr(&mut pkt, "example.com", 1, 300, &[1, 2, 3, 4]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        let allowlists = vec![Allowlist {
+            mark: 6,
+            mask: 0xff,
+            patterns: vec!["*.example.com".to_string()],
+        }];
+        assert_eq!(report_addresses(&dp, 6, &allowlists, 0xff).len(), 1);
+    }
+
+    #[test]
+    fn report_addresses_a_non_matching_allowlist_mark_does_not_suppress() {
+        let mut pkt = reply_header(1, 1, 1, 0, 0);
+        push_question(&mut pkt, "example.com", 1);
+        push_rr(&mut pkt, "example.com", 1, 300, &[1, 2, 3, 4]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        // Allowlist matches mark 7, not the connection's mark of 6.
+        let allowlists = vec![Allowlist { mark: 7, mask: 0xff, patterns: vec!["*".to_string()] }];
+        assert_eq!(report_addresses(&dp, 6, &allowlists, 0xff).len(), 1);
+    }
+
+    #[test]
+    fn report_addresses_ignores_non_in_class_records() {
+        let mut pkt = reply_header(1, 1, 1, 0, 0);
+        push_question(&mut pkt, "example.com", 1);
+        let mut bm = BytesMut::new();
+        write_name(&mut bm, "example.com");
+        pkt.extend_from_slice(&bm);
+        pkt.extend_from_slice(&1u16.to_be_bytes()); // type A
+        pkt.extend_from_slice(&3u16.to_be_bytes()); // class CH, not IN
+        pkt.extend_from_slice(&300u32.to_be_bytes());
+        pkt.extend_from_slice(&4u16.to_be_bytes());
+        pkt.extend_from_slice(&[1, 2, 3, 4]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        assert!(report_addresses(&dp, 6, &[], 0).is_empty());
+    }
+
+    #[test]
+    fn report_addresses_aborts_the_rest_of_the_answer_on_a_malformed_a_record() {
+        // A well-formed CNAME first, then an A record with a truncated
+        // address — upstream returns outright rather than skipping just the
+        // bad record (`rfc1035.c:1198-1199`), so only the CNAME survives.
+        let mut pkt = reply_header(1, 1, 2, 0, 0);
+        push_question(&mut pkt, "alias.example.com", 1);
+        push_rr(&mut pkt, "alias.example.com", 5, 300, &cname_rdata("target.example.com"));
+        push_rr(&mut pkt, "target.example.com", 1, 300, &[1, 2, 3]); // only 3 bytes
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        let out = report_addresses(&dp, 6, &[], 0);
+        assert_eq!(out, vec![ReportedAddress {
+            name:     "alias.example.com".to_string(),
+            resolved: "target.example.com".to_string(),
+            ttl:      300,
+        }]);
+    }
+
+    #[test]
+    fn report_addresses_filters_unsafe_names() {
+        // A name containing a raw control byte fails `safe_name` and must not
+        // be reported (`rfc1035.c:1201,1211`), even though the record itself
+        // is otherwise well-formed.
+        let mut pkt = reply_header(1, 1, 1, 0, 0);
+        push_question(&mut pkt, "example.com", 1);
+        push_rr(&mut pkt, "b\u{01}d.example.com", 1, 300, &[1, 2, 3, 4]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        assert!(report_addresses(&dp, 6, &[], 0).is_empty());
     }
 
     // ── crec_isstale ─────────────────────────────────────────────────────────

@@ -578,8 +578,8 @@ pub async fn build_shared_cache(daemon_handle: &DaemonHandle) -> crate::cache::S
 /// function as well.
 pub fn daemon_forward_config(daemon: &Daemon) -> crate::forward::ForwardConfig {
     use crate::types::constants::{
-        OPT_CONNTRACK, OPT_DNSSEC_PROXY, OPT_DNSSEC_VALID, OPT_LOCAL_REBIND, OPT_NO_NEG,
-        OPT_NO_REBIND,
+        OPT_CMARK_ALST_EN, OPT_CONNTRACK, OPT_DNSSEC_PROXY, OPT_DNSSEC_VALID, OPT_LOCAL_REBIND,
+        OPT_NO_NEG, OPT_NO_REBIND,
     };
 
     // `SERV_LITERAL_ADDRESS` entries (`local=/domain/` with no address,
@@ -625,6 +625,9 @@ pub fn daemon_forward_config(daemon: &Daemon) -> crate::forward::ForwardConfig {
         port:           daemon.port,
         conntrack:      daemon.option_bool(OPT_CONNTRACK),
         ipsets:         daemon.ipsets.clone(),
+        cmark_alst_en:  daemon.option_bool(OPT_CMARK_ALST_EN),
+        allowlists:     daemon.allowlists.clone(),
+        allowlist_mask: daemon.allowlist_mask,
         ..Default::default()
     }
 }
