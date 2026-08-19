@@ -1000,6 +1000,13 @@ pub struct LocalData {
     /// Sorted lookup table built once from `address_server_list` — see
     /// [`crate::rfc1035::LocalConfig::address_servers`].
     pub address_servers: crate::domain_match::ServerArray,
+    /// Domains with a `SERV_LITERAL_ADDRESS` server entry and no upstream —
+    /// see [`crate::rfc1035::LocalConfig::literal_domains`].
+    pub literal_domains: Vec<String>,
+    /// `--cache-size` — see [`crate::rfc1035::LocalConfig::cachesize`].
+    pub cachesize: i32,
+    /// `--log-queries` options — see [`crate::rfc1035::LocalConfig::log_opts`].
+    pub log_opts: crate::cache::LogQueryOptions,
 }
 
 impl Default for LocalData {
@@ -1021,6 +1028,9 @@ impl Default for LocalData {
             synth_domains: Vec::new(),
             address_server_list: Vec::new(),
             address_servers: crate::domain_match::ServerArray::build(&[], &[]),
+            literal_domains: Vec::new(),
+            cachesize:     DEFAULT_CACHE_SIZE as i32,
+            log_opts:      crate::cache::LogQueryOptions::default(),
         }
     }
 }
@@ -1043,6 +1053,9 @@ impl LocalData {
             synth_domains: &self.synth_domains,
             address_servers: &self.address_servers,
             address_server_list: &self.address_server_list,
+            literal_domains: &self.literal_domains,
+            cachesize:     self.cachesize,
+            log_opts:      self.log_opts,
         }
     }
 

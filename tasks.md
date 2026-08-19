@@ -458,12 +458,77 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     (`rfc1035.c:620`).
   - `log_txt` (`rfc1035.rs`, port of `rfc1035.c:653-682`) truncates each TXT string at its first
     non-printable byte and logs via `tracing::debug!` per string, called from
-    `extract_addresses`'s TXT branch. C logs through its general `log_query()` facility, which
-    this crate does not have (`grep -rn "fn log_query"` finds nothing outside
-    `forward::log_query_mysockaddr`, an unrelated helper) — `answer_request`'s local-config TXT
-    branch (`rfc1035.c`'s second `log_txt` call site, serving from cache/local data) does not
-    call `log_txt` yet, so TXT answers built from `--txt-record` are not logged the way a
-    forwarded TXT reply now is.
+    `extract_addresses`'s TXT branch. `answer_request`'s local-config TXT branch (`rfc1035.c`'s
+    second `log_txt` call site, serving from cache/local data) still does not call `log_txt`, so
+    TXT answers built from `--txt-record` are not logged the way a forwarded TXT reply is — this
+    is unrelated to `log_query` below, which now exists and is wired into the same branch.
+  - **`log_query` (Issue #23 / T3-cache) — implemented in `cache.rs`, wired into a representative
+    subset of real call sites, not exhaustive.** `crate::cache::log_query` is a faithful,
+    unit-tested port of `cache.c:2311-2500` (all `OPT_LOG`/`OPT_LOG_ONLY_FAILED`/`OPT_AUTH_LOG`
+    gates, the full `source`/`name`/`verb`/`dest`/`extra` flag matrix including `F_IPSET`,
+    `F_KEYTAG`, `F_RCODE`+EDE, `F_REVERSE`, the `OPT_EXTRALOG` two-branch format) — see
+    `cache::tests::log_query_*`. It is a pure function returning `Option<String>`
+    (`LogQueryOptions` gates it, no hidden global state) rather than calling `my_syslog`
+    directly, so callers own emission; `rfc1035::answer_request` wires it into: the config/cached
+    CNAME chain, cached NXDOMAIN, local TXT/MX/SRV/NAPTR records, host_records and cached A/AAAA
+    (positive and negative), PTR from host_records/cache, `--domain-needed`'s local NXDOMAIN/NOERR
+    decision, and the new CHAOS NOTIMP fallback. **Not wired**: `forward.rs`'s forward-to-upstream
+    (`F_SERVER`) and reply-received (`F_UPSTREAM`) paths — `forward::log_query_mysockaddr` already
+    builds the right `(flags, addr, port)` tuple but still has no caller; `dnssec.rs`/`auth.rs`
+    validation-result logging (`F_SECSTAT`/`F_DNSSEC`); ipset/nftset match logging (`F_IPSET`,
+    logic ported and tested but no live call site); the freeform `ptr_records` branch (no clean
+    address to attach); ANY of the auth-server (`auth.rs`) answer paths. `log_query`'s
+    `id`/`source_addr` parameters (the `OPT_EXTRALOG` `<id> <addr>/<port>` prefix) are always
+    passed `0`/`None` from `answer_request` — there is no per-transaction display-id counter or
+    client-address threading into that call site yet (`answer_request` never receives the
+    client's socket address), so extralog output is well-formed but the id is always `0`.
+  - **Transactional insert (Issue #23 / T3-cache) — implemented.** `DnsCache::start_insert` /
+    `stage_insert` / `end_insert` (`cache.rs`) port `cache_start_insert`/`cache_insert`/
+    `cache_end_insert` (`cache.c:646-905`): a sticky `insert_error` flag makes every `stage_insert`
+    after the first failure a no-op, and `end_insert` discards the *whole* batch when any record
+    in it failed, instead of the previous behaviour where `rfc1035::commit_staged` committed each
+    staged record independently via `really_insert` in a loop (so a CNAME ahead of a rejected
+    terminal record stayed live, pointing at nothing). `commit_staged` now uses the transactional
+    API. `really_insert` still exists as a single-record transaction (used by the one remaining
+    direct caller, the SOA negative-cache insert in `answer_request`'s domain-needed path, and by
+    ~15 existing unit tests) and is unaffected by any concurrently-open `stage_insert` batch.
+  - **`is_outdated_cname_pointer` (Issue #23 / T3-cache) — implemented, exercises a code path no
+    current caller reaches.** `DnsCache::is_outdated_cname_pointer` ports `cache.c:449-462` and is
+    applied inside `end_insert`. Every CNAME this crate constructs sets `CnameAddr::is_name_ptr =
+    true` (the target is always resolved by a fresh name lookup, never a cached raw pointer into
+    another `crec` slot), so the stale-pointer bug class C guards against cannot occur through any
+    real call site today — the `is_name_ptr == false` branch (checked against `uid`/target
+    liveness) is implemented and unit-tested (`pointer_cname_with_stale_uid_is_dropped`,
+    `pointer_cname_with_missing_target_is_dropped`) but currently dead code, kept for parity if
+    that representation is ever added.
+  - **`cache_make_stat` / built-in `.bind` stat TXT records (Issue #23 / T3-cache) — partially
+    implemented.** `crate::cache::cache_make_stat` ports `cache.c:1906-1996` for
+    `cachesize.bind`/`insertions.bind`/`evictions.bind`/`misses.bind`/`hits.bind` (dynamic TXT
+    content from the live `METRIC_DNS_CACHE_INSERTED`/`METRIC_DNS_CACHE_LIVE_FREED`/
+    `METRIC_DNS_QUERIES_FORWARDED`/`METRIC_DNS_LOCAL_ANSWERED` counters, matching upstream's own
+    somewhat confusing naming — `misses.bind`/`hits.bind` are forwarded-vs-locally-answered query
+    counts, not literal cache hit/miss counts, upstream included). `dnsmasq::daemon_local_data`
+    registers these five as CHAOS-class synthetic TXT records unless `--no-ident` is set
+    (`option.c:6097-6113`), and `answer_request`'s TXT branch (now reachable for CHAOS queries —
+    see below) renders them dynamically with `ttl=0`, matching `rfc1035.c:1736-1743`. **Not
+    ported**: `version.bind`/`authors.bind`/`copyright.bind` (static text, unrelated to caching —
+    no `TXT_STAT_*` involved, just plain `add_txt` calls) and `TXT_STAT_AUTH`/`TXT_STAT_SERVERS`
+    (need an auth-query counter and per-upstream-server query/failure counters this crate does not
+    track anywhere yet).
+  - **CHAOS-class query handling fixed as a side effect of the above.** `answer_request` used to
+    special-case `qclass == 3` before any local-answer attempt and always return NOTIMP for
+    `*.bind`/`*.server`-suffixed names, which meant a configured CHAOS TXT record (or the new
+    built-in stat records) could never actually answer a CHAOS query — dead code from the moment
+    any CHAOS TXT record existed. It now matches upstream's real structure (`rfc1035.c`: local-data
+    branches run for both IN and CHAOS, gated per-section by `qclass == C_IN` only where C gates
+    them; the CHAOS NOTIMP fallback runs last, only `if !ans`). One upstream quirk is preserved
+    deliberately, not fixed: the NOTIMP fallback calls `hostname_issubdomain("bind", name)` with
+    the arguments in the opposite order from every other call site in C, so it only matches the
+    literal names `"bind"`/`"server"`, never an actual `*.bind` subdomain query — see the comment
+    at the call site in `answer_request` for the full trace. Also fixed in passing: the TXT
+    answer's wire-format `class` field was hardcoded to `1` (IN) even when serving a CHAOS-class
+    record, which would have produced a malformed CHAOS reply the first time this path became
+    reachable.
   - `check_for_local_domain` now checks `daemon->int_names` (`--interface-name`) for a
     domain-suffix match, matching upstream — but only for the domain-needed NOERR/NXDOMAIN
     decision. Actually *answering* an A/AAAA/PTR query for an interface-name domain with the

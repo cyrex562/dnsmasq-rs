@@ -603,10 +603,15 @@ struct DhcpDaemonRuntime {
 pub fn daemon_local_data(daemon: &Daemon) -> crate::forward::LocalData {
     let address_server_list = literal_servers(daemon);
     let address_servers = crate::domain_match::ServerArray::build(&[], &address_server_list);
+    let ident = !daemon.option_bool(crate::types::constants::OPT_NO_IDENT);
+    let mut txt_records = daemon.txt.clone();
+    if ident {
+        txt_records.extend(builtin_stat_txt_records());
+    }
     crate::forward::LocalData {
         local_ttl:     daemon.local_ttl,
         edns_pktsz:    daemon.edns_pktsz,
-        txt_records:   daemon.txt.clone(),
+        txt_records,
         rr_records:    daemon.rr.clone(),
         mx_records:    daemon.mxnames.clone(),
         ptr_records:   daemon.ptr.clone(),
@@ -618,7 +623,53 @@ pub fn daemon_local_data(daemon: &Daemon) -> crate::forward::LocalData {
         synth_domains: daemon.synth_domains.clone(),
         address_servers,
         address_server_list,
+        literal_domains: literal_server_domains(daemon),
+        cachesize:     daemon.cachesize,
+        log_opts: crate::cache::LogQueryOptions {
+            log:            daemon.option_bool(crate::types::constants::OPT_LOG),
+            log_only_failed: daemon.option_bool(crate::types::constants::OPT_LOG_ONLY_FAILED),
+            auth_log:       daemon.option_bool(crate::types::constants::OPT_AUTH_LOG),
+            extralog:       daemon.option_bool(crate::types::constants::OPT_EXTRALOG),
+            log_proto:      daemon.option_bool(crate::types::constants::OPT_LOG_PROTO),
+        },
     }
+}
+
+/// Build the synthetic `cachesize.bind` / `insertions.bind` / `evictions.bind`
+/// / `misses.bind` / `hits.bind` CHAOS TXT records `answer_request` renders
+/// dynamically via `cache_make_stat`.  Port of the `add_txt(..., TXT_STAT_*)`
+/// calls at startup (`option.c:6103-6107`), minus `version.bind`/
+/// `authors.bind`/`copyright.bind` (static text, not cache-related — see
+/// `tasks.md`) and `auth.bind`/`servers.bind` (need counters this crate does
+/// not track yet).
+fn builtin_stat_txt_records() -> Vec<crate::types::dns_records::TxtRecord> {
+    use crate::cache::{TXT_STAT_CACHESIZE, TXT_STAT_EVICTIONS, TXT_STAT_HITS, TXT_STAT_INSERTS, TXT_STAT_MISSES};
+    use crate::types::dns_records::TxtRecord;
+    const CHAOS: u16 = 3;
+    [
+        ("cachesize.bind",  TXT_STAT_CACHESIZE),
+        ("insertions.bind", TXT_STAT_INSERTS),
+        ("evictions.bind",  TXT_STAT_EVICTIONS),
+        ("misses.bind",     TXT_STAT_MISSES),
+        ("hits.bind",       TXT_STAT_HITS),
+    ]
+    .into_iter()
+    .map(|(name, stat)| TxtRecord { name: name.to_string(), txt: Vec::new(), class: CHAOS, stat })
+    .collect()
+}
+
+/// Domains from `daemon.servers` entries with `SERV_LITERAL_ADDRESS` set
+/// (no real upstream) — these are never forwarded.  Shared by
+/// [`daemon_local_data`] (answers them NXDOMAIN) and [`daemon_forward_config`]
+/// (excludes them from the upstream list).
+fn literal_server_domains(daemon: &Daemon) -> Vec<String> {
+    use crate::types::server::SERV_LITERAL_ADDRESS;
+    daemon
+        .servers
+        .iter()
+        .filter(|s| s.flags & SERV_LITERAL_ADDRESS != 0 && !s.domain.is_empty())
+        .map(|s| s.domain.clone())
+        .collect()
 }
 
 /// `daemon.servers` entries with `SERV_LITERAL_ADDRESS` set (`--address=`,
@@ -2848,7 +2899,8 @@ mod tests {
         assert_eq!(local.local_ttl, 60);
         assert_eq!(local.host_records.len(), 1);
         assert_eq!(local.cnames.len(), 1);
-        assert_eq!(local.txt_records.len(), 1);
+        // 1 configured + 5 built-in `*.bind` stat records (`--no-ident` unset).
+        assert_eq!(local.txt_records.len(), 6);
         assert_eq!(local.rr_records.len(), 1);
         assert_eq!(local.mx_records.len(), 1);
         assert_eq!(local.ptr_records.len(), 1);
@@ -2859,7 +2911,28 @@ mod tests {
 
     #[test]
     fn daemon_local_data_empty_by_default() {
-        assert!(daemon_local_data(&Daemon::default()).is_empty());
+        // No configured local data — but the built-in `*.bind` stat records
+        // are always present unless `--no-ident` is set (`option.c:6097-6113`),
+        // so `txt_records` alone is not literally empty even though nothing
+        // was configured.
+        let local = daemon_local_data(&Daemon::default());
+        assert_eq!(local.txt_records.len(), 5);
+        assert!(local.rr_records.is_empty());
+        assert!(local.mx_records.is_empty());
+        assert!(local.ptr_records.is_empty());
+        assert!(local.host_records.is_empty());
+        assert!(local.cnames.is_empty());
+        assert!(local.naptr_records.is_empty());
+        assert!(local.int_names.is_empty());
+    }
+
+    #[test]
+    fn daemon_local_data_no_ident_suppresses_builtin_stat_records() {
+        let lines = crate::option::parse_config_text("no-ident", "test").unwrap();
+        let mut daemon = Daemon::default();
+        crate::option::apply_config(&mut daemon, &lines).unwrap();
+        let local = daemon_local_data(&daemon);
+        assert!(local.txt_records.is_empty());
     }
 
     /// Every knob `process_reply` consults has to survive the trip from a

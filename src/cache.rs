@@ -12,8 +12,10 @@ use lru::LruCache;
 use crate::metrics::{inc_metric, Metric};
 use crate::types::addr::AllAddr;
 use crate::types::constants::{
-    F_CNAME, F_CONFIG, F_DHCP, F_DNSSEC, F_DNSKEY, F_DS, F_FORWARD, F_HOSTS, F_IMMORTAL,
-    F_IPV4, F_IPV6, F_NEG, F_NXDOMAIN, F_REVERSE, F_RR, UID_NONE,
+    F_AUTH, F_CNAME, F_CONFIG, F_DHCP, F_DNSSEC, F_DNSKEY, F_DNSSECOK, F_DS, F_FORWARD, F_HOSTS,
+    F_IMMORTAL, F_IPSET, F_IPV4, F_IPV6, F_KEYTAG, F_NEG, F_NOERR, F_NOEXTRA, F_NXDOMAIN,
+    F_QUERY, F_RCODE, F_REVERSE, F_RR, F_RRNAME, F_SECSTAT, F_SERVER, F_STALE, F_UPSTREAM,
+    UID_NONE,
 };
 
 // ---------------------------------------------------------------------------
@@ -121,6 +123,13 @@ pub enum InsertOutcome {
     CachingDisabled,
 }
 
+/// Result of [`DnsCache::prepare_insert`]: a record ready to commit, either
+/// as new content or as a no-op confirming an identical existing record.
+enum PreparedInsert {
+    New(CacheRecord),
+    SameAddr(CacheRecord),
+}
+
 pub struct DnsCache {
     max_size: usize,
     records:  LruCache<CacheKey, CacheRecord>,
@@ -134,6 +143,17 @@ pub struct DnsCache {
     pub evictions: u64,
     pub hits:      u64,
     pub misses:    u64,
+    /// Records staged by [`Self::stage_insert`] since the last
+    /// [`Self::start_insert`], not yet linked into the live cache.  Mirrors
+    /// C's file-static `new_chain` (`cache.c:634`).
+    new_chain: Vec<CacheRecord>,
+    /// Sticky failure flag for the current insert transaction.  Once set by a
+    /// failed [`Self::stage_insert`], every subsequent `stage_insert` call in
+    /// the same transaction is a no-op, and [`Self::end_insert`] discards the
+    /// whole batch instead of committing it.  Mirrors C's file-static
+    /// `insert_error` (`cache.c:635`, `really_insert()`'s
+    /// `if (insert_error) return NULL;` at `cache.c:700-701`).
+    insert_error: bool,
 }
 
 /// A [`DnsCache`] shared between the forwarding loop and reload handling.
@@ -209,6 +229,8 @@ impl DnsCache {
             evictions: 0,
             hits:      0,
             misses:    0,
+            new_chain: Vec::new(),
+            insert_error: false,
         }
     }
 
@@ -261,7 +283,37 @@ impl DnsCache {
     /// Only DNS-answer records (`!F_HOSTS & !F_DHCP & !F_CONFIG`) go through
     /// TTL clamping.  Static records are inserted directly (same as calling
     /// [`insert`] directly).
-    pub fn really_insert(&mut self, mut rec: CacheRecord, now: Instant) -> InsertOutcome {
+    ///
+    /// This is a single-record transaction: equivalent to calling
+    /// [`Self::start_insert`], [`Self::stage_insert`] once, then
+    /// [`Self::end_insert`].  For a multi-record batch (e.g. a CNAME chain
+    /// plus its terminal answer) that must commit or discard together, use
+    /// the transactional API directly instead of calling this in a loop —
+    /// see [`Self::stage_insert`] for why.
+    pub fn really_insert(&mut self, rec: CacheRecord, now: Instant) -> InsertOutcome {
+        match self.prepare_insert(rec, now) {
+            Ok(PreparedInsert::New(r)) => {
+                self.insert(r);
+                InsertOutcome::Inserted
+            }
+            Ok(PreparedInsert::SameAddr(r)) => {
+                // Matches C's `really_insert()` returning the existing `crec`
+                // unmodified (`cache.c:719-727`): nothing new to commit.
+                let _ = r;
+                InsertOutcome::BlockedSameAddr
+            }
+            Err(outcome) => outcome,
+        }
+    }
+
+    /// Validate and prepare `rec` for insertion, without committing it.
+    ///
+    /// Shared core of [`Self::really_insert`] (immediate, single-record) and
+    /// [`Self::stage_insert`] (transactional, multi-record).  Port of the
+    /// validation portion of C's `really_insert()` (`cache.c:690-837`), minus
+    /// the final `cache_hash()`/`cache_link()` step, which C also defers to
+    /// `cache_end_insert()`.
+    fn prepare_insert(&mut self, mut rec: CacheRecord, now: Instant) -> Result<PreparedInsert, InsertOutcome> {
         use crate::types::constants::{F_DNSKEY, F_DS};
 
         let is_static = (rec.flags & (F_HOSTS | F_DHCP | F_CONFIG)) != 0;
@@ -284,7 +336,7 @@ impl DnsCache {
 
             // Reject zero-TTL records (no stale-caching support yet).
             if rec.ttl == 0 && (rec.flags & F_IMMORTAL) == 0 {
-                return InsertOutcome::ZeroTtlDropped;
+                return Err(InsertOutcome::ZeroTtlDropped);
             }
 
             // Recompute expiry after TTL clamping.
@@ -303,23 +355,126 @@ impl DnsCache {
                     // Incoming DNS answer — check if address matches.
                     match (&existing.addr, &rec.addr) {
                         (Some(AllAddr::Addr4(ex)), Some(AllAddr::Addr4(r))) if ex == r => {
-                            return InsertOutcome::BlockedSameAddr;
+                            return Ok(PreparedInsert::SameAddr(rec));
                         }
                         (Some(AllAddr::Addr6(ex)), Some(AllAddr::Addr6(r))) if ex == r => {
-                            return InsertOutcome::BlockedSameAddr;
+                            return Ok(PreparedInsert::SameAddr(rec));
                         }
-                        _ => return InsertOutcome::BlockedConflict,
+                        _ => return Err(InsertOutcome::BlockedConflict),
                     }
                 }
             }
         }
 
         if self.max_size == 0 {
-            return InsertOutcome::CachingDisabled;
+            return Err(InsertOutcome::CachingDisabled);
         }
 
-        self.insert(rec);
-        InsertOutcome::Inserted
+        Ok(PreparedInsert::New(rec))
+    }
+
+    /// Begin a new insert transaction.
+    ///
+    /// Discards anything left over from a transaction that was never
+    /// committed with [`Self::end_insert`] (e.g. the caller bailed out after
+    /// a bad packet) and clears the sticky error flag.  Port of
+    /// `cache_start_insert()` (`cache.c:646-659`).
+    pub fn start_insert(&mut self) {
+        self.new_chain.clear();
+        self.insert_error = false;
+    }
+
+    /// Stage `rec` for insertion as part of the current transaction.
+    ///
+    /// Port of `cache_insert()` + `really_insert()` (`cache.c:661-837`) in
+    /// their transactional role: the record is *not* linked into the live
+    /// cache yet, only appended to the pending batch.  If validation fails —
+    /// zero TTL, a static-record conflict, or no cache capacity — the
+    /// transaction's sticky error flag is set and this and every subsequent
+    /// `stage_insert` call silently no-ops until the next [`Self::start_insert`]
+    /// (`cache.c:700-701`: "if previous insertion failed give up now").
+    ///
+    /// This is what makes a multi-record insert (a CNAME chain plus its
+    /// terminal A/AAAA record) atomic: if the terminal record is rejected,
+    /// [`Self::end_insert`] discards the CNAME staged ahead of it too, rather
+    /// than leaving a CNAME in the cache that points nowhere.
+    pub fn stage_insert(&mut self, rec: CacheRecord, now: Instant) -> Option<InsertOutcome> {
+        if self.insert_error {
+            return None;
+        }
+        match self.prepare_insert(rec, now) {
+            Ok(PreparedInsert::New(r)) => {
+                self.new_chain.push(r);
+                Some(InsertOutcome::Inserted)
+            }
+            Ok(PreparedInsert::SameAddr(_)) => Some(InsertOutcome::BlockedSameAddr),
+            Err(outcome) => {
+                self.insert_error = true;
+                Some(outcome)
+            }
+        }
+    }
+
+    /// Commit the current insert transaction.
+    ///
+    /// If any [`Self::stage_insert`] call in this transaction failed, nothing
+    /// is committed — the whole batch is discarded, matching C's
+    /// `cache_end_insert()` returning immediately when `insert_error` is set
+    /// (`cache.c:842-843`) and leaving `new_chain` to be freed by the next
+    /// `cache_start_insert()`.  Otherwise every staged record is linked into
+    /// the live cache, except a CNAME whose target turned out to be an
+    /// [`Self::is_outdated_cname_pointer`] — C drops those rather than
+    /// linking a CNAME to nowhere (`cache.c:856-857`).
+    ///
+    /// Returns the number of records actually committed.
+    pub fn end_insert(&mut self) -> usize {
+        if self.insert_error {
+            self.new_chain.clear();
+            self.insert_error = false;
+            return 0;
+        }
+        let staged = std::mem::take(&mut self.new_chain);
+        let mut committed = 0;
+        for rec in staged {
+            if self.is_outdated_cname_pointer(&rec) {
+                continue;
+            }
+            self.insert(rec);
+            committed += 1;
+        }
+        committed
+    }
+
+    /// Returns `true` if `rec` is a CNAME whose target pointer is stale and
+    /// should be dropped rather than linked into the cache.
+    ///
+    /// Port of `is_outdated_cname_pointer()` (`cache.c:449-462`).  C stores a
+    /// CNAME's target either as a raw name string (`is_name_ptr == 1`) or as
+    /// a direct pointer into another `crec` slot identified by `uid`, so that
+    /// slot can be reused for something else later without leaving a
+    /// dangling reference — this detects that case.  Every CNAME constructed
+    /// by this port stores `target_name` as a name pointer
+    /// (`CnameAddr::is_name_ptr == true`), never a slot reference, so in
+    /// practice this only returns `true` for the pointer-variant case no
+    /// current call site produces; it exists so `end_insert` stays a
+    /// faithful port if that representation is ever added, and is exercised
+    /// directly by unit tests below.
+    fn is_outdated_cname_pointer(&self, rec: &CacheRecord) -> bool {
+        if rec.flags & F_CNAME == 0 {
+            return false;
+        }
+        let Some(AllAddr::Cname(c)) = &rec.addr else { return false };
+        if c.is_name_ptr {
+            return false;
+        }
+        let Some(target_name) = c.target_name.as_deref() else { return true };
+        let target_lower = target_name.to_lowercase();
+        let live = self.records.iter().any(|(k, r)| {
+            k.name == target_lower
+                && (r.flags & (F_DNSKEY | F_DS)) == 0
+                && r.uid == c.uid
+        });
+        !live
     }
 
     /// Remaining lifetime of `rec`, in seconds, as it should be served to a
@@ -833,6 +988,364 @@ pub fn querystr_flags(desc: Option<&str>, rec: &CacheRecord) -> String {
         _ => 0,
     };
     querystr(desc, t)
+}
+
+// ---------------------------------------------------------------------------
+// log_query — query logging sink (`--log-queries`)
+// ---------------------------------------------------------------------------
+
+/// Standard DNS-over-UDP/TCP port.  Mirrors C's `NAMESERVER_PORT` (`53`):
+/// `log_query` only appends `#<port>` to a forwarded-server log line when the
+/// server uses a non-standard port.
+pub const NAMESERVER_PORT: u16 = 53;
+
+/// The options [`log_query`] gates and formats on, read once per call instead
+/// of through a global `option_bool()` the way C does.  Populated from
+/// `Daemon`'s `OPT_LOG` / `OPT_LOG_ONLY_FAILED` / `OPT_AUTH_LOG` /
+/// `OPT_EXTRALOG` / `OPT_LOG_PROTO` bits by callers.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LogQueryOptions {
+    /// `--log-queries` — master switch; `log_query` is a no-op without it.
+    pub log: bool,
+    /// `--log-queries=only_failed` — suppress everything but `F_RCODE`/`F_NEG`.
+    pub log_only_failed: bool,
+    /// `--auth-log`-style gate: when set, only queries carrying `F_NOERR`
+    /// (reused by callers to mean "this log arises from an auth query") are
+    /// logged.  Mirrors C's `OPT_AUTH_LOG` check (`cache.c:2327`).
+    pub auth_log: bool,
+    /// `--log-queries=extra` — richer line format: `<id> <source> ...`
+    /// instead of plain `<source> ...`, plus DNSSEC/EDE annotations.
+    pub extralog: bool,
+    /// `--log-queries=extra,proto` — prefix the extralog line with `TCP `/`UDP `.
+    pub log_proto: bool,
+}
+
+/// Returns `true` if `flags` indicates a failed lookup (`F_RCODE` or `F_NEG`
+/// set).  Port of `error_occured()` (`cache.c:2302-2309`).
+fn error_occured(flags: u32) -> bool {
+    flags & F_RCODE != 0 || flags & F_NEG != 0
+}
+
+/// Sanitise a name for logging: mirrors C's `sanitise()` (`cache.c:2004-2023`,
+/// distinct from `rfc2131.c`'s DHCP-only helper of the same name).  A name
+/// containing any non-printable byte is replaced wholesale with
+/// `"<name unprintable>"`; otherwise it is lower-cased byte-for-byte, so
+/// 0x20-encoded replies do not make logs look like ransom notes cut from a
+/// newspaper.
+fn sanitise_for_log(name: &str) -> String {
+    if name.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+        name.to_lowercase()
+    } else {
+        "<name unprintable>".to_string()
+    }
+}
+
+/// Extended DNS Error (RFC 8914) code this crate's log output can produce.
+/// A local copy rather than a re-export: `crate::dnssec::EDE_*` lives behind
+/// the `dnssec` feature, but `log_query` is core `cache.rs` and must build
+/// under `--no-default-features` too.  Values match `crate::dnssec::EDE_*`
+/// and upstream's `dns-protocol.h` (offset by one from the RFC 8914 code,
+/// same as upstream's `#define`s).
+pub const LOG_EDE_UNSET:        u16 = 0;
+const LOG_EDE_US_SERVFAIL:  u16 = 23;
+const LOG_EDE_SIG_NYV:      u16 = 8;
+const LOG_EDE_SIG_EXP:      u16 = 7;
+const LOG_EDE_USUPDNSKEY:   u16 = 11;
+const LOG_EDE_NO_ZONEKEY:   u16 = 9;
+const LOG_EDE_NO_DNSKEY:    u16 = 10;
+const LOG_EDE_USUPDS:       u16 = 12;
+const LOG_EDE_UNS_NS3_ITER: u16 = 27;
+const LOG_EDE_NO_NSEC:      u16 = 14;
+const LOG_EDE_DNSSEC_IND:   u16 = 13;
+const LOG_EDE_NO_RRSIG:     u16 = 15;
+
+/// Human-readable text for an Extended DNS Error code, for the `(EDE: ...)`
+/// log annotation.  Port of `edestr()` (`cache.c:2263-2299`), covering the
+/// EDE codes this crate's DNSSEC path actually produces; anything else —
+/// including `LOG_EDE_UNSET` — renders as `"unknown"`, matching C's
+/// `default:` arm.
+fn edestr(ede: u16) -> &'static str {
+    match ede {
+        LOG_EDE_US_SERVFAIL  => "upstream returned SERVFAIL",
+        LOG_EDE_SIG_NYV      => "DNSSEC sig not yet valid",
+        LOG_EDE_SIG_EXP      => "DNSSEC signature expired",
+        LOG_EDE_USUPDNSKEY   => "unsupported DNSKEY algorithm",
+        LOG_EDE_NO_ZONEKEY   => "no zone key bit set",
+        LOG_EDE_NO_DNSKEY    => "DNSKEY missing",
+        LOG_EDE_USUPDS       => "unsupported DS digest",
+        LOG_EDE_UNS_NS3_ITER => "unsupported NSEC3 iterations value",
+        LOG_EDE_NO_NSEC       => "NSEC(3) missing",
+        LOG_EDE_DNSSEC_IND    => "DNSSEC indeterminate",
+        LOG_EDE_NO_RRSIG      => "RRSIG missing",
+        _                     => "unknown",
+    }
+}
+
+/// Text for the small set of RCODEs C spells out by name instead of by
+/// number (`cache.c:2360-2369`).  `None` means "print the numeric code".
+fn rcode_name(rcode: u16) -> Option<&'static str> {
+    match rcode {
+        2 /* SERVFAIL */ => Some("SERVFAIL"),
+        5 /* REFUSED  */ => Some("REFUSED"),
+        1 /* FORMERR  */ => Some("FORMERR"),
+        4 /* NOTIMP   */ => Some("not implemented"),
+        _ => None,
+    }
+}
+
+/// Build the `--log-queries` line for one query outcome, or `None` if
+/// logging is gated off.  Port of `log_query()` (`cache.c:2311-2500`).
+///
+/// Callers pass the result to [`crate::log::my_syslog`] (`LOG_INFO`) to
+/// actually emit it — this function stays pure so its output can be asserted
+/// against upstream's format directly.
+///
+/// - `flags` — the same `F_*` combination a `CacheRecord` or log call site in
+///   C would carry (source, record kind, negative/CNAME/reverse markers, …).
+/// - `name` — the query name; `None` mirrors passing a NULL `char *name` in
+///   C, `Some("")` mirrors passing an empty (but non-NULL) string.
+/// - `addr` — the record's address/log payload, when the log line needs one.
+/// - `arg` — an extra string whose meaning depends on `flags` (a query-type
+///   description, an RR-name marker like `"<TXT>"`, a keytag `sprintf`
+///   format, a hosts-file path, an ipset/nftset name, …).
+/// - `rrtype` — the RR type number, used to build `arg` via `querystr` when
+///   none of `F_SERVER`/`F_IPSET`/`F_QUERY` is set, or (with `F_SERVER`) the
+///   upstream server's port.
+/// - `id` — the per-transaction display id C keeps in
+///   `daemon->log_display_id` (negative for TCP); only rendered when
+///   `opts.extralog` is set.
+/// - `source_addr` — the querying client's `(address, port)`, mirroring
+///   `daemon->log_source_addr`; only rendered when `opts.extralog` is set and
+///   `F_NOEXTRA` is not.
+#[allow(clippy::too_many_arguments)]
+pub fn log_query(
+    opts:        &LogQueryOptions,
+    flags:       u32,
+    name:        Option<&str>,
+    addr:        Option<&AllAddr>,
+    arg:         Option<&str>,
+    rrtype:      u16,
+    id:          i32,
+    source_addr: Option<(std::net::IpAddr, u16)>,
+) -> Option<String> {
+    if !opts.log {
+        return None;
+    }
+    if opts.log_only_failed && !error_occured(flags) {
+        return None;
+    }
+    // F_NOERR is reused here to indicate logs arising from auth queries.
+    if flags & F_NOERR == 0 && opts.auth_log {
+        return None;
+    }
+
+    let mut verb  = "is".to_string();
+    let mut extra = String::new();
+
+    // Build query-type string if requested.
+    let mut arg = arg.map(str::to_string);
+    if flags & (F_SERVER | F_IPSET | F_QUERY) == 0 && rrtype > 0 {
+        arg = Some(querystr(arg.as_deref(), rrtype));
+    }
+
+    let mut dest = arg.clone().unwrap_or_default();
+
+    if flags & F_DNSSECOK != 0 && opts.extralog {
+        extra = " (DNSSEC signed)".to_string();
+    }
+
+    let mut name = name.map(sanitise_for_log);
+
+    // `daemon->addrbuff` in C: the address string rendered below, reused by
+    // the F_REVERSE branch further down.
+    let mut addrbuff = String::new();
+
+    if let Some(a) = addr {
+        if flags & F_RR != 0 {
+            let t = if flags & F_KEYTAG != 0 {
+                match a { AllAddr::RrBlock(b) => b.rrtype, _ => 0 }
+            } else {
+                match a { AllAddr::RrData(d) => d.rrtype, _ => 0 }
+            };
+            dest = querystr(None, t);
+        } else if flags & F_KEYTAG != 0 {
+            if let AllAddr::Log(l) = a {
+                if let Some(fmt) = &arg {
+                    addrbuff = fmt
+                        .replacen("%u", &l.keytag.to_string(), 1)
+                        .replacen("%u", &l.algo.to_string(), 1)
+                        .replacen("%u", &l.digest.to_string(), 1);
+                    dest = addrbuff.clone();
+                }
+            }
+        } else if flags & F_RCODE != 0 {
+            if let AllAddr::Log(l) = a {
+                dest = match rcode_name(l.rcode) {
+                    Some(s) => s.to_string(),
+                    None => {
+                        addrbuff = l.rcode.to_string();
+                        addrbuff.clone()
+                    }
+                };
+                if l.ede != LOG_EDE_UNSET as i32 {
+                    extra = format!(" (EDE: {})", edestr(l.ede as u16));
+                }
+            }
+        } else if flags & (F_IPV4 | F_IPV6) != 0 {
+            if let Some(ip) = a.as_ip() {
+                addrbuff = ip.to_string();
+                dest = addrbuff.clone();
+                if flags & F_SERVER != 0 && rrtype != NAMESERVER_PORT {
+                    extra = format!("#{rrtype}");
+                }
+            }
+        } else {
+            dest = arg.clone().unwrap_or_default();
+        }
+    }
+
+    if flags & F_REVERSE != 0 {
+        dest = name.clone().unwrap_or_default();
+        name = Some(addrbuff.clone());
+    }
+
+    if flags & F_NEG != 0 {
+        dest = if flags & F_NXDOMAIN != 0 {
+            "NXDOMAIN".to_string()
+        } else if flags & F_IPV4 != 0 {
+            "NODATA-IPv4".to_string()
+        } else if flags & F_IPV6 != 0 {
+            "NODATA-IPv6".to_string()
+        } else {
+            "NODATA".to_string()
+        };
+    } else if flags & F_CNAME != 0 {
+        dest = "<CNAME>".to_string();
+    } else if flags & F_RRNAME != 0 {
+        dest = arg.clone().unwrap_or_default();
+    }
+
+    let mut source;
+    if flags & F_CONFIG != 0 {
+        source = "config".to_string();
+    } else if flags & F_DHCP != 0 {
+        source = "DHCP".to_string();
+    } else if flags & F_HOSTS != 0 {
+        source = arg.clone().unwrap_or_default();
+    } else if flags & F_UPSTREAM != 0 {
+        source = "reply".to_string();
+    } else if flags & F_AUTH != 0 {
+        source = "auth".to_string();
+    } else if flags & F_QUERY != 0 {
+        source = "query".to_string();
+    } else if flags & F_SECSTAT != 0 {
+        if let Some(AllAddr::Log(l)) = addr {
+            if l.ede != LOG_EDE_UNSET as i32 && opts.extralog {
+                extra = format!(" (EDE: {})", edestr(l.ede as u16));
+            }
+        }
+        source = "validation".to_string();
+        dest   = arg.clone().unwrap_or_default();
+    } else if flags & F_DNSSEC != 0 {
+        source = arg.clone().unwrap_or_default();
+        verb   = "to".to_string();
+    } else if flags & F_SERVER != 0 {
+        source = "forwarded".to_string();
+        verb   = "to".to_string();
+    } else if flags & F_IPSET != 0 {
+        source = if rrtype != 0 { "ipset add".to_string() } else { "nftset add".to_string() };
+        dest   = name.clone().unwrap_or_default();
+        name   = arg.clone();
+        verb   = addrbuff.clone();
+    } else if flags & F_STALE != 0 {
+        source = "cached-stale".to_string();
+    } else {
+        source = "cached".to_string();
+    }
+
+    let mut gap = " ".to_string();
+    if flags & F_QUERY != 0 {
+        if flags & F_CONFIG != 0 {
+            source = "non-query opcode".to_string();
+            name = Some((rrtype & 0xf).to_string());
+        } else if rrtype > 0 {
+            source = querystr(Some(&source), rrtype);
+        }
+        verb = "from".to_string();
+    }
+
+    let name = match name {
+        None => { gap = String::new(); String::new() }
+        Some(n) if n.is_empty() => ".".to_string(),
+        Some(n) => n,
+    };
+
+    if opts.extralog {
+        let proto = if opts.log_proto { if id < 0 { "TCP " } else { "UDP " } } else { "" };
+        let display_id = id.unsigned_abs();
+        if flags & F_NOEXTRA != 0 || source_addr.is_none() {
+            Some(format!("{proto}{display_id} {source} {name}{gap}{verb} {dest}{extra}"))
+        } else {
+            let (ip, port) = source_addr.expect("checked above");
+            Some(format!(
+                "{proto}{display_id} {ip}/{port} {source} {name}{gap}{verb} {dest}{extra}"
+            ))
+        }
+    } else {
+        Some(format!("{source} {name}{gap}{verb} {dest}{extra}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cache_make_stat — synthetic `.bind` CHAOS TXT statistics records
+// ---------------------------------------------------------------------------
+
+/// `t->stat` discriminator values from `struct txt_record` (`dnsmasq.h:386-391`).
+/// Only the cache-related counters are ported; `TXT_STAT_AUTH` (needs an auth
+/// query counter this crate does not track) and `TXT_STAT_SERVERS` (needs
+/// per-upstream query counters) are out of scope — see `tasks.md`.
+pub const TXT_STAT_CACHESIZE: i32 = 1;
+pub const TXT_STAT_INSERTS:   i32 = 2;
+pub const TXT_STAT_EVICTIONS: i32 = 3;
+pub const TXT_STAT_MISSES:    i32 = 4;
+pub const TXT_STAT_HITS:      i32 = 5;
+
+/// Build the TXT rdata (one length-prefixed character-string) for a
+/// synthetic `.bind` statistics record, or `None` for an unrecognised `stat`
+/// value.  Port of `cache_make_stat()` (`cache.c:1906-1996`), minus the
+/// `TXT_STAT_SERVERS` branch (see [`TXT_STAT_CACHESIZE`] doc).
+///
+/// `cachesize` is `daemon->cachesize`; `inserts`/`evictions`/`misses`/`hits`
+/// are the live `METRIC_DNS_CACHE_INSERTED` / `METRIC_DNS_CACHE_LIVE_FREED` /
+/// `METRIC_DNS_QUERIES_FORWARDED` / `METRIC_DNS_LOCAL_ANSWERED` counters
+/// (`cache.c:1926-1938` reads the same four metrics for these four record
+/// kinds — note `misses.bind`/`hits.bind` are *not* literal cache
+/// miss/hit counts upstream, they are forwarded-vs-locally-answered query
+/// counts, and this keeps that naming). Callers read these once via
+/// [`crate::metrics::get_metric`] and pass them in, keeping this function a
+/// pure formatter — like [`log_query`] — instead of reaching into global
+/// state itself.
+pub fn cache_make_stat(
+    stat:      i32,
+    cachesize: i32,
+    inserts:   u64,
+    evictions: u64,
+    misses:    u64,
+    hits:      u64,
+) -> Option<Vec<u8>> {
+    let text = match stat {
+        TXT_STAT_CACHESIZE => cachesize.to_string(),
+        TXT_STAT_INSERTS   => inserts.to_string(),
+        TXT_STAT_EVICTIONS => evictions.to_string(),
+        TXT_STAT_MISSES    => misses.to_string(),
+        TXT_STAT_HITS      => hits.to_string(),
+        _ => return None,
+    };
+    let text = if text.len() > 255 { &text[..255] } else { &text[..] };
+    let mut rdata = Vec::with_capacity(1 + text.len());
+    rdata.push(text.len() as u8);
+    rdata.extend_from_slice(text.as_bytes());
+    Some(rdata)
 }
 
 /// IANA DNS type table — `(type_number, mnemonic)`.
@@ -2655,5 +3168,517 @@ mod tests {
         let mut cache = DnsCache::new(16);
         let now = Instant::now();
         assert_eq!(cache_unhash_dhcp(&mut cache, now), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // log_query
+    // ------------------------------------------------------------------
+
+    use crate::types::addr::{CnameAddr, LogAddr};
+    use std::net::Ipv4Addr as Ip4;
+
+    fn opts_log_only() -> LogQueryOptions {
+        LogQueryOptions { log: true, ..Default::default() }
+    }
+
+    #[test]
+    fn log_query_gated_off_by_default() {
+        let opts = LogQueryOptions::default(); // log: false
+        assert_eq!(log_query(&opts, F_IPV4 | F_FORWARD, Some("example.com"),
+            Some(&AllAddr::Addr4(Ip4::new(1,2,3,4))), None, 0, 0, None), None);
+    }
+
+    #[test]
+    fn log_query_only_failed_suppresses_success() {
+        let opts = LogQueryOptions { log: true, log_only_failed: true, ..Default::default() };
+        // No F_RCODE / F_NEG set -> not an error -> suppressed.
+        assert_eq!(log_query(&opts, F_IPV4 | F_FORWARD, Some("example.com"),
+            Some(&AllAddr::Addr4(Ip4::new(1,2,3,4))), None, 0, 0, None), None);
+    }
+
+    #[test]
+    fn log_query_only_failed_allows_negative() {
+        let opts = LogQueryOptions { log: true, log_only_failed: true, ..Default::default() };
+        let line = log_query(&opts, F_NEG | F_NXDOMAIN, Some("example.com"), None, None, 0, 0, None);
+        assert!(line.is_some());
+    }
+
+    #[test]
+    fn log_query_auth_log_requires_noerr_flag() {
+        let opts = LogQueryOptions { log: true, auth_log: true, ..Default::default() };
+        assert_eq!(log_query(&opts, F_UPSTREAM, Some("example.com"), None, None, 0, 0, None), None);
+        assert!(log_query(&opts, F_UPSTREAM | F_NOERR, Some("example.com"), None, None, 0, 0, None).is_some());
+    }
+
+    #[test]
+    fn log_query_cached_a_record() {
+        let opts = opts_log_only();
+        let line = log_query(&opts, F_IPV4 | F_FORWARD, Some("example.com"),
+            Some(&AllAddr::Addr4(Ip4::new(1,2,3,4))), None, 0, 0, None).unwrap();
+        assert_eq!(line, "cached example.com is 1.2.3.4");
+    }
+
+    #[test]
+    fn log_query_config_source() {
+        let opts = opts_log_only();
+        let line = log_query(&opts, F_CONFIG | F_IPV4, Some("example.com"),
+            Some(&AllAddr::Addr4(Ip4::new(9,9,9,9))), None, 0, 0, None).unwrap();
+        assert_eq!(line, "config example.com is 9.9.9.9");
+    }
+
+    #[test]
+    fn log_query_dhcp_source() {
+        let opts = opts_log_only();
+        let line = log_query(&opts, F_DHCP | F_IPV4, Some("host.lan"),
+            Some(&AllAddr::Addr4(Ip4::new(10,0,0,5))), None, 0, 0, None).unwrap();
+        assert_eq!(line, "DHCP host.lan is 10.0.0.5");
+    }
+
+    #[test]
+    fn log_query_upstream_reply_source() {
+        let opts = opts_log_only();
+        let line = log_query(&opts, F_UPSTREAM | F_IPV4, Some("example.com"),
+            Some(&AllAddr::Addr4(Ip4::new(1,1,1,1))), None, 0, 0, None).unwrap();
+        assert_eq!(line, "reply example.com is 1.1.1.1");
+    }
+
+    #[test]
+    fn log_query_stale_source() {
+        let opts = opts_log_only();
+        let line = log_query(&opts, F_STALE | F_IPV4, Some("example.com"),
+            Some(&AllAddr::Addr4(Ip4::new(1,2,3,4))), None, 0, 0, None).unwrap();
+        assert_eq!(line, "cached-stale example.com is 1.2.3.4");
+    }
+
+    #[test]
+    fn log_query_forwarded_to_server_with_port() {
+        let opts = opts_log_only();
+        // A non-standard port is appended as `#<port>`.
+        let line = log_query(&opts, F_SERVER | F_FORWARD | F_IPV4, Some("example.com"),
+            Some(&AllAddr::Addr4(Ip4::new(8,8,8,8))), None, 5353, 0, None).unwrap();
+        assert_eq!(line, "forwarded example.com to 8.8.8.8#5353");
+    }
+
+    #[test]
+    fn log_query_forwarded_to_server_standard_port_no_suffix() {
+        let opts = opts_log_only();
+        let line = log_query(&opts, F_SERVER | F_FORWARD | F_IPV4, Some("example.com"),
+            Some(&AllAddr::Addr4(Ip4::new(8,8,8,8))), None, NAMESERVER_PORT, 0, None).unwrap();
+        assert_eq!(line, "forwarded example.com to 8.8.8.8");
+    }
+
+    #[test]
+    fn log_query_negative_nxdomain() {
+        let opts = opts_log_only();
+        let line = log_query(&opts, F_NEG | F_NXDOMAIN | F_UPSTREAM, Some("example.com"),
+            None, None, 0, 0, None).unwrap();
+        assert_eq!(line, "reply example.com is NXDOMAIN");
+    }
+
+    #[test]
+    fn log_query_negative_nodata_ipv4() {
+        let opts = opts_log_only();
+        let line = log_query(&opts, F_NEG | F_IPV4 | F_UPSTREAM, Some("example.com"),
+            None, None, 0, 0, None).unwrap();
+        assert_eq!(line, "reply example.com is NODATA-IPv4");
+    }
+
+    #[test]
+    fn log_query_negative_nodata_generic() {
+        let opts = opts_log_only();
+        let line = log_query(&opts, F_NEG | F_UPSTREAM, Some("example.com"),
+            None, None, 0, 0, None).unwrap();
+        assert_eq!(line, "reply example.com is NODATA");
+    }
+
+    #[test]
+    fn log_query_cname_marker() {
+        let opts = opts_log_only();
+        let line = log_query(&opts, F_CNAME | F_FORWARD, Some("alias.example.com"),
+            None, None, 0, 0, None).unwrap();
+        assert_eq!(line, "cached alias.example.com is <CNAME>");
+    }
+
+    #[test]
+    fn log_query_reverse_swaps_name_and_dest() {
+        let opts = opts_log_only();
+        // A PTR answer: name is the query (in-addr.arpa domain), addr is the
+        // resolved IP; C swaps them so the line reads "<ip> is <name>".
+        let line = log_query(&opts, F_REVERSE | F_IPV4 | F_CONFIG, Some("myhost.example.com"),
+            Some(&AllAddr::Addr4(Ip4::new(192,168,1,1))), None, 0, 0, None).unwrap();
+        assert_eq!(line, "config 192.168.1.1 is myhost.example.com");
+    }
+
+    #[test]
+    fn log_query_rrname_uses_arg_marker() {
+        let opts = opts_log_only();
+        let line = log_query(&opts, F_CONFIG | F_RRNAME, Some("example.com"),
+            None, Some("<TXT>"), 0, 0, None).unwrap();
+        assert_eq!(line, "config example.com is <TXT>");
+    }
+
+    #[test]
+    fn log_query_query_from_client() {
+        let opts = opts_log_only();
+        // Plain incoming-query log line: "query[A] from example.com" style —
+        // here `name` is the query name and rrtype builds the `query[A]` tag
+        // via the F_QUERY source branch.
+        let line = log_query(&opts, F_QUERY, Some("example.com"), None, None, 1, 0, None).unwrap();
+        assert_eq!(line, "query[A] example.com from ");
+    }
+
+    #[test]
+    fn log_query_unprintable_name_replaced() {
+        let opts = opts_log_only();
+        let line = log_query(&opts, F_IPV4 | F_FORWARD, Some("bad\u{0007}name.com"),
+            Some(&AllAddr::Addr4(Ip4::new(1,2,3,4))), None, 0, 0, None).unwrap();
+        assert!(line.contains("<name unprintable>"));
+    }
+
+    #[test]
+    fn log_query_empty_name_becomes_dot() {
+        let opts = opts_log_only();
+        let line = log_query(&opts, F_IPV4 | F_FORWARD, Some(""),
+            Some(&AllAddr::Addr4(Ip4::new(1,2,3,4))), None, 0, 0, None).unwrap();
+        assert_eq!(line, "cached . is 1.2.3.4");
+    }
+
+    #[test]
+    fn log_query_null_name_omits_gap() {
+        let opts = opts_log_only();
+        let line = log_query(&opts, F_UPSTREAM, None, None, Some("truncated"), 0, 0, None).unwrap();
+        assert_eq!(line, "reply is truncated");
+    }
+
+    #[test]
+    fn log_query_extralog_plain_format() {
+        let opts = LogQueryOptions { log: true, extralog: true, ..Default::default() };
+        let line = log_query(&opts, F_IPV4 | F_FORWARD, Some("example.com"),
+            Some(&AllAddr::Addr4(Ip4::new(1,2,3,4))), None, 0, 42, None).unwrap();
+        assert_eq!(line, "42 cached example.com is 1.2.3.4");
+    }
+
+    #[test]
+    fn log_query_extralog_with_source_addr() {
+        let opts = LogQueryOptions { log: true, extralog: true, ..Default::default() };
+        let line = log_query(&opts, F_IPV4 | F_FORWARD, Some("example.com"),
+            Some(&AllAddr::Addr4(Ip4::new(1,2,3,4))), None, 0, 42,
+            Some((std::net::IpAddr::V4(Ip4::new(192,168,1,5)), 5353))).unwrap();
+        assert_eq!(line, "42 192.168.1.5/5353 cached example.com is 1.2.3.4");
+    }
+
+    #[test]
+    fn log_query_extralog_noextra_skips_source_addr() {
+        let opts = LogQueryOptions { log: true, extralog: true, ..Default::default() };
+        let line = log_query(&opts, F_IPV4 | F_FORWARD | F_NOEXTRA, Some("example.com"),
+            Some(&AllAddr::Addr4(Ip4::new(1,2,3,4))), None, 0, 42,
+            Some((std::net::IpAddr::V4(Ip4::new(192,168,1,5)), 5353))).unwrap();
+        assert_eq!(line, "42 cached example.com is 1.2.3.4");
+    }
+
+    #[test]
+    fn log_query_extralog_proto_prefix() {
+        let opts = LogQueryOptions { log: true, extralog: true, log_proto: true, ..Default::default() };
+        let udp = log_query(&opts, F_IPV4 | F_FORWARD, Some("example.com"),
+            Some(&AllAddr::Addr4(Ip4::new(1,2,3,4))), None, 0, 5, None).unwrap();
+        assert!(udp.starts_with("UDP 5 "));
+        let tcp = log_query(&opts, F_IPV4 | F_FORWARD, Some("example.com"),
+            Some(&AllAddr::Addr4(Ip4::new(1,2,3,4))), None, 0, -5, None).unwrap();
+        assert!(tcp.starts_with("TCP 5 "));
+    }
+
+    #[test]
+    fn log_query_rcode_named() {
+        let opts = opts_log_only();
+        let addr = AllAddr::Log(LogAddr { keytag: 0, algo: 0, digest: 0, rcode: 2, ede: 0 });
+        let line = log_query(&opts, F_CONFIG | F_RCODE, Some("error"), Some(&addr), None, 0, 0, None).unwrap();
+        assert_eq!(line, "config error is SERVFAIL");
+    }
+
+    #[test]
+    fn log_query_rcode_numeric_fallback() {
+        let opts = opts_log_only();
+        let addr = AllAddr::Log(LogAddr { keytag: 0, algo: 0, digest: 0, rcode: 9, ede: 0 });
+        let line = log_query(&opts, F_CONFIG | F_RCODE, Some("error"), Some(&addr), None, 0, 0, None).unwrap();
+        assert_eq!(line, "config error is 9");
+    }
+
+    #[test]
+    fn log_query_rcode_with_ede_extralog() {
+        let opts = LogQueryOptions { log: true, extralog: true, ..Default::default() };
+        let addr = AllAddr::Log(LogAddr { keytag: 0, algo: 0, digest: 0, rcode: 2, ede: LOG_EDE_US_SERVFAIL as i32 });
+        let line = log_query(&opts, F_UPSTREAM | F_RCODE, Some("error"), Some(&addr), None, 0, 0, None).unwrap();
+        assert!(line.contains("(EDE: upstream returned SERVFAIL)"));
+    }
+
+    // ------------------------------------------------------------------
+    // Transactional insert: start_insert / stage_insert / end_insert
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn transactional_insert_commits_whole_batch() {
+        let mut cache = DnsCache::new(16);
+        let now = Instant::now();
+        let future = now + Duration::from_secs(300);
+        cache.start_insert();
+        cache.stage_insert(make_a_record("a.example.com", Ip4::new(1,1,1,1), 300, future), now);
+        cache.stage_insert(make_a_record("b.example.com", Ip4::new(2,2,2,2), 300, future), now);
+        assert_eq!(cache.len(), 0); // nothing visible until end_insert
+        let committed = cache.end_insert();
+        assert_eq!(committed, 2);
+        assert!(cache.lookup_by_name("a.example.com", F_IPV4, now).is_some());
+        assert!(cache.lookup_by_name("b.example.com", F_IPV4, now).is_some());
+    }
+
+    /// This is the acceptance-criteria scenario: a CNAME chain where the
+    /// terminal record fails validation must discard the CNAME too, not
+    /// leave it pointing nowhere in the live cache.
+    #[test]
+    fn transactional_insert_discards_whole_batch_on_later_failure() {
+        let mut cache = DnsCache::new(16);
+        let now = Instant::now();
+        let future = now + Duration::from_secs(300);
+
+        let cname = CacheRecord {
+            name: "alias.example.com".into(),
+            flags: F_CNAME | F_FORWARD,
+            ttl: 300,
+            expires: future,
+            addr: Some(AllAddr::Cname(CnameAddr {
+                is_name_ptr: true,
+                target_name: Some("target.example.com".into()),
+                uid: UID_NONE,
+            })),
+            rdata: None,
+            uid: UID_NONE,
+        };
+        // Zero-TTL terminal record: really_insert would reject this on its own.
+        let terminal = CacheRecord {
+            name: "target.example.com".into(),
+            flags: F_IPV4 | F_FORWARD,
+            ttl: 0,
+            expires: now,
+            addr: Some(AllAddr::Addr4(Ip4::new(5,5,5,5))),
+            rdata: None,
+            uid: UID_NONE,
+        };
+
+        cache.start_insert();
+        let r1 = cache.stage_insert(cname, now);
+        let r2 = cache.stage_insert(terminal, now);
+        assert_eq!(r1, Some(InsertOutcome::Inserted));
+        assert_eq!(r2, Some(InsertOutcome::ZeroTtlDropped));
+        let committed = cache.end_insert();
+        assert_eq!(committed, 0);
+        assert!(cache.lookup_by_name("alias.example.com", F_CNAME, now).is_none());
+        assert!(cache.lookup_by_name("target.example.com", F_IPV4, now).is_none());
+    }
+
+    #[test]
+    fn transactional_insert_sticky_error_no_ops_further_stages() {
+        let mut cache = DnsCache::new(16);
+        let now = Instant::now();
+        let future = now + Duration::from_secs(300);
+        cache.start_insert();
+        let bad = CacheRecord {
+            name: "bad.example.com".into(), flags: F_IPV4 | F_FORWARD,
+            ttl: 0, expires: now, addr: Some(AllAddr::Addr4(Ip4::new(1,1,1,1))),
+            rdata: None, uid: UID_NONE,
+        };
+        assert_eq!(cache.stage_insert(bad, now), Some(InsertOutcome::ZeroTtlDropped));
+        // Once the transaction has errored, further stages are silent no-ops
+        // (mirrors C's `really_insert()`: "if previous insertion failed give
+        // up now").
+        let ok = make_a_record("ok.example.com", Ip4::new(2,2,2,2), 300, future);
+        assert_eq!(cache.stage_insert(ok, now), None);
+        assert_eq!(cache.end_insert(), 0);
+    }
+
+    #[test]
+    fn start_insert_discards_a_previously_uncommitted_batch() {
+        let mut cache = DnsCache::new(16);
+        let now = Instant::now();
+        let future = now + Duration::from_secs(300);
+        cache.start_insert();
+        cache.stage_insert(make_a_record("orphan.example.com", Ip4::new(3,3,3,3), 300, future), now);
+        // Caller bails out without calling end_insert (e.g. bad packet) —
+        // the next start_insert must clean up rather than leaking it into a
+        // later transaction's commit.
+        cache.start_insert();
+        cache.stage_insert(make_a_record("real.example.com", Ip4::new(4,4,4,4), 300, future), now);
+        let committed = cache.end_insert();
+        assert_eq!(committed, 1);
+        assert!(cache.lookup_by_name("orphan.example.com", F_IPV4, now).is_none());
+        assert!(cache.lookup_by_name("real.example.com", F_IPV4, now).is_some());
+    }
+
+    #[test]
+    fn stage_insert_same_addr_is_not_an_error() {
+        let mut cache = DnsCache::new(16);
+        let now = Instant::now();
+        let future = now + Duration::from_secs(300);
+        let mut existing = make_a_record("host.example.com", Ip4::new(1,1,1,1), 300, future);
+        existing.flags |= F_HOSTS;
+        cache.insert(existing);
+
+        cache.start_insert();
+        let dup = make_a_record("host.example.com", Ip4::new(1,1,1,1), 300, future);
+        assert_eq!(cache.stage_insert(dup, now), Some(InsertOutcome::BlockedSameAddr));
+        let other = make_a_record("other.example.com", Ip4::new(2,2,2,2), 300, future);
+        assert_eq!(cache.stage_insert(other, now), Some(InsertOutcome::Inserted));
+        assert_eq!(cache.end_insert(), 1);
+        assert!(cache.lookup_by_name("other.example.com", F_IPV4, now).is_some());
+    }
+
+    #[test]
+    fn really_insert_is_a_single_record_transaction() {
+        // really_insert must still work standalone (existing callers), and
+        // not be affected by a stray uncommitted stage_insert batch.
+        let mut cache = DnsCache::new(16);
+        let now = Instant::now();
+        let future = now + Duration::from_secs(300);
+        cache.start_insert();
+        cache.stage_insert(make_a_record("uncommitted.example.com", Ip4::new(9,9,9,9), 300, future), now);
+        // Never call end_insert — leave the batch pending.
+        let outcome = cache.really_insert(make_a_record("direct.example.com", Ip4::new(7,7,7,7), 300, future), now);
+        assert_eq!(outcome, InsertOutcome::Inserted);
+        assert!(cache.lookup_by_name("direct.example.com", F_IPV4, now).is_some());
+    }
+
+    // ------------------------------------------------------------------
+    // is_outdated_cname_pointer (exercised through end_insert)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn name_pointer_cname_is_never_outdated() {
+        let mut cache = DnsCache::new(16);
+        let now = Instant::now();
+        let future = now + Duration::from_secs(300);
+        let cname = CacheRecord {
+            name: "alias.example.com".into(),
+            flags: F_CNAME | F_FORWARD,
+            ttl: 300,
+            expires: future,
+            addr: Some(AllAddr::Cname(CnameAddr {
+                is_name_ptr: true, // the representation every call site uses
+                target_name: Some("target.example.com".into()),
+                uid: UID_NONE,
+            })),
+            rdata: None,
+            uid: UID_NONE,
+        };
+        cache.start_insert();
+        cache.stage_insert(cname, now);
+        assert_eq!(cache.end_insert(), 1);
+        assert!(cache.lookup_by_name("alias.example.com", F_CNAME, now).is_some());
+    }
+
+    #[test]
+    fn pointer_cname_with_live_target_is_kept() {
+        let mut cache = DnsCache::new(16);
+        let now = Instant::now();
+        let future = now + Duration::from_secs(300);
+        let mut target = make_a_record("target.example.com", Ip4::new(6,6,6,6), 300, future);
+        target.uid = 42;
+        cache.insert(target);
+
+        let cname = CacheRecord {
+            name: "alias.example.com".into(),
+            flags: F_CNAME | F_FORWARD,
+            ttl: 300,
+            expires: future,
+            addr: Some(AllAddr::Cname(CnameAddr {
+                is_name_ptr: false,
+                target_name: Some("target.example.com".into()),
+                uid: 42,
+            })),
+            rdata: None,
+            uid: UID_NONE,
+        };
+        cache.start_insert();
+        cache.stage_insert(cname, now);
+        assert_eq!(cache.end_insert(), 1);
+        assert!(cache.lookup_by_name("alias.example.com", F_CNAME, now).is_some());
+    }
+
+    #[test]
+    fn pointer_cname_with_stale_uid_is_dropped() {
+        let mut cache = DnsCache::new(16);
+        let now = Instant::now();
+        let future = now + Duration::from_secs(300);
+        // Target slot was reused for something else — uid no longer matches.
+        let mut target = make_a_record("target.example.com", Ip4::new(6,6,6,6), 300, future);
+        target.uid = 99;
+        cache.insert(target);
+
+        let cname = CacheRecord {
+            name: "alias.example.com".into(),
+            flags: F_CNAME | F_FORWARD,
+            ttl: 300,
+            expires: future,
+            addr: Some(AllAddr::Cname(CnameAddr {
+                is_name_ptr: false,
+                target_name: Some("target.example.com".into()),
+                uid: 42, // stale — target's uid is now 99
+            })),
+            rdata: None,
+            uid: UID_NONE,
+        };
+        cache.start_insert();
+        cache.stage_insert(cname, now);
+        assert_eq!(cache.end_insert(), 0);
+        assert!(cache.lookup_by_name("alias.example.com", F_CNAME, now).is_none());
+    }
+
+    #[test]
+    fn pointer_cname_with_missing_target_is_dropped() {
+        let mut cache = DnsCache::new(16);
+        let now = Instant::now();
+        let future = now + Duration::from_secs(300);
+        let cname = CacheRecord {
+            name: "alias.example.com".into(),
+            flags: F_CNAME | F_FORWARD,
+            ttl: 300,
+            expires: future,
+            addr: Some(AllAddr::Cname(CnameAddr {
+                is_name_ptr: false,
+                target_name: Some("missing.example.com".into()),
+                uid: 1,
+            })),
+            rdata: None,
+            uid: UID_NONE,
+        };
+        cache.start_insert();
+        cache.stage_insert(cname, now);
+        assert_eq!(cache.end_insert(), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // cache_make_stat
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn cache_make_stat_cachesize() {
+        let rdata = cache_make_stat(TXT_STAT_CACHESIZE, 150, 0, 0, 0, 0).unwrap();
+        assert_eq!(rdata[0] as usize, rdata.len() - 1);
+        assert_eq!(&rdata[1..], b"150");
+    }
+
+    #[test]
+    fn cache_make_stat_insertions() {
+        let rdata = cache_make_stat(TXT_STAT_INSERTS, 0, 2, 0, 0, 0).unwrap();
+        assert_eq!(&rdata[1..], b"2");
+    }
+
+    #[test]
+    fn cache_make_stat_unknown_kind_returns_none() {
+        assert_eq!(cache_make_stat(999, 0, 0, 0, 0, 0), None);
+    }
+
+    #[test]
+    fn cache_make_stat_evictions_misses_hits_distinct_fields() {
+        assert_eq!(&cache_make_stat(TXT_STAT_EVICTIONS, 0, 0, 1, 0, 0).unwrap()[1..], b"1");
+        assert_eq!(&cache_make_stat(TXT_STAT_MISSES, 0, 0, 0, 3, 0).unwrap()[1..], b"3");
+        assert_eq!(&cache_make_stat(TXT_STAT_HITS, 0, 0, 0, 0, 7).unwrap()[1..], b"7");
     }
 }

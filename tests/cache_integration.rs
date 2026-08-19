@@ -217,6 +217,9 @@ fn empty_local() -> LocalConfig<'static> {
         synth_domains: &[],
         address_servers: empty_server_array(),
         address_server_list: &[],
+        literal_domains: &[],
+        cachesize: 150,
+        log_opts: Default::default(),
     }
 }
 
