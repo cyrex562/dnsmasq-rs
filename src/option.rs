@@ -2029,8 +2029,29 @@ fn parse_server_or_address(
         (vec![], v)
     };
 
-    // Empty address is allowed for `local=` (means "answer locally with NXDOMAIN")
+    // Empty address ("server=/domain/", "local=/domain/", "address=/domain/")
+    // means "never forward, answer locally" (option.c:3060-3110: `if (!arg ||
+    // !*arg) flags = SERV_LITERAL_ADDRESS;`) — create a literal, address-less
+    // server entry per domain (or one catch-all entry with no domains given).
     if addr_part.is_empty() {
+        let dummy_addr = MySockAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0));
+        if domains.is_empty() {
+            daemon.servers.push(new_server(
+                SERV_LITERAL_ADDRESS,
+                String::new(),
+                dummy_addr.clone(),
+                dummy_addr,
+            ));
+        } else {
+            for domain in domains {
+                daemon.servers.push(new_server(
+                    SERV_LITERAL_ADDRESS,
+                    domain,
+                    dummy_addr.clone(),
+                    dummy_addr.clone(),
+                ));
+            }
+        }
         return Ok(());
     }
 
@@ -5799,6 +5820,56 @@ mod tests {
         let lines = parse_config_text("server=/a.com/b.com/8.8.8.8", "test").unwrap();
         apply_config(&mut d, &lines).unwrap();
         assert_eq!(d.servers.len(), 2);
+    }
+
+    #[test]
+    fn apply_address_with_ip_creates_literal_address_server() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("address=/example.com/1.2.3.4", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.servers.len(), 1);
+        let s = &d.servers[0];
+        assert_eq!(s.domain, "example.com");
+        assert_eq!(s.flags & SERV_LITERAL_ADDRESS, SERV_LITERAL_ADDRESS);
+        assert_eq!(s.flags & SERV_4ADDR, SERV_4ADDR);
+        assert_eq!(s.addr.ip(), "1.2.3.4".parse::<std::net::IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn apply_address_with_no_ip_creates_literal_no_forward_server() {
+        // `address=/example.com/` (no address) blocks the domain instead of
+        // silently doing nothing — matches `server=/example.com/`
+        // (option.c:3060-3110: `if (!arg || !*arg) flags = SERV_LITERAL_ADDRESS;`).
+        let mut d = Daemon::default();
+        let lines = parse_config_text("address=/example.com/", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.servers.len(), 1);
+        let s = &d.servers[0];
+        assert_eq!(s.domain, "example.com");
+        assert_eq!(s.flags & SERV_LITERAL_ADDRESS, SERV_LITERAL_ADDRESS);
+        assert_eq!(s.flags & (SERV_4ADDR | SERV_6ADDR), 0);
+    }
+
+    #[test]
+    fn apply_local_with_no_ip_creates_literal_no_forward_server() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("local=/example.com/", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.servers.len(), 1);
+        let s = &d.servers[0];
+        assert_eq!(s.domain, "example.com");
+        assert_eq!(s.flags & SERV_LITERAL_ADDRESS, SERV_LITERAL_ADDRESS);
+    }
+
+    #[test]
+    fn apply_server_with_no_ip_creates_literal_no_forward_server() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("server=/example.com/", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.servers.len(), 1);
+        let s = &d.servers[0];
+        assert_eq!(s.domain, "example.com");
+        assert_eq!(s.flags & SERV_LITERAL_ADDRESS, SERV_LITERAL_ADDRESS);
     }
 
     #[test]

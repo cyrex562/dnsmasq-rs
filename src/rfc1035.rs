@@ -40,6 +40,9 @@ pub enum DnsError {
     UnexpectedEof,
 }
 
+/// Default (non-EDNS0) maximum UDP reply size (`PACKETSZ`, `dns-const.h`).
+const PACKETSZ: usize = 512;
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Name codec
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1072,11 +1075,20 @@ pub struct LocalConfig<'a> {
     /// synthesis rules consulted for A/AAAA and PTR queries that have no
     /// other local answer (`domain.c:is_name_synthetic`/`is_rev_synth`).
     pub synth_domains: &'a [CondDomain],
-    /// Domains with a `SERV_LITERAL_ADDRESS` `server` entry and no upstream
-    /// address (`local=/domain/` with no address, or `rev-server` with the
-    /// server part omitted): never forwarded, and answered NXDOMAIN here
-    /// when nothing else matches, for any query type.
-    pub literal_domains: &'a [String],
+    /// Sorted lookup table over `address_server_list` — every `server` entry
+    /// with `SERV_LITERAL_ADDRESS` set (`--address=`, `--server=/domain/`
+    /// with no address, `--local=/domain/`, `rev-server` with the server
+    /// part omitted). Never forwarded; answered directly here (an IP
+    /// literal, or NOERR/NXDOMAIN for a bare domain) when nothing else
+    /// matches, for any query type. Built once at config-reload time by
+    /// [`crate::domain_match::ServerArray::build`] (`local_domains` arg),
+    /// not per query. Port of `is_local_answer()` / `make_local_answer()`
+    /// (domain-match.c).
+    pub address_servers: &'a crate::domain_match::ServerArray,
+    /// The exact slice passed as `ServerArray::build`'s `local_domains`
+    /// argument to produce `address_servers` — `ServerEntry::index` looks up
+    /// into this slice for the actual configured address.
+    pub address_server_list: &'a [crate::types::server::Server],
 }
 
 /// Port of C's `setup_reply()`.  Sets standard response flags on a DnsHeader.
@@ -1102,21 +1114,6 @@ pub fn setup_reply(header: &mut DnsHeader, flags: u32) {
         // an empty answer caches a negative result we never established.
         header.set_rcode(5); // REFUSED
     }
-}
-
-/// True when `name` equals or is a subdomain of any entry in `domains`
-/// (case-insensitive, label-boundary-aware suffix match).
-fn domain_matches_any_suffix(name: &str, domains: &[String]) -> bool {
-    domains.iter().any(|domain| {
-        let dlen = domain.len();
-        if dlen == 0 || name.len() < dlen {
-            return false;
-        }
-        let start = name.len() - dlen;
-        let suffix = &name[start..];
-        suffix.eq_ignore_ascii_case(domain)
-            && (name.len() == dlen || name.as_bytes().get(start.wrapping_sub(1)) == Some(&b'.'))
-    })
 }
 
 /// Port of C's `answer_request()`.  Answers DNS queries from local config and cache.
@@ -1479,7 +1476,68 @@ pub fn answer_request(
         }
     }
 
-    // 6. No answer found: don't forward simple (dot-free) A/AAAA names when
+    // 5i. `--address=`/`--server=/domain/`-style literal answers: a domain
+    // with a `SERV_LITERAL_ADDRESS` server entry is never forwarded, for any
+    // query type. An entry with a configured IP answers with it (for
+    // A/AAAA/ANY); a bare entry (no address) answers NXDOMAIN, or NOERR if
+    // the name is otherwise locally known. Port of `is_local_answer()` /
+    // `make_local_answer()` (domain-match.c). Placed *before* the
+    // `nodots_local` fallback below to match upstream's own ordering
+    // (`forward.c:346-361`: `lookup_domain`/`is_local_answer` are tried
+    // first, and the `OPT_NODOTS_LOCAL` check only runs `if (!flags)`) — a
+    // single-label name with both `--address=` and `--domain-needed`
+    // configured must still resolve to its literal address.
+    let mut truncated = false;
+    if !ans {
+        let gotname = (if qtype == 1 || qtype == 255 { F_IPV4 } else { 0 })
+            | (if qtype == 28 || qtype == 255 { F_IPV6 } else { 0 });
+        if let Some((first, last)) = config.address_servers.lookup(&name, gotname) {
+            let local_flags = crate::domain_match::is_local_answer(config.address_servers, first, || {
+                check_for_local_domain(&name, config, &*cache, now)
+            });
+            if local_flags & F_NXDOMAIN != 0 {
+                ans      = true;
+                nxdomain = true;
+            } else if local_flags & F_NOERR != 0 {
+                ans = true;
+            } else if local_flags & (F_IPV4 | F_IPV6) != 0 {
+                ans  = true;
+                auth = true;
+                let addr_answers = crate::domain_match::make_local_answer(
+                    config.address_servers,
+                    config.address_server_list,
+                    first,
+                    last,
+                    local_flags & gotname,
+                    &name,
+                    ttl,
+                );
+                // All-or-nothing: if these RRs wouldn't fit the reply's size
+                // budget, drop them all and set TC instead of returning a
+                // partial answer (domain-match.c:453-460 zeroes the whole
+                // `anscount`, not just the RRs that overflowed).
+                let budget = if query.additional.iter().any(|rr| rr.rtype == 41) {
+                    config.edns_pktsz as usize
+                } else {
+                    PACKETSZ
+                };
+                let base_len = response.write().len();
+                let mut rr_buf = BytesMut::new();
+                for rr in &addr_answers {
+                    write_rr(&mut rr_buf, rr);
+                }
+                if base_len + rr_buf.len() > budget {
+                    truncated = true;
+                } else {
+                    answers.extend(addr_answers);
+                }
+            }
+            // Any other combination (result 0: not a literal-address entry,
+            // e.g. F_SERVER-only groups) falls through to forwarding.
+        }
+    }
+
+    // 6. Still no answer: don't forward simple (dot-free) A/AAAA names when
     // `--domain-needed` is set, except the empty name (`forward.c:355-361`).
     // Upstream's `extract_request()` returns `F_IPV4|F_IPV6` for a `T_ANY`
     // (255) query too, so ANY is covered by the same `gotname & (F_IPV4|F_IPV6)`
@@ -1487,15 +1545,6 @@ pub fn answer_request(
     if !ans && config.nodots_local && (qtype == 1 || qtype == 28 || qtype == 255) && !name.contains('.') && !name.is_empty() {
         ans = true;
         nxdomain = !check_for_local_domain(&name, config, &*cache, now);
-    }
-
-    // 6b. A domain with a `SERV_LITERAL_ADDRESS` server entry and no
-    // upstream (`local=/domain/` with no address, or `rev-server` with the
-    // server part omitted) is never forwarded, for any query type — answer
-    // NXDOMAIN instead of falling through to forwarding.
-    if !ans && domain_matches_any_suffix(&name, config.literal_domains) {
-        ans      = true;
-        nxdomain = true;
     }
 
     if !ans {
@@ -1538,6 +1587,9 @@ pub fn answer_request(
     }
     response.header.hb3 |= HB3_QR;
     response.header.hb4 |= HB4_RA;
+    if truncated {
+        response.header.hb3 |= HB3_TC;
+    }
 
     Some(response)
 }
@@ -2948,6 +3000,16 @@ mod tests {
         DnsPacket::parse(&buf).unwrap()
     }
 
+    /// A `'static` empty [`ServerArray`](crate::domain_match::ServerArray) for
+    /// [`empty_config`] to borrow — `LocalConfig` ties `address_servers`'
+    /// lifetime to the config, so a freshly built empty array can't be
+    /// returned from this function by value.
+    fn empty_server_array() -> &'static crate::domain_match::ServerArray {
+        use std::sync::OnceLock;
+        static ARR: OnceLock<crate::domain_match::ServerArray> = OnceLock::new();
+        ARR.get_or_init(|| crate::domain_match::ServerArray::build(&[], &[]))
+    }
+
     fn empty_config<'a>() -> LocalConfig<'a> {
         LocalConfig {
             local_ttl:    60,
@@ -2962,7 +3024,8 @@ mod tests {
             int_names:    &[],
             nodots_local: false,
             synth_domains: &[],
-            literal_domains: &[],
+            address_servers: empty_server_array(),
+            address_server_list: &[],
         }
     }
 
@@ -3323,6 +3386,259 @@ mod tests {
         let cfg = LocalConfig { nodots_local: false, ..empty_config() };
 
         assert!(answer_request(&query, &mut cache, now, &cfg).is_none());
+    }
+
+    // ── --address= / --server=/domain/ literal answers ──────────────────────
+    //
+    // Port of `is_local_answer()` / `make_local_answer()` (domain-match.c),
+    // wired into `answer_request()`'s local-data pass as the final fallback
+    // (after host records, cache, and everything else config data can
+    // answer), matching upstream's `lookup_domain`/`is_local_answer` call
+    // in `forward.c` running only once `answer_request()` itself has found
+    // nothing.
+
+    use crate::domain_match::ServerArray;
+    use crate::types::addr::MySockAddr;
+    use crate::types::server::{Server, SERV_4ADDR, SERV_6ADDR, SERV_ALL_ZEROS, SERV_LITERAL_ADDRESS};
+    use std::net::SocketAddrV4;
+
+    fn literal_server(domain: &str, flags: u16, ip: Option<std::net::IpAddr>) -> Server {
+        let addr = match ip {
+            Some(std::net::IpAddr::V4(a)) => MySockAddr::V4(SocketAddrV4::new(a, 0)),
+            Some(std::net::IpAddr::V6(a)) => MySockAddr::V6(std::net::SocketAddrV6::new(a, 0, 0, 0)),
+            None => MySockAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+        };
+        Server {
+            flags: flags | SERV_LITERAL_ADDRESS,
+            domain: domain.to_string(),
+            addr: addr.clone(),
+            source_addr: addr,
+            interface: String::new(),
+            ifindex: 0,
+            queries: 0,
+            failed_queries: 0,
+            nxdomain_replies: 0,
+            retrys: 0,
+            query_latency: 0,
+            mma_latency: 0,
+            forwardtime: None,
+            forwardcount: 0,
+            tcpfd: -1,
+            serial: 0,
+            arrayposn: -1,
+            last_server: -1,
+            #[cfg(feature = "loop")]
+            uid: 0,
+        }
+    }
+
+    #[test]
+    fn address_literal_answers_with_configured_ipv4() {
+        let servers = vec![literal_server(
+            "example.com", SERV_4ADDR, Some("1.2.3.4".parse().unwrap()),
+        )];
+        let arr = ServerArray::build(&[], &servers);
+        let cfg = LocalConfig { address_servers: &arr, address_server_list: &servers, ..empty_config() };
+
+        let query = make_query("example.com", 1); // A
+        let mut cache = DnsCache::new(100);
+        let resp = answer_request(&query, &mut cache, Instant::now(), &cfg)
+            .expect("--address= must answer locally");
+        assert_eq!(resp.header.rcode(), 0);
+        assert!(resp.header.is_aa());
+        assert_eq!(resp.answers.len(), 1);
+        assert_eq!(resp.answers[0].rtype, 1);
+        assert_eq!(resp.answers[0].rdata, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn address_literal_answers_with_configured_ipv6() {
+        let servers = vec![literal_server("example.com", SERV_6ADDR, Some("::1".parse().unwrap()))];
+        let arr = ServerArray::build(&[], &servers);
+        let cfg = LocalConfig { address_servers: &arr, address_server_list: &servers, ..empty_config() };
+
+        let query = make_query("example.com", 28); // AAAA
+        let mut cache = DnsCache::new(100);
+        let resp = answer_request(&query, &mut cache, Instant::now(), &cfg)
+            .expect("--address= must answer locally");
+        assert_eq!(resp.answers.len(), 1);
+        assert_eq!(resp.answers[0].rtype, 28);
+        assert_eq!(resp.answers[0].rdata, "::1".parse::<std::net::Ipv6Addr>().unwrap().octets().to_vec());
+    }
+
+    #[test]
+    fn address_literal_all_zeros_answers_a_and_aaaa_for_any_query() {
+        let servers = vec![literal_server("example.com", SERV_ALL_ZEROS, None)];
+        let arr = ServerArray::build(&[], &servers);
+        let cfg = LocalConfig { address_servers: &arr, address_server_list: &servers, ..empty_config() };
+
+        let query = make_query("example.com", 255); // ANY
+        let mut cache = DnsCache::new(100);
+        let resp = answer_request(&query, &mut cache, Instant::now(), &cfg)
+            .expect("--address=/domain/# must answer locally");
+        assert_eq!(resp.answers.len(), 2);
+        assert!(resp.answers.iter().any(|a| a.rtype == 1 && a.rdata == vec![0, 0, 0, 0]));
+        assert!(resp.answers.iter().any(|a| a.rtype == 28 && a.rdata == vec![0u8; 16]));
+    }
+
+    /// A bare `--server=/example.com/` (no address) is documented to behave
+    /// exactly like `--address=/example.com/`: NXDOMAIN for the domain and
+    /// all its subdomains, unless the name is otherwise locally known (man
+    /// page: "one or more domains with no address returns a no-such-domain
+    /// answer").
+    #[test]
+    fn bare_literal_domain_returns_nxdomain_by_default() {
+        let servers = vec![literal_server("example.com", 0, None)];
+        let arr = ServerArray::build(&[], &servers);
+        let cfg = LocalConfig { address_servers: &arr, address_server_list: &servers, ..empty_config() };
+
+        let query = make_query("example.com", 1);
+        let mut cache = DnsCache::new(100);
+        let resp = answer_request(&query, &mut cache, Instant::now(), &cfg)
+            .expect("a bare literal domain must never be forwarded");
+        assert_eq!(resp.header.rcode(), 3); // NXDOMAIN
+        assert_eq!(resp.header.ancount, 0);
+    }
+
+    /// The subdomain case, and a non-A/AAAA qtype: a bare literal domain
+    /// blocks *every* query type, unlike an address literal (see below).
+    #[test]
+    fn bare_literal_domain_blocks_subdomains_and_all_qtypes() {
+        let servers = vec![literal_server("example.com", 0, None)];
+        let arr = ServerArray::build(&[], &servers);
+        let cfg = LocalConfig { address_servers: &arr, address_server_list: &servers, ..empty_config() };
+
+        let query = make_query("www.example.com", 16); // TXT
+        let mut cache = DnsCache::new(100);
+        let resp = answer_request(&query, &mut cache, Instant::now(), &cfg)
+            .expect("a bare literal domain must block every qtype, including subdomains");
+        assert_eq!(resp.header.rcode(), 3); // NXDOMAIN
+    }
+
+    /// A bare literal domain whose name is otherwise locally known (matches
+    /// `check_for_local_domain`) answers NOERR/NODATA instead of NXDOMAIN —
+    /// the rollback case in `is_local_answer` (domain-match.c:396-401).
+    #[test]
+    fn bare_literal_domain_returns_noerr_when_name_locally_known() {
+        let servers = vec![literal_server("example.com", 0, None)];
+        let arr = ServerArray::build(&[], &servers);
+        let mx = MxSrvRecord {
+            name: "example.com".into(), target: "mail.example.com".into(),
+            priority: 10, is_srv: false, weight: 0, srv_port: 0, offset: 0,
+        };
+        let cfg = LocalConfig {
+            address_servers: &arr,
+            address_server_list: &servers,
+            mx_records: std::slice::from_ref(&mx),
+            ..empty_config()
+        };
+
+        // A query for the TXT type: the MX record itself doesn't answer it,
+        // but check_for_local_domain() still reports the name as known.
+        let query = make_query("example.com", 16);
+        let mut cache = DnsCache::new(100);
+        let resp = answer_request(&query, &mut cache, Instant::now(), &cfg)
+            .expect("should answer locally");
+        assert_eq!(resp.header.rcode(), 0); // NOERROR
+        assert_eq!(resp.header.ancount, 0);
+    }
+
+    /// Since dnsmasq 2.86, a domain with only an address literal (no bare
+    /// entry) forwards query types other than A/AAAA upstream instead of
+    /// answering NODATA — verified against domain-match.c's `filter_servers`
+    /// cascade, which only special-cases the literal-address group for
+    /// F_IPV4/F_IPV6 lookups.
+    #[test]
+    fn address_literal_lets_other_qtypes_go_upstream() {
+        let servers = vec![literal_server(
+            "example.com", SERV_4ADDR, Some("1.2.3.4".parse().unwrap()),
+        )];
+        let arr = ServerArray::build(&[], &servers);
+        let cfg = LocalConfig { address_servers: &arr, address_server_list: &servers, ..empty_config() };
+
+        let query = make_query("example.com", 16); // TXT
+        let mut cache = DnsCache::new(100);
+        assert!(
+            answer_request(&query, &mut cache, Instant::now(), &cfg).is_none(),
+            "non-A/AAAA queries for an address-literal-only domain must be forwarded",
+        );
+    }
+
+    /// Man page: "/etc/hosts and DHCP leases override this for individual
+    /// names" — a host_records match takes priority over an address literal
+    /// for the same name.
+    #[test]
+    fn host_record_overrides_address_literal_for_same_name() {
+        use crate::types::dns_records::HostRecord;
+        let servers = vec![literal_server(
+            "example.com", SERV_4ADDR, Some("9.9.9.9".parse().unwrap()),
+        )];
+        let arr = ServerArray::build(&[], &servers);
+        let hr = HostRecord {
+            ttl: 60, flags: 0, names: vec!["example.com".into()],
+            addr4: Some(Ipv4Addr::new(10, 0, 0, 1)), addr6: None,
+        };
+        let cfg = LocalConfig {
+            address_servers: &arr,
+            address_server_list: &servers,
+            host_records: std::slice::from_ref(&hr),
+            ..empty_config()
+        };
+
+        let query = make_query("example.com", 1);
+        let mut cache = DnsCache::new(100);
+        let resp = answer_request(&query, &mut cache, Instant::now(), &cfg).unwrap();
+        assert_eq!(resp.answers.len(), 1);
+        assert_eq!(resp.answers[0].rdata, vec![10, 0, 0, 1]);
+    }
+
+    /// When the address answers would not fit the reply's size budget, the
+    /// whole answer section is dropped and TC is set instead of returning a
+    /// partial answer (domain-match.c:453-460: on truncation `anscount` is
+    /// reset to 0 for the whole call, not just the RRs that didn't fit).
+    #[test]
+    fn address_literal_sets_tc_and_empties_answers_when_reply_does_not_fit() {
+        // 64 IPv4 literals for the same domain, each contributing an A RR
+        // (name + fixed RR overhead + 4-byte rdata) — comfortably over the
+        // default 512-byte PACKETSZ budget for a query with no EDNS0 OPT.
+        let servers: Vec<Server> = (0..64u8)
+            .map(|i| literal_server("example.com", SERV_4ADDR, Some(std::net::IpAddr::V4(Ipv4Addr::new(10, 0, 0, i)))))
+            .collect();
+        let arr = ServerArray::build(&[], &servers);
+        let cfg = LocalConfig { address_servers: &arr, address_server_list: &servers, ..empty_config() };
+
+        let query = make_query("example.com", 1);
+        let mut cache = DnsCache::new(100);
+        let resp = answer_request(&query, &mut cache, Instant::now(), &cfg)
+            .expect("must still reply, just truncated");
+        assert!(resp.header.hb3 & HB3_TC != 0, "TC bit must be set");
+        assert_eq!(resp.answers.len(), 0);
+        assert_eq!(resp.header.ancount, 0);
+    }
+
+    /// Ordering regression: upstream tries `lookup_domain`/`is_local_answer`
+    /// *before* the `OPT_NODOTS_LOCAL` fallback (`forward.c:346-361`), so a
+    /// single-label domain with a configured literal address must still
+    /// resolve to it even when `--domain-needed` is also set — it must not
+    /// be shadowed by the dot-free-name NXDOMAIN/NOERR fallback.
+    #[test]
+    fn address_literal_on_single_label_domain_wins_over_nodots_local() {
+        let servers = vec![literal_server("foo", SERV_4ADDR, Some("1.2.3.4".parse().unwrap()))];
+        let arr = ServerArray::build(&[], &servers);
+        let cfg = LocalConfig {
+            address_servers: &arr,
+            address_server_list: &servers,
+            nodots_local: true,
+            ..empty_config()
+        };
+
+        let query = make_query("foo", 1); // A, no dot
+        let mut cache = DnsCache::new(100);
+        let resp = answer_request(&query, &mut cache, Instant::now(), &cfg)
+            .expect("should answer locally");
+        assert_eq!(resp.header.rcode(), 0);
+        assert_eq!(resp.answers.len(), 1);
+        assert_eq!(resp.answers[0].rdata, vec![1, 2, 3, 4]);
     }
 
     // ── synth-domain wiring (domain.c: is_name_synthetic / is_rev_synth) ────

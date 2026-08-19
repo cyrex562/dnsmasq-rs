@@ -994,9 +994,12 @@ pub struct LocalData {
     pub nodots_local:  bool,
     /// `--synth-domain` (`daemon->synth_domains`).
     pub synth_domains: Vec<CondDomain>,
-    /// Domains with a `SERV_LITERAL_ADDRESS` server entry and no upstream —
-    /// see [`crate::rfc1035::LocalConfig::literal_domains`].
-    pub literal_domains: Vec<String>,
+    /// `server` entries with `SERV_LITERAL_ADDRESS` set — see
+    /// [`crate::rfc1035::LocalConfig::address_server_list`].
+    pub address_server_list: Vec<crate::types::server::Server>,
+    /// Sorted lookup table built once from `address_server_list` — see
+    /// [`crate::rfc1035::LocalConfig::address_servers`].
+    pub address_servers: crate::domain_match::ServerArray,
 }
 
 impl Default for LocalData {
@@ -1016,7 +1019,8 @@ impl Default for LocalData {
             int_names:     Vec::new(),
             nodots_local:  false,
             synth_domains: Vec::new(),
-            literal_domains: Vec::new(),
+            address_server_list: Vec::new(),
+            address_servers: crate::domain_match::ServerArray::build(&[], &[]),
         }
     }
 }
@@ -1037,7 +1041,8 @@ impl LocalData {
             int_names:     &self.int_names,
             nodots_local:  self.nodots_local,
             synth_domains: &self.synth_domains,
-            literal_domains: &self.literal_domains,
+            address_servers: &self.address_servers,
+            address_server_list: &self.address_server_list,
         }
     }
 
@@ -1052,6 +1057,7 @@ impl LocalData {
             && self.cnames.is_empty()
             && self.naptr_records.is_empty()
             && self.int_names.is_empty()
+            && self.address_server_list.is_empty()
     }
 }
 
