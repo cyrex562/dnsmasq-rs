@@ -212,6 +212,13 @@ pub struct Daemon {
     pub dhcp_relay_ids: Vec<DhcpRelayIdRule>,
     #[cfg(feature = "dhcp")]
     pub dhcp_reply_delays: Vec<DhcpReplyDelay>,
+    /// `--bootp-dynamic[=<tag>[,<tag>]]` gate rules (`daemon->bootp_dynamic`,
+    /// a `struct dhcp_netid_list`). Each entry is one directive occurrence's
+    /// AND-combined tag filter (empty = matches unconditionally); a BOOTP
+    /// client without a nailed `dhcp-host` address may only be given a
+    /// dynamic address when at least one entry matches (rfc2131.c:661-668).
+    #[cfg(feature = "dhcp")]
+    pub bootp_dynamic:   Vec<Vec<DhcpNetid>>,
     #[cfg(feature = "dhcp")]
     pub boot_config:     Vec<DhcpBoot>,
     /// Conditional tag-setting rules from `tag-if` (`struct tag_if`).
@@ -496,6 +503,8 @@ impl Default for Daemon {
             dhcp_relay_ids: vec![],
             #[cfg(feature = "dhcp")]
             dhcp_reply_delays: vec![],
+            #[cfg(feature = "dhcp")]
+            bootp_dynamic: vec![],
             #[cfg(feature = "dhcp")]
             boot_config: vec![],
             #[cfg(feature = "dhcp")]

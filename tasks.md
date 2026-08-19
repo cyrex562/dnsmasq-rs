@@ -1416,6 +1416,40 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   DHCP/PXE runtime consumers (tracked here until then), and `umbrella`'s
   fields get threaded into a real outgoing-EDNS0 call site.
 
+- [ ] Issue #30 remainder — `rfc2131.c` PXE proxyDHCP path (BOOTP,
+  LEASEQUERY, and `apply_delay`'s ACK gating are now done; see
+  `dispatch_bootp`/`dispatch_leasequery`/`handle_leasequery` in `src/dhcp.rs`
+  and `src/rfc2131.rs`, and `dhcp-rapid-commit` support in the `Discover` arm
+  of `dispatch_dhcp_with_meta`):
+  - `pxe_uefi_workaround()` / `pxe_opts()` (rfc2131.c:2392-2556) and the
+    proxyDHCP reply branch that calls them (rfc2131.c:955-1050, gated on
+    `CONTEXT_PROXY` + DISCOVER/REQUEST) are not ported. Blocked on the
+    `pxe-service`/`pxe-prompt` no-ops above: there is no `PxeService`
+    type or `daemon.pxe_services` to build the PXE menu (PXE_MENU /
+    PXE_SERVERS / PXE_MENU_PROMPT / PXE_DISCOVERY_CONTROL) from, and no
+    `CONTEXT_PROXY` handling anywhere in `dispatch_dhcp_with_meta`. Port 4011
+    redirection (rfc2131.c:994-998) is unported for the same reason.
+    `apply_delay`'s PXE-proxy call site (rfc2131.c:1046) has nothing to call
+    it from yet.
+  - Upstream's `known`/`known-othernet` netid tagging (rfc2131.c:544-560,
+    based on whether `find_config` matches with vs. without the arriving
+    `context`) is not derived for any message type, BOOTP included — this
+    port's `derived_tags`/`dispatch_bootp` never add those tags. Pre-existing
+    gap, not new to BOOTP.
+  - BOOTP's proxy-context exclusion (`context->flags & CONTEXT_PROXY`,
+    rfc2131.c:571-572) is not checked in `dispatch_bootp` for the same
+    "no `CONTEXT_PROXY` concept in dispatch" reason as above.
+  - `do_options`'s unconditional `mess->siaddr = context->local` default
+    (rfc2131.c:2667-2668, before any `dhcp-boot` match) is not ported for
+    *any* message type — `decorate_reply`/`handle_bootp` only ever set
+    `siaddr` from a `dhcp-boot` match or the handler's own `server_id`, never
+    from a context's `local` address. Pre-existing gap, not new to BOOTP.
+  Required tests: `pxe_uefi_workaround`/proxyDHCP need a PXE menu data model
+  before they're testable; `known`/`known-othernet` tagging and the
+  `siaddr` default need `dhcp.rs`/`rfc2131.rs` consumer tests once ported.
+  Done when: each gap above is closed or the PXE menu/`CONTEXT_PROXY`
+  infrastructure it depends on exists and is tracked separately.
+
 - [x] `connmark-allowlist` / `connmark-allowlist-enable` (option.c:3283-3330,
   `OPT_CMARK_ALST_EN`): parsing is gated on the `conntrack` feature (mirroring
   upstream's `#ifndef HAVE_CONNTRACK` hard error — the directive is rejected

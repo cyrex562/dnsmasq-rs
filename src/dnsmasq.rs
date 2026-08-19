@@ -876,6 +876,11 @@ fn daemon_dhcp_runtime(daemon: &Daemon) -> Option<DhcpDaemonRuntime> {
             no_ping: daemon.option_bool(crate::types::constants::OPT_NO_PING),
             consec_addr: daemon.option_bool(crate::types::constants::OPT_CONSEC_ADDR),
             dhcp_ignore: daemon.dhcp_ignore.clone(),
+            bootp_dynamic: daemon.bootp_dynamic.iter().map(|l| l.list.clone()).collect(),
+            rapid_commit: daemon.option_bool(crate::types::constants::OPT_RAPID_COMMIT),
+            leasequery_addr: daemon.leasequery_addr.clone(),
+            leasequery_enabled: daemon.option_bool(crate::types::constants::OPT_LEASEQUERY),
+            leasequery_source: Ipv4Addr::UNSPECIFIED,
         },
         loop_opts: crate::dhcp::DhcpLoopOptions {
             reply_port_override: (client_port != 68).then_some(client_port),

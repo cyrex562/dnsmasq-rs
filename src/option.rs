@@ -5959,6 +5959,20 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dhcp")]
+    fn apply_bootp_dynamic_records_tag_filters() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("bootp-dynamic\nbootp-dynamic=tag:foo,bar", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.bootp_dynamic.len(), 2);
+        assert!(d.bootp_dynamic[0].is_empty());
+        assert_eq!(
+            d.bootp_dynamic[1].iter().map(|n| n.net.as_str()).collect::<Vec<_>>(),
+            vec!["foo", "bar"]
+        );
+    }
+
+    #[test]
     fn apply_dhcp_authoritative_and_read_ethers_flags() {
         let mut d = Daemon::default();
         let lines = parse_config_text("dhcp-authoritative\nread-ethers", "test").unwrap();
