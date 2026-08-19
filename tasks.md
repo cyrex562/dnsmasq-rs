@@ -462,26 +462,38 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     second `log_txt` call site, serving from cache/local data) still does not call `log_txt`, so
     TXT answers built from `--txt-record` are not logged the way a forwarded TXT reply is — this
     is unrelated to `log_query` below, which now exists and is wired into the same branch.
-  - **`log_query` (Issue #23 / T3-cache) — implemented in `cache.rs`, wired into a representative
-    subset of real call sites, not exhaustive.** `crate::cache::log_query` is a faithful,
-    unit-tested port of `cache.c:2311-2500` (all `OPT_LOG`/`OPT_LOG_ONLY_FAILED`/`OPT_AUTH_LOG`
-    gates, the full `source`/`name`/`verb`/`dest`/`extra` flag matrix including `F_IPSET`,
-    `F_KEYTAG`, `F_RCODE`+EDE, `F_REVERSE`, the `OPT_EXTRALOG` two-branch format) — see
+  - **`log_query` (Issue #23 / T3-cache) — implemented in `cache.rs`, wired into every query
+    processed by the client-facing forward loop plus a representative subset of local-answer
+    call sites, not exhaustive.** `crate::cache::log_query` is a faithful, unit-tested port of
+    `cache.c:2311-2500` (all `OPT_LOG`/`OPT_LOG_ONLY_FAILED`/`OPT_AUTH_LOG` gates, the full
+    `source`/`name`/`verb`/`dest`/`extra` flag matrix including `F_IPSET`, `F_KEYTAG`,
+    `F_RCODE`+EDE, `F_REVERSE`, the `OPT_EXTRALOG` two-branch format) — see
     `cache::tests::log_query_*`. It is a pure function returning `Option<String>`
     (`LogQueryOptions` gates it, no hidden global state) rather than calling `my_syslog`
     directly, so callers own emission; `rfc1035::answer_request` wires it into: the config/cached
     CNAME chain, cached NXDOMAIN, local TXT/MX/SRV/NAPTR records, host_records and cached A/AAAA
     (positive and negative), PTR from host_records/cache, `--domain-needed`'s local NXDOMAIN/NOERR
-    decision, and the new CHAOS NOTIMP fallback. **Not wired**: `forward.rs`'s forward-to-upstream
-    (`F_SERVER`) and reply-received (`F_UPSTREAM`) paths — `forward::log_query_mysockaddr` already
-    builds the right `(flags, addr, port)` tuple but still has no caller; `dnssec.rs`/`auth.rs`
+    decision, and the new CHAOS NOTIMP fallback.
+    `forward.rs` (the dominant real-world path — a fresh, uncached query that gets forwarded)
+    now logs the three points `forward.c`'s `udp_request()`/`process_reply()` do: every incoming
+    client query (`F_QUERY[|F_CONFIG]`, `run_forward_loop_on`'s query-receipt branch, mirroring
+    `forward.c:1826-1834`), every query actually sent upstream (`F_SERVER`,
+    `ForwardEngine::send_upstream`, only once the send succeeds, mirroring `forward.c:541-557`),
+    and a non-NOERROR/NXDOMAIN or truncated upstream reply (`F_UPSTREAM[|F_RCODE]`,
+    `process_reply`, mirroring `forward.c:781-792`). `forward::log_query_mysockaddr` — previously
+    dead code with only its own unit tests as callers — now has a real caller via
+    `forwarded_query_log_line`, which reuses it for the family-flag/port-as-rrtype computation
+    before handing the result to `crate::cache::log_query`. **Still not wired**: a cache *hit*
+    inside the forward loop (`answer_locally`'s success path currently reaches `answer_request`,
+    which does log — but a hit served by `forward.rs`'s own `cache_upstream_reply`/extract path
+    on a *subsequent* identical forwarded query does not re-log per-record); `dnssec.rs`/`auth.rs`
     validation-result logging (`F_SECSTAT`/`F_DNSSEC`); ipset/nftset match logging (`F_IPSET`,
     logic ported and tested but no live call site); the freeform `ptr_records` branch (no clean
-    address to attach); ANY of the auth-server (`auth.rs`) answer paths. `log_query`'s
+    address to attach); ANY of the auth-server (`auth.rs`) answer paths; DNSSEC retry logging
+    (`F_DNSSEC`, `forward.c:560-561`, since DNSSEC retry queries are not implemented). `log_query`'s
     `id`/`source_addr` parameters (the `OPT_EXTRALOG` `<id> <addr>/<port>` prefix) are always
-    passed `0`/`None` from `answer_request` — there is no per-transaction display-id counter or
-    client-address threading into that call site yet (`answer_request` never receives the
-    client's socket address), so extralog output is well-formed but the id is always `0`.
+    passed `0`/`None` from every call site — there is no per-transaction display-id counter
+    threaded through yet, so extralog output is well-formed but the id is always `0`.
   - **Transactional insert (Issue #23 / T3-cache) — implemented.** `DnsCache::start_insert` /
     `stage_insert` / `end_insert` (`cache.rs`) port `cache_start_insert`/`cache_insert`/
     `cache_end_insert` (`cache.c:646-905`): a sticky `insert_error` flag makes every `stage_insert`
