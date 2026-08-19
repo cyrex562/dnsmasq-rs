@@ -494,6 +494,20 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     `id`/`source_addr` parameters (the `OPT_EXTRALOG` `<id> <addr>/<port>` prefix) are always
     passed `0`/`None` from every call site — there is no per-transaction display-id counter
     threaded through yet, so extralog output is well-formed but the id is always `0`.
+  - **`record_source` (Issue #23 / T3-cache) — implemented.** `crate::cache::record_source`
+    ports `cache.c:2190-2215`: a `uid -> file path` registry populated by `load_hosts_file`
+    (every hosts-format file this port loads, `/etc/hosts` included, goes through it with its
+    own path, so a flat map is equivalent to C's `SRC_CONFIG`/`SRC_HOSTS`/`addn_hosts`-list
+    lookup) and consulted by `record_source`, falling back to `"<unknown>"` for an unregistered
+    `uid` exactly as C does. `rfc1035::answer_request`'s five cached-lookup `log_query` call
+    sites (cached CNAME, cached NXDOMAIN, PTR-from-cache positive match, and A/AAAA-from-cache
+    positive match) now thread the record's `uid` through `cached_answer_source_arg` instead of
+    always passing `None`, matching C's `record_source(crecp->uid)` at `rfc1035.c:1690,1710,1898,
+    2077` call-for-call — including which branches get it (positive answers) and which don't
+    (negative/NXDOMAIN branches at `rfc1035.c:1889,2063` pass `NULL` in C too). Previously an
+    `/etc/hosts`- or `--addn-hosts`-sourced answer logged via `--log-queries` had an empty source
+    field instead of naming the file; see `cache::tests::record_source_*` and
+    `rfc1035::tests::cached_answer_source_arg_*` / `answer_request_a_record_from_hosts_file_*`.
   - **Transactional insert (Issue #23 / T3-cache) — implemented.** `DnsCache::start_insert` /
     `stage_insert` / `end_insert` (`cache.rs`) port `cache_start_insert`/`cache_insert`/
     `cache_end_insert` (`cache.c:646-905`): a sticky `insert_error` flag makes every `stage_insert`

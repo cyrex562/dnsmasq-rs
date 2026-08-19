@@ -3,8 +3,10 @@
 //! The cache is a bounded LRU map keyed by `(name, type-flags)`.  Expired
 //! entries are evicted lazily on lookup and proactively via `expire_old`.
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use lru::LruCache;
@@ -41,6 +43,49 @@ pub fn next_uid() -> u32 {
         }
         // Wrapped to 0 — skip it
     }
+}
+
+// ---------------------------------------------------------------------------
+// record_source — uid -> origin-file lookup (mirrors C `record_source()`)
+// ---------------------------------------------------------------------------
+
+/// Registry mapping a hosts-file-derived `uid` back to the file it was loaded
+/// from. Populated by [`load_hosts_file`], consulted by [`record_source`].
+///
+/// C keeps this as a linked list of `struct hostsfile` (`daemon->addn_hosts`)
+/// plus two fixed constants (`SRC_CONFIG`, `SRC_HOSTS` for `/etc/hosts`); a
+/// flat `uid -> path` map is equivalent here because every hosts-format file
+/// this port loads — `/etc/hosts` included — goes through
+/// [`load_hosts_file`] with its own path, so the registered string is always
+/// the exact path `--log-queries` should attribute the answer to.
+fn record_sources() -> &'static Mutex<HashMap<u32, String>> {
+    static SOURCES: OnceLock<Mutex<HashMap<u32, String>>> = OnceLock::new();
+    SOURCES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Register `uid` as having been loaded from `source` (a file path).
+fn register_record_source(uid: u32, source: &str) {
+    if uid == UID_NONE {
+        return;
+    }
+    if let Ok(mut sources) = record_sources().lock() {
+        sources.insert(uid, source.to_string());
+    }
+}
+
+/// Resolve a cache record's `uid` back to the file it was loaded from.
+///
+/// Port of C's `record_source()` (`cache.c:2190-2215`): used as the `arg` to
+/// [`log_query`] for `F_HOSTS`-flagged answers, so `--log-queries` output
+/// names the actual `/etc/hosts` / `--addn-hosts` file an answer came from
+/// instead of leaving the source blank. Returns `"<unknown>"` for a `uid`
+/// nothing registered, matching C's fallback.
+pub fn record_source(uid: u32) -> String {
+    record_sources()
+        .lock()
+        .ok()
+        .and_then(|sources| sources.get(&uid).cloned())
+        .unwrap_or_else(|| "<unknown>".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1751,6 +1796,7 @@ pub fn load_hosts_file(
 ) -> std::io::Result<(u32, usize)> {
     let uid = next_uid();
     let text = std::fs::read_to_string(path)?;
+    register_record_source(uid, path);
     let total = text.lines()
         .map(|l| parse_hosts_line(l, ttl, uid, now, cache))
         .sum();
@@ -2317,6 +2363,35 @@ mod tests {
         parse_hosts_line("10.0.0.7  flagtest", 60, UID_NONE, now, &mut cache);
         let rec = cache.lookup_by_name("flagtest", F_IPV4, now).unwrap();
         assert!(rec.flags & F_HOSTS != 0, "F_HOSTS flag should be set");
+    }
+
+    #[test]
+    fn record_source_unregistered_uid_returns_unknown() {
+        // Mirrors C's `record_source()` fallback: an index nothing registered
+        // returns "<unknown>" rather than panicking or an empty string.
+        assert_eq!(record_source(u32::MAX - 1), "<unknown>");
+    }
+
+    #[test]
+    fn record_source_returns_path_registered_by_load_hosts_file() {
+        // The gap flagged in review: log_query's F_HOSTS branch renders `arg`
+        // as the source, so `load_hosts_file` must register uid -> file path
+        // the same way C's `record_source(crecp->uid)` resolves an
+        // `addn_hosts` entry back to its filename.
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        use std::io::Write;
+        writeln!(file, "10.9.9.9  recordsourcehost").unwrap();
+        let path = file.path().to_str().unwrap().to_string();
+
+        let (uid, count) = load_hosts_file(&path, 60, now, &mut cache).unwrap();
+        assert!(count > 0);
+        assert_eq!(record_source(uid), path);
+
+        let rec = cache.lookup_by_name("recordsourcehost", F_IPV4, now).unwrap();
+        assert_eq!(rec.uid, uid);
+        assert!(rec.flags & F_HOSTS != 0);
     }
 
     #[test]

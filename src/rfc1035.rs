@@ -1163,6 +1163,37 @@ pub fn setup_reply(header: &mut DnsHeader, flags: u32) {
     }
 }
 
+/// True when `name` equals or is a subdomain of any entry in `domains`
+/// (case-insensitive, label-boundary-aware suffix match).
+fn domain_matches_any_suffix(name: &str, domains: &[String]) -> bool {
+    domains.iter().any(|domain| {
+        let dlen = domain.len();
+        if dlen == 0 || name.len() < dlen {
+            return false;
+        }
+        let start = name.len() - dlen;
+        let suffix = &name[start..];
+        suffix.eq_ignore_ascii_case(domain)
+            && (name.len() == dlen || name.as_bytes().get(start.wrapping_sub(1)) == Some(&b'.'))
+    })
+}
+
+/// `arg` for `log_query` at a cached-answer call site.
+///
+/// C always passes `record_source(crecp->uid)` here (`rfc1035.c:1690`,
+/// `:1710`, `:1898`, `:2077`) — every cached-lookup call to `log_query`
+/// forwards the record's origin file unconditionally, regardless of whether
+/// the record actually carries `F_HOSTS`. `log_query`'s `F_HOSTS` branch is
+/// the only one that renders it (as `source`); for any other cache record
+/// (config/DHCP/upstream-derived, `uid == UID_NONE`) `record_source` falls
+/// back to `"<unknown>"`, which is computed but never displayed. Matching
+/// that call shape exactly — rather than only computing it when `F_HOSTS` is
+/// set — keeps this a literal port instead of an equivalent-but-different
+/// shortcut.
+fn cached_answer_source_arg(uid: u32) -> Option<String> {
+    Some(crate::cache::record_source(uid))
+}
+
 /// Port of C's `answer_request()`.  Answers DNS queries from local config and cache.
 ///
 /// Returns `None` when the query should be forwarded to an upstream resolver.
@@ -1265,22 +1296,22 @@ pub fn answer_request(
 
             // Cached CNAME.  It carries its own TTL — `ttl` here is `local-ttl`,
             // a static-record default that says nothing about an upstream answer.
-            let cname_target: Option<(String, u32, u32)> = cache
+            let cname_target: Option<(String, u32, u32, u32)> = cache
                 .lookup_by_name(&name, F_CNAME, now)
                 .and_then(|r| {
                     if let Some(AllAddr::Cname(ref c)) = r.addr {
-                        c.target_name.clone().map(|t| (t, DnsCache::crec_ttl(r, now), r.flags))
+                        c.target_name.clone().map(|t| (t, DnsCache::crec_ttl(r, now), r.flags, r.uid))
                     } else {
                         None
                     }
                 });
-            if let Some((target, cname_ttl, cname_flags)) = cname_target {
+            if let Some((target, cname_ttl, cname_flags, cname_uid)) = cname_target {
                 let mut rd = BytesMut::new();
                 write_name(&mut rd, &target);
                 answers.push(DnsRr {
                     name: name.clone(), rtype: 5, class: 1, ttl: cname_ttl, rdata: rd.to_vec(),
                 });
-                log(cname_flags, Some(&name), None, None, 0);
+                log(cname_flags, Some(&name), None, cached_answer_source_arg(cname_uid).as_deref(), 0);
                 name = target.to_lowercase();
                 if qtype == 5 /* CNAME */ {
                     // The CNAME *is* the answer the client asked for.
@@ -1292,7 +1323,8 @@ pub fn answer_request(
 
             // Cached NXDOMAIN.
             if let Some(r) = cache.lookup_by_name(&name, F_NXDOMAIN | F_NEG, now) {
-                log(r.flags, Some(&name), None, None, 0);
+                let arg = cached_answer_source_arg(r.uid);
+                log(r.flags, Some(&name), None, arg.as_deref(), 0);
                 nxdomain = true;
                 ans      = true;
             }
@@ -1404,9 +1436,11 @@ pub fn answer_request(
                     // Try cache reverse lookup.
                     let cached = cache
                         .lookup_by_addr(&addr, now)
-                        .map(|r| (r.name.clone(), r.flags, DnsCache::crec_ttl(r, now)));
-                    if let Some((hostname, flags, cached_ttl)) = cached {
+                        .map(|r| (r.name.clone(), r.flags, DnsCache::crec_ttl(r, now), r.uid));
+                    if let Some((hostname, flags, cached_ttl, uid)) = cached {
                         if flags & F_NXDOMAIN != 0 {
+                            // C passes NULL here (`rfc1035.c:1889`) — only the
+                            // found-a-name branch below passes `record_source`.
                             log(flags | F_REVERSE, Some(&name), Some(&addr), None, 0);
                             nxdomain = true;
                             ans      = true;
@@ -1417,7 +1451,8 @@ pub fn answer_request(
                                 name: name.clone(), rtype: 12, class: 1,
                                 ttl: cached_ttl, rdata: rd.to_vec(),
                             });
-                            log(flags & !F_FORWARD, Some(&name), Some(&addr), None, 0);
+                            let arg = cached_answer_source_arg(uid);
+                            log(flags & !F_FORWARD, Some(&name), Some(&addr), arg.as_deref(), 0);
                             ans = true;
                         }
                         found_ptr = true;
@@ -1484,12 +1519,14 @@ pub fn answer_request(
             if want_a {
                 let cached = cache
                     .lookup_forward(&name, F_IPV4, now)
-                    .map(|r| (r.addr.clone(), r.flags, DnsCache::crec_ttl(r, now)));
-                if let Some((addr, flags, cached_ttl)) = cached {
+                    .map(|r| (r.addr.clone(), r.flags, DnsCache::crec_ttl(r, now), r.uid));
+                if let Some((addr, flags, cached_ttl, uid)) = cached {
                     if flags & F_NEG != 0 {
                         if flags & F_NXDOMAIN != 0 {
                             nxdomain = true;
                         }
+                        // C passes NULL here (`rfc1035.c:2063`) — only the
+                        // positive-answer branch below passes `record_source`.
                         log(flags, Some(&name), None, None, 0);
                         ans = true;
                     } else if let Some(AllAddr::Addr4(ip)) = addr {
@@ -1497,7 +1534,8 @@ pub fn answer_request(
                             name: name.clone(), rtype: 1, class: 1,
                             ttl: cached_ttl, rdata: ip.octets().to_vec(),
                         });
-                        log(flags, Some(&name), Some(&AllAddr::Addr4(ip)), None, 0);
+                        let arg = cached_answer_source_arg(uid);
+                        log(flags, Some(&name), Some(&AllAddr::Addr4(ip)), arg.as_deref(), 0);
                         ans = true;
                     }
                 } else if let Some(ip4) = crate::domain::synthesize_ipv4(&name, config.synth_domains) {
@@ -1515,12 +1553,14 @@ pub fn answer_request(
             if want_aaaa {
                 let cached = cache
                     .lookup_forward(&name, F_IPV6, now)
-                    .map(|r| (r.addr.clone(), r.flags, DnsCache::crec_ttl(r, now)));
-                if let Some((addr, flags, cached_ttl)) = cached {
+                    .map(|r| (r.addr.clone(), r.flags, DnsCache::crec_ttl(r, now), r.uid));
+                if let Some((addr, flags, cached_ttl, uid)) = cached {
                     if flags & F_NEG != 0 {
                         if flags & F_NXDOMAIN != 0 {
                             nxdomain = true;
                         }
+                        // C passes NULL here (`rfc1035.c:2063`) — only the
+                        // positive-answer branch below passes `record_source`.
                         log(flags, Some(&name), None, None, 0);
                         ans = true;
                     } else if let Some(AllAddr::Addr6(ip)) = addr {
@@ -1528,7 +1568,8 @@ pub fn answer_request(
                             name: name.clone(), rtype: 28, class: 1,
                             ttl: cached_ttl, rdata: ip.octets().to_vec(),
                         });
-                        log(flags, Some(&name), Some(&AllAddr::Addr6(ip)), None, 0);
+                        let arg = cached_answer_source_arg(uid);
+                        log(flags, Some(&name), Some(&AllAddr::Addr6(ip)), arg.as_deref(), 0);
                         ans = true;
                     }
                 } else if let Some(ip6) = crate::domain::synthesize_ipv6(&name, config.synth_domains) {
@@ -4600,5 +4641,62 @@ mod tests {
         // Lease has 30s remaining but local_ttl=60 → cap at 30
         let ttl = crec_ttl(130, 100, F_DHCP, 0, 60);
         assert_eq!(ttl, 30);
+    }
+
+    // ── cached_answer_source_arg ─────────────────────────────────────────────
+
+    #[test]
+    fn cached_answer_source_arg_resolves_hosts_file_path() {
+        // The gap review flagged: `answer_request`'s cached-lookup branches
+        // always passed `arg = None` to `log_query`, so an F_HOSTS-sourced
+        // answer produced a log line with an empty source field instead of
+        // naming the hosts file it came from. `cached_answer_source_arg`
+        // closes that gap the same way C's call sites do — by resolving the
+        // record's `uid` through `record_source`.
+        let mut cache = DnsCache::new(16);
+        let now = Instant::now();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        use std::io::Write;
+        writeln!(file, "10.1.2.3  cachedsourcehost").unwrap();
+        let path = file.path().to_str().unwrap().to_string();
+
+        let (uid, _count) = crate::cache::load_hosts_file(&path, 60, now, &mut cache).unwrap();
+        assert_eq!(cached_answer_source_arg(uid), Some(path));
+    }
+
+    #[test]
+    fn cached_answer_source_arg_unregistered_uid_is_unknown_placeholder() {
+        // Mirrors C computing `record_source()` unconditionally even for a
+        // non-hosts record — `log_query` only renders it when `F_HOSTS` is
+        // set, so a harmless placeholder here is correct, not a bug.
+        assert_eq!(cached_answer_source_arg(UID_NONE), Some("<unknown>".to_string()));
+    }
+
+    #[test]
+    fn answer_request_a_record_from_hosts_file_is_answered_correctly() {
+        // End-to-end: an A query answered from a cache entry loaded via
+        // `load_hosts_file` still returns the right address once the log
+        // call site threads `r.uid` through instead of discarding it.
+        let mut cache = DnsCache::new(16);
+        let now = Instant::now();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        use std::io::Write;
+        writeln!(file, "10.5.6.7  hostsfile.example").unwrap();
+        let path = file.path().to_str().unwrap().to_string();
+        crate::cache::load_hosts_file(&path, 60, now, &mut cache).unwrap();
+
+        let query = DnsPacket::parse(&{
+            let mut pkt = vec![
+                0x00, 0x01, HB3_RD, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ];
+            pkt.extend_from_slice(b"\x09hostsfile\x07example\x00");
+            pkt.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+            pkt
+        }).unwrap();
+
+        let cfg = empty_config();
+        let resp = answer_request(&query, &mut cache, now, &cfg).expect("should answer locally");
+        assert_eq!(resp.answers.len(), 1);
+        assert_eq!(resp.answers[0].rdata, vec![10, 5, 6, 7]);
     }
 }
