@@ -391,7 +391,9 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     elsewhere in this file) — `add_umbrella_opt` still takes them as plain parameters
     rather than reading `Daemon` directly, so a real caller only needs to thread
     `daemon.umbrella_org`/`umbrella_asset`/`umbrella_device` through once the
-    outgoing-query path exists.
+    outgoing-query path exists. The MAC half of that gap is now unblocked on the
+    resolution side — `arp::find_mac_for_daemon` (see the `arp.c` entry below) can supply a
+    real MAC for `add_mac`/`add_dns_client` — but nothing calls it from here yet either.
   - ipset kernel population is now wired end to end: `rfc1035::extract_addresses` matches the
     query name against `ExtractConfig::ipsets` (a local `domain_find_sets`, duplicating
     `forward::domain_find_sets`/`IpSet` — nothing constructs an `IpSet` from parsed config,
@@ -2553,6 +2555,60 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     (SLAAC's real target, DHCPv4-committed leases, now gets tracked/probed from the loop that
     actually owns them), but still means e.g. a DHCPv6-stateful lease and its dual-stack sibling's
     DHCPv4 lease aren't visible to each other's loop.
+
+- [x] `arp.rs`: cache never populated; no kernel-refresh glue or call sites (Issue #33 / T3-arp).
+  Source of truth: `arp.c:107-208` (`find_mac`), `netlink.c:154` (`iface_enumerate`).
+  `ArpCache` (the state-machine port) previously had no orchestrator: `find_mac_cached` was
+  lookup-only and nothing ever called `begin_refresh`/`filter_mac`/`finish_refresh` outside its
+  own unit tests, so the cache could never actually be populated from the kernel. `arp::find_mac`
+  is now that orchestrator, a faithful port of `find_mac()`'s single-retry loop (cache hit ->
+  return; miss -> exactly one `begin_refresh`/enumerate/`finish_refresh` cycle -> retry, this time
+  accepting a negative match too (C's `|| updated`) -> `add_empty` on a second miss), with the
+  kernel-enumeration step dependency-injected as a closure so the state-machine logic is testable
+  without a real socket (`arp::tests::find_mac_*`). `arp::find_mac_for_daemon` is the real,
+  Linux-only wiring: it lazily opens a persistent `netlink::NetlinkSocket` (mirroring
+  `daemon->netlinkfd`/`netlink_init()`, opened once and reused rather than per-call) and drives
+  `netlink::iface_enumerate(..., AF_UNSPEC, ...)`, feeding every `IfaceRecord::Arp` entry through
+  `filter_mac`. `Daemon` gained `arp_cache: ArpCache` and `arp_netlink: Option<NetlinkSocket>`
+  fields (unconditional — MAC options are core DNS behavior, not DHCP-gated).
+  `arp::drain_arp_script_events` is the `do_arp_script_run` glue: it drains the queue and, when
+  `OPT_SCRIPT_ARP` is set, converts each `ArpAction` into a `helper::ScriptData` via the existing
+  `ScriptData::for_arp` (feature `dhcp`); when the option is unset it still drains (so cache state
+  advances) but builds nothing, matching `do_arp_script_run` always popping/advancing while
+  `queue_arp()` alone is gated on the option.
+  `dhcp6::get_client_mac` (Linux-only) is a port of `get_client_mac()` (`dhcp6.c:307-348`) built
+  on `find_mac_for_daemon`, resolving and `debug!`-logging a DHCPv6 client's MAC.
+  Explicitly still unsupported / deferred, tracked here rather than silently dropped:
+  - **No ICMPv6 active-probe retry.** C's `get_client_mac` sends up to 5 Neighbour Solicitations
+    (100ms apart) via `daemon->icmp6fd` to populate the kernel's neighbour cache for a client that
+    hasn't sent recent traffic (`dhcp6.c:329-343`). This port has no ICMPv6 socket wired up at
+    all, so it only ever consults the kernel's *existing* neighbour table.
+  - **No privilege-dropped-child cache-only mode.** C's `daemon->pipe_to_parent != -1` check
+    (`arp.c:119,148-150`) makes a forked child reuse the parent's cache without ever touching a
+    netlink socket itself. This port's DNS path has no forked-child model, so `find_mac_for_daemon`
+    always has kernel access when a socket is open; `find_mac`'s `can_query_kernel` parameter
+    exists and is fully honored, so wiring in that distinction later needs no further change to
+    the orchestrator itself.
+  - **No live callers yet — the pre-existing gaps are still open, not created by this change.**
+    `edns0::add_edns0_config`/`edns0_needs_mac` (which would consume a resolved MAC for
+    `--add-mac`/`--mac-base64`/`--mac-hex`) already have no call site in `forward.rs` at all — a
+    separate, larger, already-tracked gap (see the `edns0.c`/`FREC_NO_CACHE` entries above); MAC
+    resolution is now available for whenever that wiring lands, but this change does not add it.
+    Likewise `dhcp6::get_client_mac` has no caller: DHCPv6 packet dispatch
+    (`dispatch_dhcp6`/`handle_solicit`/`handle_request6`) has no client-MAC field to populate and
+    is itself not wired into any receive loop yet (`dispatch_dhcp6` has zero callers in the tree).
+  - **`tftp.c:470`'s MAC substitution is not addressed at all.** `src/tftp.rs` has no MAC-aware
+    filename substitution and this change does not add one; `find_mac_for_daemon` is available for
+    whoever picks that up.
+  - **`do_arp_script_run` events are built but never delivered.** `drain_arp_script_events`
+    produces `ScriptData` values; actually calling `HelperHandle::send` on them needs a running
+    helper, which (per the `helper.rs` entry above) nothing forks from the main startup path yet.
+  Covered by `arp::tests::find_mac_*` (cache-hit short-circuit, kernel-populate-on-miss,
+  negative-entry recording, no-kernel-access child-style path, empty-entry upgrade on refresh,
+  single-enumerate-per-call), `arp::tests::find_mac_for_daemon_opens_socket_and_does_not_panic`
+  and `netlink::tests::open_netlink_socket_returns_usable_fd` (real socket, Linux only),
+  `arp::tests::drain_arp_script_events_*` (feature `dhcp`), and
+  `dhcp6::tests::get_client_mac_*` (Linux only).
 
 ## P4 Test Harness And Tooling
 

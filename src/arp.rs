@@ -9,8 +9,13 @@
 //! * `Mark`  — was `Found`/`Empty`; awaiting re-confirmation in this refresh cycle.
 //! * `Empty` — negative cache entry: address seen but no MAC available.
 //!
-//! The kernel-enumeration glue (`iface_enumerate`) is left to the caller;
-//! `ArpCache::filter_mac` is the callback that integrates kernel results.
+//! [`find_mac`] is the orchestrator that ties the state machine to kernel
+//! enumeration, mirroring C's `find_mac()` (`arp.c:107-208`): a cache hit
+//! returns immediately, a miss triggers exactly one refresh cycle
+//! (`begin_refresh`/`filter_mac`/`finish_refresh`) via the caller-supplied
+//! `enumerate` closure, then the cache is re-checked once before falling
+//! back to a negative (`add_empty`) entry. [`find_mac_for_daemon`] is the
+//! Linux, real-kernel wiring of that closure via [`crate::netlink`].
 
 use std::collections::VecDeque;
 use std::net::IpAddr;
@@ -79,6 +84,7 @@ pub enum ArpAction {
 ///
 /// Mirrors the three linked-lists in the C (`arps`, `old`, `freelist`)
 /// using two `Vec`s (active, old).
+#[derive(Debug)]
 pub struct ArpCache {
     /// Active ARP entries (`arps` in C).
     active: Vec<ArpRecord>,
@@ -217,6 +223,115 @@ impl ArpCache {
         });
     }
 
+}
+
+/// Look up (and, on a miss, refresh from the kernel and retry) the MAC
+/// address for `addr`.
+///
+/// Mirrors `find_mac()` (`arp.c:107-208`) end to end:
+///
+/// 1. If the cache doesn't need a forced refresh (`!cache.is_stale(now)`) or
+///    the caller cannot query the kernel at all (`can_query_kernel == false`,
+///    C's "child with no netlink socket" branch, `arp.c:119,148-150`), try the
+///    in-cache lookup first.
+/// 2. If that misses and `can_query_kernel` is true, run exactly one refresh
+///    cycle — `enumerate` is expected to call [`ArpCache::filter_mac`] once
+///    per kernel-reported entry, mirroring `iface_enumerate(..., filter_mac)`
+///    (`arp.c:163`) — then retry the lookup, this time accepting a negative
+///    (`Empty`) entry as a match too (C's `|| updated`, `arp.c:139`).
+/// 3. If it still misses, record a negative entry via [`ArpCache::add_empty`]
+///    so the kernel isn't re-queried for this address until the next
+///    refresh, and return `None`.
+///
+/// `enumerate` is dependency-injected so this orchestration is testable
+/// without a real netlink socket; [`find_mac_for_daemon`] supplies the real
+/// kernel-backed closure.
+pub fn find_mac<E>(
+    cache: &mut ArpCache,
+    addr: IpAddr,
+    lazy: bool,
+    now: u64,
+    can_query_kernel: bool,
+    mut enumerate: E,
+) -> Option<Vec<u8>>
+where
+    E: FnMut(&mut ArpCache),
+{
+    let mut updated = false;
+    loop {
+        if !cache.is_stale(now) || !can_query_kernel {
+            if let Some(mac) = cache.find_mac_cached(addr, lazy || updated) {
+                return Some(mac.to_vec());
+            }
+        }
+
+        if !can_query_kernel {
+            return None;
+        }
+
+        if !updated {
+            updated = true;
+            cache.begin_refresh(now);
+            enumerate(cache);
+            cache.finish_refresh();
+            continue;
+        }
+
+        break;
+    }
+
+    cache.add_empty(addr);
+    None
+}
+
+/// Real, Linux-backed [`find_mac`]: opens the daemon's persistent netlink
+/// socket on first use (mirroring `netlink_init()` populating
+/// `daemon->netlinkfd` once at startup, `netlink.c:60-92`) and drives a
+/// refresh via [`crate::netlink::iface_enumerate`].
+///
+/// Returns `None` (with no kernel query attempted) if the socket has never
+/// been opened and cannot be opened now — e.g. no netlink support in this
+/// environment. Unlike C's `daemon->pipe_to_parent != -1` check (privilege-
+/// dropped children reuse the parent's cache instead of holding their own
+/// netlink socket, `arp.c:119,148-150`), this port has no forked-child
+/// model for the main DNS path, so `can_query_kernel` here reduces to
+/// "do we have a socket" — tracked as a deliberate deviation in `tasks.md`.
+#[cfg(target_os = "linux")]
+pub fn find_mac_for_daemon(
+    daemon: &mut crate::types::daemon::Daemon,
+    addr: IpAddr,
+    lazy: bool,
+    now: u64,
+) -> Option<Vec<u8>> {
+    if daemon.arp_netlink.is_none() {
+        match crate::netlink::open_netlink_socket() {
+            Ok(sock) => daemon.arp_netlink = Some(sock),
+            Err(e) => {
+                tracing::warn!("failed to open netlink socket for ARP cache: {e}");
+            }
+        }
+    }
+
+    let netlink = daemon.arp_netlink.as_ref().map(|s| (s.fd, s.pid));
+    let can_query_kernel = netlink.is_some();
+    let cache = &mut daemon.arp_cache;
+
+    find_mac(cache, addr, lazy, now, can_query_kernel, |cache| {
+        let Some((fd, pid)) = netlink else { return };
+        // AF_UNSPEC (0) requests the neighbour table, matching
+        // `iface_enumerate(AF_UNSPEC, NULL, filter_mac)` (`arp.c:163`).
+        let _ = crate::netlink::iface_enumerate(fd, pid, 0, &mut |rec| {
+            if let crate::netlink::IfaceRecord::Arp { family, ip, mac } = rec {
+                if let Some(ip_addr) = crate::netlink::parse_ip(&ip, family) {
+                    cache.filter_mac(ip_addr, &mac);
+                }
+            }
+            true
+        });
+    })
+}
+
+impl ArpCache {
     // ── Script notification ───────────────────────────────────────────────────
 
     /// Drain one pending ARP event.
@@ -265,6 +380,43 @@ impl ArpCache {
     pub fn old_len(&self) -> usize {
         self.old.len()
     }
+}
+
+/// Drain every pending ARP event and convert it into the wire event the
+/// (privilege-dropped) script helper consumes, mirroring `do_arp_script_run`'s
+/// `queue_arp()` calls (`arp.c:217-233`) gated on `OPT_SCRIPT_ARP`
+/// (`option_bool(OPT_SCRIPT_ARP)`, `arp.c:218,232`).
+///
+/// This only builds the [`crate::helper::ScriptData`] events — actually
+/// delivering them to a running helper still needs `HelperHandle::send`,
+/// which (per `tasks.md`) has no caller anywhere yet because the helper
+/// process itself isn't forked from the main startup path. Once that
+/// wiring lands, its ARP call site is exactly "call this, then `send()`
+/// each result."
+#[cfg(feature = "dhcp")]
+pub fn drain_arp_script_events(cache: &mut ArpCache, script_arp_enabled: bool) -> Vec<crate::helper::ScriptData> {
+    if !script_arp_enabled {
+        // Still drain the queue so state (Mark->old, New->Found) advances;
+        // C's `do_arp_script_run` always pops/advances regardless of the
+        // `OPT_SCRIPT_ARP` check, which only gates the `queue_arp()` call.
+        let mut n = 0;
+        while cache.do_arp_script_run().is_some() {
+            n += 1;
+            if n > 100_000 {
+                break; // defensive: never spin forever on a malformed cache
+            }
+        }
+        return Vec::new();
+    }
+
+    let mut events = Vec::new();
+    while let Some(action) = cache.do_arp_script_run() {
+        events.push(match action {
+            ArpAction::Add { addr, hwaddr } => crate::helper::ScriptData::for_arp(false, &hwaddr, addr),
+            ArpAction::Del { addr, hwaddr } => crate::helper::ScriptData::for_arp(true, &hwaddr, addr),
+        });
+    }
+    events
 }
 
 impl Default for ArpCache {
@@ -494,5 +646,142 @@ mod tests {
         let ok = cache.filter_mac(v4(1, 2, 3, 4), &long_mac);
         assert!(!ok);
         assert!(cache.is_empty());
+    }
+
+    // ── find_mac orchestrator ─────────────────────────────────────────────────
+
+    #[test]
+    fn find_mac_populates_cache_via_kernel_enumerate() {
+        let mut cache = ArpCache::new();
+        let addr = v4(10, 0, 0, 5);
+        let mut enumerate_calls = 0;
+        let mac = find_mac(&mut cache, addr, false, 0, true, |c| {
+            enumerate_calls += 1;
+            c.filter_mac(addr, MAC1);
+        });
+        assert_eq!(mac, Some(MAC1.to_vec()));
+        assert_eq!(enumerate_calls, 1);
+        assert_eq!(cache.find_mac_cached(addr, false), Some(MAC1));
+    }
+
+    #[test]
+    fn find_mac_cache_hit_never_enumerates() {
+        let mut cache = ArpCache::new();
+        cache.begin_refresh(0);
+        cache.filter_mac(v4(10, 0, 0, 5), MAC1);
+        cache.finish_refresh();
+
+        let mut called = false;
+        // now = 10 < REFRESH_INTERVAL, so the cache is still fresh.
+        let mac = find_mac(&mut cache, v4(10, 0, 0, 5), false, 10, true, |_| called = true);
+        assert_eq!(mac, Some(MAC1.to_vec()));
+        assert!(!called, "a cache hit must not trigger a kernel refresh");
+    }
+
+    #[test]
+    fn find_mac_adds_empty_entry_when_kernel_has_no_match() {
+        let mut cache = ArpCache::new();
+        let addr = v4(10, 0, 0, 9);
+        let mac = find_mac(&mut cache, addr, false, 0, true, |_c| { /* kernel: no match */ });
+        assert_eq!(mac, None);
+        assert_eq!(cache.len(), 1); // negative entry recorded
+        assert_eq!(cache.find_mac_cached(addr, false), None);
+    }
+
+    #[test]
+    fn find_mac_without_kernel_access_returns_none_and_does_not_mark_empty() {
+        // Mirrors C's "child process with no netlink socket" branch
+        // (`arp.c:148-150`): a miss returns 0 immediately, with no negative
+        // cache entry recorded.
+        let mut cache = ArpCache::new();
+        let addr = v4(10, 0, 0, 9);
+        let mut called = false;
+        let mac = find_mac(&mut cache, addr, false, 0, false, |_| called = true);
+        assert_eq!(mac, None);
+        assert!(!called);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn find_mac_upgrades_existing_empty_entry_via_refresh() {
+        let mut cache = ArpCache::new();
+        let addr = v4(10, 0, 0, 7);
+        cache.add_empty(addr);
+
+        let mac = find_mac(&mut cache, addr, false, REFRESH_INTERVAL * 2, true, |c| {
+            c.filter_mac(addr, MAC2);
+        });
+        assert_eq!(mac, Some(MAC2.to_vec()));
+    }
+
+    #[test]
+    fn find_mac_only_enumerates_once_per_call() {
+        let mut cache = ArpCache::new();
+        let addr = v4(10, 0, 0, 8);
+        let mut calls = 0;
+        let _ = find_mac(&mut cache, addr, false, REFRESH_INTERVAL * 5, true, |_| calls += 1);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn find_mac_lazy_returns_existing_negative_entry_without_refresh() {
+        let mut cache = ArpCache::new();
+        let addr = v4(10, 0, 0, 9);
+        cache.add_empty(addr);
+        let mut called = false;
+        // Fresh cache (now=0), lazy=true: an Empty entry counts as a match,
+        // but since it carries no hwaddr bytes, find_mac still reports it as
+        // "no MAC" (matching C returning `arp->hwlen` == 0) without ever
+        // touching the kernel.
+        let mac = find_mac(&mut cache, addr, true, 0, true, |_| called = true);
+        assert_eq!(mac, None);
+        assert!(called, "a rejected/empty match still falls through to a refresh attempt");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn find_mac_for_daemon_opens_socket_and_does_not_panic() {
+        let mut daemon = crate::types::daemon::Daemon::default();
+        assert!(daemon.arp_netlink.is_none());
+        // TEST-NET-3 (RFC 5737): documentation-only, never a real neighbour.
+        let addr = v4(203, 0, 113, 250);
+        let _ = find_mac_for_daemon(&mut daemon, addr, false, 0);
+        assert!(daemon.arp_netlink.is_some(), "netlink socket should have been opened");
+    }
+
+    // ── drain_arp_script_events ───────────────────────────────────────────────
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn drain_arp_script_events_disabled_still_advances_state_but_returns_nothing() {
+        let mut cache = ArpCache::new();
+        cache.begin_refresh(0);
+        cache.filter_mac(v4(10, 1, 1, 1), MAC1);
+        cache.finish_refresh();
+
+        let events = drain_arp_script_events(&mut cache, false);
+        assert!(events.is_empty());
+        // The New entry should have been advanced to Found by the drain.
+        assert_eq!(drain_arp_script_events(&mut cache, true).len(), 0);
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn drain_arp_script_events_enabled_returns_add_and_del() {
+        let mut cache = ArpCache::new();
+        cache.begin_refresh(0);
+        cache.filter_mac(v4(10, 1, 1, 1), MAC1);
+        cache.finish_refresh();
+        cache.begin_refresh(REFRESH_INTERVAL);
+        // entry not re-confirmed -> moves to old (deletion)
+        cache.finish_refresh();
+        cache.begin_refresh(REFRESH_INTERVAL * 2);
+        cache.filter_mac(v4(10, 1, 1, 2), MAC2);
+        cache.finish_refresh();
+
+        let events = drain_arp_script_events(&mut cache, true);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].action, crate::types::dhcp::ACTION_ARP_DEL);
+        assert_eq!(events[1].action, crate::types::dhcp::ACTION_ARP);
     }
 }
