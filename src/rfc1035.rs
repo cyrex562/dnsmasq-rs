@@ -3235,7 +3235,7 @@ mod tests {
     #[test]
     fn check_for_local_domain_matches_synthetic_name() {
         let sd = CondDomain {
-            domain: "synth.test".into(), prefix: None, interface: None,
+            domain: "synth.test".into(), prefix: None, interface: None, al: vec![],
             start: Ipv4Addr::new(10, 0, 0, 0), end: Ipv4Addr::new(10, 0, 0, 255),
             start6: Ipv6Addr::UNSPECIFIED, end6: Ipv6Addr::UNSPECIFIED,
             is6: false, indexed: false, prefixlen: 0,
@@ -3332,6 +3332,7 @@ mod tests {
             domain: domain.to_string(),
             prefix: prefix.map(|s| s.to_string()),
             interface: None,
+            al: vec![],
             start,
             end,
             start6: Ipv6Addr::UNSPECIFIED,

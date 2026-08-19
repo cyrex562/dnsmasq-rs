@@ -3,6 +3,9 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use crate::types::dns_records::{Addrlist, ADDRLIST_IPV6};
+use crate::util::{is_same_net6, is_same_net_prefix};
+
 /// A conditional domain mapping: maps a range of IP addresses to a domain.
 #[derive(Debug, Clone)]
 pub struct CondDomain {
@@ -10,9 +13,17 @@ pub struct CondDomain {
     pub prefix:    Option<String>,
     /// Interface a subnet-form `synth-domain`/`domain` was sourced from
     /// (`struct cond_domain.interface`, `dnsmasq.h:1042`).  Set only for the
-    /// `synth-domain=<domain>,<iface>` form; matching against the interface's
-    /// runtime address list is not implemented (see `tasks.md`).
+    /// `synth-domain=<domain>,<iface>` / `domain=<domain>,<iface>` form; when
+    /// set, `match_domain`/`match_domain6` search `al` instead of `start`/
+    /// `end`/`prefixlen`, matching `domain.c:220-227,259-266`.  Nothing in
+    /// this repo currently populates `interface`/`al` from live interface
+    /// enumeration (`network.c:459-475` is unported) — see `tasks.md`.
     pub interface: Option<String>,
+    /// Addresses of `interface`, refreshed on interface (re-)enumeration
+    /// (`struct cond_domain.al`, `dnsmasq.h:1043`; `network.c:459-475`/
+    /// `:790-797`). Only consulted when `interface.is_some()`. Always empty
+    /// today since nothing populates it yet (see `interface` doc above).
+    pub al:        Vec<Addrlist>,
     pub start:     Ipv4Addr,
     pub end:       Ipv4Addr,
     pub start6:    Ipv6Addr,
@@ -229,13 +240,22 @@ pub fn rev_synth_ipv6(addr: Ipv6Addr, domains: &[CondDomain]) -> Option<String> 
 ///
 /// Port of `match_domain()` from domain.c:218-234.
 pub fn match_domain(addr: Ipv4Addr, c: &CondDomain) -> bool {
-    if c.is6 {
-        return false;
+    if c.interface.is_some() {
+        c.al.iter().any(|al| {
+            al.flags & ADDRLIST_IPV6 == 0
+                && al
+                    .addr
+                    .as_ipv4()
+                    .is_some_and(|a| is_same_net_prefix(addr, a, al.prefixlen.clamp(0, 32) as u8))
+        })
+    } else if !c.is6 {
+        let a = u32::from(addr);
+        let s = u32::from(c.start);
+        let e = u32::from(c.end);
+        a >= s && a <= e
+    } else {
+        false
     }
-    let a = u32::from(addr);
-    let s = u32::from(c.start);
-    let e = u32::from(c.end);
-    a >= s && a <= e
 }
 
 /// Search a list of conditional domains for one matching the IPv4 address.
@@ -259,13 +279,25 @@ pub fn get_domain(addr: Ipv4Addr, domains: &[CondDomain], default: &str) -> Stri
 ///
 /// Port of `match_domain6()` from domain.c:255-282.
 pub fn match_domain6(addr: Ipv6Addr, c: &CondDomain) -> bool {
-    if !c.is6 {
-        return false;
+    if c.interface.is_some() {
+        c.al.iter().any(|al| {
+            al.flags & ADDRLIST_IPV6 != 0
+                && al.addr.as_ipv6().is_some_and(|a| {
+                    is_same_net6(&addr, &a, al.prefixlen.clamp(0, 128) as usize)
+                })
+        })
+    } else if c.is6 {
+        if c.prefixlen >= 64 {
+            let addrpart = ipv6_low64(addr);
+            is_same_net6(&addr, &c.start6, 64)
+                && addrpart >= ipv6_low64(c.start6)
+                && addrpart <= ipv6_low64(c.end6)
+        } else {
+            is_same_net6(&addr, &c.start6, c.prefixlen as usize)
+        }
+    } else {
+        false
     }
-    let a = ipv6_low64(addr);
-    let s = ipv6_low64(c.start6);
-    let e = ipv6_low64(c.end6);
-    a >= s && a <= e
 }
 
 /// Search a list of conditional domains for one matching the IPv6 address.
@@ -294,6 +326,7 @@ mod tests {
             domain: domain.to_string(),
             prefix: prefix.map(|s| s.to_string()),
             interface: None,
+            al:      vec![],
             start,
             end,
             start6:  Ipv6Addr::UNSPECIFIED,
@@ -469,6 +502,7 @@ mod tests {
             domain: "example.com".to_string(),
             prefix: None,
             interface: None,
+            al: vec![],
             start: "10.0.0.0".parse().unwrap(),
             end: "10.0.0.255".parse().unwrap(),
             start6: Ipv6Addr::UNSPECIFIED,
@@ -595,17 +629,31 @@ mod tests {
     // ── rev_synth_ipv6 ──────────────────────────────────────────────────────
 
     fn make_v6_domain(domain: &str, prefix: Option<&str>, start6: Ipv6Addr, end6: Ipv6Addr, indexed: bool) -> CondDomain {
+        make_v6_domain_prefixlen(domain, prefix, start6, end6, indexed, 64)
+    }
+
+    /// Like `make_v6_domain` but with an explicit `prefixlen`, for exercising
+    /// `match_domain6`'s prefixlen-dependent branching (domain.c:267-279).
+    fn make_v6_domain_prefixlen(
+        domain: &str,
+        prefix: Option<&str>,
+        start6: Ipv6Addr,
+        end6: Ipv6Addr,
+        indexed: bool,
+        prefixlen: u32,
+    ) -> CondDomain {
         CondDomain {
             domain: domain.to_string(),
             prefix: prefix.map(|s| s.to_string()),
             interface: None,
+            al: vec![],
             start: Ipv4Addr::UNSPECIFIED,
             end: Ipv4Addr::UNSPECIFIED,
             start6,
             end6,
             is6: true,
             indexed,
-            prefixlen: 0,
+            prefixlen,
         }
     }
 
@@ -710,5 +758,133 @@ mod tests {
     #[test]
     fn get_domain6_fallback() {
         assert_eq!(get_domain6("fe80::1".parse().unwrap(), &[], "default.lan"), "default.lan");
+    }
+
+    // ── match_domain6 prefixlen branching (domain.c:267-279) ─────────────────
+
+    #[test]
+    fn match_domain6_prefixlen_ge_64_rejects_wrong_net() {
+        // Low64 numerically falls in [start,end], but the address is in a
+        // different /64 block entirely -- upstream's `is_same_net6(addr,
+        // &c->start6, 64)` check must reject this even though the old Rust
+        // code (bare low64 range compare) would have accepted it.
+        let d = make_v6_domain_prefixlen(
+            "example.com", None,
+            "2001:db8:1::1".parse().unwrap(), "2001:db8:1::ff".parse().unwrap(),
+            false, 64,
+        );
+        assert!(!match_domain6("2001:db8:2::42".parse().unwrap(), &d));
+    }
+
+    #[test]
+    fn match_domain6_prefixlen_short_matches_same_prefix() {
+        // prefixlen 48: any address sharing the /48 must match, even though
+        // its low bits fall well outside [start6,end6].
+        let d = make_v6_domain_prefixlen(
+            "example.com", None,
+            "2001:db8:1::1".parse().unwrap(), "2001:db8:1::ff".parse().unwrap(),
+            false, 48,
+        );
+        assert!(match_domain6("2001:db8:1:ffff::9999".parse().unwrap(), &d));
+    }
+
+    #[test]
+    fn match_domain6_prefixlen_short_rejects_different_prefix() {
+        // Different /48 block, even though the low 64 bits coincide with
+        // the configured [start6,end6] range.
+        let d = make_v6_domain_prefixlen(
+            "example.com", None,
+            "2001:db8:1::1".parse().unwrap(), "2001:db8:1::ff".parse().unwrap(),
+            false, 48,
+        );
+        assert!(!match_domain6("2001:db8:2::1".parse().unwrap(), &d));
+    }
+
+    // ── match_domain / match_domain6 interface branch (domain.c:220-227,259-266) ─
+
+    fn make_al4(addr: Ipv4Addr, prefixlen: i32) -> Addrlist {
+        Addrlist {
+            addr: crate::types::addr::AllAddr::Addr4(addr),
+            flags: 0,
+            prefixlen,
+            decline_time: None,
+        }
+    }
+
+    fn make_al6(addr: Ipv6Addr, prefixlen: i32) -> Addrlist {
+        Addrlist {
+            addr: crate::types::addr::AllAddr::Addr6(addr),
+            flags: ADDRLIST_IPV6,
+            prefixlen,
+            decline_time: None,
+        }
+    }
+
+    #[test]
+    fn match_domain_interface_matches_al_entry() {
+        let mut d = make_domain("lan", None, "10.0.0.0".parse().unwrap(), "10.0.0.255".parse().unwrap());
+        d.interface = Some("eth0".to_string());
+        d.al = vec![make_al4("192.168.1.0".parse().unwrap(), 24)];
+        assert!(match_domain("192.168.1.42".parse().unwrap(), &d));
+    }
+
+    #[test]
+    fn match_domain_interface_ignores_start_end_range() {
+        // Even though addr falls in start/end, the interface branch only
+        // consults `al`, matching upstream's if/else-if (not a fallback).
+        let mut d = make_domain("lan", None, "10.0.0.0".parse().unwrap(), "10.0.0.255".parse().unwrap());
+        d.interface = Some("eth0".to_string());
+        d.al = vec![];
+        assert!(!match_domain("10.0.0.42".parse().unwrap(), &d));
+    }
+
+    #[test]
+    fn match_domain_interface_skips_ipv6_al_entries() {
+        // `al` holds only an IPv6 entry for this interface; an IPv4 query
+        // must not match it even though the interface itself matched.
+        let mut d = make_domain("lan", None, Ipv4Addr::UNSPECIFIED, Ipv4Addr::UNSPECIFIED);
+        d.interface = Some("eth0".to_string());
+        d.al = vec![make_al6("2001:db8::1".parse().unwrap(), 64)];
+        assert!(!match_domain("10.0.0.1".parse().unwrap(), &d));
+    }
+
+    #[test]
+    fn match_domain6_interface_matches_al_entry() {
+        let mut d = make_v6_domain("lan", None, "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(), false);
+        d.interface = Some("eth0".to_string());
+        d.al = vec![make_al6("2001:db8:9::".parse().unwrap(), 64)];
+        assert!(match_domain6("2001:db8:9::1234".parse().unwrap(), &d));
+    }
+
+    #[test]
+    fn match_domain6_interface_ignores_start_end_range() {
+        let mut d = make_v6_domain("lan", None, "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(), false);
+        d.interface = Some("eth0".to_string());
+        d.al = vec![];
+        assert!(!match_domain6("2001:db8::42".parse().unwrap(), &d));
+    }
+
+    #[test]
+    fn match_domain6_interface_skips_ipv4_al_entries() {
+        let mut d = make_v6_domain("lan", None, Ipv6Addr::UNSPECIFIED, Ipv6Addr::UNSPECIFIED, false);
+        d.interface = Some("eth0".to_string());
+        d.al = vec![make_al4("192.168.1.0".parse().unwrap(), 24)];
+        assert!(!match_domain6("2001:db8::1".parse().unwrap(), &d));
+    }
+
+    #[test]
+    fn get_domain_via_interface_al() {
+        let mut d = make_domain("iface.lan", None, Ipv4Addr::UNSPECIFIED, Ipv4Addr::UNSPECIFIED);
+        d.interface = Some("eth0".to_string());
+        d.al = vec![make_al4("192.168.1.0".parse().unwrap(), 24)];
+        assert_eq!(get_domain("192.168.1.5".parse().unwrap(), &[d], "default.lan"), "iface.lan");
+    }
+
+    #[test]
+    fn get_domain6_via_interface_al() {
+        let mut d = make_v6_domain("iface.lan", None, Ipv6Addr::UNSPECIFIED, Ipv6Addr::UNSPECIFIED, false);
+        d.interface = Some("eth0".to_string());
+        d.al = vec![make_al6("2001:db8:9::".parse().unwrap(), 64)];
+        assert_eq!(get_domain6("2001:db8:9::1".parse().unwrap(), &[d], "default.lan"), "iface.lan");
     }
 }

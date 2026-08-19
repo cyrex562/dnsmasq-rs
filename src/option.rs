@@ -2223,6 +2223,7 @@ fn parse_synth_domain(daemon: &mut Daemon, v: &str, cl: &ConfigLine) -> Result<(
         domain: domain.to_string(),
         prefix: None,
         interface: None,
+        al: vec![],
         start: Ipv4Addr::UNSPECIFIED,
         end: Ipv4Addr::UNSPECIFIED,
         start6: Ipv6Addr::UNSPECIFIED,

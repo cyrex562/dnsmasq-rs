@@ -1001,9 +1001,17 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     is **not implemented** — upstream restricts that fallback to `option=='s'`
     (bare `--domain`) too, so a non-address, non-CIDR second field is
     rejected as invalid for `synth-domain`, matching upstream exactly.
-    `CondDomain.interface` exists for structural parity (and so a future
-    `--domain` subnet-from-interface implementation has a home) but nothing
-    currently populates or consults it.
+    `CondDomain.interface` and the newer `CondDomain.al: Vec<Addrlist>` field
+    (Issue #25) exist for structural parity, and `match_domain`/`match_domain6`
+    (`src/domain.rs`) now correctly implement the `c->interface`/`al` branch
+    and the `prefixlen`-dependent branching from `domain.c:220-227,259-266`,
+    but nothing populates `interface`/`al` yet: `network.c:459-475`'s
+    "refresh `cond->al` from live interface addresses on (re-)enumeration"
+    step is unported (`src/network.rs`), so a future `--domain`/`synth-domain`
+    subnet-from-interface implementation has a home in both the parser and
+    the matcher, but is not observable end-to-end until that population step
+    and the `--domain` subnet-form parsing into `Daemon::cond_domain`
+    (mentioned above) both land.
   - `bridge-interface` and `shared-network` populate `Daemon::bridges` /
     `Daemon::shared_networks`, but nothing in `src/dhcp.rs`/`src/rfc2131.rs`
     consults either yet — upstream uses `bridges` to remap an arriving
