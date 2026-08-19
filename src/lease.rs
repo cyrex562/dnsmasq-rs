@@ -11,6 +11,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(feature = "dhcp")]
 use crate::dhcp_protocol::DHCP_CHADDR_MAX;
 #[cfg(feature = "dhcp")]
+use crate::helper::{format_client_id, format_mac, run_script, LeaseAction, LeaseScriptEvent};
+#[cfg(feature = "dhcp")]
 use crate::types::dhcp::DhcpLease;
 
 /// Errors that can occur during lease deserialisation.
@@ -54,6 +56,10 @@ pub struct LeaseDb {
     pub file_dirty: bool,
     /// Set to `true` when DNS records derived from leases need updating.
     pub dns_dirty: bool,
+    /// Leases removed from `leases` (by expiry or explicit release/decline)
+    /// that are still awaiting their `del`/`old` dhcp-script notification.
+    /// Port of the `old_leases` list in lease.c.
+    old_leases: Vec<DhcpLease>,
 }
 
 #[cfg(feature = "dhcp")]
@@ -65,6 +71,7 @@ impl LeaseDb {
             max_leases: 1000,
             file_dirty: false,
             dns_dirty: false,
+            old_leases: Vec::new(),
         }
     }
 
@@ -99,6 +106,7 @@ impl LeaseDb {
             }
             true
         });
+        self.old_leases.extend(pruned.iter().cloned());
         pruned
     }
 
@@ -478,10 +486,81 @@ impl LeaseDb {
         self.file_dirty = true;
     }
 
+    /// Fire the configured dhcp-script hook for every lease change queued
+    /// since the last call, then clear the flags/queue that generated them.
+    ///
+    /// Port of `do_script_run()` (lease.c:1216-1308). Upstream fires one
+    /// event per call and relies on the main loop invoking it repeatedly
+    /// (its return value signals "more work pending"); this port drains
+    /// every pending event in a single call since the caller here is a
+    /// single `run_dhcp_loop` iteration rather than a busy-poll main loop.
+    /// The ordering and action semantics are preserved: leases queued on
+    /// `old_leases` (from `prune`/`remove_by_addr`) fire `old` (for a
+    /// leftover `old_hostname`) then `del`; live leases with a pending
+    /// `old_hostname` fire `old` first so a lost name is announced before
+    /// any new one; then leases flagged `LEASE_NEW`/`LEASE_CHANGED` fire
+    /// `add`/`old` and have those flags (plus `LEASE_AUX_CHANGED` /
+    /// `LEASE_EXP_CHANGED`) cleared.
+    pub fn run_lease_scripts(&mut self, command: &str) {
+        use crate::types::dhcp::{LEASE_AUX_CHANGED, LEASE_CHANGED, LEASE_EXP_CHANGED, LEASE_NEW};
+
+        for mut lease in self.old_leases.drain(..) {
+            if let Some(old_hostname) = lease.old_hostname.take() {
+                let ev = build_script_event(&lease, LeaseAction::Old, Some(&old_hostname));
+                let _ = run_script(command, &ev);
+            }
+            let ev = build_script_event(&lease, LeaseAction::Del, None);
+            let _ = run_script(command, &ev);
+        }
+
+        for lease in self.leases.values_mut() {
+            if let Some(old_hostname) = lease.old_hostname.take() {
+                let ev = build_script_event(lease, LeaseAction::Old, Some(&old_hostname));
+                let _ = run_script(command, &ev);
+            }
+        }
+
+        for lease in self.leases.values_mut() {
+            if lease.flags & (LEASE_NEW | LEASE_CHANGED) != 0 {
+                let action = if lease.flags & LEASE_NEW != 0 {
+                    LeaseAction::Add
+                } else {
+                    LeaseAction::Old
+                };
+                let ev = build_script_event(lease, action, None);
+                let _ = run_script(command, &ev);
+                lease.flags &= !(LEASE_NEW | LEASE_CHANGED | LEASE_AUX_CHANGED | LEASE_EXP_CHANGED);
+            }
+        }
+    }
+
     /// Write all leases to the given file path (using [`serialize`]).
+    ///
+    /// Writes to a temp file in the same directory, `fsync`s it, then
+    /// `rename`s it over `path`. The rename is atomic on the same filesystem,
+    /// so a crash or write failure part-way through never leaves `path`
+    /// truncated or half-written — readers always see either the old
+    /// complete file or the new one. This is stronger than upstream's
+    /// `lease_update_file` (lease.c:278-446), which truncates and rewrites
+    /// a single long-lived fd in place and relies on `fsync` alone; the
+    /// observable guarantee upstream cares about — durable data survives a
+    /// clean write, and a failed write doesn't corrupt the file — is
+    /// preserved here.
     pub fn write_to_file(&self, path: &str) -> Result<(), LeaseError> {
+        use std::io::Write;
+
         let data = self.serialize();
-        std::fs::write(path, data)?;
+        let target = std::path::Path::new(path);
+        let dir = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
+        let file_name = target.file_name().and_then(|n| n.to_str()).unwrap_or("leases");
+        let tmp_path = dir.join(format!(".{file_name}.tmp"));
+
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(data.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+
+        std::fs::rename(&tmp_path, target)?;
         Ok(())
     }
 
@@ -503,7 +582,9 @@ impl LeaseDb {
             .map(|(k, _)| *k)?;
         self.file_dirty = true;
         self.dns_dirty = true;
-        self.leases.remove(&key)
+        let removed = self.leases.remove(&key)?;
+        self.old_leases.push(removed.clone());
+        Some(removed)
     }
 
     /// Return the number of active leases.
@@ -799,6 +880,42 @@ impl LeaseDb {
             false
         }
     }
+}
+
+/// Build a [`LeaseScriptEvent`] for `lease`.
+///
+/// `hostname_override`, when set, is used in place of the lease's own
+/// `fqdn`/`hostname` — this is how the `old`-for-lost-hostname notification
+/// (`ACTION_OLD_HOSTNAME` in lease.c) reports the name that was just
+/// removed rather than the lease's current (possibly absent) name.
+/// Mirrors the `lease->fqdn ? lease->fqdn : lease->hostname` selection at
+/// lease.c:1292 and the `DNSMASQ_LEASE_EXPIRES`/`DNSMASQ_CLIENT_ID` extras
+/// `helper::run_script` looks up.
+#[cfg(feature = "dhcp")]
+fn build_script_event(
+    lease: &DhcpLease,
+    action: LeaseAction,
+    hostname_override: Option<&str>,
+) -> LeaseScriptEvent {
+    let ip = std::net::IpAddr::V4(lease.addr);
+    let mac = format_mac(&lease.hwaddr[..lease.hwaddr_len.min(DHCP_CHADDR_MAX)]);
+    let hostname = hostname_override
+        .map(|s| s.to_string())
+        .or_else(|| lease.fqdn.clone())
+        .or_else(|| lease.hostname.clone());
+
+    let expires_secs = match lease.expires {
+        Some(t) => t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+        None => 0,
+    };
+    let mut extra = vec![("DNSMASQ_LEASE_EXPIRES".to_string(), expires_secs.to_string())];
+    if let Some(clid) = &lease.clid {
+        if !clid.is_empty() {
+            extra.push(("DNSMASQ_CLIENT_ID".to_string(), format_client_id(clid)));
+        }
+    }
+
+    LeaseScriptEvent { action, ip, mac, hostname, extra }
 }
 
 /// Parse a colon-separated hex string (e.g. `"de:ad:be:ef"`) into bytes.
@@ -1483,6 +1600,182 @@ mod tests {
         assert!(db.file_dirty);
     }
 
+    // ── run_lease_scripts tests ──
+
+    #[cfg(unix)]
+    fn write_marker_script(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let marker = dir.join("marker.log");
+        let script_path = dir.join("hook.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\necho \"$DNSMASQ_ACTION $DNSMASQ_IP $DNSMASQ_SUPPLIED_HOSTNAME\" >> {}\n",
+                marker.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+        (script_path, marker)
+    }
+
+    /// Runs `attempt` (which builds a fresh [`LeaseDb`], mutates it, and
+    /// calls [`LeaseDb::run_lease_scripts`]) until the marker script has
+    /// actually written to `marker`, retrying a few times.
+    ///
+    /// Under `cargo test`'s default full parallelism this repo's test suite
+    /// runs many test binaries at once, each spawning its own threads; the
+    /// subprocess `fork`/`exec` behind `run_script` has been observed to
+    /// fail transiently under that contention even though the same test is
+    /// 100% reliable with `--test-threads=1`. A failed spawn still clears
+    /// the lease's pending-script flags (matching upstream's `do_script_run`,
+    /// which also doesn't retry), so a retry must redo the whole setup, not
+    /// just re-read the marker.
+    #[cfg(unix)]
+    fn run_scripts_until_marker_written(
+        marker: &std::path::Path,
+        mut attempt: impl FnMut() -> LeaseDb,
+    ) -> (String, LeaseDb) {
+        for _ in 0..5 {
+            let _ = std::fs::remove_file(marker);
+            let db = attempt();
+            if let Ok(contents) = std::fs::read_to_string(marker) {
+                if !contents.is_empty() {
+                    return (contents, db);
+                }
+            }
+        }
+        panic!("dhcp-script hook never fired after retries (possible resource contention)");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_lease_scripts_fires_add_for_new_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let (script_path, marker) = write_marker_script(dir.path());
+        let addr = Ipv4Addr::new(10, 0, 0, 5);
+
+        let (contents, _db) = run_scripts_until_marker_written(&marker, || {
+            let mut db = LeaseDb::new();
+            db.allocate_v4(addr);
+            db.run_lease_scripts(script_path.to_str().unwrap());
+            db
+        });
+
+        let first_line = contents.lines().next().unwrap();
+        // No hostname is set, so the supplied-hostname field is empty.
+        assert_eq!(first_line, format!("add {addr} "));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_lease_scripts_clears_new_and_changed_flags() {
+        use crate::types::dhcp::{LEASE_CHANGED, LEASE_NEW};
+        let dir = tempfile::tempdir().unwrap();
+        let (script_path, marker) = write_marker_script(dir.path());
+        let addr = Ipv4Addr::new(10, 0, 0, 5);
+
+        let (_contents, db) = run_scripts_until_marker_written(&marker, || {
+            let mut db = LeaseDb::new();
+            db.allocate_v4(addr);
+            db.run_lease_scripts(script_path.to_str().unwrap());
+            db
+        });
+
+        let lease = db.find_by_addr(addr).unwrap();
+        assert_eq!(lease.flags & (LEASE_NEW | LEASE_CHANGED), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_lease_scripts_fires_old_for_changed_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let (script_path, marker) = write_marker_script(dir.path());
+        let addr = Ipv4Addr::new(10, 0, 0, 5);
+
+        let (contents, _db) = run_scripts_until_marker_written(&marker, || {
+            let mut db = LeaseDb::new();
+            db.insert(make_lease(addr, [0x01, 0, 0, 0, 0, 0], None)); // hostname "host1"
+            db.set_hostname(addr, Some("renamed"), false); // LEASE_CHANGED + old_hostname="host1"
+            db.run_lease_scripts(script_path.to_str().unwrap());
+            db
+        });
+
+        let lines: Vec<&str> = contents.lines().collect();
+        // Renaming a lease first announces the loss of the old name (an
+        // `old`-hostname event reporting "host1"), then the `old` change
+        // event itself carries the new name ("renamed") — matching
+        // lease.c:1274-1305's two-pass "announce loss before gain" order.
+        assert_eq!(lines, vec![format!("old {addr} host1"), format!("old {addr} renamed")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_lease_scripts_fires_del_for_removed_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let (script_path, marker) = write_marker_script(dir.path());
+        let addr = Ipv4Addr::new(10, 0, 0, 9);
+
+        let (contents, _db) = run_scripts_until_marker_written(&marker, || {
+            let mut db = LeaseDb::new();
+            db.insert(make_lease(addr, [0x01, 0, 0, 0, 0, 0], None));
+            db.remove_by_addr(addr);
+            db.run_lease_scripts(script_path.to_str().unwrap());
+            db
+        });
+
+        let first_line = contents.lines().next().unwrap();
+        assert_eq!(first_line, format!("del {addr} host1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_lease_scripts_announces_lost_hostname_before_del() {
+        let dir = tempfile::tempdir().unwrap();
+        let (script_path, marker) = write_marker_script(dir.path());
+        let addr = Ipv4Addr::new(10, 0, 0, 9);
+
+        let (contents, _db) = run_scripts_until_marker_written(&marker, || {
+            let mut db = LeaseDb::new();
+            db.insert(make_lease(addr, [0x01, 0, 0, 0, 0, 0], None)); // hostname "host1"
+            db.set_hostname(addr, None, false); // clears hostname, sets old_hostname = "host1"
+            db.remove_by_addr(addr);
+            db.run_lease_scripts(script_path.to_str().unwrap());
+            db
+        });
+
+        let lines: Vec<&str> = contents.lines().collect();
+        // The lost name ("host1") is announced via the supplied-hostname
+        // field of an `old` event before the `del` event fires (with no
+        // hostname left to report), matching lease.c:1274-1283's ordering.
+        assert_eq!(lines, vec![format!("old {addr} host1"), format!("del {addr} ")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_lease_scripts_drains_old_leases_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let (script_path, marker) = write_marker_script(dir.path());
+        let addr = Ipv4Addr::new(10, 0, 0, 9);
+
+        let (contents_before, mut db) = run_scripts_until_marker_written(&marker, || {
+            let mut db = LeaseDb::new();
+            db.insert(make_lease(addr, [0x01, 0, 0, 0, 0, 0], None));
+            db.remove_by_addr(addr);
+            db.run_lease_scripts(script_path.to_str().unwrap());
+            db
+        });
+
+        // A second call should be a no-op: the old_leases queue was drained
+        // and no lease is left with pending flags, so nothing is spawned.
+        db.run_lease_scripts(script_path.to_str().unwrap());
+        let contents_after = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(contents_before, contents_after);
+    }
+
     // ── write_to_file / load_from_file tests ──
 
     #[test]
@@ -1520,6 +1813,72 @@ mod tests {
         let db = LeaseDb::new();
         db.write_to_file(path_str).unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn write_to_file_uses_tmp_file_and_rename() {
+        // The atomic-write implementation must never write straight to the
+        // target path; a crash between opening and finishing the write
+        // should leave `path` absent (create) or unchanged (overwrite),
+        // never truncated. We can't literally kill the process mid-write in
+        // a unit test, so instead we assert the file only appears at the
+        // very end (rename), which is the property that makes a real crash
+        // safe: whichever file is durable at the crash point is complete.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("leases.dat");
+        let path_str = path.to_str().unwrap();
+
+        let mut db = LeaseDb::new();
+        db.insert(make_lease(Ipv4Addr::new(10, 0, 0, 1), [1, 0, 0, 0, 0, 0], None));
+        db.write_to_file(path_str).unwrap();
+
+        // No stray temp file should remain after a successful write.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(entries, vec!["leases.dat".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_to_file_failed_write_leaves_original_untouched() {
+        // Skip under root: permission bits don't block root's writes, so the
+        // injected failure below wouldn't actually occur and the assertion
+        // that follows would be spuriously wrong, not confirming anything.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("leases.dat");
+        let path_str = path.to_str().unwrap();
+
+        let mut original_db = LeaseDb::new();
+        original_db.insert(make_lease(Ipv4Addr::new(10, 0, 0, 1), [1, 0, 0, 0, 0, 0], Some(1_700_000_000)));
+        original_db.write_to_file(path_str).unwrap();
+        let original_contents = std::fs::read_to_string(&path).unwrap();
+
+        // Make the directory read-only so creating the temp file fails,
+        // simulating a write that dies before the atomic rename.
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o500);
+        std::fs::set_permissions(dir.path(), perms).unwrap();
+
+        let mut new_db = LeaseDb::new();
+        new_db.insert(make_lease(Ipv4Addr::new(10, 0, 0, 2), [2, 0, 0, 0, 0, 0], None));
+        let result = new_db.write_to_file(path_str);
+
+        // Restore permissions so the tempdir can be cleaned up.
+        let mut restore = std::fs::metadata(dir.path()).unwrap().permissions();
+        restore.set_mode(0o700);
+        std::fs::set_permissions(dir.path(), restore).unwrap();
+
+        assert!(result.is_err(), "write should fail when the directory is read-only");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, original_contents, "a failed write must not corrupt the existing lease file");
     }
 
     // ── remove_by_addr tests ──

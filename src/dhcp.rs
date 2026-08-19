@@ -69,6 +69,9 @@ pub struct DhcpServerConfig {
     pub domain_suffix: Option<String>,
     /// Path to persist the lease database to (`--dhcp-leasefile`).
     pub lease_file: Option<String>,
+    /// The dhcp-script hook command (`--dhcp-script`), run on lease
+    /// add/old/del via [`crate::lease::LeaseDb::run_lease_scripts`].
+    pub lease_change_command: Option<String>,
     /// Option-substring classifier rules from parsed `dhcp-match`.
     pub match_rules: Vec<crate::types::dhcp::DhcpOpt>,
     /// Client-hostname classifier rules from parsed `dhcp-name-match`.
@@ -128,6 +131,7 @@ impl Default for DhcpServerConfig {
             boot_configs: Vec::new(),
             domain_suffix: None,
             lease_file: None,
+            lease_change_command: None,
             match_rules: Vec::new(),
             name_match_rules: Vec::new(),
             tag_rules: Vec::new(),
@@ -1362,12 +1366,33 @@ pub async fn run_dhcp_loop(
                 }
 
                 if lease_db.file_dirty {
-                    if let Some(path) = cfg.lease_file.as_deref() {
-                        if let Err(err) = lease_db.write_to_file(path) {
-                            warn!("failed to write DHCP lease file {path}: {err}");
-                        }
+                    let write_ok = match cfg.lease_file.as_deref() {
+                        Some(path) => match lease_db.write_to_file(path) {
+                            Ok(()) => true,
+                            Err(err) => {
+                                warn!("failed to write DHCP lease file {path}: {err}");
+                                false
+                            }
+                        },
+                        None => true,
+                    };
+                    // Only clear the dirty flag once the write actually
+                    // succeeded (or there was nothing to write); otherwise
+                    // the next dispatch would silently skip retrying it.
+                    if write_ok {
+                        lease_db.file_dirty = false;
                     }
-                    lease_db.file_dirty = false;
+                }
+
+                // Fire dhcp-script hooks (ADD/OLD/DEL) for whatever changed
+                // in this dispatch. Port of `do_script_run()`'s call site in
+                // the upstream main loop (dnsmasq.c), invoked here once per
+                // dispatch rather than looped on a "more work" return value
+                // — see `LeaseDb::run_lease_scripts` for why.
+                if let Some(command) = cfg.lease_change_command.as_deref() {
+                    if !command.is_empty() {
+                        lease_db.run_lease_scripts(command);
+                    }
                 }
 
                 let Some(dispatched) = dispatched else {
@@ -2414,6 +2439,7 @@ mod tests {
             boot_configs: vec![],
             domain_suffix: None,
             lease_file: None,
+            lease_change_command: None,
             match_rules: vec![],
             name_match_rules: vec![],
             tag_rules: vec![],

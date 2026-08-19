@@ -1179,6 +1179,57 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     cases call `narrow_context`/check the server-id option before acting; `handle_release`/
     `handle_decline` only check the address against the pool bounds.
 
+- [x] Atomic lease-file persistence and dhcp-script hooks (lease.c:278-1308).
+  `LeaseDb::write_to_file` (`src/lease.rs`) was a bare `std::fs::write` — a crash or
+  write failure mid-call could truncate/corrupt the lease file, unlike upstream's
+  fsync'd rewrite. It now writes to a `.{name}.tmp` sibling in the same directory,
+  `File::sync_all()`s it, then `std::fs::rename`s it over the target — the rename is
+  atomic on the same filesystem, so readers only ever see the old complete file or the
+  new one, never a partial write. This is a stronger crash-safety guarantee than
+  upstream's `lease_update_file` (which truncates a long-lived fd in place and fsyncs),
+  while preserving the same observable property upstream cares about (durable writes
+  survive, failed writes don't corrupt the file).
+
+  `LeaseDb::run_lease_scripts(command)` is the `do_script_run()`-equivalent that was
+  entirely missing: `helper::run_script`/`build_env`/`queue_script` existed and were
+  tested but had zero callers outside their own tests, and `daemon.lease_change_command`
+  (set by `dhcp-script=`) was read nowhere. `run_lease_scripts` now fires `add`/`old`/`del`
+  events for `LEASE_NEW`/`LEASE_CHANGED` leases and for leases queued on a new
+  `LeaseDb::old_leases` list (populated by `prune`/`remove_by_addr`, mirroring lease.c's
+  `old_leases` list), including the "announce the lost hostname before the new one"
+  ordering at lease.c:1274-1283. It is wired into `run_dhcp_loop` (`src/dhcp.rs`) right
+  after the lease-file write, gated on the new `DhcpServerConfig::lease_change_command`
+  (threaded from `daemon.lease_change_command` in `daemon_dhcp_runtime`,
+  `src/dnsmasq.rs`). Also fixed while touching this code: `run_dhcp_loop` was clearing
+  `LeaseDb::file_dirty` unconditionally, even when `write_to_file` returned `Err` — a
+  failed write was silently treated as done and never retried; it now only clears the
+  flag on `Ok`.
+
+  Deliberate simplification: upstream's `do_script_run` fires one event per call and
+  relies on the main loop invoking it repeatedly (its return value signals "more work
+  pending"), because upstream's main loop is itself a single-threaded poll loop where a
+  long-running script would stall everything else. `run_lease_scripts` drains all
+  pending events in one call instead, since the caller here is one `run_dhcp_loop`
+  iteration rather than a busy-poll main loop; the fire order and env vars per event are
+  otherwise unchanged. Like upstream, a script that fails to spawn does not get retried
+  — the pending flags/queue entry are cleared regardless of `run_script`'s result.
+
+  Still not ported: `lease_ping_reply`, `lease_update_slaac`, `lease_find_interfaces`,
+  `lease_make_duid` (lease.c:497-556) have no Rust equivalents — these are
+  SLAAC/RA-adjacent (periodic ping-before-assign for SLAAC addresses, interface
+  enumeration for the DHCPv6 DUID, DUID generation) and out of scope for this pass;
+  `slaac.rs`/`radv.rs` may cover overlapping ground under different names but that
+  hasn't been checked. `rerun_scripts()` (which marks every lease `LEASE_CHANGED` so a
+  reload re-fires all hooks) still has no caller outside its own unit tests — wiring it
+  into the SIGHUP/reload path is tracked separately above ("DHCP reload
+  (`reread_dhcp`/.../`rerun_scripts`) are not implemented — SIGHUP is DNS-only for
+  now").
+  Covered by `lease::tests::{write_to_file_uses_tmp_file_and_rename,
+  write_to_file_failed_write_leaves_original_untouched, run_lease_scripts_fires_add_for_new_lease,
+  run_lease_scripts_fires_old_for_changed_lease, run_lease_scripts_fires_del_for_removed_lease,
+  run_lease_scripts_announces_lost_hostname_before_del, run_lease_scripts_clears_new_and_changed_flags,
+  run_lease_scripts_drains_old_leases_queue}`.
+
 - [x] Port the ICMP conflict probe, `--read-ethers`, and real per-interface
   context selection (dhcp.c: `do_icmp_ping`/`address_allocate`/
   `dhcp_read_ethers`/`guess_range_netmask`/`complete_context`).
