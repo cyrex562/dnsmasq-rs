@@ -66,6 +66,32 @@ pub fn init_daemon_with(mut daemon: Daemon) -> DaemonHandle {
                 Err(err) => error!("failed to read {}: {err}", crate::dhcp::ETHERS_FILE),
             }
         }
+
+        // Startup diagnostics for each configured DHCP range/relay, mirroring
+        // dnsmasq.c:996-1008's log_context()/log_relay() calls.
+        let opt_ra = daemon.option_bool(crate::types::constants::OPT_RA);
+        let v4 = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+        for ctx in &daemon.dhcp {
+            for msg in crate::dhcp_common::log_context(v4, ctx, opt_ra) {
+                info!("{msg}");
+            }
+        }
+        for relay in &daemon.relay4 {
+            info!("{}", crate::dhcp_common::log_relay(v4, relay));
+        }
+
+        #[cfg(feature = "dhcp6")]
+        {
+            let v6 = std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
+            for ctx in &daemon.dhcp6 {
+                for msg in crate::dhcp_common::log_context(v6, ctx, opt_ra) {
+                    info!("{msg}");
+                }
+            }
+            for relay in &daemon.relay6 {
+                info!("{}", crate::dhcp_common::log_relay(v6, relay));
+            }
+        }
     }
     Arc::new(RwLock::new(daemon))
 }
@@ -1701,6 +1727,70 @@ mod tests {
             #[cfg(feature = "dhcp6")]
             preferred: 0,
         }
+    }
+
+    /// Minimal [`tracing_subscriber::fmt::MakeWriter`] that captures formatted
+    /// log lines into a shared buffer, so tests can assert on `tracing::info!`
+    /// output without a real logging sink.
+    #[cfg(feature = "dhcp")]
+    #[derive(Clone, Default)]
+    struct CapturingWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    #[cfg(feature = "dhcp")]
+    impl std::io::Write for CapturingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "dhcp")]
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn init_daemon_with_logs_dhcp_context_and_relay() {
+        use crate::types::addr::AllAddr;
+        use crate::types::dhcp::DhcpRelay;
+
+        let mut daemon = Daemon::default();
+        daemon.dhcp.push(test_dhcp_context());
+        daemon.relay4.push(DhcpRelay {
+            local_addr: AllAddr::Addr4(Ipv4Addr::new(10, 0, 0, 1)),
+            server_addr: AllAddr::Addr4(Ipv4Addr::new(10, 0, 0, 2)),
+            uplink_addr: AllAddr::Addr4(Ipv4Addr::UNSPECIFIED),
+            interface: Some("eth0".to_string()),
+            iface_index: 1,
+            port: i32::from(crate::dhcp_protocol::DHCP_SERVER_PORT),
+            split_mode: 0,
+            warned: 0,
+            matchcount: 0,
+        });
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = CapturingWriter(buf.clone());
+        let subscriber = tracing_subscriber::fmt().with_writer(writer).with_ansi(false).finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let _handle = init_daemon_with(daemon);
+        });
+
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("DHCP, IP range 10.0.0.100 -- 10.0.0.150, lease time 1h"),
+            "startup log should contain the dhcp-range line, got: {output}"
+        );
+        assert!(
+            output.contains("DHCP relay from 10.0.0.1 to 10.0.0.2 via eth0"),
+            "startup log should contain the dhcp-relay line, got: {output}"
+        );
     }
 
     #[test]
