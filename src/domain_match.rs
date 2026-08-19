@@ -128,6 +128,7 @@ fn compare_entries(a: &ServerEntry, b: &ServerEntry) -> Ordering {
 /// Sorted DNS server lookup table.
 ///
 /// Equivalent to `daemon->serverarray` in dnsmasq.
+#[derive(Debug, Clone)]
 pub struct ServerArray {
     entries: Vec<ServerEntry>,
     /// `true` if any entry has `SERV_WILDCARD` set.
@@ -514,8 +515,12 @@ impl ServerArray {
 /// Check whether the server at array position `first` returns a local answer.
 ///
 /// Returns a bitmask of `F_IPV4`, `F_IPV6`, `F_NOERR`, or `F_NXDOMAIN` (or `0`).
-/// Mirrors `is_local_answer` in C.
-pub fn is_local_answer(arr: &ServerArray, first: usize) -> u32 {
+/// `is_locally_known` is called (at most once) only when `first`'s entry
+/// carries no address of its own and no same-domain sibling does either — it
+/// should mirror upstream's `check_for_local_domain(name, now)`, i.e. "is this
+/// name otherwise known from local config, DHCP, or the cache", to decide
+/// NOERR (NODATA) vs NXDOMAIN. Mirrors `is_local_answer` in C.
+pub fn is_local_answer(arr: &ServerArray, mut first: usize, is_locally_known: impl FnOnce() -> bool) -> u32 {
     let entry = match arr.get(first) {
         Some(e) => e,
         None => return 0,
@@ -532,8 +537,91 @@ pub fn is_local_answer(arr: &ServerArray, first: usize) -> u32 {
     if entry.flags & SERV_ALL_ZEROS != 0 {
         return F_IPV4 | F_IPV6;
     }
-    // No specific address → NXDOMAIN (no local domain name either).
-    F_NXDOMAIN
+
+    // No specific address on this entry: roll back to the first entry in the
+    // same domain group and check whether it (or the local-domain check)
+    // gives us grounds for NOERR instead of NXDOMAIN.
+    while first > 0 && arr.same_group(first - 1, first) {
+        first -= 1;
+    }
+    let rolled = &arr.entries[first];
+    if rolled.flags & SERV_LOCAL_ADDRESS != 0 || is_locally_known() {
+        F_NOERR
+    } else {
+        F_NXDOMAIN
+    }
+}
+
+// ── make_local_answer ─────────────────────────────────────────────────────
+
+/// Build local A/AAAA answer records for the literal-address server group
+/// `[first, last)` returned by [`ServerArray::lookup`].
+///
+/// `servers` must be the same slice passed as `local_domains` to the
+/// [`ServerArray::build`] call that produced `arr` — addresses are looked up
+/// by `ServerEntry::index` into it. `flags` is the record-type bits to emit
+/// (`is_local_answer`'s return value, ANDed with the query's requested
+/// types) — `F_IPV4` emits an A record per entry in range, `F_IPV6` an AAAA
+/// record, and both together (the `SERV_ALL_ZEROS` case) emit one of each per
+/// entry. Mirrors the RR-building half of `make_local_answer()`
+/// (domain-match.c:409-475); truncation and wire-level header/logging
+/// plumbing are the caller's responsibility.
+pub fn make_local_answer(
+    arr: &ServerArray,
+    servers: &[Server],
+    first: usize,
+    last: usize,
+    flags: u32,
+    name: &str,
+    ttl: u32,
+) -> Vec<crate::rfc1035::DnsRr> {
+    use crate::rfc1035::DnsRr;
+
+    let mut answers = Vec::new();
+
+    if flags & F_IPV4 != 0 {
+        for i in first..last {
+            let Some(entry) = arr.get(i) else { continue };
+            let addr4 = if entry.flags & SERV_ALL_ZEROS != 0 {
+                Ipv4Addr::UNSPECIFIED
+            } else {
+                match servers.get(entry.index).map(|s| s.addr.ip()) {
+                    Some(std::net::IpAddr::V4(ip)) => ip,
+                    _ => continue,
+                }
+            };
+            answers.push(DnsRr {
+                name: name.to_string(),
+                rtype: 1, // T_A
+                class: 1, // C_IN
+                ttl,
+                rdata: addr4.octets().to_vec(),
+            });
+        }
+    }
+
+    if flags & F_IPV6 != 0 {
+        for i in first..last {
+            let Some(entry) = arr.get(i) else { continue };
+            let addr6 = if entry.flags & SERV_ALL_ZEROS != 0 {
+                std::net::Ipv6Addr::UNSPECIFIED
+            } else {
+                match servers.get(entry.index).map(|s| s.addr.ip()) {
+                    Some(std::net::IpAddr::V6(ip)) => ip,
+                    _ => continue,
+                }
+            };
+            answers.push(DnsRr {
+                name: name.to_string(),
+                rtype: 28, // T_AAAA
+                class: 1,  // C_IN
+                ttl,
+                rdata: addr6.octets().to_vec(),
+            });
+        }
+    }
+
+    answers
 }
 
 // ── Server list management ────────────────────────────────────────────────────
@@ -671,6 +759,24 @@ mod tests {
     fn local_ipv6(domain: &str) -> Server {
         let mut s = upstream(domain);
         s.flags = SERV_LITERAL_ADDRESS | SERV_6ADDR;
+        s
+    }
+
+    fn local_ipv4_at(domain: &str, ip: Ipv4Addr) -> Server {
+        let mut s = local_ipv4(domain);
+        s.addr = MySockAddr::V4(SocketAddrV4::new(ip, 0));
+        s
+    }
+
+    fn local_ipv6_at(domain: &str, ip: std::net::Ipv6Addr) -> Server {
+        let mut s = local_ipv6(domain);
+        s.addr = MySockAddr::V6(std::net::SocketAddrV6::new(ip, 0, 0, 0));
+        s
+    }
+
+    fn local_all_zeros(domain: &str) -> Server {
+        let mut s = upstream(domain);
+        s.flags = SERV_LITERAL_ADDRESS | SERV_ALL_ZEROS;
         s
     }
 
@@ -818,7 +924,7 @@ mod tests {
         let local_domains = vec![local_ipv4("example.com")];
         let arr = ServerArray::build(&[], &local_domains);
         let (lo, _) = arr.lookup("example.com", F_IPV4).unwrap();
-        assert_eq!(is_local_answer(&arr, lo), F_IPV4);
+        assert_eq!(is_local_answer(&arr, lo, || false), F_IPV4);
     }
 
     #[test]
@@ -826,7 +932,7 @@ mod tests {
         let local_domains = vec![local_ipv6("example.com")];
         let arr = ServerArray::build(&[], &local_domains);
         let (lo, _) = arr.lookup("example.com", F_IPV6).unwrap();
-        assert_eq!(is_local_answer(&arr, lo), F_IPV6);
+        assert_eq!(is_local_answer(&arr, lo, || false), F_IPV6);
     }
 
     #[test]
@@ -835,7 +941,39 @@ mod tests {
         let arr = ServerArray::build(&[], &local_domains);
         // NXDOMAIN literal: use flags=0 (no F_SERVER / F_DOMAINSRV / F_CONFIG).
         let (lo, _) = arr.lookup("example.com", 0).unwrap();
-        assert_eq!(is_local_answer(&arr, lo), F_NXDOMAIN);
+        // No other same-domain address entry, and the caller's local-domain
+        // check reports "not locally known" — matches upstream's default
+        // `--server=/example.com/` / `--address=/example.com/` behavior
+        // (man page: "one or more domains with no address returns a
+        // no-such-domain answer").
+        assert_eq!(is_local_answer(&arr, lo, || false), F_NXDOMAIN);
+    }
+
+    #[test]
+    fn is_local_answer_noerr_when_name_locally_known() {
+        // Same literal-no-address entry, but the caller's local-domain check
+        // (`check_for_local_domain` in the real caller) reports the name as
+        // otherwise locally known (e.g. it has an MX/TXT/NAPTR record) — the
+        // rollback in `is_local_answer` should answer NOERR (NODATA), not
+        // NXDOMAIN (domain-match.c:396-401).
+        let local_domains = vec![local_nxdomain("example.com")];
+        let arr = ServerArray::build(&[], &local_domains);
+        let (lo, _) = arr.lookup("example.com", 0).unwrap();
+        assert_eq!(is_local_answer(&arr, lo, || true), F_NOERR);
+    }
+
+    #[test]
+    fn is_local_answer_noerr_when_samegroup_has_address() {
+        // A domain with both a plain "block" entry and an address entry:
+        // rolling back from the block entry finds the address entry in the
+        // same group (`SERV_LOCAL_ADDRESS`), which alone is enough for NOERR
+        // regardless of the local-domain check.
+        let local_domains = vec![local_ipv4("example.com"), local_nxdomain("example.com")];
+        let arr = ServerArray::build(&[], &local_domains);
+        // Query with flags=0 so filter_servers lands on the NXDOMAIN-literal
+        // entry (the F_IPV4 branch requires the F_IPV4 query flag).
+        let (lo, _) = arr.lookup("example.com", 0).unwrap();
+        assert_eq!(is_local_answer(&arr, lo, || false), F_NOERR);
     }
 
     #[test]
@@ -843,7 +981,7 @@ mod tests {
         let servers = vec![upstream("example.com")];
         let arr = ServerArray::build(&servers, &[]);
         let (lo, _) = arr.lookup("example.com", F_SERVER).unwrap();
-        assert_eq!(is_local_answer(&arr, lo), 0);
+        assert_eq!(is_local_answer(&arr, lo, || false), 0);
     }
 
     // ── mark_servers / cleanup_servers / add_update_server ───────────────────
@@ -909,5 +1047,79 @@ mod tests {
         let servers = vec![upstream("a.com"), upstream("b.com")];
         let arr = ServerArray::build(&servers, &[]);
         assert!(!arr.same_group(0, 1));
+    }
+
+    // ── make_local_answer ─────────────────────────────────────────────────────
+
+    #[test]
+    fn make_local_answer_returns_configured_ipv4() {
+        let local_domains = vec![local_ipv4_at("example.com", Ipv4Addr::new(1, 2, 3, 4))];
+        let arr = ServerArray::build(&[], &local_domains);
+        let (first, last) = arr.lookup("example.com", F_IPV4).unwrap();
+        let answers =
+            make_local_answer(&arr, &local_domains, first, last, F_IPV4, "example.com", 300);
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].rtype, 1); // T_A
+        assert_eq!(answers[0].class, 1); // C_IN
+        assert_eq!(answers[0].ttl, 300);
+        assert_eq!(answers[0].name, "example.com");
+        assert_eq!(answers[0].rdata, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn make_local_answer_returns_configured_ipv6() {
+        let ip = "::1".parse::<std::net::Ipv6Addr>().unwrap();
+        let local_domains = vec![local_ipv6_at("example.com", ip)];
+        let arr = ServerArray::build(&[], &local_domains);
+        let (first, last) = arr.lookup("example.com", F_IPV6).unwrap();
+        let answers =
+            make_local_answer(&arr, &local_domains, first, last, F_IPV6, "example.com", 300);
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].rtype, 28); // T_AAAA
+        assert_eq!(answers[0].rdata, ip.octets().to_vec());
+    }
+
+    #[test]
+    fn make_local_answer_all_zeros_answers_both_families() {
+        let local_domains = vec![local_all_zeros("example.com")];
+        let arr = ServerArray::build(&[], &local_domains);
+        let (first, last) = arr.lookup("example.com", F_IPV4 | F_IPV6).unwrap();
+        let answers = make_local_answer(
+            &arr,
+            &local_domains,
+            first,
+            last,
+            F_IPV4 | F_IPV6,
+            "example.com",
+            300,
+        );
+        assert_eq!(answers.len(), 2);
+        assert!(answers.iter().any(|a| a.rtype == 1 && a.rdata == vec![0, 0, 0, 0]));
+        assert!(answers.iter().any(|a| a.rtype == 28 && a.rdata == vec![0u8; 16]));
+    }
+
+    #[test]
+    fn make_local_answer_multiple_addresses_for_one_domain() {
+        // `--address=/example.com/1.1.1.1 --address=/example.com/2.2.2.2`
+        let local_domains = vec![
+            local_ipv4_at("example.com", Ipv4Addr::new(1, 1, 1, 1)),
+            local_ipv4_at("example.com", Ipv4Addr::new(2, 2, 2, 2)),
+        ];
+        let arr = ServerArray::build(&[], &local_domains);
+        let (first, last) = arr.lookup("example.com", F_IPV4).unwrap();
+        let answers =
+            make_local_answer(&arr, &local_domains, first, last, F_IPV4, "example.com", 300);
+        assert_eq!(answers.len(), 2);
+    }
+
+    #[test]
+    fn make_local_answer_ipv6_only_query_gets_no_a_record() {
+        let local_domains = vec![local_ipv6_at("example.com", "::1".parse().unwrap())];
+        let arr = ServerArray::build(&[], &local_domains);
+        let (first, last) = arr.lookup("example.com", F_IPV6).unwrap();
+        // Caller asks only for F_IPV6 even though the group could serve more.
+        let answers =
+            make_local_answer(&arr, &local_domains, first, last, F_IPV6, "example.com", 300);
+        assert!(answers.iter().all(|a| a.rtype == 28));
     }
 }

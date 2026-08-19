@@ -195,6 +195,12 @@ fn a_query(name: &str) -> DnsPacket {
     }
 }
 
+fn empty_server_array() -> &'static dnsmasq_rs::domain_match::ServerArray {
+    use std::sync::OnceLock;
+    static ARR: OnceLock<dnsmasq_rs::domain_match::ServerArray> = OnceLock::new();
+    ARR.get_or_init(|| dnsmasq_rs::domain_match::ServerArray::build(&[], &[]))
+}
+
 fn empty_local() -> LocalConfig<'static> {
     LocalConfig {
         local_ttl: 0,
@@ -209,7 +215,8 @@ fn empty_local() -> LocalConfig<'static> {
         int_names: &[],
         nodots_local: false,
         synth_domains: &[],
-        literal_domains: &[],
+        address_servers: empty_server_array(),
+        address_server_list: &[],
     }
 }
 

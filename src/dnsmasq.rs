@@ -518,6 +518,8 @@ struct DhcpDaemonRuntime {
 /// `daemon->rr`, `daemon->mxnames`, `daemon->ptr`, `daemon->naptr`, the
 /// `host-record` list and the configured CNAMEs.
 pub fn daemon_local_data(daemon: &Daemon) -> crate::forward::LocalData {
+    let address_server_list = literal_servers(daemon);
+    let address_servers = crate::domain_match::ServerArray::build(&[], &address_server_list);
     crate::forward::LocalData {
         local_ttl:     daemon.local_ttl,
         edns_pktsz:    daemon.edns_pktsz,
@@ -531,21 +533,24 @@ pub fn daemon_local_data(daemon: &Daemon) -> crate::forward::LocalData {
         int_names:     daemon.int_names.clone(),
         nodots_local:  daemon.option_bool(crate::types::constants::OPT_NODOTS_LOCAL),
         synth_domains: daemon.synth_domains.clone(),
-        literal_domains: literal_server_domains(daemon),
+        address_servers,
+        address_server_list,
     }
 }
 
-/// Domains from `daemon.servers` entries with `SERV_LITERAL_ADDRESS` set
-/// (no real upstream) — these are never forwarded.  Shared by
-/// [`daemon_local_data`] (answers them NXDOMAIN) and [`daemon_forward_config`]
+/// `daemon.servers` entries with `SERV_LITERAL_ADDRESS` set (`--address=`,
+/// `--server=/domain/` or `--local=/domain/` with no address, `rev-server`
+/// with the server part omitted) — never forwarded.  Shared by
+/// [`daemon_local_data`] (answers them directly via `ServerArray::lookup` +
+/// `is_local_answer`/`make_local_answer`) and [`daemon_forward_config`]
 /// (excludes them from the upstream list).
-fn literal_server_domains(daemon: &Daemon) -> Vec<String> {
+fn literal_servers(daemon: &Daemon) -> Vec<crate::types::server::Server> {
     use crate::types::server::SERV_LITERAL_ADDRESS;
     daemon
         .servers
         .iter()
-        .filter(|s| s.flags & SERV_LITERAL_ADDRESS != 0 && !s.domain.is_empty())
-        .map(|s| s.domain.clone())
+        .filter(|s| s.flags & SERV_LITERAL_ADDRESS != 0)
+        .cloned()
         .collect()
 }
 

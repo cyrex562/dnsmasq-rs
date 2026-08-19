@@ -1071,6 +1071,48 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   bind interface fire correctly, DHCPv6 relay entries actually forward
   traffic, and a lease's remembered agent-id is echoed on request.
 
+- [ ] Issue #26 `domain-match.c`: `is_local_answer`/`make_local_answer` now
+  have real callers. `ServerArray::lookup` + `domain_match::is_local_answer`
+  + `domain_match::make_local_answer` are wired into
+  `rfc1035.rs::answer_request` as its final local-data fallback (mirroring
+  where `forward.c` calls them: only once nothing earlier already answered
+  the query), fed by a `ServerArray` built once at config-reload time
+  (`dnsmasq.rs::daemon_local_data`) over every `SERV_LITERAL_ADDRESS` server
+  entry — `--address=/domain/ip`, `--server=/domain/` and `--local=/domain/`
+  with no address, and `rev-server` with the server part omitted all share
+  this path. `option.rs::parse_server_or_address` also had a real bug fixed
+  here: the empty-address form (`server=`/`local=`/`address=` with no IP)
+  previously hit an early `return Ok(())` and created no `Server` entry at
+  all, silently doing nothing — `local=/domain/` was a complete no-op before
+  this change. Left unsupported:
+  - `/#/` as a domain segment (wildcard "any domain", man page: `address=/#/1.2.3.4`)
+    is not special-cased by `parse_server_or_address` — it is parsed as the
+    literal domain string `"#"`, not the empty (catch-all) domain, so
+    `--address=/#/1.2.3.4` currently answers only queries for the name `#`.
+  - `#` as the address segment (man page: `address=/example.com/#`, meaning
+    "syntactic sugar for both `0.0.0.0` and `::`") is not special-cased
+    either — `parse_server_or_address` tries to parse it as an IP and
+    rejects it with `InvalidValue`. `SERV_ALL_ZEROS` itself is fully
+    implemented and tested (`domain_match::make_local_answer` answers both
+    A and AAAA with the zero address) — only the `#` config-syntax shorthand
+    for it is missing.
+  - Answer-size truncation (TC bit + emptied answer section when the reply
+    would not fit) is implemented only for this literal-address path, not
+    generally: every other locally-answered query type in `answer_request`
+    (TXT, host records, PTR, MX, SRV, NAPTR, cache hits) still builds an
+    unbounded answer section with no size check, unlike upstream's
+    `make_local_answer()`, which upstream uses for the whole reply, not just
+    address literals.
+  - No `log_query`-equivalent call accompanies these answers (see the
+    existing `log_txt` gap above, `tasks.md:410-412`) — this crate has no
+    general `log_query` facility yet.
+  Required tests: a `/#/`-wildcard-domain test and a `#`-null-address test
+  once those config-syntax gaps are closed; a general (non-address) local
+  answer truncation test once that is implemented.
+  Done when: `/#/` and address-position `#` parse per the man page, and
+  every locally-answered query type respects a reply size budget, not just
+  address literals.
+
 ## P3 Feature-Specific Completion
 
 - [ ] Finish behavior-critical gaps in DNS forwarding and cache interaction.
