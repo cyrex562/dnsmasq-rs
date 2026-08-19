@@ -1326,6 +1326,34 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   Required tests: feature-gated compile checks, targeted integration tests, parity scenarios only when implementation is real.
   Done when: each optional feature is either implemented with tests or explicitly marked incomplete.
 
+- [x] `dhcp_common::log_context` / `log_relay` — startup diagnostics for dhcp-range/dhcp-relay (Issue #29 / T3-dhcp-common).
+  Source of truth: `dhcp-common.c:951-1081` (`log_context`, `log_relay`), called from `dnsmasq.c:996-1008`.
+  `log_context` now returns the same set of messages upstream's up-to-three `my_syslog()` calls
+  produce per context: the range/static/proxy/RA-stateless line (skipped for `CONTEXT_OLD`,
+  gated by `CONTEXT_DHCP || family==v4`), the DHCPv6-only "DHCPv4-derived IPv6 names" line
+  (`CONTEXT_RA_NAME`), and the DHCPv6-only "router advertisement" line (`CONTEXT_RA` or
+  `opt_ra && CONTEXT_DHCP`). Lease-time and "prefix deprecated" text are mutually exclusive, as
+  upstream's shared buffer makes them; STATIC/PROXY branches print the end address, not start,
+  and PROXY omits lease time, matching the `%.0s`-suppressed upstream format strings exactly.
+  `log_relay` includes the local (`relay->local`) address, distinguishes `split_mode`, and only
+  applies the broadcast/split-mode branch selection when an interface is bound (upstream's
+  no-interface case is always the plain "from X to Y" form). Both are wired into
+  `dnsmasq::init_daemon_with`, iterating `daemon.dhcp`/`relay4` and (`dhcp6` feature)
+  `daemon.dhcp6`/`relay6`, mirroring `dnsmasq.c:996-1008`.
+  Covered by `dhcp_common::tests::log_context_*` / `log_relay_*` (range/static/proxy/RA-stateless
+  for both families, mutual-exclusion of lease-time vs. deprecated, RA-name/RA lines, relay
+  broadcast/split-mode/no-interface/non-default-port cases) and
+  `dnsmasq::tests::init_daemon_with_logs_dhcp_context_and_relay` (end-to-end: a `Daemon` with a
+  configured `dhcp-range`-equivalent context and relay actually emits the expected `tracing`
+  output at startup).
+  Explicitly still unsupported: `CONTEXT_CONSTRUCTED`/`CONTEXT_TEMPLATE` prefix annotations
+  (upstream's "constructed for X" / "template for X" suffix, which requires resolving
+  `if_index` to an interface name via `indextoname()`). `DhcpContext` has no `template_interface`
+  field and no ifindex→name lookup is wired up; contexts with these flags set log the same text
+  as an equivalent plain range/static/proxy context, without the suffix. `dhcp_construct_contexts`
+  (which is what actually sets `CONTEXT_CONSTRUCTED`/`CONTEXT_TEMPLATE` at runtime, called from
+  `dhcp6.c:771/807/852`) is not ported either, so this gap is currently unreachable in practice.
+
 ## P4 Test Harness And Tooling
 
 - [ ] Build reusable parity fixtures.

@@ -555,124 +555,145 @@ fn decode_cstring(val: &[u8]) -> Result<String, String> {
     Ok(strings.join(", "))
 }
 
+/// Zero the low 64 bits (interface identifier) of an IPv6 address, leaving
+/// the /64 network prefix. Mirrors `setaddr6part(addr, 0)` in `util.c`.
+#[cfg(all(feature = "dhcp", feature = "dhcp6"))]
+fn subnet6_str(addr: std::net::Ipv6Addr) -> String {
+    let mut octets = addr.octets();
+    for b in &mut octets[8..16] {
+        *b = 0;
+    }
+    std::net::Ipv6Addr::from(octets).to_string()
+}
+
 /// Log the startup configuration for a DHCP context.
 ///
-/// Formats and returns a log message for the given context (IPv4 or IPv6),
-/// mirroring upstream's `log_context()` diagnostic output.
+/// Returns zero to three formatted diagnostic lines for the given context
+/// (IPv4 or IPv6), mirroring upstream's `log_context()`, which issues between
+/// zero and three separate `my_syslog()` calls per context. `opt_ra` is the
+/// caller's `option_bool(OPT_RA)` — needed because the IPv6 "router
+/// advertisement" line fires whenever RA is globally enabled on a DHCP
+/// context, not only when `CONTEXT_RA` is set on this particular context.
 ///
-/// Returns an empty string for `CONTEXT_OLD` contexts (which are skipped in logging).
+/// Interface-name resolution for `CONTEXT_CONSTRUCTED`/`CONTEXT_TEMPLATE`
+/// prefixes (upstream's `indextoname()`/`template_interface` suffix) is not
+/// ported — see `tasks.md`. Those contexts log the same text as a plain
+/// range/static/proxy context, without the "constructed for X" / "template
+/// for X" suffix upstream appends.
 #[cfg(feature = "dhcp")]
-pub fn log_context(family: std::net::IpAddr, ctx: &crate::types::dhcp::DhcpContext) -> String {
+pub fn log_context(family: std::net::IpAddr, ctx: &crate::types::dhcp::DhcpContext, opt_ra: bool) -> Vec<String> {
     use crate::types::dhcp::*;
-
-    if (ctx.flags & CONTEXT_OLD) != 0 {
-        return String::new();
-    }
+    use crate::util::prettyprint_time;
 
     let is_v6 = matches!(family, std::net::IpAddr::V6(_));
+    let family_str = if is_v6 { "DHCPv6" } else { "DHCP" };
 
-    if is_v6 {
-        #[cfg(feature = "dhcp6")]
-        {
-            if (ctx.flags & CONTEXT_DHCP) == 0 {
-                return String::new();
-            }
-
-            let mut msg = format!("DHCPv6, IP range {}", ctx.start6);
-            msg.push_str(&format!(" -- {}", ctx.end6));
-
-            let lease_time = if ctx.lease_time == 0xffffffff {
-                "infinite".to_string()
-            } else {
-                format_time(ctx.lease_time)
-            };
-            msg.push_str(&format!(", lease time {}", lease_time));
-
-            if (ctx.flags & CONTEXT_DEPRECATE) != 0 {
-                msg.push_str(" (prefix deprecated)");
-            }
-
-            if (ctx.flags & CONTEXT_RA_NAME) != 0 {
-                msg.push_str(&format!(", DHCPv4-derived IPv6 names on"));
-            }
-
-            if (ctx.flags & (CONTEXT_RA | CONTEXT_RA_STATELESS)) != 0 {
-                msg.push_str(", router advertisement");
-            }
-
-            return msg;
-        }
-        #[cfg(not(feature = "dhcp6"))]
-        return String::new();
-    }
-
-    let mut msg = String::new();
-
-    if (ctx.flags & CONTEXT_STATIC) != 0 {
-        msg.push_str("DHCP, static only");
-    } else if (ctx.flags & CONTEXT_PROXY) != 0 {
-        msg.push_str(&format!("DHCP, proxy on {}", ctx.start));
+    // ", prefix deprecated" and ", lease time X" are mutually exclusive
+    // (upstream writes one or the other into the same buffer).
+    let namebuff = if is_v6 && (ctx.flags & CONTEXT_DEPRECATE) != 0 {
+        ", prefix deprecated".to_string()
     } else {
-        msg.push_str(&format!("DHCP, IP range {} -- {}", ctx.start, ctx.end));
-    }
-
-    let lease_time = if ctx.lease_time == 0xffffffff {
-        "infinite".to_string()
-    } else {
-        format_time(ctx.lease_time)
+        format!(", lease time {}", prettyprint_time(ctx.lease_time))
     };
-    msg.push_str(&format!(", lease time {}", lease_time));
 
-    msg
+    let mut messages = Vec::new();
+
+    if (ctx.flags & CONTEXT_OLD) == 0 && ((ctx.flags & CONTEXT_DHCP) != 0 || !is_v6) {
+        if is_v6 {
+            #[cfg(feature = "dhcp6")]
+            {
+                let dhcp_buff3 = ctx.end6.to_string();
+                let msg = if (ctx.flags & CONTEXT_RA_STATELESS) != 0 {
+                    format!("{family_str} stateless on {}", subnet6_str(ctx.start6))
+                } else if (ctx.flags & CONTEXT_STATIC) != 0 {
+                    format!("{family_str}, static leases only on {dhcp_buff3}{namebuff}")
+                } else if (ctx.flags & CONTEXT_PROXY) != 0 {
+                    format!("{family_str}, proxy on subnet {dhcp_buff3}")
+                } else {
+                    format!("{family_str}, IP range {} -- {dhcp_buff3}{namebuff}", ctx.start6)
+                };
+                messages.push(msg);
+            }
+        } else {
+            let dhcp_buff3 = ctx.end.to_string();
+            let msg = if (ctx.flags & CONTEXT_STATIC) != 0 {
+                format!("{family_str}, static leases only on {dhcp_buff3}{namebuff}")
+            } else if (ctx.flags & CONTEXT_PROXY) != 0 {
+                format!("{family_str}, proxy on subnet {dhcp_buff3}")
+            } else {
+                format!("{family_str}, IP range {} -- {dhcp_buff3}{namebuff}", ctx.start)
+            };
+            messages.push(msg);
+        }
+    }
+
+    #[cfg(feature = "dhcp6")]
+    if is_v6 {
+        let addrbuff = subnet6_str(ctx.start6);
+
+        if (ctx.flags & CONTEXT_RA_NAME) != 0 && (ctx.flags & CONTEXT_OLD) == 0 {
+            messages.push(format!("DHCPv4-derived IPv6 names on {addrbuff}"));
+        }
+
+        if (ctx.flags & CONTEXT_RA) != 0 || (opt_ra && (ctx.flags & CONTEXT_DHCP) != 0) {
+            messages.push(format!("router advertisement on {addrbuff}"));
+        }
+    }
+    #[cfg(not(feature = "dhcp6"))]
+    let _ = opt_ra;
+
+    messages
+}
+
+/// Format an [`AllAddr`](crate::types::addr::AllAddr) address for log output.
+#[cfg(feature = "dhcp")]
+fn all_addr_str(addr: &crate::types::addr::AllAddr) -> String {
+    use crate::types::addr::AllAddr;
+    match addr {
+        AllAddr::Addr4(a) => a.to_string(),
+        AllAddr::Addr6(a) => a.to_string(),
+        _ => "unknown".to_string(),
+    }
 }
 
 /// Log the startup configuration for a DHCP relay.
 ///
-/// Formats and returns a log message for the given relay configuration,
-/// mirroring upstream's `log_relay()` diagnostic output.
+/// Mirrors upstream's `log_relay()`: one message per relay, chosen by whether
+/// the relay targets the broadcast/all-servers-multicast address, whether an
+/// interface is bound, and whether split-relay mode is active. When no
+/// interface is configured, upstream always logs the plain "from X to Y" form
+/// — the broadcast/split-mode distinction only applies once an interface is
+/// known.
 #[cfg(feature = "dhcp")]
 pub fn log_relay(family: std::net::IpAddr, relay: &crate::types::dhcp::DhcpRelay) -> String {
     use crate::types::addr::AllAddr;
 
     let is_v6 = matches!(family, std::net::IpAddr::V6(_));
 
-    let server_str = match &relay.server_addr {
-        AllAddr::Addr4(addr) => addr.to_string(),
-        AllAddr::Addr6(addr) => addr.to_string(),
-        _ => "unknown".to_string(),
+    let local_str = all_addr_str(&relay.local_addr);
+    let mut server_str = all_addr_str(&relay.server_addr);
+
+    let broadcast = if is_v6 {
+        matches!(&relay.server_addr, AllAddr::Addr6(a) if *a == "FF05::1:3".parse::<std::net::Ipv6Addr>().unwrap())
+    } else {
+        matches!(&relay.server_addr, AllAddr::Addr4(a) if a.is_unspecified())
     };
 
-    let mut msg = String::new();
-
-    if is_v6 {
-        if let AllAddr::Addr6(addr) = &relay.server_addr {
-            if addr.is_unspecified() {
-                msg.push_str("DHCPv6 relay on ");
-            } else {
-                msg.push_str(&format!("DHCPv6 relay to {} on ", server_str));
-            }
-        }
+    let default_port = if is_v6 {
+        i32::from(crate::dhcp6_protocol::DHCPV6_SERVER_PORT)
     } else {
-        if let AllAddr::Addr4(addr) = &relay.server_addr {
-            if addr.is_unspecified() {
-                msg.push_str("DHCP relay broadcast on ");
-            } else {
-                msg.push_str(&format!("DHCP relay to {} on ", server_str));
-            }
-        }
+        i32::from(crate::dhcp_protocol::DHCP_SERVER_PORT)
+    };
+    if relay.port != default_port {
+        server_str.push_str(&format!("#{}", relay.port));
     }
 
-    if let Some(ref iface) = relay.interface {
-        msg.push_str(iface);
-    } else {
-        msg.push_str("all");
+    match &relay.interface {
+        Some(iface) if broadcast => format!("DHCP relay from {local_str} via {iface}"),
+        Some(iface) if relay.split_mode != 0 => format!("DHCP split-relay from {local_str} to {server_str} via {iface}"),
+        Some(iface) => format!("DHCP relay from {local_str} to {server_str} via {iface}"),
+        None => format!("DHCP relay from {local_str} to {server_str}"),
     }
-
-    if relay.port != 67 && relay.port != 547 {
-        msg.push_str(&format!(" #{}", relay.port));
-    }
-
-    msg
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2095,53 +2116,12 @@ mod tests {
 
     // ── log_context ──────────────────────────────────────────────────────────────
 
-    #[test]
     #[cfg(feature = "dhcp")]
-    fn log_context_ipv4_plain_range() {
+    fn base_ctx() -> crate::types::dhcp::DhcpContext {
         use crate::types::dhcp::{DhcpContext, DhcpNetid};
         use std::net::{Ipv4Addr, Ipv6Addr};
 
-        let ctx = DhcpContext {
-            lease_time: 3600,
-            addr_epoch: 0,
-            netmask: Ipv4Addr::new(255, 255, 255, 0),
-            broadcast: Ipv4Addr::new(192, 168, 1, 255),
-            local: Ipv4Addr::new(192, 168, 1, 1),
-            router: Ipv4Addr::new(192, 168, 1, 1),
-            start: Ipv4Addr::new(192, 168, 1, 100),
-            end: Ipv4Addr::new(192, 168, 1, 200),
-            flags: 0, // No special flags
-            netid: DhcpNetid { net: "net".into() },
-            filter: vec![],
-            #[cfg(feature = "dhcp6")]
-            start6: Ipv6Addr::UNSPECIFIED,
-            #[cfg(feature = "dhcp6")]
-            end6: Ipv6Addr::UNSPECIFIED,
-            #[cfg(feature = "dhcp6")]
-            local6: Ipv6Addr::UNSPECIFIED,
-            #[cfg(feature = "dhcp6")]
-            prefix: 0,
-            #[cfg(feature = "dhcp6")]
-            if_index: 0,
-            #[cfg(feature = "dhcp6")]
-            valid: 0,
-            #[cfg(feature = "dhcp6")]
-            preferred: 0,
-        };
-
-        let log_msg = log_context(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), &ctx);
-        assert!(log_msg.contains("192.168.1.100"), "Should contain start address");
-        assert!(log_msg.contains("192.168.1.200"), "Should contain end address");
-        assert!(log_msg.contains("1h") || log_msg.contains("3600"), "Should contain lease time");
-    }
-
-    #[test]
-    #[cfg(feature = "dhcp")]
-    fn log_context_skips_old_context() {
-        use crate::types::dhcp::{DhcpContext, DhcpNetid, CONTEXT_OLD};
-        use std::net::{Ipv4Addr, Ipv6Addr};
-
-        let mut ctx = DhcpContext {
+        DhcpContext {
             lease_time: 3600,
             addr_epoch: 0,
             netmask: Ipv4Addr::new(255, 255, 255, 0),
@@ -2154,36 +2134,162 @@ mod tests {
             netid: DhcpNetid { net: "net".into() },
             filter: vec![],
             #[cfg(feature = "dhcp6")]
-            start6: Ipv6Addr::UNSPECIFIED,
+            start6: "fd00::100".parse().unwrap(),
             #[cfg(feature = "dhcp6")]
-            end6: Ipv6Addr::UNSPECIFIED,
+            end6: "fd00::200".parse().unwrap(),
             #[cfg(feature = "dhcp6")]
             local6: Ipv6Addr::UNSPECIFIED,
             #[cfg(feature = "dhcp6")]
-            prefix: 0,
+            prefix: 64,
             #[cfg(feature = "dhcp6")]
             if_index: 0,
             #[cfg(feature = "dhcp6")]
             valid: 0,
             #[cfg(feature = "dhcp6")]
             preferred: 0,
-        };
-        ctx.flags = CONTEXT_OLD;
+        }
+    }
 
-        let log_msg = log_context(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), &ctx);
-        assert_eq!(log_msg, "", "CONTEXT_OLD contexts should return empty string");
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn log_context_ipv4_plain_range() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let ctx = base_ctx();
+        let msgs = log_context(IpAddr::V4(Ipv4Addr::UNSPECIFIED), &ctx, false);
+        assert_eq!(msgs, vec!["DHCP, IP range 192.168.1.100 -- 192.168.1.200, lease time 1h".to_string()]);
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn log_context_ipv4_static_uses_end_addr_not_start() {
+        use crate::types::dhcp::CONTEXT_STATIC;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let mut ctx = base_ctx();
+        ctx.flags = CONTEXT_STATIC;
+        let msgs = log_context(IpAddr::V4(Ipv4Addr::UNSPECIFIED), &ctx, false);
+        assert_eq!(msgs, vec!["DHCP, static leases only on 192.168.1.200, lease time 1h".to_string()]);
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn log_context_ipv4_proxy_has_no_lease_time() {
+        use crate::types::dhcp::CONTEXT_PROXY;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let mut ctx = base_ctx();
+        ctx.flags = CONTEXT_PROXY;
+        let msgs = log_context(IpAddr::V4(Ipv4Addr::UNSPECIFIED), &ctx, false);
+        assert_eq!(msgs, vec!["DHCP, proxy on subnet 192.168.1.200".to_string()]);
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn log_context_skips_old_context() {
+        use crate::types::dhcp::CONTEXT_OLD;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let mut ctx = base_ctx();
+        ctx.flags = CONTEXT_OLD;
+        let msgs = log_context(IpAddr::V4(Ipv4Addr::UNSPECIFIED), &ctx, false);
+        assert!(msgs.is_empty(), "CONTEXT_OLD contexts should produce no messages");
+    }
+
+    #[test]
+    #[cfg(all(feature = "dhcp", feature = "dhcp6"))]
+    fn log_context_ipv6_plain_range() {
+        use crate::types::dhcp::CONTEXT_DHCP;
+        use std::net::{IpAddr, Ipv6Addr};
+
+        let mut ctx = base_ctx();
+        ctx.flags = CONTEXT_DHCP;
+        ctx.lease_time = 7200;
+        let msgs = log_context(IpAddr::V6(Ipv6Addr::UNSPECIFIED), &ctx, false);
+        assert_eq!(msgs, vec!["DHCPv6, IP range fd00::100 -- fd00::200, lease time 2h".to_string()]);
+    }
+
+    #[test]
+    #[cfg(all(feature = "dhcp", feature = "dhcp6"))]
+    fn log_context_ipv6_deprecated_excludes_lease_time() {
+        use crate::types::dhcp::{CONTEXT_DEPRECATE, CONTEXT_DHCP};
+        use std::net::{IpAddr, Ipv6Addr};
+
+        let mut ctx = base_ctx();
+        ctx.flags = CONTEXT_DHCP | CONTEXT_DEPRECATE;
+        let msgs = log_context(IpAddr::V6(Ipv6Addr::UNSPECIFIED), &ctx, false);
+        assert_eq!(msgs, vec!["DHCPv6, IP range fd00::100 -- fd00::200, prefix deprecated".to_string()]);
+    }
+
+    #[test]
+    #[cfg(all(feature = "dhcp", feature = "dhcp6"))]
+    fn log_context_ipv6_static_and_proxy() {
+        use crate::types::dhcp::{CONTEXT_DHCP, CONTEXT_PROXY, CONTEXT_STATIC};
+        use std::net::{IpAddr, Ipv6Addr};
+
+        let mut static_ctx = base_ctx();
+        static_ctx.flags = CONTEXT_DHCP | CONTEXT_STATIC;
+        let msgs = log_context(IpAddr::V6(Ipv6Addr::UNSPECIFIED), &static_ctx, false);
+        assert_eq!(msgs, vec!["DHCPv6, static leases only on fd00::200, lease time 1h".to_string()]);
+
+        let mut proxy_ctx = base_ctx();
+        proxy_ctx.flags = CONTEXT_DHCP | CONTEXT_PROXY;
+        let msgs = log_context(IpAddr::V6(Ipv6Addr::UNSPECIFIED), &proxy_ctx, false);
+        assert_eq!(msgs, vec!["DHCPv6, proxy on subnet fd00::200".to_string()]);
+    }
+
+    #[test]
+    #[cfg(all(feature = "dhcp", feature = "dhcp6"))]
+    fn log_context_ipv6_ra_stateless_uses_subnet() {
+        use crate::types::dhcp::{CONTEXT_DHCP, CONTEXT_RA_STATELESS};
+        use std::net::{IpAddr, Ipv6Addr};
+
+        let mut ctx = base_ctx();
+        ctx.flags = CONTEXT_DHCP | CONTEXT_RA_STATELESS;
+        let msgs = log_context(IpAddr::V6(Ipv6Addr::UNSPECIFIED), &ctx, false);
+        assert_eq!(msgs, vec!["DHCPv6 stateless on fd00::".to_string()]);
+    }
+
+    #[test]
+    #[cfg(all(feature = "dhcp", feature = "dhcp6"))]
+    fn log_context_ra_name_and_ra_lines() {
+        use crate::types::dhcp::{CONTEXT_RA, CONTEXT_RA_NAME};
+        use std::net::{IpAddr, Ipv6Addr};
+
+        let mut ctx = base_ctx();
+        ctx.flags = CONTEXT_RA_NAME | CONTEXT_RA;
+        let msgs = log_context(IpAddr::V6(Ipv6Addr::UNSPECIFIED), &ctx, false);
+        assert_eq!(
+            msgs,
+            vec![
+                "DHCPv4-derived IPv6 names on fd00::".to_string(),
+                "router advertisement on fd00::".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "dhcp", feature = "dhcp6"))]
+    fn log_context_opt_ra_triggers_ra_line_for_dhcp_context() {
+        use crate::types::dhcp::CONTEXT_DHCP;
+        use std::net::{IpAddr, Ipv6Addr};
+
+        let mut ctx = base_ctx();
+        ctx.flags = CONTEXT_DHCP;
+        let msgs = log_context(IpAddr::V6(Ipv6Addr::UNSPECIFIED), &ctx, true);
+        assert!(msgs.iter().any(|m| m == "router advertisement on fd00::"),
+            "opt_ra + CONTEXT_DHCP on v6 should emit a router-advertisement line, got {msgs:?}");
     }
 
     // ── log_relay ────────────────────────────────────────────────────────────────
 
-    #[test]
     #[cfg(feature = "dhcp")]
-    fn log_relay_ipv4_normal() {
-        use crate::types::dhcp::DhcpRelay;
+    fn base_relay() -> crate::types::dhcp::DhcpRelay {
         use crate::types::addr::AllAddr;
+        use crate::types::dhcp::DhcpRelay;
         use std::net::Ipv4Addr;
 
-        let relay = DhcpRelay {
+        DhcpRelay {
             local_addr: AllAddr::Addr4(Ipv4Addr::new(192, 168, 1, 1)),
             server_addr: AllAddr::Addr4(Ipv4Addr::new(10, 0, 0, 1)),
             uplink_addr: AllAddr::Addr4(Ipv4Addr::UNSPECIFIED),
@@ -2193,56 +2299,91 @@ mod tests {
             split_mode: 0,
             warned: 0,
             matchcount: 0,
-        };
+        }
+    }
 
-        let log_msg = log_relay(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), &relay);
-        assert!(log_msg.contains("relay"), "Should mention relay");
-        assert!(log_msg.contains("10.0.0.1"), "Should contain server address");
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn log_relay_ipv4_normal_includes_local_addr() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let relay = base_relay();
+        let msg = log_relay(IpAddr::V4(Ipv4Addr::UNSPECIFIED), &relay);
+        assert_eq!(msg, "DHCP relay from 192.168.1.1 to 10.0.0.1");
     }
 
     #[test]
     #[cfg(feature = "dhcp")]
     fn log_relay_with_interface() {
-        use crate::types::dhcp::DhcpRelay;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let mut relay = base_relay();
+        relay.interface = Some("eth0".to_string());
+        let msg = log_relay(IpAddr::V4(Ipv4Addr::UNSPECIFIED), &relay);
+        assert_eq!(msg, "DHCP relay from 192.168.1.1 to 10.0.0.1 via eth0");
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn log_relay_broadcast_with_interface_omits_server() {
         use crate::types::addr::AllAddr;
-        use std::net::Ipv4Addr;
+        use std::net::{IpAddr, Ipv4Addr};
 
-        let relay = DhcpRelay {
-            local_addr: AllAddr::Addr4(Ipv4Addr::new(192, 168, 1, 1)),
-            server_addr: AllAddr::Addr4(Ipv4Addr::new(10, 0, 0, 1)),
-            uplink_addr: AllAddr::Addr4(Ipv4Addr::UNSPECIFIED),
-            interface: Some("eth0".to_string()),
-            iface_index: 1,
-            port: 67,
-            split_mode: 0,
-            warned: 0,
-            matchcount: 0,
-        };
+        let mut relay = base_relay();
+        relay.server_addr = AllAddr::Addr4(Ipv4Addr::UNSPECIFIED);
+        relay.interface = Some("eth0".to_string());
+        let msg = log_relay(IpAddr::V4(Ipv4Addr::UNSPECIFIED), &relay);
+        assert_eq!(msg, "DHCP relay from 192.168.1.1 via eth0");
+    }
 
-        let log_msg = log_relay(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), &relay);
-        assert!(log_msg.contains("eth0"), "Should mention interface");
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn log_relay_split_mode() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let mut relay = base_relay();
+        relay.interface = Some("eth0".to_string());
+        relay.split_mode = 1;
+        let msg = log_relay(IpAddr::V4(Ipv4Addr::UNSPECIFIED), &relay);
+        assert_eq!(msg, "DHCP split-relay from 192.168.1.1 to 10.0.0.1 via eth0");
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn log_relay_no_interface_ignores_broadcast_flag() {
+        use crate::types::addr::AllAddr;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let mut relay = base_relay();
+        relay.server_addr = AllAddr::Addr4(Ipv4Addr::UNSPECIFIED);
+        relay.interface = None;
+        let msg = log_relay(IpAddr::V4(Ipv4Addr::UNSPECIFIED), &relay);
+        assert_eq!(msg, "DHCP relay from 192.168.1.1 to 0.0.0.0");
     }
 
     #[test]
     #[cfg(feature = "dhcp")]
     fn log_relay_non_default_port() {
-        use crate::types::dhcp::DhcpRelay;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let mut relay = base_relay();
+        relay.port = 8067;
+        let msg = log_relay(IpAddr::V4(Ipv4Addr::UNSPECIFIED), &relay);
+        assert_eq!(msg, "DHCP relay from 192.168.1.1 to 10.0.0.1#8067");
+    }
+
+    #[test]
+    #[cfg(all(feature = "dhcp", feature = "dhcp6"))]
+    fn log_relay_ipv6_broadcast_uses_all_servers_multicast() {
         use crate::types::addr::AllAddr;
-        use std::net::Ipv4Addr;
+        use std::net::{IpAddr, Ipv6Addr};
 
-        let relay = DhcpRelay {
-            local_addr: AllAddr::Addr4(Ipv4Addr::new(192, 168, 1, 1)),
-            server_addr: AllAddr::Addr4(Ipv4Addr::new(10, 0, 0, 1)),
-            uplink_addr: AllAddr::Addr4(Ipv4Addr::UNSPECIFIED),
-            interface: None,
-            iface_index: 0,
-            port: 8067,
-            split_mode: 0,
-            warned: 0,
-            matchcount: 0,
-        };
-
-        let log_msg = log_relay(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), &relay);
-        assert!(log_msg.contains("#8067") || log_msg.contains("8067"), "Should include non-default port");
+        let mut relay = base_relay();
+        relay.local_addr = AllAddr::Addr6("fd00::1".parse().unwrap());
+        relay.server_addr = AllAddr::Addr6("FF05::1:3".parse().unwrap());
+        relay.interface = Some("eth0".to_string());
+        relay.port = 547;
+        let msg = log_relay(IpAddr::V6(Ipv6Addr::UNSPECIFIED), &relay);
+        assert_eq!(msg, "DHCP relay from fd00::1 via eth0");
     }
 }
