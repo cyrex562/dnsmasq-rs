@@ -135,6 +135,39 @@ pub fn ubus_event_bcast_connmark_allowlist_resolved(
 ) {
 }
 
+/// Broadcast a `connmark_allowlist_refused` ubus event: a query was denied by
+/// `--connmark-allowlist-enable` because no allowlist entry matched its
+/// connection mark and query name.
+///
+/// Called from [`crate::forward`]'s query-admission check, mirroring
+/// `ubus_event_bcast_connmark_allowlist_refused()` (`forward.c:1554`, inside
+/// `answer_disallowed()`). Same best-effort, never-errors posture as
+/// [`ubus_event_bcast_connmark_allowlist_resolved`].
+#[cfg(unix)]
+pub fn ubus_event_bcast_connmark_allowlist_refused(mark: u32, name: &str) {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    let mut params = HashMap::new();
+    params.insert("mark".to_string(), mark.to_string());
+    params.insert("name".to_string(), name.to_string());
+    let msg = UbusMsg {
+        object: "dnsmasq".to_string(),
+        method: "connmark_allowlist_refused".to_string(),
+        params,
+    };
+    let encoded = encode_ubus_msg(&msg);
+
+    if let Ok(mut stream) = UnixStream::connect(UBUS_SOCKET_PATH) {
+        let _ = stream.write_all(&encoded);
+    }
+}
+
+/// No-op stub on non-Unix targets — ubus is only ever reached over a Unix
+/// domain socket.
+#[cfg(not(unix))]
+pub fn ubus_event_bcast_connmark_allowlist_refused(_mark: u32, _name: &str) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +229,12 @@ mod tests {
     #[cfg(unix)]
     fn bcast_connmark_allowlist_resolved_does_not_panic_with_no_listener() {
         ubus_event_bcast_connmark_allowlist_resolved(6, "example.com", "1.2.3.4", 300);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bcast_connmark_allowlist_refused_does_not_panic_with_no_listener() {
+        ubus_event_bcast_connmark_allowlist_refused(6, "blocked.example.com");
     }
 
     #[test]

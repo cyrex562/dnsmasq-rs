@@ -1967,6 +1967,45 @@ pub fn report_addresses(
     out
 }
 
+/// Port of `is_query_allowed_for_mark()` (`forward.c:1523-1543`,
+/// `HAVE_CONNTRACK`).
+///
+/// `--connmark-allowlist-enable` admission check: a query is allowed through
+/// if some `--connmark-allowlist` entry's mark matches `mark` under both the
+/// global `allowlist_mask` and that entry's own mask, and one of its patterns
+/// is either the literal wildcard `"*"` (name-independent) or matches `name`
+/// as a glob pattern (which additionally requires `name` to be a
+/// syntactically valid DNS name, mirroring C's `is_allowable_name` gate).
+pub fn is_query_allowed_for_mark(
+    mark: u32,
+    name: &str,
+    allowlists: &[crate::types::network::Allowlist],
+    allowlist_mask: u32,
+) -> bool {
+    let mut did_validate_name = false;
+    let mut is_allowable_name = false;
+
+    for al in allowlists {
+        if al.mark != (mark & allowlist_mask & al.mask) {
+            continue;
+        }
+        for pattern in &al.patterns {
+            if pattern == "*" {
+                return true;
+            }
+            if !did_validate_name {
+                is_allowable_name = crate::pattern::is_valid_dns_name(name);
+                did_validate_name = true;
+            }
+            if is_allowable_name && crate::pattern::is_dns_name_matching_pattern(name, pattern) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 /// Check if a cache record is stale (TTL expired).
 ///
 /// Returns true if the record is not immortal and its TTD is in the past.
@@ -3861,6 +3900,66 @@ mod tests {
         let dp = DnsPacket::parse(&pkt).unwrap();
 
         assert!(report_addresses(&dp, 6, &[], 0).is_empty());
+    }
+
+    // ── is_query_allowed_for_mark ───────────────────────────────────────────
+
+    #[test]
+    fn is_query_allowed_for_mark_no_allowlists_disallows() {
+        assert!(!is_query_allowed_for_mark(6, "example.com", &[], 0));
+    }
+
+    #[test]
+    fn is_query_allowed_for_mark_wildcard_pattern_allows_any_name() {
+        let allowlists =
+            [Allowlist { mark: 6, mask: u32::MAX, patterns: vec!["*".to_string()] }];
+        assert!(is_query_allowed_for_mark(6, "anything.at.all", &allowlists, u32::MAX));
+    }
+
+    #[test]
+    fn is_query_allowed_for_mark_matching_name_pattern_allows() {
+        let allowlists = [Allowlist {
+            mark: 6,
+            mask: u32::MAX,
+            patterns: vec!["*.example.com".to_string()],
+        }];
+        assert!(is_query_allowed_for_mark(6, "www.example.com", &allowlists, u32::MAX));
+    }
+
+    #[test]
+    fn is_query_allowed_for_mark_non_matching_name_pattern_disallows() {
+        let allowlists = [Allowlist {
+            mark: 6,
+            mask: u32::MAX,
+            patterns: vec!["*.example.com".to_string()],
+        }];
+        assert!(!is_query_allowed_for_mark(6, "www.example.org", &allowlists, u32::MAX));
+    }
+
+    #[test]
+    fn is_query_allowed_for_mark_non_matching_mark_disallows() {
+        let allowlists =
+            [Allowlist { mark: 6, mask: u32::MAX, patterns: vec!["*".to_string()] }];
+        assert!(!is_query_allowed_for_mark(7, "example.com", &allowlists, u32::MAX));
+    }
+
+    #[test]
+    fn is_query_allowed_for_mark_invalid_name_with_non_wildcard_pattern_disallows() {
+        // A single-label name fails `is_valid_dns_name`, so even a pattern
+        // that would otherwise match by glob never gets the chance to
+        // (`forward.c:1533-1541`: `is_allowable_name` gates the pattern loop).
+        let allowlists =
+            [Allowlist { mark: 6, mask: u32::MAX, patterns: vec!["*example*".to_string()] }];
+        assert!(!is_query_allowed_for_mark(6, "example", &allowlists, u32::MAX));
+    }
+
+    #[test]
+    fn is_query_allowed_for_mark_applies_the_allowlist_mask() {
+        // `al.mark == (mark & daemon->allowlist_mask & al.mask)`: with a mask
+        // of 0xF, marks 6 and 22 (0b10110) collide on the low nibble.
+        let allowlists =
+            [Allowlist { mark: 6, mask: u32::MAX, patterns: vec!["*".to_string()] }];
+        assert!(is_query_allowed_for_mark(22, "example.com", &allowlists, 0xF));
     }
 
     // ── crec_isstale ─────────────────────────────────────────────────────────

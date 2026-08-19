@@ -1835,9 +1835,10 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
         // `mask = UINT32_MAX` before the optional-arg override. Upstream
         // hard-errors this directive without HAVE_CONNTRACK (option.c:3283-3286)
         // rather than silently ignoring it; do the same for the `conntrack`
-        // feature. Runtime consumption of `allowlist_mask`/`allowlists`
-        // (forward.c's mark-based bypass, not yet ported) is tracked in
-        // tasks.md under "Issue #18 remaining DHCP/PXE directives".
+        // feature. Runtime consumption of `allowlist_mask`/`allowlists` is
+        // wired into `forward::mark_admits_query` (query admission, ported
+        // from `is_query_allowed_for_mark()`) and `rfc1035::report_addresses`
+        // (reply-time ubus reporting) — see `tasks.md`.
         "connmark-allowlist-enable" => {
             #[cfg(not(feature = "conntrack"))]
             {
