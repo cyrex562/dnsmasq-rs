@@ -1255,6 +1255,19 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   run_lease_scripts_announces_lost_hostname_before_del, run_lease_scripts_clears_new_and_changed_flags,
   run_lease_scripts_drains_old_leases_queue}`.
 
+  Fixed in review: `helper::run_script` only set env vars
+  (`DNSMASQ_ACTION`/`DNSMASQ_IP`/`DNSMASQ_MAC`/`DNSMASQ_SUPPLIED_HOSTNAME`) and passed
+  zero positional args, so `$1`-`$4` were empty for any invoked script. Upstream's
+  `execl(daemon->lease_change_command, basename, action_str, mac_or_duid, ip, hostname,
+  NULL)` (helper.c:681-684) is the documented calling convention (dnsmasq.8:1826-1841:
+  "The arguments to the process are 'add', 'old' or 'del', the MAC address ..., the IP
+  address, and the hostname") that real dhcp-script hooks, including dnsmasq's own
+  contrib scripts, rely on. `run_script` now does `cmd.arg(action).arg(mac).arg(ip)` and
+  conditionally `.arg(hostname)` only when `Some` — matching upstream's behavior of
+  omitting the hostname arg entirely (not passing an empty string) when
+  `execl`'s vararg list ends early. Covered by
+  `helper::tests::{run_script_passes_positional_args, run_script_omits_hostname_arg_when_none}`.
+
 - [x] Port the ICMP conflict probe, `--read-ethers`, and real per-interface
   context selection (dhcp.c: `do_icmp_ping`/`address_allocate`/
   `dhcp_read_ethers`/`guess_range_netmask`/`complete_context`).

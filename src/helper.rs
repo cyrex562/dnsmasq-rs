@@ -939,6 +939,44 @@ mod tests {
     }
 
     #[test]
+    fn format_client_id_empty() {
+        assert_eq!(format_client_id(&[]), "");
+    }
+
+    #[test]
+    fn format_client_id_single() {
+        assert_eq!(format_client_id(&[0xff]), "ff");
+    }
+
+    // ── grab_extradata ───────────────────────────────────────────────────────
+
+    #[test]
+    fn grab_extradata_simple() {
+        let buf = b"hello\0rest";
+        let (val, rem) = grab_extradata(buf).unwrap();
+        assert_eq!(val, "hello");
+        assert_eq!(rem, b"rest");
+    }
+
+    #[test]
+    fn grab_extradata_empty_entry() {
+        let buf = b"\0rest";
+        let (val, rem) = grab_extradata(buf).unwrap();
+        assert_eq!(val, "");
+        assert_eq!(rem, b"rest");
+    }
+
+    #[test]
+    fn grab_extradata_no_null() {
+        assert!(grab_extradata(b"hello").is_none());
+    }
+
+    #[test]
+    fn grab_extradata_empty_buf() {
+        assert!(grab_extradata(b"").is_none());
+    }
+
+    #[test]
     fn grab_extradata_chained() {
         let buf = b"first\0second\0";
         let (v1, r1) = grab_extradata(buf).unwrap();
