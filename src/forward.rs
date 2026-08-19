@@ -1615,7 +1615,7 @@ impl ForwardEngine {
         self.upstream_order
             .iter()
             .copied()
-            .filter(|&idx| self.config.server_domains.get(idx).map_or(true, |d| d.is_empty()))
+            .filter(|&idx| self.config.server_domains.get(idx).is_none_or(|d| d.is_empty()))
             .collect()
     }
 

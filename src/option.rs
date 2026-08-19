@@ -2223,7 +2223,7 @@ fn parse_synth_domain(daemon: &mut Daemon, v: &str, cl: &ConfigLine) -> Result<(
         let size: u32 = size_str.parse().map_err(|_| invalid_value_for(cl, key, v, "bad prefix length"))?;
 
         if let Ok(addr4) = net_part.parse::<Ipv4Addr>() {
-            if size < 1 || size > 32 {
+            if !(1..=32).contains(&size) {
                 return Err(invalid_value_for(cl, key, v, "bad prefix length"));
             }
             let mask = (1u32 << (32 - size)) - 1;
@@ -2235,7 +2235,7 @@ fn parse_synth_domain(daemon: &mut Daemon, v: &str, cl: &ConfigLine) -> Result<(
                 cd.prefix = Some(p.to_string());
             }
         } else if let Ok(addr6) = net_part.parse::<Ipv6Addr>() {
-            if size < 1 || size > 128 {
+            if !(1..=128).contains(&size) {
                 return Err(invalid_value_for(cl, key, v, "bad prefix length"));
             }
             let addrpart = crate::domain::ipv6_low64(addr6);
@@ -2327,7 +2327,7 @@ fn parse_bridge_interface(daemon: &mut Daemon, v: &str, cl: &ConfigLine) -> Resu
 
     for alias in rest.split(',') {
         let alias = alias.trim();
-        if !alias.is_empty() && alias.len() <= BRIDGE_IF_NAMESIZE - 1 {
+        if !alias.is_empty() && alias.len() < BRIDGE_IF_NAMESIZE {
             daemon.bridges[idx].aliases.push(alias.to_string());
         }
     }
@@ -4485,7 +4485,7 @@ pub fn atoi_check8(s: &str) -> Option<u8> {
 /// `domain_rev4()` from option.c:1135-1219.
 pub fn domain_rev4(addr: std::net::Ipv4Addr, prefix_len: u32) -> Result<Vec<String>, &'static str> {
     let size = prefix_len;
-    if size > 32 || size < 1 {
+    if !(1..=32).contains(&size) {
         return Err("bad IPv4 prefix length");
     }
 
@@ -4526,7 +4526,7 @@ pub fn domain_rev4(addr: std::net::Ipv4Addr, prefix_len: u32) -> Result<Vec<Stri
 /// Port of the IPv6 half of `domain_rev6()` from option.c:1221-1307.
 pub fn domain_rev6(addr: std::net::Ipv6Addr, prefix_len: u32) -> Result<Vec<String>, &'static str> {
     let size = prefix_len;
-    if size > 128 || size < 1 {
+    if !(1..=128).contains(&size) {
         return Err("bad IPv6 prefix length");
     }
 

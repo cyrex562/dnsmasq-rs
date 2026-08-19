@@ -1167,9 +1167,8 @@ pub fn answer_request(
                         answers.push(DnsRr {
                             name: name.clone(), rtype: 12, class: 1, ttl, rdata: rd.to_vec(),
                         });
-                        ans       = true;
-                        auth      = true;
-                        found_ptr = true;
+                        ans  = true;
+                        auth = true;
                     }
                 }
             }
@@ -1719,6 +1718,7 @@ pub fn crec_ttl(ttd: u64, now: u64, flags: u32, max_ttl: u32, local_ttl: u32) ->
     }
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::dns_protocol::{HB3_QR, HB3_RD, HB4_RA};
