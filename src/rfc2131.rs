@@ -515,6 +515,200 @@ pub fn relay_server_to_client(pkt: &mut DhcpPacket) -> Option<Ipv4Addr> {
     Some(pkt.giaddr)
 }
 
+/// One forwarded copy of a DHCP request produced by [`relay_upstream4`]: the
+/// modified packet plus where and from which address to send it.
+#[cfg(feature = "dhcp")]
+#[derive(Debug, Clone)]
+pub struct RelayForward {
+    /// Where to send the forwarded packet (a configured server, or a
+    /// broadcast address resolved via `resolve_broadcast`).
+    pub dest: Ipv4Addr,
+    /// UDP destination port (`relay.port`).
+    pub port: u16,
+    /// Source address the packet should be sent from (`relay.local`/`relay.uplink`).
+    pub from: Ipv4Addr,
+    /// The packet as it should go on the wire: `giaddr` stamped and, in split
+    /// mode, an RFC 3046 agent-information option appended.
+    pub packet: DhcpPacket,
+}
+
+/// Layer-3 DHCP relay forwarding: for every configured IPv4 relay that
+/// matches the interface `pkt` arrived on, build a forwarded copy addressed
+/// to that relay's server.
+///
+/// Port of `relay_upstream4()` (`rfc2131.c:3058-3225`).
+///
+/// Two of upstream's ioctls become injected lookups here since this is a pure
+/// function with no socket access of its own:
+/// - `resolve_uplink` stands in for `ioctl(SIOCGIFADDR)`: given a split-mode
+///   relay's `interface` name, returns that interface's own IPv4 address.
+///   Also updates `relay.uplink_addr`, exactly as upstream's
+///   `relay->uplink.addr4 = ...` assignment does.
+/// - `resolve_broadcast` stands in for `ioctl(SIOCGIFBRDADDR)`: given an
+///   interface name, returns its broadcast address, used when a relay's
+///   `server_addr` is unspecified (broadcast mode).
+///
+/// `iface_index` is the numeric index of the interface `pkt` arrived on; a
+/// non-split relay only fires when it matches `relay.iface_index` (upstream
+/// binds that field to the interface owning `relay.local` — see
+/// `dhcp.c:669-673` — callers are expected to do the same before calling in).
+#[cfg(feature = "dhcp")]
+pub fn relay_upstream4(
+    iface_addr: Ipv4Addr,
+    iface_index: i32,
+    pkt: &DhcpPacket,
+    unicast: bool,
+    relays: &mut [crate::types::dhcp::DhcpRelay],
+    mut resolve_uplink: impl FnMut(&str) -> Option<Ipv4Addr>,
+    mut resolve_broadcast: impl FnMut(&str) -> Option<Ipv4Addr>,
+) -> Vec<RelayForward> {
+    use crate::dhcp_protocol::{OPTION_AGENT_ID, SUBOPT_FLAGS, SUBOPT_REMOTE_ID, SUBOPT_SERVER_OR, SUBOPT_SUBNET_SELECT};
+    use crate::types::addr::AllAddr;
+
+    if pkt.op != BOOTREQUEST || pkt.hops > 20 {
+        return Vec::new();
+    }
+
+    let orig_giaddr = pkt.giaddr;
+    let mut out = Vec::new();
+
+    for relay in relays.iter_mut() {
+        let AllAddr::Addr4(local4) = relay.local_addr else { continue };
+
+        let mut mess = pkt.clone();
+        mess.hops = pkt.hops + 1;
+
+        let from4 = if relay.split_mode == 0 && relay.iface_index != 0 && relay.iface_index == iface_index {
+            if orig_giaddr != Ipv4Addr::UNSPECIFIED {
+                if orig_giaddr == local4 {
+                    continue; // already gatewayed by us: loop
+                }
+            } else {
+                mess.giaddr = local4;
+            }
+            local4
+        } else if relay.split_mode != 0 && local4 == iface_addr {
+            if let Some(iface) = relay.interface.clone() {
+                match resolve_uplink(&iface) {
+                    Some(addr) => relay.uplink_addr = AllAddr::Addr4(addr),
+                    None => continue,
+                }
+            }
+            let AllAddr::Addr4(uplink4) = relay.uplink_addr else { continue };
+
+            if orig_giaddr != Ipv4Addr::UNSPECIFIED {
+                if orig_giaddr == uplink4 {
+                    continue; // already gatewayed by us: loop
+                }
+            } else {
+                mess.giaddr = uplink4;
+
+                // RFC 3046 agent-information: RFC 3527 subnet-select (our
+                // client-facing address), RFC 5107 server-id-override (same
+                // address), RFC 5010 flags, and an RFC 3046 remote-id holding
+                // the arrival interface index so relay_reply4 can route the
+                // reply back out the same interface.
+                let mut payload = [0u8; 21];
+                payload[0] = SUBOPT_SUBNET_SELECT;
+                payload[1] = 4;
+                payload[2..6].copy_from_slice(&local4.octets());
+                payload[6] = SUBOPT_SERVER_OR;
+                payload[7] = 4;
+                payload[8..12].copy_from_slice(&local4.octets());
+                payload[12] = SUBOPT_FLAGS;
+                payload[13] = 1;
+                payload[14] = if unicast { 0x80 } else { 0x00 };
+                payload[15] = SUBOPT_REMOTE_ID;
+                payload[16] = 4;
+                payload[17..21].copy_from_slice(&(iface_index as u32).to_be_bytes());
+                option_put_raw(&mut mess.options, OPTION_AGENT_ID, &payload);
+            }
+            uplink4
+        } else {
+            continue;
+        };
+
+        let AllAddr::Addr4(server4) = relay.server_addr else { continue };
+        let dest = if server4 == Ipv4Addr::UNSPECIFIED {
+            let Some(bcast) = relay.interface.as_deref().and_then(&mut resolve_broadcast) else { continue };
+            bcast
+        } else {
+            server4
+        };
+
+        out.push(RelayForward {
+            dest,
+            port: relay.port as u16,
+            from: from4,
+            packet: mess,
+        });
+    }
+
+    out
+}
+
+/// Match a relayed DHCP reply against configured relays and report which
+/// interface to send it back out.
+///
+/// Port of `relay_reply4()` (`rfc2131.c:3227-3262`). In split mode, strips
+/// the agent-information option this daemon injected in `relay_upstream4`
+/// before the reply reaches the client, per RFC 3046 §2.1.
+///
+/// Returns `0` when `pkt` was not relayed via any configured relay (matching
+/// upstream, where the caller treats a zero return as "not ours").
+#[cfg(feature = "dhcp")]
+pub fn relay_reply4(pkt: &mut DhcpPacket, relays: &[crate::types::dhcp::DhcpRelay], arrival_interface: Option<&str>) -> i32 {
+    use crate::dhcp_protocol::{OPTION_AGENT_ID, OPTION_END, SUBOPT_REMOTE_ID};
+    use crate::types::addr::AllAddr;
+
+    if pkt.giaddr == Ipv4Addr::UNSPECIFIED || pkt.op != BOOTREPLY {
+        return 0;
+    }
+
+    for relay in relays {
+        let mut return_iface = 0i32;
+
+        if relay.split_mode != 0 {
+            if let AllAddr::Addr4(uplink4) = relay.uplink_addr {
+                if pkt.giaddr == uplink4 {
+                    if let Some(idx) = option_find1(&pkt.options, OPTION_AGENT_ID, 1) {
+                        let data = option_val_at(&pkt.options, idx);
+                        if let Some(sidx) = option_find1(data, SUBOPT_REMOTE_ID, 4) {
+                            return_iface = option_uint_at(data, sidx, 0, 4) as i32;
+                        }
+
+                        // Delete agent info before returning it to the client (RFC 3046 §2.1).
+                        let len = option_len_at(&pkt.options, idx);
+                        pkt.options[idx] = OPTION_END;
+                        let start = idx + 1;
+                        let end = (start + len + 2).min(pkt.options.len());
+                        for b in &mut pkt.options[start..end] {
+                            *b = 0;
+                        }
+                    }
+                }
+            }
+        } else if let AllAddr::Addr4(local4) = relay.local_addr {
+            if pkt.giaddr == local4 {
+                return_iface = relay.iface_index;
+            }
+        }
+
+        if return_iface != 0 {
+            let matches_iface = match (relay.interface.as_deref(), arrival_interface) {
+                (None, _) => true,
+                (Some(pattern), Some(actual)) => crate::util::wildcard_match(pattern, actual),
+                (Some(_), None) => false,
+            };
+            if matches_iface {
+                return return_iface;
+            }
+        }
+    }
+
+    0
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Option-building helpers
 // (ported from rfc2131.c: free_space, do_opt, match_vendor_opts,
@@ -1246,7 +1440,7 @@ pub fn find_boot<'a>(
 #[cfg(all(test, feature = "dhcp"))]
 mod tests {
     use super::*;
-    use crate::dhcp_protocol::{DhcpPacket, DHCP_CHADDR_MAX, OPTION_OVERLOAD, OPTION_PAD};
+    use crate::dhcp_protocol::{DhcpPacket, DHCP_CHADDR_MAX, OPTION_AGENT_ID, OPTION_OVERLOAD, OPTION_PAD};
 
     fn base_packet() -> DhcpPacket {
         DhcpPacket {
@@ -1631,6 +1825,204 @@ mod tests {
     fn relay_server_to_client_returns_none_without_giaddr() {
         let mut pkt = base_packet();
         assert!(relay_server_to_client(&mut pkt).is_none());
+    }
+
+    // ── relay_upstream4 / relay_reply4 (rfc2131.c:3058-3262) ───────────────────
+
+    fn normal_relay(local: Ipv4Addr, server: Ipv4Addr, iface_index: i32) -> crate::types::dhcp::DhcpRelay {
+        crate::types::dhcp::DhcpRelay {
+            local_addr:  crate::types::addr::AllAddr::Addr4(local),
+            server_addr: crate::types::addr::AllAddr::Addr4(server),
+            uplink_addr: crate::types::addr::AllAddr::Addr4(Ipv4Addr::UNSPECIFIED),
+            interface:   None,
+            iface_index,
+            port:        67,
+            split_mode:  0,
+            warned:      0,
+            matchcount:  0,
+        }
+    }
+
+    fn split_relay(local: Ipv4Addr, server: Ipv4Addr, interface: &str) -> crate::types::dhcp::DhcpRelay {
+        crate::types::dhcp::DhcpRelay {
+            local_addr:  crate::types::addr::AllAddr::Addr4(local),
+            server_addr: crate::types::addr::AllAddr::Addr4(server),
+            uplink_addr: crate::types::addr::AllAddr::Addr4(Ipv4Addr::UNSPECIFIED),
+            interface:   Some(interface.to_string()),
+            iface_index: 0,
+            port:        67,
+            split_mode:  1,
+            warned:      0,
+            matchcount:  0,
+        }
+    }
+
+    #[test]
+    fn relay_upstream4_stamps_giaddr_and_forwards_to_server() {
+        let iface_addr = Ipv4Addr::new(192, 168, 1, 1);
+        let pkt = base_packet();
+        let mut relays = vec![normal_relay(iface_addr, Ipv4Addr::new(10, 0, 0, 1), 2)];
+
+        let forwards = relay_upstream4(iface_addr, 2, &pkt, false, &mut relays, |_| None, |_| None);
+
+        assert_eq!(forwards.len(), 1);
+        let fwd = &forwards[0];
+        assert_eq!(fwd.dest, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(fwd.port, 67);
+        assert_eq!(fwd.from, iface_addr);
+        assert_eq!(fwd.packet.giaddr, iface_addr);
+        assert_eq!(fwd.packet.hops, 1);
+    }
+
+    #[test]
+    fn relay_upstream4_skips_non_matching_interface() {
+        let iface_addr = Ipv4Addr::new(192, 168, 1, 1);
+        let pkt = base_packet();
+        let mut relays = vec![normal_relay(iface_addr, Ipv4Addr::new(10, 0, 0, 1), 2)];
+
+        let forwards = relay_upstream4(iface_addr, 3, &pkt, false, &mut relays, |_| None, |_| None);
+
+        assert!(forwards.is_empty());
+    }
+
+    #[test]
+    fn relay_upstream4_loop_detection_skips_own_giaddr() {
+        let iface_addr = Ipv4Addr::new(192, 168, 1, 1);
+        let mut pkt = base_packet();
+        pkt.giaddr = iface_addr; // already gatewayed by us
+        let mut relays = vec![normal_relay(iface_addr, Ipv4Addr::new(10, 0, 0, 1), 2)];
+
+        let forwards = relay_upstream4(iface_addr, 2, &pkt, false, &mut relays, |_| None, |_| None);
+
+        assert!(forwards.is_empty());
+    }
+
+    #[test]
+    fn relay_upstream4_drops_packet_over_hop_limit() {
+        let iface_addr = Ipv4Addr::new(192, 168, 1, 1);
+        let mut pkt = base_packet();
+        pkt.hops = 21;
+        let mut relays = vec![normal_relay(iface_addr, Ipv4Addr::new(10, 0, 0, 1), 2)];
+
+        let forwards = relay_upstream4(iface_addr, 2, &pkt, false, &mut relays, |_| None, |_| None);
+
+        assert!(forwards.is_empty());
+    }
+
+    #[test]
+    fn relay_upstream4_broadcasts_when_server_unspecified() {
+        let iface_addr = Ipv4Addr::new(192, 168, 1, 1);
+        let pkt = base_packet();
+        let mut relays = vec![normal_relay(iface_addr, Ipv4Addr::UNSPECIFIED, 2)];
+        relays[0].interface = Some("eth0".to_string());
+
+        let forwards = relay_upstream4(
+            iface_addr, 2, &pkt, false, &mut relays,
+            |_| None,
+            |iface| (iface == "eth0").then_some(Ipv4Addr::new(192, 168, 1, 255)),
+        );
+
+        assert_eq!(forwards.len(), 1);
+        assert_eq!(forwards[0].dest, Ipv4Addr::new(192, 168, 1, 255));
+    }
+
+    #[test]
+    fn relay_upstream4_split_mode_injects_option82() {
+        let iface_addr = Ipv4Addr::new(192, 168, 1, 1); // client-facing address
+        let pkt = base_packet();
+        let mut relays = vec![split_relay(iface_addr, Ipv4Addr::new(10, 0, 0, 1), "eth1")];
+        let uplink = Ipv4Addr::new(203, 0, 113, 1);
+
+        let forwards = relay_upstream4(
+            iface_addr, 5, &pkt, true, &mut relays,
+            |iface| (iface == "eth1").then_some(uplink),
+            |_| None,
+        );
+
+        assert_eq!(forwards.len(), 1);
+        let fwd = &forwards[0];
+        assert_eq!(fwd.from, uplink);
+        assert_eq!(fwd.packet.giaddr, uplink);
+        assert!(matches!(relays[0].uplink_addr, crate::types::addr::AllAddr::Addr4(a) if a == uplink));
+
+        let idx = option_find1(&fwd.packet.options, OPTION_AGENT_ID, 1).expect("agent-id option present");
+        assert_eq!(option_len_at(&fwd.packet.options, idx), 21);
+        let data = option_val_at(&fwd.packet.options, idx);
+        let subnet_idx = option_find1(data, crate::dhcp_protocol::SUBOPT_SUBNET_SELECT, 4).unwrap();
+        assert_eq!(option_val_at(data, subnet_idx), iface_addr.octets());
+        let remote_idx = option_find1(data, crate::dhcp_protocol::SUBOPT_REMOTE_ID, 4).unwrap();
+        assert_eq!(option_uint_at(data, remote_idx, 0, 4), 5);
+        let flags_idx = option_find1(data, crate::dhcp_protocol::SUBOPT_FLAGS, 1).unwrap();
+        assert_eq!(option_val_at(data, flags_idx), [0x80]); // unicast
+    }
+
+    #[test]
+    fn relay_upstream4_split_mode_requires_matching_local_addr() {
+        let iface_addr = Ipv4Addr::new(192, 168, 1, 1);
+        let pkt = base_packet();
+        let mut relays = vec![split_relay(Ipv4Addr::new(10, 10, 10, 10), Ipv4Addr::new(10, 0, 0, 1), "eth1")];
+
+        let forwards = relay_upstream4(iface_addr, 5, &pkt, true, &mut relays, |_| None, |_| None);
+
+        assert!(forwards.is_empty());
+    }
+
+    #[test]
+    fn relay_reply4_normal_mode_returns_iface_index() {
+        let mut pkt = base_packet();
+        pkt.op = BOOTREPLY;
+        pkt.giaddr = Ipv4Addr::new(192, 168, 1, 1);
+        let relays = vec![normal_relay(Ipv4Addr::new(192, 168, 1, 1), Ipv4Addr::new(10, 0, 0, 1), 2)];
+
+        let iface = relay_reply4(&mut pkt, &relays, None);
+
+        assert_eq!(iface, 2);
+    }
+
+    #[test]
+    fn relay_reply4_ignores_non_reply_or_unset_giaddr() {
+        let mut pkt = base_packet(); // op is BOOTREQUEST, giaddr unset
+        let relays = vec![normal_relay(Ipv4Addr::new(192, 168, 1, 1), Ipv4Addr::new(10, 0, 0, 1), 2)];
+        assert_eq!(relay_reply4(&mut pkt, &relays, None), 0);
+
+        pkt.op = BOOTREPLY;
+        assert_eq!(relay_reply4(&mut pkt, &relays, None), 0); // giaddr still unset
+    }
+
+    #[test]
+    fn relay_reply4_honors_interface_wildcard() {
+        let mut pkt = base_packet();
+        pkt.op = BOOTREPLY;
+        pkt.giaddr = Ipv4Addr::new(192, 168, 1, 1);
+        let mut relay = normal_relay(Ipv4Addr::new(192, 168, 1, 1), Ipv4Addr::new(10, 0, 0, 1), 2);
+        relay.interface = Some("eth*".to_string());
+        let relays = vec![relay];
+
+        assert_eq!(relay_reply4(&mut pkt, &relays, Some("eth0")), 2);
+        assert_eq!(relay_reply4(&mut pkt, &relays, Some("wlan0")), 0);
+    }
+
+    #[test]
+    fn relay_reply4_split_mode_extracts_and_strips_remote_id() {
+        let iface_addr = Ipv4Addr::new(192, 168, 1, 1);
+        let req = base_packet();
+        let mut relays = vec![split_relay(iface_addr, Ipv4Addr::new(10, 0, 0, 1), "eth1")];
+        let uplink = Ipv4Addr::new(203, 0, 113, 1);
+        let forwards = relay_upstream4(
+            iface_addr, 7, &req, false, &mut relays,
+            |_| Some(uplink),
+            |_| None,
+        );
+        let mut reply = forwards[0].packet.clone();
+        reply.op = BOOTREPLY;
+        // giaddr is already `uplink` from the forwarded request, as a real
+        // server would echo it back unchanged.
+
+        let iface = relay_reply4(&mut reply, &relays, Some("eth1"));
+
+        assert_eq!(iface, 7);
+        // Agent-id must be stripped per RFC 3046 §2.1 before the reply reaches the client.
+        assert!(option_find1(&reply.options, OPTION_AGENT_ID, 0).is_none());
     }
 
     // ── append_opt / has_opt_raw ──────────────────────────────────────────────

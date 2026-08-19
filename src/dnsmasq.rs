@@ -658,6 +658,10 @@ fn daemon_dhcp_runtime(daemon: &Daemon) -> Option<DhcpDaemonRuntime> {
     let client_port = u16::try_from(daemon.dhcp_client_port).ok()?;
     let bind_ip = first_ipv4_listen_addr(&daemon.if_addrs).unwrap_or(Ipv4Addr::UNSPECIFIED);
     let bind_interface = first_bind_interface(daemon);
+    let relay_iface_index = bind_interface
+        .as_deref()
+        .map_or(0, |name| crate::network::nametoindex(name) as i32);
+    let relay_iface_name = bind_interface.clone();
 
     Some(DhcpDaemonRuntime {
         bind_addr: SocketAddr::from((bind_ip, server_port)),
@@ -685,9 +689,13 @@ fn daemon_dhcp_runtime(daemon: &Daemon) -> Option<DhcpDaemonRuntime> {
             match_rules: daemon.dhcp_match.clone(),
             name_match_rules: daemon.dhcp_name_match.clone(),
             tag_rules: daemon.tag_if.clone(),
+            relay4: daemon.relay4.clone(),
         },
         loop_opts: crate::dhcp::DhcpLoopOptions {
             reply_port_override: (client_port != 68).then_some(client_port),
+            relay_iface_addr: bind_ip,
+            relay_iface_index,
+            relay_iface_name,
         },
     })
 }

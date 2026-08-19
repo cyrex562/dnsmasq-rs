@@ -25,7 +25,8 @@ use crate::lease::LeaseDb;
 use crate::metrics::{inc_metric, Metric};
 use crate::rfc2131::{
     do_options, find_boot, find_requested_ip, handle_decline, handle_discover, handle_inform,
-    handle_release, handle_request, is_pxe_client, option_put, DhcpReply, DoOptionsConfig,
+    handle_release, handle_request, is_pxe_client, option_put, relay_reply4, relay_upstream4,
+    DhcpReply, DoOptionsConfig,
 };
 use crate::dhcp_common::find_config;
 
@@ -72,6 +73,8 @@ pub struct DhcpServerConfig {
     pub name_match_rules: Vec<crate::types::dhcp::DhcpMatchName>,
     /// Conditional tag-setting rules from parsed `tag-if`.
     pub tag_rules: Vec<crate::dhcp_common::TagIf>,
+    /// IPv4 relay entries from parsed `dhcp-relay`/`dhcp-split-relay`.
+    pub relay4: Vec<crate::types::dhcp::DhcpRelay>,
 }
 
 impl Default for DhcpServerConfig {
@@ -95,6 +98,7 @@ impl Default for DhcpServerConfig {
             match_rules: Vec::new(),
             name_match_rules: Vec::new(),
             tag_rules: Vec::new(),
+            relay4: Vec::new(),
         }
     }
 }
@@ -105,11 +109,32 @@ pub struct DispatchedDhcpReply {
     pub delay_secs: u32,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DhcpLoopOptions {
     /// Optional reply-port override for unprivileged test and harness setups.
     /// When set, replies are sent to this port instead of the RFC2131 default.
     pub reply_port_override: Option<u16>,
+    /// The IPv4 address of the interface this loop's socket is bound to.
+    /// Used to match non-split `dhcp-relay` entries against arriving requests
+    /// (`relay_upstream4`'s `iface_addr`; see `dhcp.c:669-673`).
+    pub relay_iface_addr: Ipv4Addr,
+    /// Numeric index of the bound interface, resolved via `if_nametoindex`.
+    /// Fed to `relay_upstream4`/`relay_reply4` as `iface_index`.
+    pub relay_iface_index: i32,
+    /// Name of the bound interface, used for `relay_reply4`'s wildcard
+    /// interface match against a relay's configured `interface`.
+    pub relay_iface_name: Option<String>,
+}
+
+impl Default for DhcpLoopOptions {
+    fn default() -> Self {
+        Self {
+            reply_port_override: None,
+            relay_iface_addr: Ipv4Addr::UNSPECIFIED,
+            relay_iface_index: 0,
+            relay_iface_name: None,
+        }
+    }
 }
 
 fn rfc3004_user_classes(raw: &[u8]) -> Option<Vec<&[u8]>> {
@@ -364,6 +389,16 @@ fn decorate_reply(
     }
 
     do_options(&mut reply_pkt, &mut opt_cfg);
+
+    // Echo option 82 (agent information) back verbatim as the last option in
+    // the reply, per RFC 3046 §2.1 (rfc2131.c:189-205, :2075-2079). This
+    // fires whenever the request carried one, independent of whether this
+    // daemon has any `dhcp-relay` of its own configured — an upstream relay
+    // agent may have added it before the request reached us.
+    if let Some(agent_info) = find_option(&pkt.options, OPTION_AGENT_ID) {
+        crate::rfc2131::option_put_raw(&mut reply_pkt.options, OPTION_AGENT_ID, agent_info);
+    }
+
     reply.options = reply_pkt.options;
 }
 
@@ -409,6 +444,39 @@ pub fn parse_dhcp_packet(data: &[u8]) -> Option<DhcpPacket> {
         file,
         options: data[240..].to_vec(),
     })
+}
+
+/// Serialize a [`DhcpPacket`] as-is into a wire-format byte buffer.
+///
+/// Unlike [`dhcp_reply_to_wire`], which composes a fresh BOOTREPLY from a
+/// [`DhcpReply`] and the originating request, this serializes `pkt` verbatim
+/// (op, hops, giaddr, options and all) — used when forwarding a relayed
+/// request or reply unchanged onto the wire.
+pub fn dhcp_packet_to_wire(pkt: &DhcpPacket) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(300);
+    buf.push(pkt.op);
+    buf.push(pkt.htype);
+    buf.push(pkt.hlen);
+    buf.push(pkt.hops);
+    buf.extend_from_slice(&pkt.xid.to_be_bytes());
+    buf.extend_from_slice(&pkt.secs.to_be_bytes());
+    buf.extend_from_slice(&pkt.flags.to_be_bytes());
+    buf.extend_from_slice(&pkt.ciaddr.octets());
+    buf.extend_from_slice(&pkt.yiaddr.octets());
+    buf.extend_from_slice(&pkt.siaddr.octets());
+    buf.extend_from_slice(&pkt.giaddr.octets());
+    buf.extend_from_slice(&pkt.chaddr);
+    buf.extend_from_slice(&pkt.sname);
+    buf.extend_from_slice(&pkt.file);
+    buf.extend_from_slice(&DHCP_COOKIE.to_be_bytes());
+    buf.extend_from_slice(&pkt.options);
+    if pkt.options.last() != Some(&OPTION_END) {
+        buf.push(OPTION_END);
+    }
+    while buf.len() < 300 {
+        buf.push(0);
+    }
+    buf
 }
 
 /// Serialize a DHCP reply into a wire-format byte buffer.
@@ -470,6 +538,55 @@ pub fn dhcp_reply_to_wire(reply: &DhcpReply, request: &DhcpPacket) -> Vec<u8> {
 /// Return true if the packet was forwarded by a relay agent (`giaddr` != 0).
 pub fn is_relayed(pkt: &DhcpPacket) -> bool {
     pkt.giaddr != Ipv4Addr::UNSPECIFIED
+}
+
+/// Destination for a reply that [`crate::rfc2131::relay_reply4`] identified as
+/// bound for a client behind us, rather than a fresh local reply.
+///
+/// Unlike [`reply_dest`], this does *not* unicast to `giaddr` — `giaddr` here
+/// is our own relay address (that's how `relay_reply4` matched the packet in
+/// the first place), not an onward relay to hop through. Mirrors upstream's
+/// `is_relay_reply` branch (`dhcp.c:402-425`), minus its interface-targeted
+/// `IP_PKTINFO` unicast-to-chaddr case, which needs raw socket options this
+/// runtime doesn't use elsewhere.
+pub fn relay_reply_client_dest(pkt: &DhcpPacket) -> SocketAddr {
+    if pkt.ciaddr != Ipv4Addr::UNSPECIFIED {
+        SocketAddr::V4(SocketAddrV4::new(pkt.ciaddr, DHCP_CLIENT_PORT))
+    } else {
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, DHCP_CLIENT_PORT))
+    }
+}
+
+/// Resolve an interface's own IPv4 address (upstream's `ioctl(SIOCGIFADDR)`).
+///
+/// Used as `relay_upstream4`'s `resolve_uplink` callback for split-mode
+/// relays that name an `interface` rather than a literal uplink address.
+fn resolve_iface_addr(name: &str) -> Option<Ipv4Addr> {
+    crate::network::enumerate_interfaces().ok()?.into_iter().find_map(|iface| {
+        (iface.name == name)
+            .then_some(iface.addr)
+            .and_then(|addr| match addr {
+                IpAddr::V4(v4) => Some(v4),
+                IpAddr::V6(_) => None,
+            })
+    })
+}
+
+/// Resolve an interface's IPv4 broadcast address (upstream's
+/// `ioctl(SIOCGIFBRDADDR)`), used for `dhcp-relay` broadcast mode
+/// (`relay.server_addr` unspecified).
+fn resolve_iface_broadcast(name: &str) -> Option<Ipv4Addr> {
+    crate::network::enumerate_interfaces().ok()?.into_iter().find_map(|iface| {
+        if iface.name != name {
+            return None;
+        }
+        match (iface.addr, iface.netmask) {
+            (IpAddr::V4(addr), Some(IpAddr::V4(mask))) => {
+                Some(Ipv4Addr::from(u32::from(addr) | !u32::from(mask)))
+            }
+            _ => None,
+        }
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -653,6 +770,18 @@ fn loop_reply_dest(pkt: &DhcpPacket, src: SocketAddr, opts: &DhcpLoopOptions) ->
     reply_dest(pkt)
 }
 
+/// Like [`loop_reply_dest`] but for a reply [`crate::rfc2131::relay_reply4`]
+/// identified as needing to go back out to a client, not [`reply_dest`]'s
+/// giaddr-first logic (see [`relay_reply_client_dest`]).
+fn loop_relay_reply_dest(pkt: &DhcpPacket, opts: &DhcpLoopOptions) -> SocketAddr {
+    if let Some(port) = opts.reply_port_override {
+        let addr = if pkt.ciaddr != Ipv4Addr::UNSPECIFIED { pkt.ciaddr } else { Ipv4Addr::BROADCAST };
+        return SocketAddr::V4(SocketAddrV4::new(addr, port));
+    }
+
+    relay_reply_client_dest(pkt)
+}
+
 /// Send a DHCP reply to an explicit destination, applying any configured delay.
 pub async fn send_dhcp_reply_to(
     socket: &tokio::net::UdpSocket,
@@ -702,10 +831,50 @@ pub async fn run_dhcp_loop(
             }
             recv = socket.recv_from(&mut buf) => {
                 let (len, src) = recv?;
-                let Some(pkt) = parse_dhcp_packet(&buf[..len]) else {
+                let Some(mut pkt) = parse_dhcp_packet(&buf[..len]) else {
                     debug!("ignoring malformed DHCP packet from {src}");
                     continue;
                 };
+
+                // Relay dispatch (rfc2131.c relay_reply4/relay_upstream4, called
+                // from dhcp.c:305/:366). A reply matching one of our relays is
+                // forwarded straight to the client and never reaches local
+                // dispatch; a request is forwarded upstream through every
+                // matching relay in addition to (not instead of) local dispatch,
+                // matching upstream's "may have configured relay, but not DHCP
+                // server" comment (dhcp.c:368-370).
+                if !cfg.relay4.is_empty() {
+                    let return_iface = relay_reply4(&mut pkt, &cfg.relay4, opts.relay_iface_name.as_deref());
+                    if return_iface != 0 {
+                        let dest = loop_relay_reply_dest(&pkt, &opts);
+                        let wire = dhcp_packet_to_wire(&pkt);
+                        if let Err(err) = socket.send_to(&wire, dest).await {
+                            warn!("failed to relay DHCP reply to {dest}: {err}");
+                        }
+                        continue;
+                    }
+
+                    if pkt.op == crate::dhcp_protocol::BOOTREQUEST {
+                        let mut relays = cfg.relay4.clone();
+                        let forwards = relay_upstream4(
+                            opts.relay_iface_addr,
+                            opts.relay_iface_index,
+                            &pkt,
+                            false,
+                            &mut relays,
+                            resolve_iface_addr,
+                            resolve_iface_broadcast,
+                        );
+                        for fwd in &forwards {
+                            let dest = SocketAddr::V4(SocketAddrV4::new(fwd.dest, fwd.port));
+                            let wire = dhcp_packet_to_wire(&fwd.packet);
+                            if let Err(err) = socket.send_to(&wire, dest).await {
+                                warn!("failed to forward DHCP request to relay {dest}: {err}");
+                            }
+                        }
+                    }
+                }
+
                 let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db);
 
                 if lease_db.file_dirty {
@@ -1028,6 +1197,7 @@ mod tests {
             match_rules: vec![],
             name_match_rules: vec![],
             tag_rules: vec![],
+            relay4: vec![],
         }
     }
 
@@ -1038,6 +1208,35 @@ mod tests {
         let reply = dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new());
         assert!(reply.is_some());
         assert_eq!(reply.unwrap().msg_type, DhcpMsgType::Offer);
+    }
+
+    /// Option 82 (agent information) must be echoed back verbatim per RFC 3046 §2.1,
+    /// even when this daemon has no `dhcp-relay` of its own configured — an upstream
+    /// relay agent may have added it before the request ever reached us.
+    #[test]
+    fn reply_echoes_inbound_agent_id_option_82() {
+        let mut pkt = base_packet();
+        let agent_info = [OPTION_AGENT_ID, 8, 1, 6, b'u', b'p', b'l', b'i', b'n', b'k'];
+        pkt.options = vec![
+            OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Discover as u8,
+        ];
+        pkt.options.extend_from_slice(&agent_info);
+        pkt.options.push(OPTION_END);
+
+        let cfg = default_cfg();
+        let reply = dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new()).expect("offer reply");
+
+        let idx = crate::rfc2131::option_find1(&reply.options, OPTION_AGENT_ID, 1)
+            .expect("agent-id echoed in reply");
+        assert_eq!(crate::rfc2131::option_val_at(&reply.options, idx), &agent_info[2..]);
+    }
+
+    #[test]
+    fn reply_has_no_agent_id_when_request_has_none() {
+        let pkt = base_packet();
+        let cfg = default_cfg();
+        let reply = dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new()).expect("offer reply");
+        assert!(crate::rfc2131::option_find1(&reply.options, OPTION_AGENT_ID, 0).is_none());
     }
 
     #[test]
@@ -1720,6 +1919,7 @@ mod tests {
         cfg.lease_file = Some(path_str.clone());
         let opts = DhcpLoopOptions {
             reply_port_override: Some(receiver_addr.port()),
+            ..Default::default()
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -2096,6 +2296,7 @@ mod tests {
         let cfg = default_cfg();
         let opts = DhcpLoopOptions {
             reply_port_override: Some(receiver_addr.port()),
+            ..Default::default()
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -2119,6 +2320,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_dhcp_loop_forwards_relayed_request_upstream() {
+        let Some(relay_sock) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+        let Some(client) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+        let Some(upstream) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+
+        let relay_addr = Ipv4Addr::new(10, 9, 9, 9);
+        let relay_sock = std::sync::Arc::new(relay_sock);
+
+        let mut cfg = default_cfg();
+        // Disable the local pool so only the relay path produces traffic.
+        cfg.pool_start = Ipv4Addr::new(10, 0, 0, 5);
+        cfg.pool_end = Ipv4Addr::new(10, 0, 0, 1);
+        cfg.relay4.push(crate::types::dhcp::DhcpRelay {
+            local_addr: crate::types::addr::AllAddr::Addr4(relay_addr),
+            server_addr: crate::types::addr::AllAddr::Addr4(upstream.local_addr().unwrap().ip().to_string().parse().unwrap()),
+            uplink_addr: crate::types::addr::AllAddr::Addr4(Ipv4Addr::UNSPECIFIED),
+            interface: None,
+            iface_index: 1,
+            port: upstream.local_addr().unwrap().port() as i32,
+            split_mode: 0,
+            warned: 0,
+            matchcount: 0,
+        });
+        let opts = DhcpLoopOptions {
+            relay_iface_addr: relay_addr,
+            relay_iface_index: 1,
+            ..Default::default()
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let loop_task = tokio::spawn(run_dhcp_loop(relay_sock.clone(), cfg, opts, LeaseDb::new(), shutdown_rx));
+
+        let pkt = base_packet();
+        let wire = packet_to_wire(&pkt);
+        client.send_to(&wire, relay_sock.local_addr().unwrap()).await.unwrap();
+
+        let mut buf = [0u8; 512];
+        let (len, _) = tokio::time::timeout(Duration::from_millis(250), upstream.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for the relay to forward the request upstream")
+            .unwrap();
+        let forwarded = parse_dhcp_packet(&buf[..len]).expect("forwarded packet should parse");
+        assert_eq!(forwarded.op, crate::dhcp_protocol::BOOTREQUEST);
+        assert_eq!(forwarded.giaddr, relay_addr);
+        assert_eq!(forwarded.hops, 1);
+        assert_eq!(get_message_type(&forwarded.options), Some(DhcpMsgType::Discover));
+
+        shutdown_tx.send(true).unwrap();
+        loop_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_dhcp_loop_relays_reply_back_to_client() {
+        let Some(relay_sock) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+        let Some(upstream) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+        let Some(client_receiver) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+
+        let relay_addr = Ipv4Addr::new(10, 9, 9, 9);
+        let relay_sock = std::sync::Arc::new(relay_sock);
+        let client_addr = client_receiver.local_addr().unwrap();
+
+        let mut cfg = default_cfg();
+        cfg.pool_start = Ipv4Addr::new(10, 0, 0, 5);
+        cfg.pool_end = Ipv4Addr::new(10, 0, 0, 1);
+        cfg.relay4.push(crate::types::dhcp::DhcpRelay {
+            local_addr: crate::types::addr::AllAddr::Addr4(relay_addr),
+            server_addr: crate::types::addr::AllAddr::Addr4(upstream.local_addr().unwrap().ip().to_string().parse().unwrap()),
+            uplink_addr: crate::types::addr::AllAddr::Addr4(Ipv4Addr::UNSPECIFIED),
+            interface: None,
+            iface_index: 1,
+            port: upstream.local_addr().unwrap().port() as i32,
+            split_mode: 0,
+            warned: 0,
+            matchcount: 0,
+        });
+        let opts = DhcpLoopOptions {
+            relay_iface_addr: relay_addr,
+            relay_iface_index: 1,
+            reply_port_override: Some(client_addr.port()),
+            ..Default::default()
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let loop_task = tokio::spawn(run_dhcp_loop(relay_sock.clone(), cfg, opts, LeaseDb::new(), shutdown_rx));
+
+        // The upstream server's OFFER, addressed back to the relay (giaddr set,
+        // ciaddr pointed at our test "client" receiver so delivery doesn't need
+        // UDP broadcast permissions).
+        let mut reply = base_packet();
+        reply.op = BOOTREPLY;
+        reply.giaddr = relay_addr;
+        reply.ciaddr = client_addr.ip().to_string().parse().unwrap();
+        reply.yiaddr = Ipv4Addr::new(10, 0, 0, 50);
+        reply.options = vec![OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Offer as u8, OPTION_END];
+        let wire = packet_to_wire(&reply);
+        upstream.send_to(&wire, relay_sock.local_addr().unwrap()).await.unwrap();
+
+        let mut buf = [0u8; 512];
+        let (len, _) = tokio::time::timeout(Duration::from_millis(250), client_receiver.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for the relay to forward the reply to the client")
+            .unwrap();
+        let delivered = parse_dhcp_packet(&buf[..len]).expect("delivered reply should parse");
+        assert_eq!(delivered.yiaddr, Ipv4Addr::new(10, 0, 0, 50));
+        assert_eq!(get_message_type(&delivered.options), Some(DhcpMsgType::Offer));
+
+        shutdown_tx.send(true).unwrap();
+        loop_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn run_dhcp_loop_honors_reply_delay() {
         use crate::types::dhcp::DhcpReplyDelay;
 
@@ -2135,6 +2445,7 @@ mod tests {
         });
         let opts = DhcpLoopOptions {
             reply_port_override: Some(receiver_addr.port()),
+            ..Default::default()
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 

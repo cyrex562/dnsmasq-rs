@@ -936,6 +936,38 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   the same way `synth_domains` now is, and DHCP context matching consumes
   `bridges`/`shared_networks`.
 
+- [ ] Issue #21 remaining `dhcp-relay` gaps. `dhcp-relay`/`dhcp-split-relay`
+  parsing (`src/option.rs::parse_dhcp_relay`) and `relay_upstream4`/
+  `relay_reply4` (`src/rfc2131.rs`, ports of `rfc2131.c:3058-3262`) are
+  implemented and wired into `run_dhcp_loop` (`src/dhcp.rs`), including real
+  (non-stubbed) split-mode uplink and broadcast-address resolution via
+  `network::enumerate_interfaces()`. Left unsupported:
+  - Multi-interface awareness: upstream re-binds each relay's `iface_index`
+    per received packet to whichever interface actually owns `relay.local`
+    (`dhcp.c:669-673`), so one daemon can relay across several interfaces at
+    once. This runtime resolves `DhcpLoopOptions.relay_iface_addr/_index/_name`
+    once at startup from the single DHCP bind interface
+    (`dnsmasq.rs::daemon_dhcp_runtime`), so only relays matching that one
+    interface ever fire; a relay entry bound to a second interface is silently
+    never selected.
+  - DHCPv6 relay forwarding: `dhcp-relay` with IPv6 addresses parses and
+    populates `Daemon.relay6` (gated `dhcp6`), but there is no
+    `relay_upstream6`/`relay_reply6` — DHCPv6 relay entries are stored and
+    never consumed. `rfc3315.c`'s relay path is a separate, larger port.
+  - Lease-remembered agent-id echo: option 82 is echoed back only when the
+    *current* request carries it (`rfc2131.c:189-205`); upstream also re-sends
+    a *previously seen* agent-id from `lease->agent_id` when the client asks
+    for option 82 via the parameter-request list but didn't include one this
+    time (`rfc2131.c:1230-1231`, plus `lease_set_agent_id` at `:1721-1729`).
+    `DhcpLease` has no `agent_id` field and nothing stores one.
+  Required tests: a multi-socket/multi-interface `run_dhcp_loop` test once
+  the interface-rebinding gap is closed; `relay_upstream6`/`relay_reply6`
+  parity tests once DHCPv6 relay forwarding is ported; a lease-persisted
+  agent-id echo test once `DhcpLease.agent_id` exists.
+  Done when: relay entries bound to interfaces other than the primary DHCP
+  bind interface fire correctly, DHCPv6 relay entries actually forward
+  traffic, and a lease's remembered agent-id is echoed on request.
+
 ## P3 Feature-Specific Completion
 
 - [ ] Finish behavior-critical gaps in DNS forwarding and cache interaction.
