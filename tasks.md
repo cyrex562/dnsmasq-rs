@@ -508,8 +508,14 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     suppress records upstream would always write. Upstream filters only on `MS_DEBUG`.
   - Solaris `priv_set`/`setppriv` (`dnsmasq.c:775-795`) is deliberately out of scope; the
     capability path is Linux-only and other platforms just `setgroups`/`setgid`/`setuid`.
-  - No helper process is forked before the privilege drop, so `dhcp-script`/`dhcp-luascript`
-    (`create_helper`, `dnsmasq.c:740`) still cannot run as a separate uid.
+  - `helper::create_helper` (a real port of `create_helper`, helper.c:79-691: forks a
+    child, drops that child's privileges to `script-user`/`script-group` via
+    `setgroups`/`setgid`/`setuid` *before* it reads anything off the pipe, then loops
+    exec'ing `dhcp-script` per event) exists and is unit-tested, but startup
+    (`dnsmasq.rs`/`main.rs`) does not call it yet — so today's real privilege-drop path
+    still does not fork a separate-uid helper the way `dnsmasq.c:744` does ahead of its own
+    `drop_root()`. See the dedicated `helper.rs` entry below for the current state and
+    remaining gaps in that module itself.
   - The pid file is never removed on shutdown, and `PR_SET_DUMPABLE` (debug mode,
     `dnsmasq.c:823`) is not set.
   - Acceptance evidence caveat: `user_and_group_change_the_running_ids_and_clear_supplementary_groups`
@@ -520,6 +526,58 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   - `StartupPipe::ready()` fires once the runtime is built, not once the forwarding task
     is actually serving, so a failure inside `run_main_loop` still escapes the invoking
     process's notice.
+
+- [x] `helper.rs`: fork a privilege-dropped script helper, replacing the two invented,
+  mutually-inconsistent wire formats that used to live there (a newline-delimited text
+  format and an ad hoc binary `queue_script` layout, neither resembling `struct
+  script_data`) with `ScriptData` — one explicit, versioned binary encoding (a fixed
+  104-byte header + a `clid ++ NUL-terminated hostname ++ extradata` blob, mirroring
+  `queue_script`'s own packing order at helper.c:829-844). `create_helper` forks a child
+  that ignores SIGTERM/SIGALRM/SIGINT, drops to `script-user`/`script-group` via
+  `setgroups(&[])`/`setgid`/`setuid` *before* it reads anything off the pipe (helper.c:100-127),
+  then loops reading `ScriptData` events and running `dhcp-script` for each — inheriting the
+  already-dropped privileges rather than execing with the daemon's own, closing the
+  regression the issue flagged. The old in-process, non-forked `run_script()` is gone.
+  Root-gated test `create_helper_drops_privileges_in_child` asserts the forked child's
+  reported uid/gid actually differ from root; `parent_is_not_blocked_by_a_hanging_script`
+  and `parent_survives_helper_child_crashing` assert the caller only ever does a pipe
+  `write()` and is never blocked on or brought down by the script it queued. The child
+  also closes every fd it inherited from the main process (sockets, log files, ...)
+  before touching the pipe or exec'ing anything — `close_inherited_fds`, a port of
+  `close_fds()` (util.c:789) called at helper.c:134 — so a compromised script can't reach
+  those fds even though it inherits the process's open-fd table across `fork()`;
+  `create_helper_child_does_not_leak_unrelated_fds_to_script` asserts this end-to-end and
+  `close_inherited_fds_closes_unrelated_descriptors` covers the helper in isolation.
+  `DNSMASQ_LOG_DHCP` (helper.c:667, `option_bool(OPT_LOG_OPTS)`) is threaded through as a
+  `log_dhcp: bool` parameter on `create_helper`/`run_helper_loop`/`run_script_child` and
+  set last in the lease-action env block, matching upstream's ordering.
+
+  Explicitly **not** covered — upstream behavior still missing:
+
+  - Nothing calls `create_helper`/`HelperHandle::send` yet. `dnsmasq.rs`/`main.rs` startup
+    does not fork the helper ahead of the main privilege drop (`dnsmasq.c:744`), and
+    `lease.rs`'s `rerun_scripts` (lease.rs:439) still only flips `LEASE_CHANGED` instead of
+    building a `ScriptData::for_lease` and sending it — same for DHCP lease
+    commit/expiry paths in `dhcp.rs` and any ARP/TFTP call sites. Until that wiring lands,
+    `dhcp-script`/`dhcp-scriptuser` are parsed into `Daemon` (not a no-op) but have no
+    runtime effect.
+  - Lua scripting (`grab_extradata_lua`, `daemon->luascript`, helper.c:136-175,319-498) is
+    deliberately out of scope, per the issue.
+  - The DHCPv6-specific env vars/argv (`DNSMASQ_IAID`, `DNSMASQ_SERVER_DUID`, the
+    per-vendorclass `DNSMASQ_VENDOR_CLASS_ID`/`DNSMASQ_VENDOR_CLASSn` loop, and the DUID
+    string used as argv[2] instead of the MAC for `is6` lease events) are not built — the
+    IPv4 lease path (`ACTION_ADD`/`ACTION_OLD`/`ACTION_DEL`) has full argv/env fidelity;
+    the `is6` case falls back to formatting `addr6`/an empty MAC field rather than the DUID.
+  - No `event_fd`/`err_fd` channel back to a main process (helper.c's `send_event` for
+    `EVENT_SCRIPT_LOG`/`EVENT_EXITED`/`EVENT_KILLED`/`EVENT_USER_ERR`/`EVENT_DIE`): script
+    stdout/stderr and nonzero exit/signal status are logged locally via `tracing` instead of
+    forwarded to the (not-yet-existing) caller, and a failed privilege drop just exits the
+    helper rather than killing the main daemon the way `EVENT_DIE` does.
+  - `helper_write`'s non-blocking, buffered, partial-write-tolerant queue
+    (helper.c:927-946) is not reproduced; `HelperHandle::send` does a blocking
+    `write_all`. Fine for the event sizes here (well under `PIPE_BUF`), but a future
+    integration into `run_main_loop`'s poll loop should restore the non-blocking queue
+    before large `extradata` blobs become possible.
 
 - [x] Apply `--interface` / `--except-interface` / `--listen-address` to the DNS listeners.
   `run_main_loop` used to bind a single `0.0.0.0:{port}` socket and never read
