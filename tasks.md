@@ -132,12 +132,36 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     (`forward.c:604-613` synchronous local-answer reply, `1902-1997` and
     `2546-2555`, both inside DNSSEC-validation-retry/failure paths) — none
     of those reply paths have a Rust counterpart yet to hang the call off of.
-    Also not ported: `is_query_allowed_for_mark()` (`forward.c:1526`), a
-    distinct query-*admission* filter (should this query even be forwarded,
-    based on the connmark allowlist patterns) that is unrelated to
-    `report_addresses`'s reply-*reporting* role and out of this ticket's
-    rfc1035.c-depth scope. The TCP reply path has no `report_addresses` call
-    either, for the same reason noted above (no Rust TCP DNS listener yet).
+    The TCP reply path has no `report_addresses` call either, for the same
+    reason noted above (no Rust TCP DNS listener yet).
+
+- [x] `is_query_allowed_for_mark()` / `answer_disallowed()` (`forward.c:1523-1567`)
+  — the query-*admission* half of `--connmark-allowlist-enable`, distinct from
+  `report_addresses`'s reply-*reporting* role above. Ported as
+  `rfc1035::is_query_allowed_for_mark` (pure port of the mark/mask/pattern
+  loop, ungated like `report_addresses` so it is unit-testable without the
+  `conntrack` feature) plus `forward::mark_admits_query` (the
+  `have_mark && (mark & allowlist_mask)` admission guard from
+  `forward.c:1905-1907`, also kept feature-independent for the same testing
+  reason). Wired into `run_forward_loop_on`'s UDP client-query branch ahead of
+  both `answer_locally` and `forward_query` — matching upstream, where the
+  admission check gates the entire `answer_request`/forward decision, not
+  just the forwarding half. A disallowed query gets `make_refused_answer`'s
+  REFUSED reply (the same reply upstream's `answer_disallowed()` builds via
+  `setup_reply(header, 0, EDE_BLOCKED)`, minus the `EDE_BLOCKED` extended
+  error — this crate's wire encoder has no EDE option support at all yet, a
+  pre-existing gap noted on `make_refused_answer` itself) and, behind
+  `feature = "conntrack"` + `feature = "ubus"`, a
+  `ubus::ubus_event_bcast_connmark_allowlist_refused` broadcast mirroring
+  `answer_disallowed()`'s `ubus_event_bcast_connmark_allowlist_refused` call.
+  The mark lookup itself (`crate::conntrack::get_incoming_mark`) is gated on
+  `feature = "conntrack"` same as everywhere else it's called.
+
+  Still not ported: the TCP call site (`forward.c:2542-2563`) — no Rust TCP
+  DNS listener yet, same gap as above — and the DNSSEC sub-query retry site,
+  which inherits its parent query's admission decision in C rather than
+  re-checking, and has no Rust DNSSEC-retry path to hang that inheritance off
+  of yet.
   - Reload staleness (partially fixed). SIGHUP reload (`dnsmasq::on_sighup` /
     `clear_cache_and_reload`) now flushes and rebuilds the *live* `DnsCache` — it is a
     `cache::SharedDnsCache` threaded into `run_forward_loop_on` rather than a task-local
@@ -896,24 +920,21 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   Done when: each directive above either updates real `Daemon` state consumed
   by the DHCP/PXE runtime path, or remains explicitly listed here.
 
-- [ ] `connmark-allowlist` / `connmark-allowlist-enable` (option.c:3283-3330,
+- [x] `connmark-allowlist` / `connmark-allowlist-enable` (option.c:3283-3330,
   `OPT_CMARK_ALST_EN`): parsing is gated on the `conntrack` feature (mirroring
   upstream's `#ifndef HAVE_CONNTRACK` hard error — the directive is rejected
   with `InvalidValue` when the feature is off, not silently accepted), and
   `daemon.allowlist_mask`/`daemon.allowlists` are populated correctly when it
-  is on. But nothing reads those fields at runtime: upstream checks
-  `option_bool(OPT_CMARK_ALST_EN)` plus the connection mark against
-  `daemon->allowlists` at six call sites in `forward.c` (605-613, 1442-1446,
-  1529-1557, 1822, 1906, 2386, 2546, 2743) and in `rfc1035.c:1153-1212` to
-  decide whether a query bypasses the allowlist (answered only if a pattern
-  matches) — none of that decision logic exists in `src/forward.rs` or
-  `src/rfc1035.rs`, and `src/conntrack.rs` only reads the incoming mark, never
-  compares it against `allowlists`.
-  Required tests: once the mark-comparison path exists in `forward.rs`, add a
-  test that a query whose connmark fails every allowlist pattern is refused
-  rather than answered.
-  Done when: `OPT_CMARK_ALST_EN` actually gates query handling per the
-  upstream call sites above, not just config parsing.
+  is on. Both the admission side (`forward::mark_admits_query` /
+  `rfc1035::is_query_allowed_for_mark`, gating the UDP client-query branch of
+  `run_forward_loop_on` ahead of local-data lookup and forwarding) and the
+  reply-reporting side (`rfc1035::report_addresses`, called from the upstream
+  fan-out loop) now consume these fields — see the `is_query_allowed_for_mark`
+  and `report_addresses` entries above for the call-site detail.
+  Still not covered: the TCP call sites (`forward.c:2542-2563`, `2743`) — no
+  Rust TCP DNS listener yet — and the DNSSEC sub-query retry call sites
+  (`1822`/`1906`-adjacent retry path, `rfc1035.c:1153-1212`'s other callers),
+  which have no Rust DNSSEC-retry path to hang off of yet.
 
 - [ ] `dhcp-vendorclass` (`src/option.rs::parse_dhcp_vendor`) only supports the 2-field
   `tag,vendor-class` form. Upstream's shared `'U'`/`'j'`/circuit/remote/subscriber case

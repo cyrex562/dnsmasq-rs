@@ -25,7 +25,7 @@ use crate::types::constants::{F_IPV4, F_IPV6, F_SERVER};
 use crate::types::dns_records::{
     BogusAddr, Cname, HostRecord, InterfaceName, MxSrvRecord, Naptr, PtrRecord, TxtRecord,
 };
-use crate::types::network::Ipsets;
+use crate::types::network::{Allowlist, Ipsets};
 use crate::domain::CondDomain;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1924,6 +1924,32 @@ fn apply_conntrack_mark(sock: &tokio::net::UdpSocket, frec_src: &FrecSrc, daemon
 #[cfg(not(all(feature = "conntrack", unix)))]
 fn apply_conntrack_mark(_sock: &tokio::net::UdpSocket, _frec_src: &FrecSrc, _daemon_port: u16) {}
 
+/// `--connmark-allowlist-enable` admission decision for one client query.
+///
+/// Mirrors the guard around `is_query_allowed_for_mark()`'s only call site
+/// (`forward.c:1905-1907`): the feature must be on, a mark must have been
+/// found for this connection, and it must share at least one bit with
+/// `allowlist_mask` — a query with no mark, or with a mark the mask ignores
+/// entirely, always passes through unfiltered. Kept independent of the
+/// `conntrack` feature (unlike the mark lookup itself) so the decision logic
+/// is unit-testable without `CAP_NET_ADMIN` or a live conntrack table.
+fn mark_admits_query(config: &ForwardConfig, mark: Option<u32>, name: &str) -> bool {
+    if !config.cmark_alst_en {
+        return true;
+    }
+    match mark {
+        Some(mark) if mark & config.allowlist_mask != 0 => {
+            crate::rfc1035::is_query_allowed_for_mark(
+                mark,
+                name,
+                &config.allowlists,
+                config.allowlist_mask,
+            )
+        }
+        _ => true,
+    }
+}
+
 /// Format a query log line from a socket address, mirroring
 /// `log_query_mysockaddr()` from `forward.c`.
 ///
@@ -2350,38 +2376,70 @@ pub async fn run_forward_loop_on(
                 let dest = meta.dest.or_else(|| listener.sock.local_addr().ok().map(|a| a.ip()));
                 // Only forward DNS queries (QR bit == 0).
                 if pkt.len() >= 12 && pkt[2] & 0x80 == 0 {
-                    // Local data and cache first — exactly as upstream does.
-                    // The lock is dropped before `send_to` so a slow client
-                    // send can't hold up a concurrent SIGHUP reload (or vice
-                    // versa) — only the lookup itself needs the cache.
-                    let local_wire = {
-                        let mut cache = cache.lock().await;
-                        answer_locally(pkt, &mut cache, &local)
-                    };
-                    if let Some(wire) = local_wire {
-                        let _ = listener.sock.send_to(&wire, src).await;
-                        inc_metric(Metric::DnsLocalAnswered);
-                    } else {
-                        match engine.forward_query(pkt, src, idx, dest).await {
-                            // The query table (or the duplicate-client budget)
-                            // is full, or the question could not be read.  C
-                            // answers REFUSED rather than dropping, so the
-                            // client fails fast instead of timing out
-                            // (`forward.c:337-343`, `forward.c:369`,
-                            // `domain-match.c:430`).  `make_refused_answer`
-                            // returning `None` is C's `make_local_answer()`
-                            // bailing out on an unwalkable question section, in
-                            // which case nothing is sent.
-                            ForwardOutcome::Refused => {
-                                if let Some(wire) =
-                                    make_refused_answer(pkt, engine.config.local.edns_pktsz)
-                                {
-                                    let _ = listener.sock.send_to(&wire, src).await;
-                                }
+                    // `--connmark-allowlist-enable`: a query whose connection
+                    // mark is not allow-listed gets REFUSED here, before it
+                    // ever reaches local-data lookup or forwarding — this
+                    // gates the whole `answer_request`/forward decision, not
+                    // just the forwarding half (`forward.c:1905-1918`).
+                    let admitted = if engine.config.cmark_alst_en {
+                        let qname = query_name_lower(pkt);
+                        #[cfg(feature = "conntrack")]
+                        let mark_lookup = dest.and_then(|d| {
+                            crate::conntrack::get_incoming_mark(src, d, /* istcp: */ false, engine.config.port)
+                        });
+                        #[cfg(not(feature = "conntrack"))]
+                        let mark_lookup: Option<u32> = None;
+
+                        let allowed = mark_admits_query(&engine.config, mark_lookup, &qname);
+                        #[cfg(all(feature = "conntrack", feature = "ubus"))]
+                        if !allowed {
+                            if let Some(mark) = mark_lookup {
+                                crate::ubus::ubus_event_bcast_connmark_allowlist_refused(mark, &qname);
                             }
-                            ForwardOutcome::Forwarded(_)
-                            | ForwardOutcome::Duplicate
-                            | ForwardOutcome::Dropped => {}
+                        }
+                        allowed
+                    } else {
+                        true
+                    };
+
+                    if !admitted {
+                        if let Some(wire) = make_refused_answer(pkt, engine.config.local.edns_pktsz) {
+                            let _ = listener.sock.send_to(&wire, src).await;
+                        }
+                    } else {
+                        // Local data and cache first — exactly as upstream does.
+                        // The lock is dropped before `send_to` so a slow client
+                        // send can't hold up a concurrent SIGHUP reload (or vice
+                        // versa) — only the lookup itself needs the cache.
+                        let local_wire = {
+                            let mut cache = cache.lock().await;
+                            answer_locally(pkt, &mut cache, &local)
+                        };
+                        if let Some(wire) = local_wire {
+                            let _ = listener.sock.send_to(&wire, src).await;
+                            inc_metric(Metric::DnsLocalAnswered);
+                        } else {
+                            match engine.forward_query(pkt, src, idx, dest).await {
+                                // The query table (or the duplicate-client budget)
+                                // is full, or the question could not be read.  C
+                                // answers REFUSED rather than dropping, so the
+                                // client fails fast instead of timing out
+                                // (`forward.c:337-343`, `forward.c:369`,
+                                // `domain-match.c:430`).  `make_refused_answer`
+                                // returning `None` is C's `make_local_answer()`
+                                // bailing out on an unwalkable question section, in
+                                // which case nothing is sent.
+                                ForwardOutcome::Refused => {
+                                    if let Some(wire) =
+                                        make_refused_answer(pkt, engine.config.local.edns_pktsz)
+                                    {
+                                        let _ = listener.sock.send_to(&wire, src).await;
+                                    }
+                                }
+                                ForwardOutcome::Forwarded(_)
+                                | ForwardOutcome::Duplicate
+                                | ForwardOutcome::Dropped => {}
+                            }
                         }
                     }
                 }
@@ -4212,6 +4270,69 @@ mod tests {
             ..FrecSrc::default()
         };
         assert_eq!(conntrack_mark_for(&frec_src, 53, false), None);
+    }
+
+    // ── mark_admits_query ────────────────────────────────────────────────────
+
+    #[test]
+    fn mark_admits_query_passes_through_when_the_feature_is_disabled() {
+        let config = ForwardConfig { cmark_alst_en: false, ..ForwardConfig::default() };
+        assert!(mark_admits_query(&config, Some(6), "blocked.example.com"));
+    }
+
+    #[test]
+    fn mark_admits_query_passes_through_a_query_with_no_mark() {
+        // `forward.c:1906`: `have_mark` must be true before the check even
+        // runs — a client whose mark could not be looked up is never denied.
+        let config = ForwardConfig {
+            cmark_alst_en: true,
+            allowlist_mask: u32::MAX,
+            allowlists: vec![Allowlist { mark: 6, mask: u32::MAX, patterns: vec![] }],
+            ..ForwardConfig::default()
+        };
+        assert!(mark_admits_query(&config, None, "blocked.example.com"));
+    }
+
+    #[test]
+    fn mark_admits_query_passes_through_a_mark_outside_the_allowlist_mask() {
+        // `forward.c:1906`: `mark & daemon->allowlist_mask` must be nonzero.
+        let config = ForwardConfig {
+            cmark_alst_en: true,
+            allowlist_mask: 0xF0,
+            allowlists: vec![Allowlist { mark: 6, mask: u32::MAX, patterns: vec![] }],
+            ..ForwardConfig::default()
+        };
+        assert!(mark_admits_query(&config, Some(0x0F), "blocked.example.com"));
+    }
+
+    #[test]
+    fn mark_admits_query_allows_a_name_matching_an_allowlist_pattern() {
+        let config = ForwardConfig {
+            cmark_alst_en: true,
+            allowlist_mask: u32::MAX,
+            allowlists: vec![Allowlist {
+                mark: 6,
+                mask: u32::MAX,
+                patterns: vec!["*.example.com".to_string()],
+            }],
+            ..ForwardConfig::default()
+        };
+        assert!(mark_admits_query(&config, Some(6), "www.example.com"));
+    }
+
+    #[test]
+    fn mark_admits_query_denies_a_name_not_matching_any_allowlist_pattern() {
+        let config = ForwardConfig {
+            cmark_alst_en: true,
+            allowlist_mask: u32::MAX,
+            allowlists: vec![Allowlist {
+                mark: 6,
+                mask: u32::MAX,
+                patterns: vec!["*.example.com".to_string()],
+            }],
+            ..ForwardConfig::default()
+        };
+        assert!(!mark_admits_query(&config, Some(6), "www.example.org"));
     }
 
     // ── server_send ───────────────────────────────────────────────────────────
