@@ -1547,8 +1547,9 @@ impl ResolvMonitor {
 /// confirm that the address is not already in use.  This struct encapsulates
 /// the timeout and ping logic.
 ///
-/// Currently a stub — `ping` always returns `false` (no reply).  A full
-/// implementation would open a raw ICMP socket and send/receive echo packets.
+/// Opens a raw `IPPROTO_ICMP` socket and sends/receives echo packets; see
+/// [`IcmpPinger::ping`] for the fallback behavior when the raw socket can't
+/// be opened (e.g. missing `CAP_NET_RAW`).
 #[cfg(feature = "dhcp")]
 pub struct IcmpPinger {
     timeout: Duration,
