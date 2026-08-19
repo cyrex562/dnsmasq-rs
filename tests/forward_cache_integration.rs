@@ -169,7 +169,7 @@ async fn spawn_server_with_cache(config: ForwardConfig, cache: SharedDnsCache) -
     let addr = sock.local_addr().ok()?;
     let listener = DnsListener { sock: Arc::new(sock), check_dst: false };
     let task = tokio::spawn(async move {
-        let _ = run_forward_loop_on(vec![listener], None, config, cache).await;
+        let _ = run_forward_loop_on(vec![listener], None, config, cache, dnsmasq_rs::arp::new_shared_arp_state()).await;
     });
     Some(Server { addr, task })
 }

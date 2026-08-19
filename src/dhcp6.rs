@@ -1300,7 +1300,7 @@ async fn icmp6_recv(
 /// that state-carrying integration lands.
 #[cfg(target_os = "linux")]
 pub fn get_client_mac(
-    daemon: &mut crate::types::daemon::Daemon,
+    daemon: &crate::types::daemon::Daemon,
     client: Ipv6Addr,
     now: u64,
 ) -> Option<Vec<u8>> {
@@ -2453,7 +2453,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn get_client_mac_resolves_from_arp_cache() {
-        let mut daemon = crate::types::daemon::Daemon::default();
+        let daemon = crate::types::daemon::Daemon::default();
         let client: Ipv6Addr = "fe80::1".parse().unwrap();
         let mac_bytes = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
 
@@ -2461,20 +2461,23 @@ mod tests {
         // independent of the real kernel neighbour table: a fresh
         // (not-yet-stale) cache entry is returned without ever touching the
         // netlink socket.
-        daemon.arp_cache.begin_refresh(0);
-        daemon.arp_cache.filter_mac(std::net::IpAddr::V6(client), &mac_bytes);
-        daemon.arp_cache.finish_refresh();
+        {
+            let mut state = daemon.arp_state.lock().unwrap();
+            state.cache.begin_refresh(0);
+            state.cache.filter_mac(std::net::IpAddr::V6(client), &mac_bytes);
+            state.cache.finish_refresh();
+        }
 
-        let mac = get_client_mac(&mut daemon, client, 0);
+        let mac = get_client_mac(&daemon, client, 0);
         assert_eq!(mac, Some(mac_bytes.to_vec()));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn get_client_mac_none_when_unresolvable() {
-        let mut daemon = crate::types::daemon::Daemon::default();
+        let daemon = crate::types::daemon::Daemon::default();
         // Documentation-only prefix (RFC 3849): never a real neighbour.
         let client: Ipv6Addr = "2001:db8::dead:beef".parse().unwrap();
-        assert_eq!(get_client_mac(&mut daemon, client, 0), None);
+        assert_eq!(get_client_mac(&daemon, client, 0), None);
     }
 }

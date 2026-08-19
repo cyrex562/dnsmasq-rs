@@ -1187,6 +1187,20 @@ pub struct ForwardConfig {
     /// snapshot.
     #[cfg(feature = "loop")]
     pub loop_servers: Vec<crate::types::server::Server>,
+    /// `--add-mac` (`OPT_ADD_MAC`): attach the querying client's hardware
+    /// address to the outgoing query as `EDNS0_OPTION_MAC`, resolved from the
+    /// ARP cache (`edns0.c:315-334`, `arp.c:107-208`).
+    pub add_mac: bool,
+    /// `--mac-base64` (`OPT_MAC_B64`): attach it base64-encoded as
+    /// `EDNS0_OPTION_NOMDEVICEID` instead (`edns0.c:280-309`).
+    pub mac_b64: bool,
+    /// `--mac-hex` (`OPT_MAC_HEX`): same option, hex-encoded instead of
+    /// base64.
+    pub mac_hex: bool,
+    /// `--stripmac` (`OPT_STRIP_MAC`): remove any MAC option a client already
+    /// attached before adding ours, matching `add_mac`/`add_dns_client`'s
+    /// shared `strip_mac` argument.
+    pub strip_mac: bool,
 }
 
 impl Default for ForwardConfig {
@@ -1230,6 +1244,10 @@ impl Default for ForwardConfig {
             loop_detect:   false,
             #[cfg(feature = "loop")]
             loop_servers:  Vec::new(),
+            add_mac:       false,
+            mac_b64:       false,
+            mac_hex:       false,
+            strip_mac:     false,
         }
     }
 }
@@ -1330,6 +1348,12 @@ pub struct ForwardEngine {
     /// [`crate::loop_detect::detect_loop`] on the incoming-query path.
     #[cfg(feature = "loop")]
     pub loop_servers: Vec<crate::types::server::Server>,
+    /// ARP/ND cache backing `--add-mac`/`--mac-base64`/`--mac-hex`
+    /// resolution in [`ForwardEngine::forward_query`]. Defaults to a private,
+    /// empty state (`new()`); [`run_forward_loop_on`] overrides it via
+    /// [`ForwardEngine::with_arp_state`] with the `Daemon`-shared one so a
+    /// refresh here is visible to DHCPv6's `get_client_mac` too.
+    pub arp_state:       crate::arp::SharedArpState,
 }
 
 impl ForwardEngine {
@@ -1345,6 +1369,7 @@ impl ForwardEngine {
             rfd_pool:       RandFdPool::sized_for(ftabsize, config.randport_limit),
             #[cfg(feature = "loop")]
             loop_servers,
+            arp_state:      crate::arp::new_shared_arp_state(),
             config,
         }
     }
@@ -1360,6 +1385,12 @@ impl ForwardEngine {
         self.loop_servers
             .get(idx)
             .is_some_and(|s| s.flags & crate::types::server::SERV_LOOP != 0)
+    /// Replace this engine's ARP state with a shared handle — used to make
+    /// the forwarding loop consult the same cache `Daemon`/DHCPv6 do, rather
+    /// than a private one populated only by this engine's own lookups.
+    pub fn with_arp_state(mut self, arp_state: crate::arp::SharedArpState) -> Self {
+        self.arp_state = arp_state;
+        self
     }
 
     /// Hand any sockets freed along with a `Frec` back to the pool.
@@ -1368,6 +1399,68 @@ impl ForwardEngine {
         if !freed.is_empty() {
             self.rfd_pool.free_rfds(&mut freed);
         }
+    }
+
+    /// Attach `--add-mac`/`--mac-base64`/`--mac-hex` EDNS0 options to `pkt`
+    /// before it is stashed for upstream, resolving `client`'s hardware
+    /// address from the shared ARP cache.
+    ///
+    /// Port of `edns0_needs_mac()` gating `add_mac()`/`add_dns_client()`
+    /// (`edns0.c:271-334`), collapsed into one pass since Rust's
+    /// `add_edns0_config` takes an already-resolved MAC rather than doing its
+    /// own lookup. `lazy = true` matches both real call sites in C
+    /// (`edns0.c:287,321`): an `ARP_EMPTY` negative cache entry counts as "no
+    /// MAC available" rather than forcing a fresh kernel refresh. Returns
+    /// `pkt` unchanged (cloned) when no MAC-consuming option is enabled, or
+    /// if the packet turns out not to carry a well-formed header.
+    ///
+    /// `strip_mac` alone (without `add_mac`/`mac_b64`/`mac_hex`) also has to
+    /// run this path even though `edns0_needs_mac()` wouldn't ask for a
+    /// lookup on its own — C's `add_mac()`/`add_dns_client()` both strip an
+    /// existing MAC option whenever `OPT_STRIP_MAC` is set regardless of
+    /// whether a replacement MAC was found (`edns0.c:280-309,315-334`), so
+    /// gating on `edns0_needs_mac()` alone would silently drop that case.
+    fn with_client_mac(&self, pkt: &[u8], client: IpAddr) -> Vec<u8> {
+        let needs_mac =
+            crate::edns0::edns0_needs_mac(self.config.mac_b64, self.config.mac_hex, self.config.add_mac);
+        if !needs_mac && !self.config.strip_mac {
+            return pkt.to_vec();
+        }
+
+        // Only actually consult the ARP cache when an add/b64/hex option is
+        // enabled — C's `add_mac()`/`add_dns_client()` each guard their own
+        // `find_mac()` call on `OPT_ADD_MAC`/`OPT_MAC_B64`/`OPT_MAC_HEX`
+        // (`edns0.c:287,321`); `--stripmac` alone never triggers a lookup.
+        let mac = if needs_mac {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            crate::arp::find_mac_shared(&self.arp_state, client, true, now)
+        } else {
+            None
+        };
+
+        let pseudoheader = crate::edns0::find_pseudoheader(pkt);
+        let (existing, udp_size, flags) = match &pseudoheader {
+            Some(info) => (info.options.clone(), info.udp_size, info.flags),
+            None => (Vec::new(), crate::types::daemon::EDNS_PKTSZ, 0),
+        };
+        let cfg = crate::edns0::Edns0QueryConfig {
+            add_mac:   self.config.add_mac,
+            strip_mac: self.config.strip_mac,
+            mac_b64:   self.config.mac_b64,
+            mac_hex:   self.config.mac_hex,
+            ..Default::default()
+        };
+        let (options, _cacheable) = crate::edns0::add_edns0_config(&existing, client, mac.as_deref(), &cfg);
+
+        // Nothing changed and there was no OPT RR to begin with — don't
+        // materialise an empty one out of thin air.
+        if options.is_empty() && pseudoheader.is_none() {
+            return pkt.to_vec();
+        }
+        crate::edns0::add_pseudoheader(pkt, udp_size, flags, &options).unwrap_or_else(|_| pkt.to_vec())
     }
 
     /// Forward `pkt` upstream, or fold it onto an identical query already in
@@ -1435,13 +1528,14 @@ impl ForwardEngine {
         self.release_rfds();
 
         let new_id = self.table.get_id();
+        let stash_pkt = self.with_client_mac(pkt, client.ip());
         {
             let Some(frec) = self.table.get_mut(idx) else { return ForwardOutcome::Dropped };
             frec.sentto        = Some(server_idx);
             frec.new_id        = new_id;
             frec.question_hash = qhash;
             frec.flags         = fwd_flags;   // C: `forward->flags = fwd_flags` (`forward.c:373`)
-            frec.stash         = Some(pkt.to_vec());
+            frec.stash         = Some(stash_pkt);
             frec.frec_src      = FrecSrc {
                 source:  Some(client),
                 dest,
@@ -2269,6 +2363,7 @@ pub async fn run_forward_loop(
         None,
         config,
         cache,
+        crate::arp::new_shared_arp_state(),
     )
     .await
 }
@@ -2523,6 +2618,7 @@ pub async fn run_forward_loop_on(
     filter:    Option<crate::network::ArrivalFilter>,
     config:    ForwardConfig,
     cache:     SharedDnsCache,
+    arp_state: crate::arp::SharedArpState,
 ) -> std::io::Result<()> {
     if listeners.is_empty() {
         return Err(std::io::Error::new(
@@ -2537,7 +2633,7 @@ pub async fn run_forward_loop_on(
     // (`dnsmasq::clear_cache_and_reload`), which is the only other thing that
     // ever touches it, so a `tokio::sync::Mutex` needs no fairness tuning.
     let local            = config.local.clone();
-    let mut engine       = ForwardEngine::new(config);
+    let mut engine       = ForwardEngine::new(config).with_arp_state(arp_state);
     let mut client_buf   = vec![0u8; MAX_PACKET_SIZE];
     let mut upstream_buf = vec![0u8; MAX_PACKET_SIZE];
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -4104,6 +4200,121 @@ mod tests {
             .lookup_frec(Instant::now(), Some(new_id), 0, 0)
             .expect("query is in flight");
         assert_eq!(engine.table.get(idx).unwrap().frec_src.dest, dest);
+    }
+
+    /// `--add-mac` must attach the client's ARP-cached hardware address to
+    /// the packet actually sent upstream — the concrete gap issue #33 called
+    /// out: kernel-populated ARP data existed but nothing in the running
+    /// daemon ever called `find_mac`/attached it to a query.
+    #[tokio::test]
+    async fn forward_query_attaches_client_mac_when_add_mac_is_enabled() {
+        let Ok(upstream) = tokio::net::UdpSocket::bind("127.0.0.1:0").await else { return };
+        let Ok(upstream_addr) = upstream.local_addr() else { return };
+        let config = ForwardConfig {
+            upstreams: vec![upstream_addr],
+            add_mac:   true,
+            ..Default::default()
+        };
+        let mut engine = ForwardEngine::new(config);
+
+        // Pre-seed the shared ARP cache with a fresh (not stale) entry so
+        // this test is deterministic and never touches a real netlink
+        // socket. `now` has to be "real" epoch time because
+        // `ForwardEngine::with_client_mac` (unit-testable in isolation via
+        // `arp::find_mac`, but driven for real here) reads the wall clock,
+        // same as every other `now` in this file (`Instant::now()` above).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let client_mac = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        {
+            let mut state = engine.arp_state.lock().unwrap();
+            state.cache.begin_refresh(now);
+            state.cache.filter_mac(client_addr().ip(), &client_mac);
+            state.cache.finish_refresh();
+        }
+
+        let query = make_dns_query("example.com", 1);
+        let ForwardOutcome::Forwarded(new_id) =
+            engine.forward_query(&query, client_addr(), 0, None).await
+        else {
+            panic!("expected the query to forward");
+        };
+
+        let idx = engine
+            .table
+            .lookup_frec(Instant::now(), Some(new_id), 0, 0)
+            .expect("query is in flight");
+        let stash = engine.table.get(idx).unwrap().stash.clone().expect("stash recorded");
+        let info = crate::edns0::find_pseudoheader(&stash).expect("MAC option requires an OPT RR");
+        let mac_opt = info
+            .options
+            .iter()
+            .find(|o| o.code == crate::dns_protocol::EDNS0_OPTION_MAC)
+            .expect("EDNS0_OPTION_MAC missing from the forwarded query");
+        assert_eq!(mac_opt.data, client_mac);
+    }
+
+    /// With no MAC-consuming option configured, the packet stashed for
+    /// upstream must be byte-for-byte the client's original query — no
+    /// spurious OPT record materialises out of the (disabled) MAC path.
+    #[tokio::test]
+    async fn forward_query_leaves_packet_untouched_when_no_mac_option_is_enabled() {
+        let Ok(upstream) = tokio::net::UdpSocket::bind("127.0.0.1:0").await else { return };
+        let Ok(upstream_addr) = upstream.local_addr() else { return };
+        let config = ForwardConfig { upstreams: vec![upstream_addr], ..Default::default() };
+        let mut engine = ForwardEngine::new(config);
+
+        let query = make_dns_query("example.com", 1);
+        let ForwardOutcome::Forwarded(new_id) =
+            engine.forward_query(&query, client_addr(), 0, None).await
+        else {
+            panic!("expected the query to forward");
+        };
+
+        let idx = engine
+            .table
+            .lookup_frec(Instant::now(), Some(new_id), 0, 0)
+            .expect("query is in flight");
+        let stash = engine.table.get(idx).unwrap().stash.clone().expect("stash recorded");
+        assert_eq!(stash, query, "no MAC option enabled must not alter the forwarded bytes");
+    }
+
+    /// `--stripmac` alone (no `--add-mac`/`--mac-base64`/`--mac-hex`) must
+    /// not touch the ARP cache at all — C's `add_mac()`/`add_dns_client()`
+    /// only call `find_mac()` when one of those is enabled (`edns0.c:287,321`)
+    /// — and, with no pre-existing OPT record to strip anything from, must
+    /// leave the query byte-for-byte alone rather than growing a spurious
+    /// empty OPT RR.
+    #[tokio::test]
+    async fn forward_query_strip_mac_alone_never_touches_the_arp_cache() {
+        let Ok(upstream) = tokio::net::UdpSocket::bind("127.0.0.1:0").await else { return };
+        let Ok(upstream_addr) = upstream.local_addr() else { return };
+        let config = ForwardConfig {
+            upstreams: vec![upstream_addr],
+            strip_mac: true,
+            ..Default::default()
+        };
+        let mut engine = ForwardEngine::new(config);
+
+        let query = make_dns_query("example.com", 1);
+        let ForwardOutcome::Forwarded(new_id) =
+            engine.forward_query(&query, client_addr(), 0, None).await
+        else {
+            panic!("expected the query to forward");
+        };
+
+        assert!(
+            engine.arp_state.lock().unwrap().netlink.is_none(),
+            "stripmac alone must never open a netlink socket",
+        );
+        let idx = engine
+            .table
+            .lookup_frec(Instant::now(), Some(new_id), 0, 0)
+            .expect("query is in flight");
+        let stash = engine.table.get(idx).unwrap().stash.clone().expect("stash recorded");
+        assert_eq!(stash, query, "nothing to strip must leave the query untouched");
     }
 
     /// `get_new_frec()` refuses once `ftabsize` queries are in flight to one

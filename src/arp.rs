@@ -14,8 +14,11 @@
 //! returns immediately, a miss triggers exactly one refresh cycle
 //! (`begin_refresh`/`filter_mac`/`finish_refresh`) via the caller-supplied
 //! `enumerate` closure, then the cache is re-checked once before falling
-//! back to a negative (`add_empty`) entry. [`find_mac_for_daemon`] is the
-//! Linux, real-kernel wiring of that closure via [`crate::netlink`].
+//! back to a negative (`add_empty`) entry. [`find_mac_for_daemon`] and
+//! [`find_mac_shared`] are the Linux, real-kernel wirings of that closure via
+//! [`crate::netlink`], sharing one [`ArpRuntimeState`] (mirroring upstream's
+//! single file-scope `arps` list) between `Daemon` and any snapshot-based
+//! runtime path such as [`crate::forward`]'s forwarding loop.
 
 use std::collections::VecDeque;
 use std::net::IpAddr;
@@ -284,10 +287,36 @@ where
     None
 }
 
-/// Real, Linux-backed [`find_mac`]: opens the daemon's persistent netlink
-/// socket on first use (mirroring `netlink_init()` populating
-/// `daemon->netlinkfd` once at startup, `netlink.c:60-92`) and drives a
-/// refresh via [`crate::netlink::iface_enumerate`].
+/// The ARP cache plus its persistent kernel socket, bundled so runtime paths
+/// that don't carry a full `Daemon` (the forwarding loop only sees a
+/// `ForwardConfig` snapshot — see `dnsmasq::daemon_forward_config`) can still
+/// share the *same* cache DHCPv6 consults via `Daemon::arp_state`, mirroring
+/// upstream's single file-scope `arps` list (`arp.c`).
+#[derive(Debug, Default)]
+pub struct ArpRuntimeState {
+    pub cache: ArpCache,
+    /// The persistent `NETLINK_ROUTE` socket `find_mac()`'s kernel refresh
+    /// uses, mirroring `daemon->netlinkfd` (opened once by `netlink_init()`
+    /// rather than per-lookup). `None` until the first refresh is attempted,
+    /// or permanently on non-Linux targets / if the socket can't be opened.
+    pub netlink: Option<crate::netlink::NetlinkSocket>,
+}
+
+/// Shared handle to an [`ArpRuntimeState`]. A plain `std::sync::Mutex` (not
+/// `tokio::sync::Mutex`) is deliberate: every lock is held only across a
+/// synchronous kernel netlink round-trip, never across an `.await`, so a
+/// blocking mutex avoids taking a lock across a suspension point.
+pub type SharedArpState = std::sync::Arc<std::sync::Mutex<ArpRuntimeState>>;
+
+/// Build a fresh, empty [`SharedArpState`] — one per daemon instance.
+pub fn new_shared_arp_state() -> SharedArpState {
+    std::sync::Arc::new(std::sync::Mutex::new(ArpRuntimeState::default()))
+}
+
+/// Real, Linux-backed [`find_mac`]: opens the persistent netlink socket on
+/// first use (mirroring `netlink_init()` populating `daemon->netlinkfd` once
+/// at startup, `netlink.c:60-92`) and drives a refresh via
+/// [`crate::netlink::iface_enumerate`].
 ///
 /// Returns `None` (with no kernel query attempted) if the socket has never
 /// been opened and cannot be opened now — e.g. no netlink support in this
@@ -297,27 +326,27 @@ where
 /// model for the main DNS path, so `can_query_kernel` here reduces to
 /// "do we have a socket" — tracked as a deliberate deviation in `tasks.md`.
 #[cfg(target_os = "linux")]
-pub fn find_mac_for_daemon(
-    daemon: &mut crate::types::daemon::Daemon,
+fn find_mac_kernel_backed(
+    cache: &mut ArpCache,
+    netlink: &mut Option<crate::netlink::NetlinkSocket>,
     addr: IpAddr,
     lazy: bool,
     now: u64,
 ) -> Option<Vec<u8>> {
-    if daemon.arp_netlink.is_none() {
+    if netlink.is_none() {
         match crate::netlink::open_netlink_socket() {
-            Ok(sock) => daemon.arp_netlink = Some(sock),
+            Ok(sock) => *netlink = Some(sock),
             Err(e) => {
                 tracing::warn!("failed to open netlink socket for ARP cache: {e}");
             }
         }
     }
 
-    let netlink = daemon.arp_netlink.as_ref().map(|s| (s.fd, s.pid));
-    let can_query_kernel = netlink.is_some();
-    let cache = &mut daemon.arp_cache;
+    let handle = netlink.as_ref().map(|s| (s.fd, s.pid));
+    let can_query_kernel = handle.is_some();
 
     find_mac(cache, addr, lazy, now, can_query_kernel, |cache| {
-        let Some((fd, pid)) = netlink else { return };
+        let Some((fd, pid)) = handle else { return };
         // AF_UNSPEC (0) requests the neighbour table, matching
         // `iface_enumerate(AF_UNSPEC, NULL, filter_mac)` (`arp.c:163`).
         let _ = crate::netlink::iface_enumerate(fd, pid, 0, &mut |rec| {
@@ -329,6 +358,45 @@ pub fn find_mac_for_daemon(
             true
         });
     })
+}
+
+/// [`find_mac_kernel_backed`] against a `Daemon`'s own ARP state.
+///
+/// Live callers: [`crate::dhcp6::get_client_mac`]. `Daemon` shares the same
+/// underlying [`ArpRuntimeState`] as [`find_mac_shared`], so a refresh
+/// triggered from either path is visible to the other.
+#[cfg(target_os = "linux")]
+pub fn find_mac_for_daemon(
+    daemon: &crate::types::daemon::Daemon,
+    addr: IpAddr,
+    lazy: bool,
+    now: u64,
+) -> Option<Vec<u8>> {
+    find_mac_shared(&daemon.arp_state, addr, lazy, now)
+}
+
+/// [`find_mac_kernel_backed`] against a standalone [`SharedArpState`], for
+/// runtime paths that only carry a snapshot of `Daemon`'s config rather than
+/// `Daemon` itself.
+///
+/// Live caller: [`crate::forward::ForwardEngine::forward_query`], which
+/// resolves the client's MAC for `--add-mac`/`--mac-base64`/`--mac-hex`
+/// before the query goes upstream (`edns0.c:315-334`, wired at
+/// `edns0::add_edns0_config`).
+#[cfg(target_os = "linux")]
+pub fn find_mac_shared(state: &SharedArpState, addr: IpAddr, lazy: bool, now: u64) -> Option<Vec<u8>> {
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    let ArpRuntimeState { cache, netlink } = &mut *guard;
+    find_mac_kernel_backed(cache, netlink, addr, lazy, now)
+}
+
+/// Non-Linux fallback: no netlink support in this port, so no kernel query is
+/// ever possible — matches `find_mac_kernel_backed`'s own "no socket" branch,
+/// just without a Linux target to open one on at all. Callers (e.g.
+/// [`crate::forward::ForwardEngine::forward_query`]) stay platform-agnostic.
+#[cfg(not(target_os = "linux"))]
+pub fn find_mac_shared(_state: &SharedArpState, _addr: IpAddr, _lazy: bool, _now: u64) -> Option<Vec<u8>> {
+    None
 }
 
 impl ArpCache {
@@ -741,12 +809,27 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn find_mac_for_daemon_opens_socket_and_does_not_panic() {
-        let mut daemon = crate::types::daemon::Daemon::default();
-        assert!(daemon.arp_netlink.is_none());
+        let daemon = crate::types::daemon::Daemon::default();
+        assert!(daemon.arp_state.lock().unwrap().netlink.is_none());
         // TEST-NET-3 (RFC 5737): documentation-only, never a real neighbour.
         let addr = v4(203, 0, 113, 250);
-        let _ = find_mac_for_daemon(&mut daemon, addr, false, 0);
-        assert!(daemon.arp_netlink.is_some(), "netlink socket should have been opened");
+        let _ = find_mac_for_daemon(&daemon, addr, false, 0);
+        assert!(
+            daemon.arp_state.lock().unwrap().netlink.is_some(),
+            "netlink socket should have been opened"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn find_mac_shared_and_find_mac_for_daemon_see_the_same_cache() {
+        // The forwarding loop (via `find_mac_shared`) and DHCPv6 (via
+        // `find_mac_for_daemon`) must consult the same underlying cache, or a
+        // refresh triggered by one is invisible to the other.
+        let daemon = crate::types::daemon::Daemon::default();
+        let addr = v4(203, 0, 113, 251);
+        let _ = find_mac_shared(&daemon.arp_state, addr, false, 0);
+        assert!(daemon.arp_state.lock().unwrap().netlink.is_some());
     }
 
     // ── drain_arp_script_events ───────────────────────────────────────────────

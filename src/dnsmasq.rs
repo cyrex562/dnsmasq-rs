@@ -717,8 +717,9 @@ pub async fn build_shared_cache(daemon_handle: &DaemonHandle) -> crate::cache::S
 /// function as well.
 pub fn daemon_forward_config(daemon: &Daemon) -> crate::forward::ForwardConfig {
     use crate::types::constants::{
-        OPT_CLIENT_SUBNET, OPT_CMARK_ALST_EN, OPT_CONNTRACK, OPT_DNSSEC_PROXY, OPT_DNSSEC_VALID,
-        OPT_LOCAL_REBIND, OPT_NO_NEG, OPT_NO_REBIND,
+        OPT_ADD_MAC, OPT_CLIENT_SUBNET, OPT_CMARK_ALST_EN, OPT_CONNTRACK, OPT_DNSSEC_PROXY,
+        OPT_DNSSEC_VALID, OPT_LOCAL_REBIND, OPT_MAC_B64, OPT_MAC_HEX, OPT_NO_NEG, OPT_NO_REBIND,
+        OPT_STRIP_MAC,
     };
 
     let to_add_subnet_opt = |s: &crate::types::network::MySubnet| crate::edns0::AddSubnetOpt {
@@ -787,6 +788,12 @@ pub fn daemon_forward_config(daemon: &Daemon) -> crate::forward::ForwardConfig {
         loop_detect:    daemon.option_bool(crate::types::constants::OPT_LOOP_DETECT),
         #[cfg(feature = "loop")]
         loop_servers:   forwardable.iter().map(|s| (*s).clone()).collect(),
+        // `--add-mac`/`--mac-base64`/`--mac-hex`/`--stripmac`: resolved via
+        // the shared ARP cache in `ForwardEngine::forward_query`.
+        add_mac:        daemon.option_bool(OPT_ADD_MAC),
+        mac_b64:        daemon.option_bool(OPT_MAC_B64),
+        mac_hex:        daemon.option_bool(OPT_MAC_HEX),
+        strip_mac:      daemon.option_bool(OPT_STRIP_MAC),
         ..Default::default()
     }
 }
@@ -1480,14 +1487,18 @@ pub async fn run_main_loop_with(
     use crate::dhcp::{DhcpLoopOptions, run_dhcp_loop};
 
     // ── Resolve configuration ────────────────────────────────────────────────
-    let (mut fwd_config, dhcp_runtime) = {
+    let (mut fwd_config, dhcp_runtime, arp_state) = {
         let d = daemon_handle.read().await;
         let fwd_config = daemon_forward_config(&d);
+        // Shared (not copied) so a kernel refresh triggered by the forwarding
+        // loop's MAC resolution is visible to DHCPv6's `get_client_mac` too —
+        // see `Daemon::arp_state`.
+        let arp_state = d.arp_state.clone();
         #[cfg(feature = "dhcp")]
         let dhcp_runtime = daemon_dhcp_runtime(&d);
         #[cfg(not(feature = "dhcp"))]
         let dhcp_runtime = ();
-        (fwd_config, dhcp_runtime)
+        (fwd_config, dhcp_runtime, arp_state)
     };
 
     // `--dns-loop-detect`: send the first round of loop probes once at
@@ -1624,7 +1635,7 @@ pub async fn run_main_loop_with(
 
     // ── Spawn the forwarding engine ──────────────────────────────────────────
     let fwd_task = tokio::spawn(async move {
-        if let Err(e) = run_forward_loop_on(dns_listeners, arrival_filter, fwd_config, cache).await {
+        if let Err(e) = run_forward_loop_on(dns_listeners, arrival_filter, fwd_config, cache, arp_state).await {
             error!("forward loop exited: {e}");
         }
     });

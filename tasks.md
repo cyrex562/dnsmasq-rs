@@ -2578,6 +2578,32 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   `queue_arp()` alone is gated on the option.
   `dhcp6::get_client_mac` (Linux-only) is a port of `get_client_mac()` (`dhcp6.c:307-348`) built
   on `find_mac_for_daemon`, resolving and `debug!`-logging a DHCPv6 client's MAC.
+
+  **Real call site landed:** `Daemon.arp_cache`/`arp_netlink` were replaced with one
+  `arp_state: SharedArpState` (`Arc<Mutex<ArpRuntimeState>>`, `arp::new_shared_arp_state()`),
+  because the forwarding loop only ever sees a `ForwardConfig` snapshot of `Daemon`
+  (`dnsmasq::daemon_forward_config`), not `Daemon` itself, and needs the *same* cache DHCPv6
+  consults rather than a private copy — mirroring upstream's single file-scope `arps` list.
+  `arp::find_mac_for_daemon` and the new `arp::find_mac_shared` both delegate to a shared
+  `find_mac_kernel_backed` against that one state. `ForwardEngine` gained an `arp_state` field
+  (defaulting to a private empty state in `new()`, overridden via `.with_arp_state()`);
+  `run_forward_loop_on` takes `arp_state: SharedArpState` as a new parameter, and
+  `dnsmasq::run_main_loop_with` clones `daemon.arp_state` into it alongside the existing
+  `fwd_config`/`cache` snapshot-plus-shared-state pattern. `ForwardEngine::forward_query` now
+  calls a new `with_client_mac()` before stashing the query for upstream: gated on
+  `edns0_needs_mac(mac_b64, mac_hex, add_mac)` (plus `strip_mac` alone, matching
+  `add_mac()`/`add_dns_client()`'s independent `OPT_STRIP_MAC` branches, `edns0.c:280-334`), it
+  resolves the client's MAC via `find_mac_shared` (`lazy = true`, matching both real C call sites
+  at `edns0.c:287,321`) and rewrites the query's EDNS0 options via the pre-existing (previously
+  unwired) `edns0::add_edns0_config`. `ForwardConfig` gained `add_mac`/`mac_b64`/`mac_hex`/
+  `strip_mac`, sourced in `dnsmasq::daemon_forward_config` from `OPT_ADD_MAC`/`OPT_MAC_B64`/
+  `OPT_MAC_HEX`/`OPT_STRIP_MAC`. This closes the acceptance criteria for issue #33: the ARP cache
+  now populates from the kernel neighbour table during actual daemon operation (the forwarding
+  loop is the one runtime receive loop that exists in this port), and `--add-mac`/`--mac-base64`/
+  `--mac-hex` resolve real addresses onto outgoing queries. Non-Linux targets get a
+  `find_mac_shared` stub that always returns `None` without touching `SharedArpState`, so
+  `forward.rs` itself stays platform-agnostic.
+
   Explicitly still unsupported / deferred, tracked here rather than silently dropped:
   - **No ICMPv6 active-probe retry.** C's `get_client_mac` sends up to 5 Neighbour Solicitations
     (100ms apart) via `daemon->icmp6fd` to populate the kernel's neighbour cache for a client that
@@ -2589,26 +2615,31 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     always has kernel access when a socket is open; `find_mac`'s `can_query_kernel` parameter
     exists and is fully honored, so wiring in that distinction later needs no further change to
     the orchestrator itself.
-  - **No live callers yet — the pre-existing gaps are still open, not created by this change.**
-    `edns0::add_edns0_config`/`edns0_needs_mac` (which would consume a resolved MAC for
-    `--add-mac`/`--mac-base64`/`--mac-hex`) already have no call site in `forward.rs` at all — a
-    separate, larger, already-tracked gap (see the `edns0.c`/`FREC_NO_CACHE` entries above); MAC
-    resolution is now available for whenever that wiring lands, but this change does not add it.
-    Likewise `dhcp6::get_client_mac` has no caller: DHCPv6 packet dispatch
-    (`dispatch_dhcp6`/`handle_solicit`/`handle_request6`) has no client-MAC field to populate and
-    is itself not wired into any receive loop yet (`dispatch_dhcp6` has zero callers in the tree).
+  - **`dhcp6::get_client_mac` still has no live caller.** This is a pre-existing, much larger gap
+    than arp.rs's own: DHCPv6 packet dispatch (`dispatch_dhcp6`/`handle_solicit`/`handle_request6`)
+    has zero callers anywhere in the tree because there is no DHCPv6 receive loop at all yet (no
+    `run_dhcp6_loop`, no bound socket) — building one is a separate, large undertaking (a DHCPv6
+    equivalent of `dhcp::run_dhcp_loop`), not something this change can bolt on safely. Now that
+    `Daemon.arp_state` is shared with the forwarding loop, wiring that loop up will make
+    `get_client_mac` resolve real addresses immediately, with no further arp.rs-side change needed.
   - **`tftp.c:470`'s MAC substitution is not addressed at all.** `src/tftp.rs` has no MAC-aware
-    filename substitution and this change does not add one; `find_mac_for_daemon` is available for
-    whoever picks that up.
+    filename substitution, and — same shape as DHCPv6 above — there is no TFTP receive loop in
+    this port yet either, so there is no runtime call site to wire into. `find_mac_shared` is
+    available for whoever adds one.
   - **`do_arp_script_run` events are built but never delivered.** `drain_arp_script_events`
     produces `ScriptData` values; actually calling `HelperHandle::send` on them needs a running
     helper, which (per the `helper.rs` entry above) nothing forks from the main startup path yet.
+    Still not wired to fire automatically from a refresh; a caller can drive it manually today.
   Covered by `arp::tests::find_mac_*` (cache-hit short-circuit, kernel-populate-on-miss,
   negative-entry recording, no-kernel-access child-style path, empty-entry upgrade on refresh,
-  single-enumerate-per-call), `arp::tests::find_mac_for_daemon_opens_socket_and_does_not_panic`
-  and `netlink::tests::open_netlink_socket_returns_usable_fd` (real socket, Linux only),
-  `arp::tests::drain_arp_script_events_*` (feature `dhcp`), and
-  `dhcp6::tests::get_client_mac_*` (Linux only).
+  single-enumerate-per-call), `arp::tests::find_mac_for_daemon_opens_socket_and_does_not_panic`,
+  `arp::tests::find_mac_shared_and_find_mac_for_daemon_see_the_same_cache` (the two real callers
+  share one cache), `netlink::tests::open_netlink_socket_returns_usable_fd` (real socket, Linux
+  only), `arp::tests::drain_arp_script_events_*` (feature `dhcp`), `dhcp6::tests::get_client_mac_*`
+  (Linux only), and `forward::tests::forward_query_attaches_client_mac_when_add_mac_is_enabled` /
+  `forward_query_leaves_packet_untouched_when_no_mac_option_is_enabled` /
+  `forward_query_strip_mac_alone_never_touches_the_arp_cache` (the real `forward_query` call site,
+  asserting the MAC actually lands in the bytes sent upstream).
 
 ## P4 Test Harness And Tooling
 
