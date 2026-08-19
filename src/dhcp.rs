@@ -75,6 +75,13 @@ pub struct DhcpServerConfig {
     pub tag_rules: Vec<crate::dhcp_common::TagIf>,
     /// IPv4 relay entries from parsed `dhcp-relay`/`dhcp-split-relay`.
     pub relay4: Vec<crate::types::dhcp::DhcpRelay>,
+    /// `--no-ping` (`OPT_NO_PING`): skip the ICMP conflict probe entirely and
+    /// treat every scanned address as free, matching dhcp.c:793-798.
+    pub no_ping: bool,
+    /// `--dhcp-sequential-ip` (`OPT_CONSEC_ADDR`): seed allocation from the
+    /// highest leased address in the range instead of a hwaddr hash,
+    /// matching dhcp.c:860-864.
+    pub consec_addr: bool,
 }
 
 impl Default for DhcpServerConfig {
@@ -99,6 +106,8 @@ impl Default for DhcpServerConfig {
             name_match_rules: Vec::new(),
             tag_rules: Vec::new(),
             relay4: Vec::new(),
+            no_ping: false,
+            consec_addr: false,
         }
     }
 }
@@ -263,19 +272,26 @@ fn select_reply_delay(
         .map_or(0, |rule| rule.delay_secs)
 }
 
+/// Select the context that best describes `reply.yiaddr`, for filling in
+/// lease-time/router/netmask reply options.
+///
+/// Delegates to [`narrow_context`] — a pool-range match (excluding
+/// `CONTEXT_STATIC`/`CONTEXT_PROXY`) first, then a static context on the same
+/// subnet, then any context on the same subnet — instead of the previous
+/// "first pool match or else the first context regardless of subnet"
+/// heuristic. This is `narrow_context()`'s upstream role (dhcp.c:717-752);
+/// it does not yet restrict candidates to the arriving interface's linked
+/// chain (`complete_context()`'s `->current` list, dhcp.c:589-660) because
+/// nothing upstream of this call knows which interface the request arrived
+/// on yet — see [`link_contexts_for_interface`] and `tasks.md`.
 fn context_for_reply<'a>(
     cfg: &'a DhcpServerConfig,
     reply: &DhcpReply,
 ) -> Option<&'a crate::types::dhcp::DhcpContext> {
-    cfg.contexts
-        .iter()
-        .find(|ctx| {
-            (ctx.flags & crate::types::dhcp::CONTEXT_STATIC) == 0
-                && reply.yiaddr != Ipv4Addr::UNSPECIFIED
-                && reply.yiaddr >= ctx.start
-                && reply.yiaddr <= ctx.end
-        })
-        .or_else(|| cfg.contexts.first())
+    if reply.yiaddr == Ipv4Addr::UNSPECIFIED {
+        return cfg.contexts.first();
+    }
+    narrow_context(&cfg.contexts, reply.yiaddr).or_else(|| cfg.contexts.first())
 }
 
 fn requested_arch(pkt: &DhcpPacket) -> i32 {
@@ -625,6 +641,8 @@ pub fn dispatch_dhcp_with_meta(
     pkt: &DhcpPacket,
     cfg: &DhcpServerConfig,
     lease_db: &mut LeaseDb,
+    ping_cache: &mut PingCache,
+    probe: &dyn AddressProbe,
 ) -> Option<DispatchedDhcpReply> {
     let msg_type = get_message_type(&pkt.options)?;
     let clid = find_option(&pkt.options, OPTION_CLIENT_ID);
@@ -659,7 +677,36 @@ pub fn dispatch_dhcp_with_meta(
     let mut reply = match msg_type {
         DhcpMsgType::Discover => {
             inc_metric(Metric::Dhcpdiscover);
-            handle_discover(pkt, cfg.pool_start, cfg.pool_end, None, cfg.server_ip, static_addr)
+            // Only run the pool scan when a static reservation won't already
+            // decide the offer — mirrors rfc2131.c's `conf.s_addr` short
+            // circuit, and avoids pinging candidates whose result is unused.
+            let scanned_addr = if static_addr.is_none() {
+                // rfc2131.c:841-848 folds `config->netid` into `tagif_netid`
+                // before the DHCPDISCOVER case, so a tag-restricted
+                // `dhcp-range` can be selected by a client's own `dhcp-host`
+                // netid, not just runtime-derived tags.
+                let mut alloc_tags = tags.clone();
+                if let Some(c) = config {
+                    alloc_tags.extend(c.netid.iter().cloned());
+                }
+                let contexts = allocation_contexts(cfg);
+                address_allocate(
+                    &contexts,
+                    lease_db,
+                    &cfg.configs,
+                    &pkt.chaddr[..hw_len],
+                    &alloc_tags,
+                    std::time::SystemTime::now(),
+                    false, // interface-arrival loopback detection is not ported yet
+                    cfg.consec_addr,
+                    cfg.no_ping,
+                    ping_cache,
+                    probe,
+                )
+            } else {
+                None
+            };
+            handle_discover(pkt, cfg.pool_start, cfg.pool_end, None, cfg.server_ip, static_addr, scanned_addr)
         }
         DhcpMsgType::Request => {
             inc_metric(Metric::Dhcprequest);
@@ -722,16 +769,33 @@ pub fn dispatch_dhcp_with_meta(
     Some(DispatchedDhcpReply { reply, delay_secs })
 }
 
+/// An [`AddressProbe`] that never reports a conflict, used where a caller
+/// has no real ICMP prober available (e.g. [`dispatch_dhcp`]'s no-frills
+/// wrapper). Equivalent to always running with `--no-ping`.
+struct NullProbe;
+
+impl AddressProbe for NullProbe {
+    fn in_use(&self, _addr: Ipv4Addr) -> bool {
+        false
+    }
+}
+
 /// Dispatch a received DHCP packet to the appropriate handler.
 ///
 /// Returns `Some(DhcpReply)` when a reply should be sent, `None` when the
 /// packet should be silently dropped (e.g. RELEASE, DECLINE, unknown type).
+///
+/// Convenience wrapper around [`dispatch_dhcp_with_meta`] for callers that
+/// don't need lease-file/delay metadata or real conflict detection: it
+/// allocates a fresh [`PingCache`] and a [`NullProbe`] per call, so repeated
+/// calls never build up ping history and never treat any address as in use.
 pub fn dispatch_dhcp(
     pkt: &DhcpPacket,
     cfg: &DhcpServerConfig,
     lease_db: &mut LeaseDb,
 ) -> Option<DhcpReply> {
-    dispatch_dhcp_with_meta(pkt, cfg, lease_db).map(|out| out.reply)
+    let mut ping_cache = PingCache::new();
+    dispatch_dhcp_with_meta(pkt, cfg, lease_db, &mut ping_cache, &NullProbe).map(|out| out.reply)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -817,8 +881,13 @@ pub async fn run_dhcp_loop(
     opts: DhcpLoopOptions,
     mut lease_db: LeaseDb,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    probe: Box<dyn AddressProbe + Send + Sync>,
 ) -> std::io::Result<()> {
     let mut buf = vec![0u8; cfg.max_packet.max(300)];
+    // Persists across packets so `do_icmp_ping`'s cache/load-limiter
+    // (dhcp.c:769-823, ported as `PingCache::check`) actually avoids
+    // re-pinging addresses within `PING_CACHE_TIME` of each other.
+    let mut ping_cache = PingCache::new();
 
     loop {
         tokio::select! {
@@ -875,7 +944,7 @@ pub async fn run_dhcp_loop(
                     }
                 }
 
-                let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db);
+                let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db, &mut ping_cache, probe.as_ref());
 
                 if lease_db.file_dirty {
                     if let Some(path) = cfg.lease_file.as_deref() {
@@ -934,7 +1003,7 @@ pub fn icmp_checksum(data: &[u8]) -> u16 {
 // Address pool helpers (ported from dhcp.c:687-763)
 // ─────────────────────────────────────────────────────────────────────────────
 
-use crate::types::dhcp::{DhcpContext, DhcpConfig, CONTEXT_STATIC, CONTEXT_PROXY, CONFIG_ADDR};
+use crate::types::dhcp::{DhcpContext, DhcpConfig, CONTEXT_STATIC, CONTEXT_PROXY, CONTEXT_NETMASK, CONTEXT_BRDCAST, CONFIG_ADDR};
 
 /// Check if `addr` is available in one of the DHCP contexts.
 ///
@@ -1015,6 +1084,65 @@ pub fn config_find_by_address(configs: &[DhcpConfig], addr: Ipv4Addr) -> Option<
         .find(|c| c.flags & CONFIG_ADDR != 0 && c.addr == addr)
 }
 
+/// The local address/netmask/broadcast of the interface a DHCP request
+/// arrived on, as `IP_PKTINFO` would report it. Mirrors the per-arrival
+/// inputs `dhcp_packet()` feeds to `complete_context()` (dhcp.c:296-365).
+///
+/// Not yet populated from a real socket read — [`bind_listeners`] doesn't
+/// request `IP_PKTINFO` on the DHCP socket, so nothing in `run_dhcp_loop`
+/// can construct one today. See `tasks.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArrivalInterface {
+    pub local: Ipv4Addr,
+    pub netmask: Ipv4Addr,
+    pub broadcast: Ipv4Addr,
+}
+
+/// Link every context that shares a subnet with the arriving interface,
+/// filling in a guessed netmask/broadcast/router for any that need it.
+///
+/// Port of `guess_range_netmask()` (dhcp.c:568-587) plus the local-subnet
+/// linking half of `complete_context()` (dhcp.c:589-660) — the
+/// `shared_networks`/`dhcp-relay` linking in the other half needs
+/// daemon-wide state this function doesn't have and isn't ported.
+///
+/// Returns the indices into `contexts` that are valid for a host directly
+/// connected to this interface (upstream's `context->current` chain);
+/// [`narrow_context`] should be restricted to just those indices once a
+/// caller has this, instead of scanning every context.
+pub fn link_contexts_for_interface(contexts: &mut [DhcpContext], iface: &ArrivalInterface) -> Vec<usize> {
+    for ctx in contexts.iter_mut() {
+        if ctx.flags & CONTEXT_NETMASK == 0
+            && (is_same_net(iface.local, ctx.start, iface.netmask)
+                || is_same_net(iface.local, ctx.end, iface.netmask))
+        {
+            ctx.netmask = iface.netmask;
+        }
+    }
+
+    let mut linked = Vec::new();
+    for (i, ctx) in contexts.iter_mut().enumerate() {
+        if ctx.netmask == Ipv4Addr::UNSPECIFIED
+            || !is_same_net(iface.local, ctx.start, ctx.netmask)
+            || !is_same_net(iface.local, ctx.end, ctx.netmask)
+        {
+            continue;
+        }
+
+        ctx.router = iface.local;
+        ctx.local = iface.local;
+        if ctx.flags & CONTEXT_BRDCAST == 0 {
+            ctx.broadcast = if is_same_net(iface.broadcast, ctx.start, ctx.netmask) {
+                iface.broadcast
+            } else {
+                Ipv4Addr::from(u32::from(ctx.start) | !u32::from(ctx.netmask))
+            };
+        }
+        linked.push(i);
+    }
+    linked
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Packet validation (ported from dhcp.c:130-176)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1085,6 +1213,456 @@ pub fn is_allocatable_addr(addr: Ipv4Addr) -> bool {
         }
     }
     true
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ICMP address-conflict probing (ported from dhcp.c:769-923, dnsmasq.c:2339-2378)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Something that can tell whether an address is already answering on the
+/// network. Implemented by [`crate::dnsmasq::IcmpPinger`] in production and by
+/// fakes in tests, so `address_allocate` never needs a real raw socket to be
+/// unit-tested.
+pub trait AddressProbe {
+    /// Returns `true` if `addr` is in use (answered an ICMP echo request).
+    fn in_use(&self, addr: Ipv4Addr) -> bool;
+}
+
+/// A single cached ping outcome. Port of `struct ping_result` (dnsmasq.h:1106).
+#[derive(Debug, Clone)]
+struct PingResult {
+    addr: Ipv4Addr,
+    time: std::time::SystemTime,
+    hash: u32,
+}
+
+/// Time-bounded, load-limited cache of ICMP conflict checks.
+///
+/// Port of `do_icmp_ping()` (dhcp.c:769-823): avoids re-pinging an address
+/// that was checked in the last `PING_CACHE_TIME` seconds, and stops pinging
+/// altogether once more than 60% of the possible checks in that window have
+/// already happened (protects against a misbehaving client hammering us with
+/// DISCOVERs).
+pub struct PingCache {
+    results: Vec<PingResult>,
+}
+
+/// Port of `config.h`'s `PING_CACHE_TIME` (30s ping-result validity).
+const PING_CACHE_TIME_SECS: f64 = 30.0;
+/// Port of `config.h`'s `PING_WAIT` (per-ping timeout, 3s).
+const PING_WAIT_SECS: f64 = 3.0;
+
+impl PingCache {
+    pub fn new() -> Self {
+        Self { results: Vec::new() }
+    }
+
+    /// Returns `Some(hash)` if `addr` is believed free (a fresh or cached
+    /// negative result), `None` if it answered a ping (in use).
+    ///
+    /// `no_ping` (`--no-ping`/`OPT_NO_PING`) and `loopback` (request arrived
+    /// on the loopback interface) both short-circuit to "not in use" without
+    /// ever probing, matching dhcp.c:793-798.
+    fn check(
+        &mut self,
+        now: std::time::SystemTime,
+        addr: Ipv4Addr,
+        hash: u32,
+        no_ping: bool,
+        loopback: bool,
+        probe: &dyn AddressProbe,
+    ) -> Option<u32> {
+        let max = (0.6 * (PING_CACHE_TIME_SECS / PING_WAIT_SECS)) as usize;
+
+        let mut count = 0usize;
+        let mut victim: Option<usize> = None;
+        for (i, r) in self.results.iter().enumerate() {
+            let age = now
+                .duration_since(r.time)
+                .unwrap_or(Duration::ZERO)
+                .as_secs_f64();
+            if age > PING_CACHE_TIME_SECS {
+                victim = Some(i);
+            } else {
+                count += 1;
+                if r.addr == addr {
+                    return Some(r.hash);
+                }
+            }
+        }
+
+        if count >= max || no_ping || loopback {
+            return Some(hash);
+        }
+
+        if probe.in_use(addr) {
+            return None;
+        }
+
+        let record = PingResult { addr, time: now, hash };
+        match victim {
+            Some(i) => self.results[i] = record,
+            None => self.results.push(record),
+        }
+        Some(hash)
+    }
+}
+
+impl Default for PingCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Plain (non-wildcard) `match_netid()` port (dhcp-common.c:224-247), used by
+/// `address_allocate`'s two-pass context selection: pass 0 requires the
+/// context's filter to be non-empty and satisfied by `netids`; pass 1
+/// (`tagnotneeded = true`) also accepts contexts with no filter at all.
+fn context_filter_matches(filter: &[crate::types::dhcp::DhcpNetid], netids: &[crate::types::dhcp::DhcpNetid], tagnotneeded: bool) -> bool {
+    if filter.is_empty() {
+        return tagnotneeded;
+    }
+    for check in filter {
+        let negated = check.net.starts_with('!') || check.net.starts_with('#');
+        if negated {
+            let name = &check.net[1..];
+            if netids.iter().any(|n| n.net == name) {
+                return false;
+            }
+        } else if !netids.iter().any(|n| n.net == check.net) {
+            return false;
+        }
+    }
+    true
+}
+
+fn next_addr_wrapping(addr: Ipv4Addr, start: Ipv4Addr, end: Ipv4Addr) -> Ipv4Addr {
+    let next = u32::from(addr).wrapping_add(1);
+    if next == u32::from(end).wrapping_add(1) {
+        start
+    } else {
+        Ipv4Addr::from(next)
+    }
+}
+
+/// Find a free address by scanning DHCP `contexts`, excluding anything
+/// leased, statically reserved, a router/server address, or Windows-unsafe
+/// (`.0`/`.255`), and confirming freedom with an ICMP ping.
+///
+/// Port of `address_allocate()` (dhcp.c:825-922). The seed address is either
+/// the highest leased address in the context (`--dhcp-authoritative` /
+/// `OPT_CONSEC_ADDR`) or a hash of `hwaddr` mixed with the context's
+/// `addr_epoch`, so restarts distribute clients across the pool instead of
+/// always starting from `start`.
+///
+/// Deliberately not ported: the `addr_epoch` perturbation upstream applies
+/// when a candidate is rejected (dhcp.c:900-921), which nudges future seeds
+/// away from recently-contested addresses. Every scan here always starts
+/// from the same seed for a given hwaddr/epoch. Tracked in `tasks.md`.
+#[allow(clippy::too_many_arguments)]
+pub fn address_allocate(
+    contexts: &[DhcpContext],
+    lease_db: &LeaseDb,
+    configs: &[DhcpConfig],
+    hwaddr: &[u8],
+    netids: &[crate::types::dhcp::DhcpNetid],
+    now: std::time::SystemTime,
+    loopback: bool,
+    consec_addr: bool,
+    no_ping: bool,
+    ping_cache: &mut PingCache,
+    probe: &dyn AddressProbe,
+) -> Option<Ipv4Addr> {
+    let hash = sdbm_hash(hwaddr);
+
+    for pass in 0..=1 {
+        for c in contexts {
+            if c.flags & (CONTEXT_STATIC | CONTEXT_PROXY) != 0 {
+                continue;
+            }
+            if !context_filter_matches(&c.filter, netids, pass == 1) {
+                continue;
+            }
+
+            let start_addr = if consec_addr {
+                lease_db.find_max_addr(c.start, c.end)
+            } else {
+                hash_to_addr(hash, c.addr_epoch, c.start, c.end)
+            };
+
+            let mut addr = start_addr;
+            loop {
+                let router_conflict = contexts.iter().any(|d| addr == d.router);
+
+                if !router_conflict
+                    && is_allocatable_addr(addr)
+                    && lease_db.find_by_addr(addr).is_none()
+                    && config_find_by_address(configs, addr).is_none()
+                {
+                    if let Some(r_hash) = ping_cache.check(now, addr, hash, no_ping, loopback, probe) {
+                        if !consec_addr || r_hash == hash {
+                            return Some(addr);
+                        }
+                    }
+                }
+
+                addr = next_addr_wrapping(addr, c.start, c.end);
+                if addr == start_addr {
+                    break;
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Build a single DHCP context spanning `[start, end]` with no filter and no
+/// router, standing in for `cfg.contexts` when a caller only populated the
+/// flat `pool_start`/`pool_end` fields (production always populates
+/// `cfg.contexts` from `dhcp-range`; this exists so hand-built
+/// `DhcpServerConfig` values in tests don't also need to).
+fn synthetic_pool_context(start: Ipv4Addr, end: Ipv4Addr) -> DhcpContext {
+    DhcpContext {
+        lease_time: 3600,
+        addr_epoch: 0,
+        netmask: Ipv4Addr::UNSPECIFIED,
+        broadcast: Ipv4Addr::UNSPECIFIED,
+        local: Ipv4Addr::UNSPECIFIED,
+        router: Ipv4Addr::UNSPECIFIED,
+        start,
+        end,
+        flags: 0,
+        netid: crate::types::dhcp::DhcpNetid { net: String::new() },
+        filter: vec![],
+        #[cfg(feature = "dhcp6")]
+        start6: std::net::Ipv6Addr::UNSPECIFIED,
+        #[cfg(feature = "dhcp6")]
+        end6: std::net::Ipv6Addr::UNSPECIFIED,
+        #[cfg(feature = "dhcp6")]
+        local6: std::net::Ipv6Addr::UNSPECIFIED,
+        #[cfg(feature = "dhcp6")]
+        prefix: 0,
+        #[cfg(feature = "dhcp6")]
+        if_index: 0,
+        #[cfg(feature = "dhcp6")]
+        valid: 0,
+        #[cfg(feature = "dhcp6")]
+        preferred: 0,
+    }
+}
+
+fn allocation_contexts(cfg: &DhcpServerConfig) -> std::borrow::Cow<'_, [DhcpContext]> {
+    if cfg.contexts.is_empty() {
+        std::borrow::Cow::Owned(vec![synthetic_pool_context(cfg.pool_start, cfg.pool_end)])
+    } else {
+        std::borrow::Cow::Borrowed(&cfg.contexts)
+    }
+}
+
+/// Build an ICMP echo-request packet (type 8, code 0) with the given
+/// identifier and sequence 0, matching the zero-initialised `struct icmp`
+/// upstream sends in `icmp_ping()` (dnsmasq.c:2339-2378) — only `icmp_type`
+/// and `icmp_id` are ever set there, so `icmp_seq` is always 0.
+pub(crate) fn build_icmp_echo_request(id: u16) -> [u8; 8] {
+    let mut pkt = [0u8; 8];
+    pkt[0] = 8; // ICMP_ECHO
+    pkt[1] = 0; // code
+    pkt[4..6].copy_from_slice(&id.to_be_bytes());
+    // seq (pkt[6..8]) stays 0.
+    let cksum = icmp_checksum(&pkt);
+    pkt[2..4].copy_from_slice(&cksum.to_be_bytes());
+    pkt
+}
+
+/// Parse a raw-socket read (`IP header + ICMP header [+ data]`) and report
+/// whether it's an echo reply matching `expected_id`/seq 0, mirroring the
+/// `packet.icmp.icmp_type == ICMP_ECHOREPLY && ... icmp_seq == 0 &&
+/// icmp_id == id` check in `delay_dhcp()` (dnsmasq.c:2466-2469).
+pub(crate) fn parse_icmp_echo_reply(data: &[u8], expected_id: u16) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    let ihl = usize::from(data[0] & 0x0f) * 4;
+    if data.len() < ihl + 8 {
+        return false;
+    }
+    let icmp = &data[ihl..];
+    const ICMP_ECHOREPLY: u8 = 0;
+    let id = u16::from_be_bytes([icmp[4], icmp[5]]);
+    let seq = u16::from_be_bytes([icmp[6], icmp[7]]);
+    icmp[0] == ICMP_ECHOREPLY && seq == 0 && id == expected_id
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// --read-ethers (ported from dhcp.c:924-1083)
+// ─────────────────────────────────────────────────────────────────────────────
+
+use crate::types::dhcp::{HwaddrConfig, CONFIG_FROM_ETHERS, CONFIG_NAME, CONFIG_NOCLID};
+
+/// Default location of the ethers file (`ETHERSFILE` in config.h).
+pub const ETHERS_FILE: &str = "/etc/ethers";
+
+/// `ARPHRD_ETHER` — the only hardware type `/etc/ethers` lines can specify.
+const ARPHRD_ETHER: i32 = 1;
+
+#[derive(Debug, Clone, PartialEq)]
+enum EthersKey {
+    Addr(Ipv4Addr),
+    Name(String),
+}
+
+#[derive(Debug, Clone)]
+struct EthersRecord {
+    hwaddr: [u8; 6],
+    key: EthersKey,
+}
+
+/// Parse `/etc/ethers`-style text (`<hwaddr> <ip-or-hostname>` per line,
+/// `#`/`+`-prefixed and blank lines ignored) into records, skipping
+/// malformed lines the same way `dhcp_read_ethers()` does (dhcp.c:958-1006):
+/// silently continuing past a bad hwaddr, bad address, or bad hostname.
+fn parse_ethers_text(text: &str) -> Vec<EthersRecord> {
+    let mut records = Vec::new();
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('+') {
+            continue;
+        }
+
+        let mut parts = line.splitn(2, char::is_whitespace);
+        let Some(mac_part) = parts.next().filter(|s| !s.is_empty()) else { continue };
+        let rest = parts.next().map(str::trim_start).unwrap_or("");
+        if rest.is_empty() {
+            continue; // "bad line" — no IP/name field (dhcp.c:970-975)
+        }
+
+        let mut hwaddr_vec = Vec::new();
+        if crate::util::parse_hex(mac_part, &mut hwaddr_vec, Some(6), None) != 6 {
+            continue; // "bad line" (dhcp.c:970-975)
+        }
+        let mut hwaddr = [0u8; 6];
+        hwaddr.copy_from_slice(&hwaddr_vec);
+
+        // dhcp.c:977-979: a "name or dotted-quad" is a dotted-quad only if
+        // every character is a digit or '.'.
+        let looks_like_addr = rest.chars().all(|c| c == '.' || c.is_ascii_digit());
+        let key = if looks_like_addr {
+            match rest.parse::<Ipv4Addr>() {
+                Ok(addr) => EthersKey::Addr(addr),
+                Err(_) => continue, // "bad address" (dhcp.c:984-988)
+            }
+        } else {
+            match crate::util::canonicalise(rest) {
+                Some(host) if crate::util::legal_hostname(&host) => EthersKey::Name(host),
+                _ => continue, // "bad name" (dhcp.c:1000-1004)
+            }
+        };
+
+        records.push(EthersRecord { hwaddr, key });
+    }
+
+    records
+}
+
+/// Merge parsed `/etc/ethers` records into `dhcp_conf`, purging any
+/// entries left over from a prior run first (dhcp.c:944-956 — this makes it
+/// safe to re-run on SIGHUP). A record whose address/hostname already
+/// matches a `CONFIG_FROM_ETHERS` entry created earlier *in this same pass*
+/// is a duplicate and is dropped (dhcp.c:1013-1016); one matching a
+/// non-ethers entry (e.g. from `dhcp-host`) is merged into it instead of
+/// creating a new one, and a record whose hwaddr exactly matches an existing
+/// hwaddr-only `dhcp-host` entry attaches to that entry (dhcp.c:1023-1043).
+fn apply_ethers_records(dhcp_conf: &mut Vec<DhcpConfig>, records: Vec<EthersRecord>) -> usize {
+    dhcp_conf.retain(|c| c.flags & CONFIG_FROM_ETHERS == 0);
+
+    let mut count = 0;
+    for rec in records {
+        let existing_idx = dhcp_conf.iter().position(|c| match &rec.key {
+            EthersKey::Addr(addr) => (c.flags & CONFIG_ADDR) != 0 && c.addr == *addr,
+            EthersKey::Name(name) => {
+                (c.flags & CONFIG_NAME) != 0
+                    && c.hostname.as_deref().is_some_and(|h| crate::util::hostname_isequal(h, name))
+            }
+        });
+
+        if let Some(idx) = existing_idx {
+            if dhcp_conf[idx].flags & CONFIG_FROM_ETHERS != 0 {
+                warn!("ignoring duplicate name or IP address in {ETHERS_FILE}");
+                continue;
+            }
+        }
+
+        let target_idx = if let Some(idx) = existing_idx {
+            idx
+        } else if let Some(idx) = dhcp_conf.iter().position(|c| {
+            c.hwaddrs.len() == 1
+                && c.hwaddrs[0].hwaddr_len == 6
+                && c.hwaddrs[0].hwaddr_type == ARPHRD_ETHER
+                && c.hwaddrs[0].wildcard_mask == 0
+                && c.hwaddrs[0].hwaddr[..6] == rec.hwaddr
+        }) {
+            idx
+        } else {
+            dhcp_conf.push(DhcpConfig {
+                flags: CONFIG_FROM_ETHERS,
+                clid: None,
+                hostname: None,
+                domain: None,
+                netid: vec![],
+                filter: vec![],
+                addr: Ipv4Addr::UNSPECIFIED,
+                decline_time: None,
+                lease_time: 0,
+                hwaddrs: vec![],
+                #[cfg(feature = "dhcp6")]
+                addr6: vec![],
+            });
+            dhcp_conf.len() - 1
+        };
+
+        let config = &mut dhcp_conf[target_idx];
+        match &rec.key {
+            EthersKey::Addr(addr) => {
+                config.flags |= CONFIG_ADDR;
+                config.addr = *addr;
+            }
+            EthersKey::Name(name) => {
+                config.flags |= CONFIG_NAME;
+                config.hostname = Some(name.clone());
+            }
+        }
+        config.flags |= CONFIG_NOCLID;
+
+        let mut hwaddr_full = [0u8; DHCP_CHADDR_MAX];
+        hwaddr_full[..6].copy_from_slice(&rec.hwaddr);
+        let mac_entry = HwaddrConfig {
+            hwaddr: hwaddr_full,
+            hwaddr_len: 6,
+            hwaddr_type: ARPHRD_ETHER,
+            wildcard_mask: 0,
+        };
+        if let Some(first) = config.hwaddrs.first_mut() {
+            *first = mac_entry;
+        } else {
+            config.hwaddrs.push(mac_entry);
+        }
+
+        count += 1;
+    }
+
+    count
+}
+
+/// Read and apply `path` (normally [`ETHERS_FILE`]) into `dhcp_conf`.
+/// Port of `dhcp_read_ethers()` (dhcp.c:924-1083), split into the pure
+/// [`parse_ethers_text`]/[`apply_ethers_records`] helpers above so parsing
+/// and merge logic are unit-testable without touching the filesystem.
+pub fn dhcp_read_ethers(dhcp_conf: &mut Vec<DhcpConfig>, path: &str) -> std::io::Result<usize> {
+    let text = std::fs::read_to_string(path)?;
+    let records = parse_ethers_text(&text);
+    Ok(apply_ethers_records(dhcp_conf, records))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1198,6 +1776,8 @@ mod tests {
             name_match_rules: vec![],
             tag_rules: vec![],
             relay4: vec![],
+            no_ping: false,
+            consec_addr: false,
         }
     }
 
@@ -1613,7 +2193,7 @@ mod tests {
             filter: vec![],
         });
 
-        let reply = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new()).expect("discover should produce an offer");
+        let reply = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe).expect("discover should produce an offer");
         assert_eq!(reply.reply.msg_type, DhcpMsgType::Offer);
         assert_eq!(reply.delay_secs, 5);
     }
@@ -1643,7 +2223,7 @@ mod tests {
             filter: vec![],
         });
 
-        let reply = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new()).expect("discover should produce an offer");
+        let reply = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe).expect("discover should produce an offer");
         assert_eq!(reply.reply.msg_type, DhcpMsgType::Offer);
         assert_eq!(reply.delay_secs, 2);
     }
@@ -1663,7 +2243,7 @@ mod tests {
             filter: vec![],
         });
 
-        let reply = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new()).expect("discover should produce an offer");
+        let reply = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe).expect("discover should produce an offer");
         assert_eq!(reply.reply.msg_type, DhcpMsgType::Offer);
         assert_eq!(reply.delay_secs, 7);
     }
@@ -1685,7 +2265,7 @@ mod tests {
             filter: vec![],
         });
 
-        let reply = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new()).expect("request should produce an ack");
+        let reply = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe).expect("request should produce an ack");
         assert_eq!(reply.reply.msg_type, DhcpMsgType::Ack);
         assert_eq!(reply.delay_secs, 0);
     }
@@ -1704,7 +2284,7 @@ mod tests {
         let cfg = default_cfg();
         let mut lease_db = LeaseDb::new();
 
-        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db).expect("request should ack");
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db, &mut PingCache::new(), &NullProbe).expect("request should ack");
         assert_eq!(dispatched.reply.msg_type, DhcpMsgType::Ack);
 
         let lease = lease_db
@@ -1726,7 +2306,7 @@ mod tests {
         pkt.options = vec![OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Release as u8, OPTION_END];
         let cfg = default_cfg();
 
-        assert!(dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db).is_none());
+        assert!(dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db, &mut PingCache::new(), &NullProbe).is_none());
         assert!(lease_db.find_by_addr(addr).is_none());
     }
 
@@ -1741,7 +2321,7 @@ mod tests {
         pkt.options = vec![OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Release as u8, OPTION_END];
         let cfg = default_cfg();
 
-        assert!(dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db).is_none());
+        assert!(dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db, &mut PingCache::new(), &NullProbe).is_none());
         // Unrelated lease must survive an out-of-pool RELEASE.
         assert!(lease_db.find_by_addr(addr).is_some());
     }
@@ -1760,7 +2340,7 @@ mod tests {
         ];
         let cfg = default_cfg();
 
-        assert!(dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db).is_none());
+        assert!(dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db, &mut PingCache::new(), &NullProbe).is_none());
         assert!(lease_db.find_by_addr(addr).is_none());
     }
 
@@ -1772,7 +2352,7 @@ mod tests {
         let cfg = default_cfg();
         let mut lease_db = LeaseDb::new();
 
-        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db).expect("inform should ack");
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db, &mut PingCache::new(), &NullProbe).expect("inform should ack");
         assert_eq!(dispatched.reply.msg_type, DhcpMsgType::Ack);
         assert_eq!(dispatched.reply.yiaddr, Ipv4Addr::UNSPECIFIED);
         assert_eq!(lease_db.count(), 0);
@@ -1866,7 +2446,7 @@ mod tests {
     fn offer_and_ack_carry_lease_time_option() {
         let pkt = base_packet(); // discover
         let cfg = default_cfg();
-        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new()).expect("discover should offer");
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe).expect("discover should offer");
         assert!(find_option(&dispatched.reply.options, crate::dhcp_protocol::OPTION_LEASE_TIME).is_some());
 
         let mut req_pkt = base_packet();
@@ -1875,7 +2455,7 @@ mod tests {
             crate::dhcp_protocol::OPTION_REQUESTED_IP, 4, 10, 0, 0, 123,
             OPTION_END,
         ];
-        let dispatched = dispatch_dhcp_with_meta(&req_pkt, &cfg, &mut LeaseDb::new()).expect("request should ack");
+        let dispatched = dispatch_dhcp_with_meta(&req_pkt, &cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe).expect("request should ack");
         assert!(find_option(&dispatched.reply.options, crate::dhcp_protocol::OPTION_LEASE_TIME).is_some());
     }
 
@@ -1885,7 +2465,7 @@ mod tests {
         pkt.ciaddr = Ipv4Addr::new(10, 0, 0, 55);
         pkt.options = vec![OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Inform as u8, OPTION_END];
         let cfg = default_cfg();
-        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new()).expect("inform should ack");
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe).expect("inform should ack");
         assert!(find_option(&dispatched.reply.options, crate::dhcp_protocol::OPTION_LEASE_TIME).is_none());
     }
 
@@ -1898,7 +2478,7 @@ mod tests {
         pkt.ciaddr = Ipv4Addr::new(10, 0, 0, 55);
         pkt.options = vec![OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Inform as u8, OPTION_END];
         let cfg = default_cfg();
-        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new()).expect("inform should ack");
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe).expect("inform should ack");
         assert!(find_option(&dispatched.reply.options, crate::dhcp_protocol::OPTION_T1).is_none());
         assert!(find_option(&dispatched.reply.options, crate::dhcp_protocol::OPTION_T2).is_none());
     }
@@ -1923,7 +2503,7 @@ mod tests {
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, LeaseDb::new(), shutdown_rx));
+        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, LeaseDb::new(), shutdown_rx, Box::new(NullProbe)));
 
         let mut pkt = base_packet();
         pkt.options = vec![
@@ -1997,7 +2577,7 @@ mod tests {
             vendor_class: None,
         });
 
-        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new()).expect("discover should produce an offer");
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe).expect("discover should produce an offer");
         assert!(find_option(&dispatched.reply.options, crate::dhcp_protocol::OPTION_DOMAINNAME).is_some());
         assert!(find_option(&dispatched.reply.options, crate::dhcp_protocol::OPTION_ROUTER).is_some());
     }
@@ -2081,7 +2661,7 @@ mod tests {
             vendor_class: None,
         });
 
-        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new()).expect("discover should produce an offer");
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe).expect("discover should produce an offer");
         assert_eq!(
             find_option(&dispatched.reply.options, crate::dhcp_protocol::OPTION_DOMAINNAME),
             Some(&b"lab.example"[..])
@@ -2127,7 +2707,7 @@ mod tests {
             vendor_class: None,
         });
 
-        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new())
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe)
             .expect("discover should produce an offer");
         assert_eq!(
             find_option(&dispatched.reply.options, crate::dhcp_protocol::OPTION_DOMAINNAME),
@@ -2149,7 +2729,7 @@ mod tests {
             netid: vec![],
         });
 
-        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new()).expect("discover should produce an offer");
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe).expect("discover should produce an offer");
         assert_eq!(dispatched.reply.siaddr, Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(dispatched.reply.file.as_deref(), Some("pxelinux.0"));
         assert_eq!(dispatched.reply.sname.as_deref(), Some("boot.example"));
@@ -2217,7 +2797,7 @@ mod tests {
 
         let pkt = base_packet();
         let cfg = default_cfg();
-        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new()).expect("discover should produce an offer");
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe).expect("discover should produce an offer");
 
         let sent = match send_dhcp_reply_to(&sender, &pkt, &dispatched, dest).await {
             Ok(sent) => sent,
@@ -2235,7 +2815,9 @@ mod tests {
 
         let reply = parse_dhcp_packet(&buf[..len]).expect("wire reply should parse");
         assert_eq!(get_message_type(&reply.options), Some(DhcpMsgType::Offer));
-        assert_eq!(reply.yiaddr, Ipv4Addr::new(10, 0, 0, 100));
+        // Hash-seeded allocation (dhcp.c:860-864) offers pool_start+1 for an
+        // all-zero hwaddr, not pool_start itself — see `sdbm_hash_never_zero`.
+        assert_eq!(reply.yiaddr, Ipv4Addr::new(10, 0, 0, 101));
     }
 
     #[tokio::test]
@@ -2252,7 +2834,7 @@ mod tests {
             delay_secs: 1,
             filter: vec![],
         });
-        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new()).expect("discover should produce an offer");
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe).expect("discover should produce an offer");
         assert_eq!(dispatched.delay_secs, 1);
 
         let started = tokio::time::Instant::now();
@@ -2300,7 +2882,7 @@ mod tests {
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, LeaseDb::new(), shutdown_rx));
+        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, LeaseDb::new(), shutdown_rx, Box::new(NullProbe)));
 
         let pkt = base_packet();
         let wire = packet_to_wire(&pkt);
@@ -2313,7 +2895,7 @@ mod tests {
             .unwrap();
         let reply = parse_dhcp_packet(&buf[..len]).expect("loop reply should parse");
         assert_eq!(get_message_type(&reply.options), Some(DhcpMsgType::Offer));
-        assert_eq!(reply.yiaddr, Ipv4Addr::new(10, 0, 0, 100));
+        assert_eq!(reply.yiaddr, Ipv4Addr::new(10, 0, 0, 101));
 
         shutdown_tx.send(true).unwrap();
         loop_task.await.unwrap().unwrap();
@@ -2349,7 +2931,7 @@ mod tests {
             ..Default::default()
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let loop_task = tokio::spawn(run_dhcp_loop(relay_sock.clone(), cfg, opts, LeaseDb::new(), shutdown_rx));
+        let loop_task = tokio::spawn(run_dhcp_loop(relay_sock.clone(), cfg, opts, LeaseDb::new(), shutdown_rx, Box::new(NullProbe)));
 
         let pkt = base_packet();
         let wire = packet_to_wire(&pkt);
@@ -2401,7 +2983,7 @@ mod tests {
             ..Default::default()
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let loop_task = tokio::spawn(run_dhcp_loop(relay_sock.clone(), cfg, opts, LeaseDb::new(), shutdown_rx));
+        let loop_task = tokio::spawn(run_dhcp_loop(relay_sock.clone(), cfg, opts, LeaseDb::new(), shutdown_rx, Box::new(NullProbe)));
 
         // The upstream server's OFFER, addressed back to the relay (giaddr set,
         // ciaddr pointed at our test "client" receiver so delivery doesn't need
@@ -2449,7 +3031,7 @@ mod tests {
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, LeaseDb::new(), shutdown_rx));
+        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, LeaseDb::new(), shutdown_rx, Box::new(NullProbe)));
 
         let pkt = base_packet();
         let wire = packet_to_wire(&pkt);
@@ -2672,6 +3254,108 @@ mod tests {
         assert!(result.is_none());
     }
 
+    // ── link_contexts_for_interface ──────────────────────────────────────────
+
+    #[test]
+    fn link_contexts_for_interface_links_same_subnet_context() {
+        // make_ctx defaults netmask to 255.255.255.0.
+        let mut contexts = [make_ctx(
+            "10.0.0.100".parse().unwrap(),
+            "10.0.0.200".parse().unwrap(),
+            Ipv4Addr::UNSPECIFIED,
+            0,
+        )];
+        let iface = ArrivalInterface {
+            local: Ipv4Addr::new(10, 0, 0, 1),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::new(10, 0, 0, 255),
+        };
+        let linked = link_contexts_for_interface(&mut contexts, &iface);
+        assert_eq!(linked, vec![0]);
+        assert_eq!(contexts[0].router, iface.local);
+        assert_eq!(contexts[0].local, iface.local);
+        assert_eq!(contexts[0].broadcast, iface.broadcast);
+    }
+
+    #[test]
+    fn link_contexts_for_interface_skips_different_subnet() {
+        let mut contexts = [make_ctx(
+            "192.168.1.100".parse().unwrap(),
+            "192.168.1.200".parse().unwrap(),
+            Ipv4Addr::UNSPECIFIED,
+            0,
+        )];
+        let iface = ArrivalInterface {
+            local: Ipv4Addr::new(10, 0, 0, 1),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::new(10, 0, 0, 255),
+        };
+        let linked = link_contexts_for_interface(&mut contexts, &iface);
+        assert!(linked.is_empty());
+        // Untouched — this context was never on the arriving interface's subnet.
+        assert_eq!(contexts[0].router, Ipv4Addr::UNSPECIFIED);
+    }
+
+    #[test]
+    fn link_contexts_for_interface_fills_in_missing_netmask() {
+        let mut ctx = make_ctx(
+            "10.0.0.100".parse().unwrap(),
+            "10.0.0.200".parse().unwrap(),
+            Ipv4Addr::UNSPECIFIED,
+            0, // no CONTEXT_NETMASK — netmask below is a placeholder to fill in
+        );
+        ctx.netmask = Ipv4Addr::UNSPECIFIED;
+        let mut contexts = [ctx];
+        let iface = ArrivalInterface {
+            local: Ipv4Addr::new(10, 0, 0, 1),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::new(10, 0, 0, 255),
+        };
+        let linked = link_contexts_for_interface(&mut contexts, &iface);
+        assert_eq!(contexts[0].netmask, iface.netmask);
+        assert_eq!(linked, vec![0]);
+    }
+
+    #[test]
+    fn link_contexts_for_interface_respects_explicit_netmask_flag() {
+        // An explicit /16 that still covers the arriving interface's address
+        // must not be clobbered by guess_range_netmask's /24 guess.
+        let mut ctx = make_ctx(
+            "10.0.0.100".parse().unwrap(),
+            "10.0.0.200".parse().unwrap(),
+            Ipv4Addr::UNSPECIFIED,
+            CONTEXT_NETMASK,
+        );
+        ctx.netmask = Ipv4Addr::new(255, 255, 0, 0);
+        let mut contexts = [ctx];
+        let iface = ArrivalInterface {
+            local: Ipv4Addr::new(10, 0, 0, 1),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::new(10, 0, 0, 255),
+        };
+        link_contexts_for_interface(&mut contexts, &iface);
+        assert_eq!(contexts[0].netmask, Ipv4Addr::new(255, 255, 0, 0));
+    }
+
+    #[test]
+    fn link_contexts_for_interface_respects_explicit_broadcast_flag() {
+        let mut ctx = make_ctx(
+            "10.0.0.100".parse().unwrap(),
+            "10.0.0.200".parse().unwrap(),
+            Ipv4Addr::UNSPECIFIED,
+            CONTEXT_BRDCAST,
+        );
+        ctx.broadcast = Ipv4Addr::new(10, 0, 0, 254); // deliberately non-standard
+        let mut contexts = [ctx];
+        let iface = ArrivalInterface {
+            local: Ipv4Addr::new(10, 0, 0, 1),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::new(10, 0, 0, 255),
+        };
+        link_contexts_for_interface(&mut contexts, &iface);
+        assert_eq!(contexts[0].broadcast, Ipv4Addr::new(10, 0, 0, 254));
+    }
+
     // ── config_find_by_address ───────────────────────────────────────────────
 
     #[test]
@@ -2837,5 +3521,401 @@ mod tests {
     fn is_allocatable_allows_10_net_255() {
         // 10.x.x.255 is NOT class C, so it's fine
         assert!(is_allocatable_addr("10.0.0.255".parse().unwrap()));
+    }
+
+    // ── address_allocate / PingCache / AddressProbe ──────────────────────────
+
+    struct ConflictProbe(std::collections::HashSet<Ipv4Addr>);
+
+    impl AddressProbe for ConflictProbe {
+        fn in_use(&self, addr: Ipv4Addr) -> bool {
+            self.0.contains(&addr)
+        }
+    }
+
+    struct CountingProbe {
+        calls: std::cell::Cell<u32>,
+        in_use: bool,
+    }
+
+    impl AddressProbe for CountingProbe {
+        fn in_use(&self, _addr: Ipv4Addr) -> bool {
+            self.calls.set(self.calls.get() + 1);
+            self.in_use
+        }
+    }
+
+    #[test]
+    fn address_allocate_skips_address_that_answers_ping() {
+        // All-zero hwaddr hashes to 1 (see sdbm_hash_never_zero), and a
+        // 3-address range [100,102] seeds at start + (1 % 3) = .101.
+        let ctx = make_ctx(
+            "10.0.0.100".parse().unwrap(),
+            "10.0.0.102".parse().unwrap(),
+            Ipv4Addr::UNSPECIFIED,
+            0,
+        );
+        let lease_db = LeaseDb::new();
+        let mut ping_cache = PingCache::new();
+        let mut in_use = std::collections::HashSet::new();
+        in_use.insert(Ipv4Addr::new(10, 0, 0, 101));
+        let probe = ConflictProbe(in_use);
+
+        let addr = address_allocate(
+            &[ctx], &lease_db, &[], &[0u8; 6], &[], std::time::SystemTime::now(),
+            false, false, false, &mut ping_cache, &probe,
+        );
+        assert_eq!(addr, Some(Ipv4Addr::new(10, 0, 0, 102)));
+    }
+
+    #[test]
+    fn address_allocate_returns_none_when_range_fully_in_use() {
+        let ctx = make_ctx(
+            "10.0.0.100".parse().unwrap(),
+            "10.0.0.101".parse().unwrap(),
+            Ipv4Addr::UNSPECIFIED,
+            0,
+        );
+        let lease_db = LeaseDb::new();
+        let mut ping_cache = PingCache::new();
+        let mut in_use = std::collections::HashSet::new();
+        in_use.insert(Ipv4Addr::new(10, 0, 0, 100));
+        in_use.insert(Ipv4Addr::new(10, 0, 0, 101));
+        let probe = ConflictProbe(in_use);
+
+        let addr = address_allocate(
+            &[ctx], &lease_db, &[], &[0u8; 6], &[], std::time::SystemTime::now(),
+            false, false, false, &mut ping_cache, &probe,
+        );
+        assert_eq!(addr, None);
+    }
+
+    #[test]
+    fn address_allocate_skips_leased_and_statically_reserved_addresses() {
+        let ctx = make_ctx(
+            "10.0.0.100".parse().unwrap(),
+            "10.0.0.102".parse().unwrap(),
+            Ipv4Addr::UNSPECIFIED,
+            0,
+        );
+        let mut lease_db = LeaseDb::new();
+        lease_db.allocate_v4(Ipv4Addr::new(10, 0, 0, 101));
+        let reserved = DhcpConfig {
+            flags: CONFIG_ADDR,
+            clid: None,
+            hostname: None,
+            domain: None,
+            netid: vec![],
+            filter: vec![],
+            addr: Ipv4Addr::new(10, 0, 0, 102),
+            decline_time: None,
+            lease_time: 0,
+            hwaddrs: vec![],
+            #[cfg(feature = "dhcp6")]
+            addr6: vec![],
+        };
+        let mut ping_cache = PingCache::new();
+
+        // seed .101 is leased, .102 is a static reservation, so the scan
+        // wraps around to .100.
+        let addr = address_allocate(
+            &[ctx], &lease_db, &[reserved], &[0u8; 6], &[], std::time::SystemTime::now(),
+            false, false, false, &mut ping_cache, &NullProbe,
+        );
+        assert_eq!(addr, Some(Ipv4Addr::new(10, 0, 0, 100)));
+    }
+
+    #[test]
+    fn address_allocate_skips_router_address() {
+        let ctx = make_ctx(
+            "10.0.0.100".parse().unwrap(),
+            "10.0.0.101".parse().unwrap(),
+            Ipv4Addr::new(10, 0, 0, 101),
+            0,
+        );
+        let lease_db = LeaseDb::new();
+        let mut ping_cache = PingCache::new();
+
+        let addr = address_allocate(
+            &[ctx], &lease_db, &[], &[0u8; 6], &[], std::time::SystemTime::now(),
+            false, false, false, &mut ping_cache, &NullProbe,
+        );
+        assert_eq!(addr, Some(Ipv4Addr::new(10, 0, 0, 100)));
+    }
+
+    #[test]
+    fn ping_cache_remembers_free_address_without_reprobing() {
+        let mut cache = PingCache::new();
+        let probe = CountingProbe { calls: std::cell::Cell::new(0), in_use: false };
+        let now = std::time::SystemTime::now();
+        let addr = Ipv4Addr::new(10, 0, 0, 5);
+
+        assert_eq!(cache.check(now, addr, 42, false, false, &probe), Some(42));
+        assert_eq!(probe.calls.get(), 1);
+        assert_eq!(cache.check(now, addr, 42, false, false, &probe), Some(42));
+        assert_eq!(probe.calls.get(), 1, "second check should hit the cache, not re-ping");
+    }
+
+    #[test]
+    fn ping_cache_returns_none_when_probe_reports_in_use() {
+        let mut cache = PingCache::new();
+        let probe = CountingProbe { calls: std::cell::Cell::new(0), in_use: true };
+        let now = std::time::SystemTime::now();
+
+        assert_eq!(cache.check(now, Ipv4Addr::new(10, 0, 0, 6), 1, false, false, &probe), None);
+    }
+
+    #[test]
+    fn ping_cache_no_ping_flag_skips_probe_entirely() {
+        let mut cache = PingCache::new();
+        let probe = CountingProbe { calls: std::cell::Cell::new(0), in_use: true };
+        let now = std::time::SystemTime::now();
+
+        assert_eq!(cache.check(now, Ipv4Addr::new(10, 0, 0, 7), 9, true, false, &probe), Some(9));
+        assert_eq!(probe.calls.get(), 0);
+    }
+
+    #[test]
+    fn ping_cache_loopback_skips_probe_entirely() {
+        let mut cache = PingCache::new();
+        let probe = CountingProbe { calls: std::cell::Cell::new(0), in_use: true };
+        let now = std::time::SystemTime::now();
+
+        assert_eq!(cache.check(now, Ipv4Addr::new(127, 0, 0, 1), 9, false, true, &probe), Some(9));
+        assert_eq!(probe.calls.get(), 0);
+    }
+
+    // ── ICMP echo packet build/parse ─────────────────────────────────────────
+
+    #[test]
+    fn build_icmp_echo_request_checksums_to_zero() {
+        let pkt = build_icmp_echo_request(0x1234);
+        assert_eq!(icmp_checksum(&pkt), 0);
+        assert_eq!(pkt[0], 8); // ICMP_ECHO
+        assert_eq!(pkt[1], 0); // code
+        assert_eq!(&pkt[6..8], &[0, 0]); // seq always 0, matching icmp_ping()
+    }
+
+    fn synthetic_icmp_reply(id: u16, icmp_type: u8, seq: u16) -> Vec<u8> {
+        let mut data = vec![0x45u8]; // IPv4, IHL=5 (20-byte header)
+        data.extend([0u8; 19]); // rest of the minimal IP header
+        data.push(icmp_type);
+        data.push(0); // code
+        data.extend([0u8, 0]); // checksum (unchecked by the parser)
+        data.extend(id.to_be_bytes());
+        data.extend(seq.to_be_bytes());
+        data
+    }
+
+    #[test]
+    fn parse_icmp_echo_reply_accepts_matching_reply() {
+        let data = synthetic_icmp_reply(0x1234, 0, 0);
+        assert!(parse_icmp_echo_reply(&data, 0x1234));
+    }
+
+    #[test]
+    fn parse_icmp_echo_reply_rejects_wrong_id() {
+        let data = synthetic_icmp_reply(0x1234, 0, 0);
+        assert!(!parse_icmp_echo_reply(&data, 0x9999));
+    }
+
+    #[test]
+    fn parse_icmp_echo_reply_rejects_non_reply_type() {
+        let data = synthetic_icmp_reply(0x1234, 8, 0); // ICMP_ECHO (request), not a reply
+        assert!(!parse_icmp_echo_reply(&data, 0x1234));
+    }
+
+    #[test]
+    fn parse_icmp_echo_reply_rejects_nonzero_seq() {
+        let data = synthetic_icmp_reply(0x1234, 0, 1);
+        assert!(!parse_icmp_echo_reply(&data, 0x1234));
+    }
+
+    #[test]
+    fn parse_icmp_echo_reply_rejects_truncated_data() {
+        assert!(!parse_icmp_echo_reply(&[0x45], 0x1234));
+        assert!(!parse_icmp_echo_reply(&[], 0x1234));
+    }
+
+    // ── dispatch_dhcp_with_meta: in-use address is skipped ───────────────────
+
+    #[test]
+    fn dispatch_discover_skips_address_that_answers_icmp_ping() {
+        let pkt = base_packet();
+        let cfg = default_cfg(); // pool 10.0.0.100-10.0.0.200, all-zero chaddr seeds .101
+        let mut lease_db = LeaseDb::new();
+        let mut ping_cache = PingCache::new();
+        let mut in_use = std::collections::HashSet::new();
+        in_use.insert(Ipv4Addr::new(10, 0, 0, 101));
+        let probe = ConflictProbe(in_use);
+
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db, &mut ping_cache, &probe)
+            .expect("discover should still offer the next free address");
+        assert_ne!(dispatched.reply.yiaddr, Ipv4Addr::new(10, 0, 0, 101));
+        assert_eq!(dispatched.reply.yiaddr, Ipv4Addr::new(10, 0, 0, 102));
+    }
+
+    // ── --read-ethers ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_ethers_text_reads_address_and_name_lines() {
+        let text = "aa:bb:cc:dd:ee:ff 10.0.0.5\n00:11:22:33:44:55 myhost\n";
+        let records = parse_ethers_text(text);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].hwaddr, [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        assert_eq!(records[0].key, EthersKey::Addr(Ipv4Addr::new(10, 0, 0, 5)));
+        assert_eq!(records[1].hwaddr, [0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        assert_eq!(records[1].key, EthersKey::Name("myhost".into()));
+    }
+
+    #[test]
+    fn parse_ethers_text_skips_comments_blank_and_plus_lines() {
+        let text = "# a comment\n\n+netgroup\naa:bb:cc:dd:ee:ff 10.0.0.5\n";
+        let records = parse_ethers_text(text);
+        assert_eq!(records.len(), 1);
+    }
+
+    #[test]
+    fn parse_ethers_text_skips_bad_hwaddr() {
+        let records = parse_ethers_text("not-a-mac 10.0.0.5\n");
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn parse_ethers_text_skips_line_with_no_second_field() {
+        let records = parse_ethers_text("aa:bb:cc:dd:ee:ff\n");
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn parse_ethers_text_skips_illegal_hostname() {
+        // A leading "-" is not a legal hostname start character.
+        let records = parse_ethers_text("aa:bb:cc:dd:ee:ff -bad\n");
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn apply_ethers_records_creates_new_config_from_address_line() {
+        let mut dhcp_conf = Vec::new();
+        let records = parse_ethers_text("aa:bb:cc:dd:ee:ff 10.0.0.5\n");
+        let count = apply_ethers_records(&mut dhcp_conf, records);
+        assert_eq!(count, 1);
+        assert_eq!(dhcp_conf.len(), 1);
+        let cfg = &dhcp_conf[0];
+        assert_ne!(cfg.flags & CONFIG_FROM_ETHERS, 0);
+        assert_ne!(cfg.flags & crate::types::dhcp::CONFIG_ADDR, 0);
+        assert_ne!(cfg.flags & CONFIG_NOCLID, 0);
+        assert_eq!(cfg.addr, Ipv4Addr::new(10, 0, 0, 5));
+        assert_eq!(cfg.hwaddrs.len(), 1);
+        assert_eq!(&cfg.hwaddrs[0].hwaddr[..6], &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        assert_eq!(cfg.hwaddrs[0].hwaddr_len, 6);
+    }
+
+    #[test]
+    fn apply_ethers_records_creates_new_config_from_name_line() {
+        let mut dhcp_conf = Vec::new();
+        let records = parse_ethers_text("aa:bb:cc:dd:ee:ff myhost\n");
+        apply_ethers_records(&mut dhcp_conf, records);
+        assert_eq!(dhcp_conf.len(), 1);
+        assert_eq!(dhcp_conf[0].hostname.as_deref(), Some("myhost"));
+        assert_ne!(dhcp_conf[0].flags & CONFIG_NAME, 0);
+    }
+
+    fn empty_static_config() -> DhcpConfig {
+        DhcpConfig {
+            flags: 0,
+            clid: None,
+            hostname: None,
+            domain: None,
+            netid: vec![],
+            filter: vec![],
+            addr: Ipv4Addr::UNSPECIFIED,
+            decline_time: None,
+            lease_time: 0,
+            hwaddrs: vec![],
+            #[cfg(feature = "dhcp6")]
+            addr6: vec![],
+        }
+    }
+
+    #[test]
+    fn apply_ethers_records_merges_into_existing_dhcp_host_by_address() {
+        let mut dhcp_conf = vec![DhcpConfig {
+            flags: crate::types::dhcp::CONFIG_ADDR,
+            addr: Ipv4Addr::new(10, 0, 0, 5),
+            ..empty_static_config()
+        }];
+        let records = parse_ethers_text("aa:bb:cc:dd:ee:ff 10.0.0.5\n");
+        let count = apply_ethers_records(&mut dhcp_conf, records);
+        assert_eq!(count, 1);
+        // Merged into the existing entry, not appended as a second one.
+        assert_eq!(dhcp_conf.len(), 1);
+        assert_eq!(dhcp_conf[0].flags & CONFIG_FROM_ETHERS, 0, "reused entry keeps its non-ethers origin");
+        assert_eq!(dhcp_conf[0].hwaddrs.len(), 1);
+    }
+
+    #[test]
+    fn apply_ethers_records_attaches_to_hwaddr_only_dhcp_host() {
+        let mac = {
+            let mut m = [0u8; DHCP_CHADDR_MAX];
+            m[..6].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+            m
+        };
+        let mut dhcp_conf = vec![DhcpConfig {
+            flags: 0, // no addr/name yet — just a bare hwaddr reservation
+            hwaddrs: vec![HwaddrConfig { hwaddr: mac, hwaddr_len: 6, hwaddr_type: 1, wildcard_mask: 0 }],
+            ..empty_static_config()
+        }];
+        let records = parse_ethers_text("aa:bb:cc:dd:ee:ff 10.0.0.5\n");
+        apply_ethers_records(&mut dhcp_conf, records);
+        assert_eq!(dhcp_conf.len(), 1, "should attach to the existing hwaddr entry, not create a new one");
+        assert_eq!(dhcp_conf[0].addr, Ipv4Addr::new(10, 0, 0, 5));
+    }
+
+    #[test]
+    fn apply_ethers_records_purges_stale_entries_on_rerun() {
+        let mut dhcp_conf = Vec::new();
+        apply_ethers_records(&mut dhcp_conf, parse_ethers_text("aa:bb:cc:dd:ee:ff 10.0.0.5\n"));
+        assert_eq!(dhcp_conf.len(), 1);
+
+        // Simulate a SIGHUP re-read with a file that no longer mentions
+        // 10.0.0.5 — the stale entry must be gone, not accumulate.
+        apply_ethers_records(&mut dhcp_conf, parse_ethers_text("00:11:22:33:44:55 10.0.0.6\n"));
+        assert_eq!(dhcp_conf.len(), 1);
+        assert_eq!(dhcp_conf[0].addr, Ipv4Addr::new(10, 0, 0, 6));
+    }
+
+    #[test]
+    fn apply_ethers_records_drops_duplicate_address_within_same_file() {
+        let mut dhcp_conf = Vec::new();
+        let records = parse_ethers_text(
+            "aa:bb:cc:dd:ee:ff 10.0.0.5\n00:11:22:33:44:55 10.0.0.5\n",
+        );
+        let count = apply_ethers_records(&mut dhcp_conf, records);
+        assert_eq!(count, 1, "the second line duplicates the first line's address");
+        assert_eq!(dhcp_conf.len(), 1);
+        assert_eq!(&dhcp_conf[0].hwaddrs[0].hwaddr[..6], &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+    }
+
+    #[test]
+    fn dhcp_read_ethers_populates_static_host_config_from_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ethers");
+        std::fs::write(&path, "aa:bb:cc:dd:ee:ff 10.0.0.5\n00:11:22:33:44:55 myhost\n").unwrap();
+
+        let mut dhcp_conf = Vec::new();
+        let count = dhcp_read_ethers(&mut dhcp_conf, path.to_str().unwrap()).expect("file should be read");
+        assert_eq!(count, 2);
+        assert!(dhcp_conf.iter().any(|c| c.flags & CONFIG_FROM_ETHERS != 0
+            && c.flags & crate::types::dhcp::CONFIG_ADDR != 0
+            && c.addr == Ipv4Addr::new(10, 0, 0, 5)));
+        assert!(dhcp_conf.iter().any(|c| c.flags & CONFIG_FROM_ETHERS != 0
+            && c.hostname.as_deref() == Some("myhost")));
+    }
+
+    #[test]
+    fn dhcp_read_ethers_missing_file_returns_error() {
+        let mut dhcp_conf = Vec::new();
+        assert!(dhcp_read_ethers(&mut dhcp_conf, "/nonexistent/path/to/ethers").is_err());
     }
 }

@@ -115,7 +115,10 @@ proptest! {
         let pool_end   = Ipv4Addr::new(10, 0, 0, start_octet.saturating_add(span));
         let opts = options_with_type(DhcpMsgType::Discover);
         let pkt  = minimal_pkt(opts, Ipv4Addr::UNSPECIFIED);
-        let reply = handle_discover(&pkt, pool_start, pool_end, None, server_ip, None);
+        // `handle_discover` no longer scans for a free address itself (that's
+        // `dhcp::address_allocate`, exercised separately); feed it a
+        // pre-scanned candidate the way `dispatch_dhcp_with_meta` would.
+        let reply = handle_discover(&pkt, pool_start, pool_end, None, server_ip, None, Some(pool_start));
         prop_assume!(reply.is_some());
         let offered = u32::from(reply.unwrap().yiaddr);
         prop_assert!(

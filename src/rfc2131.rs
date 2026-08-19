@@ -46,14 +46,21 @@ fn in_pool(addr: Ipv4Addr, start: Ipv4Addr, end: Ipv4Addr) -> bool {
     u32::from(start) <= a && a <= u32::from(end)
 }
 
-/// Pick an address to offer: re-use the existing lease address when present,
-/// otherwise hand out `pool_start`.
+/// Pick an address to offer: a static reservation wins, then a re-usable
+/// existing lease, then whatever the caller's pool scan already found.
+///
+/// `scanned_addr` is the result of [`crate::dhcp::address_allocate`] — this
+/// function has no access to the lease database, DHCP contexts, or an ICMP
+/// prober, so the actual free-address search happens in `dhcp.rs` before
+/// `handle_discover` is called, matching rfc2131.c:1298-1345's `conf` →
+/// `lease->addr` → `address_allocate()` priority chain.
 #[cfg(feature = "dhcp")]
 fn pick_offer_addr(
     pool_start: Ipv4Addr,
     pool_end: Ipv4Addr,
     existing_lease: Option<&DhcpLease>,
     static_addr: Option<Ipv4Addr>,
+    scanned_addr: Option<Ipv4Addr>,
 ) -> Option<Ipv4Addr> {
     if let Some(addr) = static_addr {
         return Some(addr);
@@ -63,12 +70,7 @@ fn pick_offer_addr(
             return Some(lease.addr);
         }
     }
-    // Fall back to pool_start (a real server would search for a free address).
-    if in_pool(pool_start, pool_start, pool_end) {
-        Some(pool_start)
-    } else {
-        None
-    }
+    scanned_addr
 }
 
 /// Build the minimal options block for an OFFER or ACK reply.
@@ -98,8 +100,9 @@ pub fn handle_discover(
     existing_lease: Option<&DhcpLease>,
     server_id: Ipv4Addr,
     static_addr: Option<Ipv4Addr>,
+    scanned_addr: Option<Ipv4Addr>,
 ) -> Option<DhcpReply> {
-    let yiaddr = pick_offer_addr(pool_start, pool_end, existing_lease, static_addr)?;
+    let yiaddr = pick_offer_addr(pool_start, pool_end, existing_lease, static_addr, scanned_addr)?;
     Some(DhcpReply {
         msg_type: DhcpMsgType::Offer,
         yiaddr,
@@ -1646,7 +1649,8 @@ mod tests {
         let start = Ipv4Addr::new(192, 168, 1, 10);
         let end = Ipv4Addr::new(192, 168, 1, 200);
         let server = Ipv4Addr::new(192, 168, 1, 1);
-        let reply = handle_discover(&pkt, start, end, None, server, None).unwrap();
+        let scanned = Ipv4Addr::new(192, 168, 1, 50);
+        let reply = handle_discover(&pkt, start, end, None, server, None, Some(scanned)).unwrap();
         assert_eq!(reply.msg_type, DhcpMsgType::Offer);
         assert!(in_pool(reply.yiaddr, start, end));
     }
@@ -1686,7 +1690,7 @@ mod tests {
             #[cfg(feature = "dhcp6")]
             vendorclass_count: 0,
         };
-        let reply = handle_discover(&pkt, start, end, Some(&lease), server, None).unwrap();
+        let reply = handle_discover(&pkt, start, end, Some(&lease), server, None, None).unwrap();
         assert_eq!(reply.yiaddr, lease_addr);
     }
 

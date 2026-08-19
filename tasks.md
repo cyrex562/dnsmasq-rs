@@ -882,6 +882,104 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     cases call `narrow_context`/check the server-id option before acting; `handle_release`/
     `handle_decline` only check the address against the pool bounds.
 
+- [x] Port the ICMP conflict probe, `--read-ethers`, and real per-interface
+  context selection (dhcp.c: `do_icmp_ping`/`address_allocate`/
+  `dhcp_read_ethers`/`guess_range_netmask`/`complete_context`).
+
+  **ICMP conflict probe.** `IcmpPinger::ping` (`src/dnsmasq.rs`) was a stub
+  that always returned `false` and was never called by anything. It now
+  opens a real `SOCK_RAW`/`IPPROTO_ICMP` socket, sends an echo request built
+  by the (previously dead) `icmp_checksum` via the new
+  `dhcp::build_icmp_echo_request`, and blocks up to its configured timeout
+  for a matching reply parsed by `dhcp::parse_icmp_echo_reply` — matching
+  `icmp_ping()`/`delay_dhcp()` (dnsmasq.c:2339-2469). If the raw socket can't
+  be opened (no `CAP_NET_RAW`) it falls back to "no reply", the same
+  fallback `icmp_ping()` itself takes on `make_icmp_sock()` failure.
+  `dhcp::address_allocate` (dhcp.c:825-922) is the actual free-address
+  scanner: seeded from `sdbm_hash(hwaddr)` (or `LeaseDb::find_max_addr` under
+  `--dhcp-sequential-ip`/`OPT_CONSEC_ADDR`), it walks a context's range
+  skipping router/leased/statically-reserved/non-`is_allocatable_addr`
+  addresses and confirms freedom via the new `dhcp::PingCache` (a port of
+  `do_icmp_ping`'s cache/load-limiter, dhcp.c:769-823). It replaces
+  `pick_offer_addr`'s old "always return `pool_start`" fallback in
+  `rfc2131::handle_discover` — `dispatch_dhcp_with_meta` now runs the real
+  scan (when no static reservation already decided the offer) and passes
+  the result in as `handle_discover`'s new `scanned_addr` parameter, so
+  `handle_discover` itself no longer knows how a free address is found.
+  `sdbm_hash`/`hash_to_addr`/`is_allocatable_addr` (previously dead, only
+  reachable from their own unit tests) are real callers now. `AddressProbe`
+  is the seam: `IcmpPinger` implements it in production, and tests use fake
+  probes instead of real sockets, so conflict detection is deterministically
+  testable in a CAP_NET_RAW-less sandbox.
+  Covered by `dhcp::tests::{address_allocate_*, ping_cache_*,
+  build_icmp_echo_request_checksums_to_zero, parse_icmp_echo_reply_*,
+  dispatch_discover_skips_address_that_answers_icmp_ping}` and
+  `dnsmasq::tests::icmp_pinger_*` (capability-gated: the raw-socket-required
+  assertions skip themselves when the sandbox turns out to have
+  `CAP_NET_RAW`, per the existing "gate capability-dependent tests" rule
+  rather than hard-coding an unprivileged result).
+
+  **`--read-ethers`.** `dhcp::dhcp_read_ethers` reads `/etc/ethers`
+  (`dhcp::ETHERS_FILE`), purges any `CONFIG_FROM_ETHERS` entries from a
+  previous run, and merges each `<hwaddr> <ip-or-hostname>` line into
+  `dhcp_conf` — matching or creating entries the same way
+  `dhcp_read_ethers()` does (dhcp.c:924-1083): reuse a `dhcp-host` entry
+  matched by address/hostname, or one whose sole hwaddr already equals this
+  line's, else create a fresh `CONFIG_FROM_ETHERS` entry. Wired into
+  `dnsmasq::init_daemon_with`, gated on `OPT_ETHERS`, so it now runs at
+  startup instead of being a stored-but-unread flag. Parsing
+  (`parse_ethers_text`) and merging (`apply_ethers_records`) are split out
+  as pure, file-free functions for unit testing.
+  Covered by `dhcp::tests::{parse_ethers_text_*, apply_ethers_records_*,
+  dhcp_read_ethers_*}`.
+
+  **Per-interface context selection.** `context_for_reply` was a flat "first
+  pool-range match, or else the first context regardless of subnet"
+  heuristic; it now delegates to `narrow_context` (already ported and
+  tested, but previously uncalled) for the pool-match →
+  static-same-subnet → any-same-subnet fallback chain `narrow_context()`
+  actually implements (dhcp.c:717-752). Separately, `link_contexts_for_interface`
+  ports `guess_range_netmask`/the local-subnet half of `complete_context`
+  (dhcp.c:568-660): given an arriving interface's local/netmask/broadcast,
+  it fills in netmask for ranges missing `CONTEXT_NETMASK`, computes
+  router/local/broadcast for every context on that subnet, and returns which
+  contexts are valid for a host on that interface.
+  Covered by `dhcp::tests::link_contexts_for_interface_*`.
+
+  Deliberate simplifications, still open:
+  - **`link_contexts_for_interface` has no caller.** Restricting it to the
+    real arrival interface needs `IP_PKTINFO` on the DHCP socket
+    (`bind_listeners`/`make_fd` below) and threading the resulting interface
+    index through `run_dhcp_loop`'s receive path, neither of which exists
+    yet. `context_for_reply`/`narrow_context` still search every configured
+    context rather than just the arriving interface's linked chain.
+  - **`complete_context`'s `shared_networks`/`dhcp-relay` linking is not
+    ported** — only the local-subnet half. Shared-network address pools and
+    `relay->iface_index` assignment (already handled separately by
+    `daemon_dhcp_runtime`'s single-bound-interface relay wiring) are out of
+    scope for `link_contexts_for_interface`.
+  - **`address_allocate`'s `addr_epoch` perturbation is not ported.** Upstream
+    nudges a context's `addr_epoch` when a candidate is rejected
+    (dhcp.c:900-921) so a future scan for the same hwaddr starts somewhere
+    else; every scan here always starts from the same hash-seeded address.
+  - **No requested-IP ping check in DISCOVER.** Upstream also pings a
+    client's *requested* address (option 50) directly, before falling back
+    to a full `address_allocate` scan (rfc2131.c:1340-1341); this port only
+    scans, so a client that asks for a specific free address by number
+    doesn't get it preferentially.
+  - **`make_fd`/`dhcp_init` socket options are still unported**: no
+    `IP_MTU_DISCOVER`/`IP_PMTUDISC_DONT`, `IP_TOS`, `IP_PKTINFO`,
+    `SO_REUSEPORT`/`SO_REUSEADDR` gating, or PXE-port (4011) bind
+    (`enable_pxe`/`daemon->pxefd` don't exist in this port at all). DHCP
+    socket setup in `bind_listeners` is still a plain bind + `set_nonblocking`
+    + optional `SO_BINDTODEVICE`.
+  - **`host_from_dns` is not ported** — DHCP lease hostname resolution has
+    no fallback to a reverse `F_HOSTS` cache lookup.
+  - **No SIGHUP re-run of `--read-ethers`.** Upstream re-reads
+    `/etc/ethers` on reload; this port only reads it once at
+    `init_daemon_with` time, consistent with the rest of the SIGHUP-reload
+    gap already tracked above ("Replace remaining daemon reload stubs").
+
 - [ ] Audit runtime paths that currently exist only as simplified helpers.
   Source of truth: comments marked `stub`, `TODO`, `unimplemented`, and parity mismatches.
   Required tests: focused regression tests per audited path.

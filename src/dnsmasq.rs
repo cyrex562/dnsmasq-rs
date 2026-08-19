@@ -50,7 +50,23 @@ pub fn init_daemon() -> DaemonHandle {
 }
 
 /// Initialize a shared daemon handle from a resolved daemon configuration.
-pub fn init_daemon_with(daemon: Daemon) -> DaemonHandle {
+///
+/// Also runs `--read-ethers` (`OPT_ETHERS`) here, mirroring upstream calling
+/// `dhcp_read_ethers()` once at startup (dnsmasq.c) before the main loop
+/// starts serving. Re-running it on SIGHUP — as upstream also does — isn't
+/// wired up yet, tracked in `tasks.md` alongside the rest of the SIGHUP
+/// reload gap noted in `dnsmasq::on_sighup`.
+pub fn init_daemon_with(mut daemon: Daemon) -> DaemonHandle {
+    #[cfg(feature = "dhcp")]
+    {
+        use tracing::{error, info};
+        if daemon.option_bool(crate::types::constants::OPT_ETHERS) {
+            match crate::dhcp::dhcp_read_ethers(&mut daemon.dhcp_conf, crate::dhcp::ETHERS_FILE) {
+                Ok(count) => info!("read {} - {count} addresses", crate::dhcp::ETHERS_FILE),
+                Err(err) => error!("failed to read {}: {err}", crate::dhcp::ETHERS_FILE),
+            }
+        }
+    }
     Arc::new(RwLock::new(daemon))
 }
 
@@ -730,6 +746,8 @@ fn daemon_dhcp_runtime(daemon: &Daemon) -> Option<DhcpDaemonRuntime> {
             name_match_rules: daemon.dhcp_name_match.clone(),
             tag_rules: daemon.tag_if.clone(),
             relay4,
+            no_ping: daemon.option_bool(crate::types::constants::OPT_NO_PING),
+            consec_addr: daemon.option_bool(crate::types::constants::OPT_CONSEC_ADDR),
         },
         loop_opts: crate::dhcp::DhcpLoopOptions {
             reply_port_override: (client_port != 68).then_some(client_port),
@@ -1190,8 +1208,10 @@ pub async fn run_main_loop_with(
             None => crate::lease::LeaseDb::new(),
         };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        // PING_WAIT (config.h) — per-candidate ICMP echo timeout.
+        let probe: Box<dyn crate::dhcp::AddressProbe + Send + Sync> = Box::new(IcmpPinger::new(3000));
         let task = tokio::spawn(async move {
-            if let Err(e) = run_dhcp_loop(dhcp_sock, dhcp_runtime.server, dhcp_runtime.loop_opts, lease_db, shutdown_rx).await {
+            if let Err(e) = run_dhcp_loop(dhcp_sock, dhcp_runtime.server, dhcp_runtime.loop_opts, lease_db, shutdown_rx, probe).await {
                 error!("dhcp loop exited: {e}");
             }
         });
@@ -1533,19 +1553,72 @@ impl IcmpPinger {
     /// Attempt to ping `addr` via ICMP echo.
     ///
     /// Returns `true` if a reply was received within the configured timeout,
-    /// indicating a potential address conflict.
+    /// indicating a potential address conflict. Port of `icmp_ping()`
+    /// (dnsmasq.c:2339-2378): opens a raw `IPPROTO_ICMP` socket, sends a
+    /// single echo request, and blocks up to the configured timeout for a
+    /// matching reply.
     ///
-    /// **Stub implementation** — always returns `false`.  A production
-    /// implementation would require `CAP_NET_RAW` or root privileges.
+    /// Requires `CAP_NET_RAW` (or root) to open the raw socket. When that's
+    /// unavailable — the common case for this daemon's own test suite and
+    /// for unprivileged deployments without the capability granted — this
+    /// falls back to "no reply", i.e. the address is treated as free. That
+    /// mirrors upstream's own fallback: `icmp_ping()` returns 0 (no reply)
+    /// if `make_icmp_sock()` fails, rather than erroring the whole daemon.
     pub fn ping(&self, addr: Ipv4Addr) -> bool {
-        use tracing::info;
+        use socket2::{Domain, Protocol, Socket, Type};
+        use tracing::debug;
 
-        info!(
-            %addr,
-            timeout_ms = self.timeout.as_millis() as u64,
-            "ICMP ping stub — no reply (not implemented)"
-        );
-        false
+        let socket = match Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4)) {
+            Ok(s) => s,
+            Err(err) => {
+                debug!(%addr, %err, "ICMP raw socket unavailable (missing CAP_NET_RAW?); treating address as free");
+                return false;
+            }
+        };
+        if socket.set_read_timeout(Some(self.timeout)).is_err() {
+            return false;
+        }
+
+        // Low 16 bits of the process id, matching upstream's `rand16()` seed
+        // for `icmp_id` closely enough: any value works as long as it's
+        // stable for the lifetime of this single request/reply exchange.
+        let id = std::process::id() as u16;
+        let packet = crate::dhcp::build_icmp_echo_request(id);
+        let dest: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(addr), 0);
+        if socket.send_to(&packet, &dest.into()).is_err() {
+            return false;
+        }
+
+        let deadline = std::time::Instant::now() + self.timeout;
+        let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 1024];
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            match socket.recv_from(&mut buf) {
+                Ok((n, from)) => {
+                    match from.as_socket_ipv4() {
+                        Some(from4) if *from4.ip() == addr => {}
+                        _ => continue,
+                    }
+                    // SAFETY: `recv_from` initialised exactly the first `n` bytes.
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(buf.as_ptr() as *const u8, n)
+                    };
+                    if crate::dhcp::parse_icmp_echo_reply(bytes, id) {
+                        return true;
+                    }
+                }
+                Err(_) => return false,
+            }
+        }
+    }
+}
+
+#[cfg(feature = "dhcp")]
+impl crate::dhcp::AddressProbe for IcmpPinger {
+    fn in_use(&self, addr: Ipv4Addr) -> bool {
+        self.ping(addr)
     }
 }
 
@@ -2781,11 +2854,25 @@ mod tests {
         assert_eq!(pinger.timeout, Duration::from_millis(500));
     }
 
+    /// Whether this process can open a raw `IPPROTO_ICMP` socket (`CAP_NET_RAW`
+    /// or root). The dev/CI sandbox this repo runs in normally can't, so tests
+    /// that assert on real-network ping outcomes gate on this instead of
+    /// hard-coding a result that only holds in an unprivileged environment.
+    #[cfg(feature = "dhcp")]
+    fn have_raw_icmp_socket() -> bool {
+        socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::RAW, Some(socket2::Protocol::ICMPV4)).is_ok()
+    }
+
     #[cfg(feature = "dhcp")]
     #[test]
-    fn icmp_pinger_stub_returns_false() {
+    fn icmp_pinger_without_raw_socket_permission_returns_false() {
+        if have_raw_icmp_socket() {
+            // Real ICMP behaviour under CAP_NET_RAW/root is environment-
+            // dependent (a loopback ping may well get a real reply), so this
+            // restricted-environment expectation doesn't apply here.
+            return;
+        }
         let pinger = IcmpPinger::new(100);
-        // Stub always returns false (no reply).
         assert!(!pinger.ping(Ipv4Addr::new(192, 168, 1, 1)));
         assert!(!pinger.ping(Ipv4Addr::new(10, 0, 0, 1)));
         assert!(!pinger.ping(Ipv4Addr::LOCALHOST));
@@ -2793,7 +2880,9 @@ mod tests {
 
     #[cfg(feature = "dhcp")]
     #[test]
-    fn icmp_pinger_zero_timeout() {
+    fn icmp_pinger_zero_timeout_returns_false() {
+        // A 0ms deadline expires before any reply could plausibly arrive,
+        // regardless of raw-socket privilege.
         let pinger = IcmpPinger::new(0);
         assert_eq!(pinger.timeout, Duration::from_millis(0));
         assert!(!pinger.ping(Ipv4Addr::new(8, 8, 8, 8)));
@@ -2804,5 +2893,16 @@ mod tests {
     fn icmp_pinger_large_timeout() {
         let pinger = IcmpPinger::new(30_000);
         assert_eq!(pinger.timeout, Duration::from_secs(30));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn icmp_pinger_address_probe_delegates_to_ping() {
+        use crate::dhcp::AddressProbe;
+        if have_raw_icmp_socket() {
+            return;
+        }
+        let pinger = IcmpPinger::new(50);
+        assert!(!AddressProbe::in_use(&pinger, Ipv4Addr::new(192, 168, 1, 1)));
     }
 }
