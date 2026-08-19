@@ -663,6 +663,25 @@ fn daemon_dhcp_runtime(daemon: &Daemon) -> Option<DhcpDaemonRuntime> {
         .map_or(0, |name| crate::network::nametoindex(name) as i32);
     let relay_iface_name = bind_interface.clone();
 
+    // Bind non-split relay entries to the interface owning `relay.local`,
+    // mirroring upstream's `complete_context` (`dhcp.c:669-673`), which sets
+    // `relay->iface_index` once at interface-enumeration time. Without this,
+    // `relay_upstream4`'s `relay.iface_index != 0` guard never matches and a
+    // configured `dhcp-relay` never fires. This runtime only tracks a single
+    // bound interface, so only relays whose `local` equals that interface's
+    // address are bound; split-mode relays match on address directly and
+    // don't need `iface_index`.
+    let mut relay4 = daemon.relay4.clone();
+    for relay in relay4.iter_mut() {
+        if relay.split_mode == 0 {
+            if let crate::types::addr::AllAddr::Addr4(local4) = relay.local_addr {
+                if local4 == bind_ip {
+                    relay.iface_index = relay_iface_index;
+                }
+            }
+        }
+    }
+
     Some(DhcpDaemonRuntime {
         bind_addr: SocketAddr::from((bind_ip, server_port)),
         bind_interface,
@@ -689,7 +708,7 @@ fn daemon_dhcp_runtime(daemon: &Daemon) -> Option<DhcpDaemonRuntime> {
             match_rules: daemon.dhcp_match.clone(),
             name_match_rules: daemon.dhcp_name_match.clone(),
             tag_rules: daemon.tag_if.clone(),
-            relay4: daemon.relay4.clone(),
+            relay4,
         },
         loop_opts: crate::dhcp::DhcpLoopOptions {
             reply_port_override: (client_port != 68).then_some(client_port),
@@ -2101,6 +2120,89 @@ mod tests {
         assert_eq!(runtime.bind_addr, SocketAddr::from((Ipv4Addr::new(127, 0, 0, 1), 1067)));
         assert_eq!(runtime.bind_interface.as_deref(), Some("eth-test"));
         assert_eq!(runtime.loop_opts.reply_port_override, Some(1068));
+    }
+
+    /// Regression test for a bug where a configured non-split `dhcp-relay`
+    /// never fired: `relay_upstream4`'s `relay.iface_index != 0` guard
+    /// (`src/rfc2131.rs`) only matches once something binds `iface_index` to
+    /// the interface owning `relay.local`, mirroring upstream's
+    /// `complete_context` (`dhcp.c:669-673`). `daemon_dhcp_runtime` must do
+    /// that binding itself since nothing else in this runtime does.
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn daemon_dhcp_runtime_binds_relay_iface_index_to_matching_local_addr() {
+        use crate::types::addr::AllAddr;
+        use crate::types::dhcp::{DhcpContext, DhcpNetid, DhcpRelay, CONTEXT_DHCP};
+        use crate::types::network::Iname;
+
+        let mut daemon = Daemon::default();
+        daemon.if_addrs.push(Iname {
+            name: None,
+            addr: Some(MySockAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))),
+            flags: 0,
+        });
+        daemon.if_names.push(Iname { name: Some("lo".into()), addr: None, flags: 0 });
+        daemon.dhcp.push(DhcpContext {
+            lease_time: 3600,
+            addr_epoch: 0,
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::new(127, 0, 0, 255),
+            local: Ipv4Addr::UNSPECIFIED,
+            router: Ipv4Addr::new(127, 0, 0, 1),
+            start: Ipv4Addr::new(127, 0, 0, 10),
+            end: Ipv4Addr::new(127, 0, 0, 20),
+            flags: CONTEXT_DHCP,
+            netid: DhcpNetid { net: "default".into() },
+            filter: vec![],
+            #[cfg(feature = "dhcp6")]
+            start6: std::net::Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            end6: std::net::Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            local6: std::net::Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            prefix: 0,
+            #[cfg(feature = "dhcp6")]
+            if_index: 0,
+            #[cfg(feature = "dhcp6")]
+            valid: 0,
+            #[cfg(feature = "dhcp6")]
+            preferred: 0,
+        });
+
+        // Matches the bound interface's own address: should get iface_index bound.
+        daemon.relay4.push(DhcpRelay {
+            local_addr: AllAddr::Addr4(Ipv4Addr::LOCALHOST),
+            server_addr: AllAddr::Addr4(Ipv4Addr::new(10, 0, 0, 1)),
+            uplink_addr: AllAddr::Addr4(Ipv4Addr::UNSPECIFIED),
+            interface: None,
+            iface_index: 0,
+            port: i32::from(crate::dhcp_protocol::DHCP_SERVER_PORT),
+            split_mode: 0,
+            warned: 0,
+            matchcount: 0,
+        });
+        // Doesn't match the bound interface's address: must stay unbound.
+        daemon.relay4.push(DhcpRelay {
+            local_addr: AllAddr::Addr4(Ipv4Addr::new(10, 9, 9, 9)),
+            server_addr: AllAddr::Addr4(Ipv4Addr::new(10, 0, 0, 1)),
+            uplink_addr: AllAddr::Addr4(Ipv4Addr::UNSPECIFIED),
+            interface: None,
+            iface_index: 0,
+            port: i32::from(crate::dhcp_protocol::DHCP_SERVER_PORT),
+            split_mode: 0,
+            warned: 0,
+            matchcount: 0,
+        });
+
+        let runtime = daemon_dhcp_runtime(&daemon).expect("dhcp runtime should be built");
+        let expected_index = crate::network::nametoindex("lo") as i32;
+        if expected_index == 0 {
+            // No usable "lo" in this sandbox; nothing to assert against.
+            return;
+        }
+        assert_eq!(runtime.server.relay4[0].iface_index, expected_index);
+        assert_eq!(runtime.server.relay4[1].iface_index, 0);
     }
 
     // ── SIGHUP reload ─────────────────────────────────────────────────────────

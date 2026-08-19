@@ -954,6 +954,12 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     populates `Daemon.relay6` (gated `dhcp6`), but there is no
     `relay_upstream6`/`relay_reply6` — DHCPv6 relay entries are stored and
     never consumed. `rfc3315.c`'s relay path is a separate, larger port.
+  - Split-mode RFC 5010 flags suboption: `relay_upstream4`'s `unicast`
+    parameter is always `false` from `run_dhcp_loop` (`src/dhcp.rs`), so the
+    injected agent-information flags byte (`rfc2131.c:3168`) is always `0x00`
+    even for a request that actually arrived unicast. Upstream derives this
+    per-packet from `IP_PKTINFO`/socket ancillary data; this runtime has no
+    such plumbing yet.
   - Lease-remembered agent-id echo: option 82 is echoed back only when the
     *current* request carries it (`rfc2131.c:189-205`); upstream also re-sends
     a *previously seen* agent-id from `lease->agent_id` when the client asks

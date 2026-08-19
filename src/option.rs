@@ -3962,7 +3962,7 @@ fn parse_dhcp_relay(value: &str, cl: &ConfigLine, split_relay: bool) -> Result<R
                 if three.is_some() || two_val.contains('*') {
                     two = None;
                 } else {
-                    three = Some(two_val);
+                    three = Some(server_part);
                 }
             }
         } else if !split_relay {
@@ -3984,7 +3984,7 @@ fn parse_dhcp_relay(value: &str, cl: &ConfigLine, split_relay: bool) -> Result<R
                         if three.is_some() || two_val.contains('*') {
                             two = None;
                         } else {
-                            three = Some(two_val);
+                            three = Some(server_part);
                         }
                     }
                 } else {
@@ -7525,6 +7525,22 @@ mod tests {
     fn apply_dhcp_relay_broadcast_two_arg_form() {
         let mut d = Daemon::default();
         let lines = parse_config_text("dhcp-relay=192.168.1.1,eth0", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.relay4.len(), 1);
+        let relay = &d.relay4[0];
+        assert!(matches!(relay.server_addr, AllAddr::Addr4(a) if a == Ipv4Addr::UNSPECIFIED));
+        assert_eq!(relay.interface.as_deref(), Some("eth0"));
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn apply_dhcp_relay_broadcast_two_arg_form_strips_port_suffix() {
+        // Regression test: upstream truncates `two` in place at '#' before
+        // reusing it as the interface name (option.c's split_chr(two, '#')
+        // mutates the buffer), so `dhcp-relay=<addr>,<iface>#<port>` in
+        // broadcast form must store the interface without the port suffix.
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-relay=192.168.1.1,eth0#67", "test").unwrap();
         apply_config(&mut d, &lines).unwrap();
         assert_eq!(d.relay4.len(), 1);
         let relay = &d.relay4[0];
