@@ -4,18 +4,21 @@
 //! resource records, and full packets.  No `unsafe` code; no C FFI.
 
 use bytes::{BufMut, BytesMut};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
 use crate::cache::{CacheRecord, DnsCache};
 use crate::types::constants::UID_NONE;
 use crate::dns_protocol::{DnsHeader, RrType, HB3_AA, HB3_QR, HB3_TC, HB4_AD, HB4_CD, HB4_RA};
-use crate::types::addr::{AllAddr, CnameAddr, RrDataAddr};
+use crate::types::addr::{AllAddr, CnameAddr, RrBlockAddr, RrDataAddr};
 use crate::types::constants::{
-    F_CNAME, F_DNSSECOK, F_FORWARD, F_IPV4, F_IPV6, F_NEG, F_NOERR, F_NXDOMAIN, F_RCODE,
+    F_CNAME, F_DNSSECOK, F_FORWARD, F_IPV4, F_IPV6, F_KEYTAG, F_NEG, F_NOERR, F_NXDOMAIN, F_RCODE,
     F_REVERSE, F_RR,
 };
-use crate::types::dns_records::{BogusAddr, Cname, Doctor, HostRecord, MxSrvRecord, Naptr, PtrRecord, TxtRecord};
+use crate::types::dns_records::{
+    BogusAddr, Cname, Doctor, HostRecord, InterfaceName, MxSrvRecord, Naptr, PtrRecord, TxtRecord,
+};
+use crate::types::network::Ipsets;
 use crate::domain::CondDomain;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -570,6 +573,13 @@ pub struct ExtractConfig {
     /// `T_SRV`/`T_PTR`, that may be cached via the `F_RR` fallback.  A `T_ANY`
     /// (255) entry on this list means "cache every RR type" (`rfc1035.c:801`).
     pub cache_rr: Vec<u16>,
+    /// `--ipset` (`daemon->ipsets`): domain-suffix → set-name mappings.
+    /// [`extract_addresses`] matches the query name against this list once
+    /// (mirroring `domain_find_sets(daemon->ipsets, ...)` at `forward.c:713`)
+    /// and reports every A/AAAA address extracted for the matched entry's set
+    /// names via [`ExtractOutcome::ipset_hits`]. Actually adding the address to
+    /// the kernel ipset is not yet implemented — see `tasks.md`.
+    pub ipsets: Vec<Ipsets>,
 }
 
 impl Default for ExtractConfig {
@@ -582,8 +592,45 @@ impl Default for ExtractConfig {
             no_neg_cache: false,
             secure: false,
             cache_rr: Vec::new(),
+            ipsets: Vec::new(),
         }
     }
+}
+
+/// An address extracted by [`extract_addresses`] that matched a configured
+/// `--ipset`/`--nftset` domain entry (`rfc1035.c:1009-1028`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpsetHit {
+    pub set_name: String,
+    pub addr:     IpAddr,
+}
+
+/// Find the most-specific [`Ipsets`] entry whose `domain` suffix matches `name`.
+///
+/// Same longest-suffix-match algorithm as upstream's `domain_find_sets()`
+/// (`forward.c:674-690`). A duplicate of [`crate::forward::domain_find_sets`],
+/// which operates on the unrelated `crate::forward::IpSet` type that nothing
+/// currently constructs from parsed config — see `tasks.md` for unifying them.
+fn domain_find_sets<'a>(setlist: &'a [Ipsets], name: &str) -> Option<&'a Ipsets> {
+    let namelen = name.len();
+    let mut matchlen: usize = 0;
+    let mut result: Option<&Ipsets> = None;
+
+    for entry in setlist {
+        let domainlen = entry.domain.len();
+        if namelen >= domainlen {
+            let matchstart = namelen - domainlen;
+            let suffix = &name[matchstart..];
+            let boundary_ok = domainlen == 0
+                || namelen == domainlen
+                || name.as_bytes().get(matchstart.wrapping_sub(1)) == Some(&b'.');
+            if suffix.eq_ignore_ascii_case(&entry.domain) && boundary_ok && domainlen >= matchlen {
+                matchlen = domainlen;
+                result = Some(entry);
+            }
+        }
+    }
+    result
 }
 
 /// Return value of [`extract_addresses`].
@@ -597,6 +644,26 @@ pub enum ExtractResult {
     BadPacket,
 }
 
+/// Full return value of [`extract_addresses`]: the cache outcome plus any
+/// `--ipset`/`--nftset` matches found along the way.
+#[derive(Debug, Clone)]
+pub struct ExtractOutcome {
+    pub result: ExtractResult,
+    /// Addresses extracted for a query name that matched a configured
+    /// `--ipset`/`--nftset` domain entry (`rfc1035.c:1009-1028`). Actually
+    /// adding these to the kernel set is not yet implemented — see `tasks.md`.
+    pub ipset_hits: Vec<IpsetHit>,
+}
+
+/// Lets every existing `assert_eq!(extract_addresses(...), ExtractResult::X)`
+/// call keep comparing against the bare result, without threading
+/// `ipset_hits` through call sites that don't care about it.
+impl PartialEq<ExtractResult> for ExtractOutcome {
+    fn eq(&self, other: &ExtractResult) -> bool {
+        self.result == *other
+    }
+}
+
 /// Maximum CNAME chain depth we will follow in a single reply.
 const CNAME_CHAIN_LIMIT: usize = 10;
 
@@ -605,27 +672,78 @@ fn clamp_ttl(ttl: u32, max_ttl: u32) -> u32 {
     if max_ttl != 0 && ttl > max_ttl { max_ttl } else { ttl }
 }
 
-/// Scan `authority` for a SOA record and return the effective negative TTL.
+/// A SOA record found by [`find_soa`] whose owner name covers the queried name.
+struct SoaMatch {
+    /// RFC 2308 negative-cache TTL: `min(rr.ttl, minimum)`.
+    neg_ttl: u32,
+    /// The SOA's own (lower-cased) owner name — a suffix of the queried name.
+    owner:   String,
+    /// The SOA RR's own TTL, *not* capped by `minimum` — this is what C caches
+    /// the SOA record itself under (`rfc1035.c:620`); the RFC 2308 capping only
+    /// applies to the derived negative-cache TTL.
+    rr_ttl:  u32,
+    /// Wire-format MNAME + RNAME + the 20 raw bytes (SERIAL/REFRESH/RETRY/
+    /// EXPIRE/MINIMUM), matching the blockdata C builds at `rfc1035.c:567-607`
+    /// so the SOA RR itself can be cached as `F_RR`.
+    rdata:   Vec<u8>,
+}
+
+/// Find the SOA record in `authority` whose owner name is `name` itself or a
+/// byte suffix of it, and compute the RFC 2308 negative-cache TTL.
 ///
-/// The negative TTL is `min(soa_ttl, soa_minimum)` as defined by RFC 2308.
-fn find_soa_minimum_ttl(authority: &[DnsRr]) -> Option<u32> {
+/// Port of `find_soa()` (`rfc1035.c:519-650`). Upstream's suffix test is a raw
+/// byte `memcmp` (`rfc1035.c:554-556`), not a dot-boundary check — preserved
+/// here rather than "fixed" to `hostname_issubdomain`, to match observed
+/// upstream behavior exactly.
+///
+/// Unlike upstream, this always returns data for the SOA RR itself when a
+/// name match is found. C conditionally skips caching the SOA
+/// (`cache = cpp == NULL`, `rfc1035.c:1092`) purely to keep a pending CNAME
+/// target's cache entry immediately adjacent to its CNAME in the hash-bucket
+/// linked list C's cache relies on for lookup order; re-calling `find_soa()`
+/// a second time afterwards (`rfc1035.c:1117`) to insert the SOA once that
+/// ordering constraint no longer applies. [`DnsCache`] is a keyed map with no
+/// such adjacency requirement (see [`extract_addresses`]'s `staged` buffer),
+/// so the caller here can always stage the SOA record in one pass.
+fn find_soa(name: &str, authority: &[DnsRr]) -> Option<SoaMatch> {
+    let name_len = name.len();
     for rr in authority {
-        if rr.rtype != 6 /* SOA */ { continue; }
-        // rdata layout after parse_rr decompression:
-        //   MNAME (wire-format labels) | RNAME (wire-format labels) |
-        //   serial(4) | refresh(4) | retry(4) | expire(4) | minimum(4)
-        let mut pos = 0usize;
-        extract_name(&rr.rdata, &mut pos).ok()?; // mname
-        extract_name(&rr.rdata, &mut pos).ok()?; // rname
-        if pos + 20 <= rr.rdata.len() {
-            let minimum = u32::from_be_bytes([
-                rr.rdata[pos + 16],
-                rr.rdata[pos + 17],
-                rr.rdata[pos + 18],
-                rr.rdata[pos + 19],
-            ]);
-            return Some(rr.ttl.min(minimum));
+        if rr.rtype != 6 /* SOA */ || rr.class != 1 /* IN */ {
+            continue;
         }
+        let owner = rr.name.to_lowercase();
+        let soa_len = owner.len();
+        // "SOA must be for the name we're interested in" (rfc1035.c:554-556).
+        if soa_len > name_len || !name[name_len - soa_len..].eq_ignore_ascii_case(&owner) {
+            continue;
+        }
+
+        // rdata layout: MNAME (wire-format labels) | RNAME (wire-format labels)
+        // | serial(4) | refresh(4) | retry(4) | expire(4) | minimum(4).
+        let mut pos = 0usize;
+        let mname = extract_name(&rr.rdata, &mut pos).ok()?;
+        let rname = extract_name(&rr.rdata, &mut pos).ok()?;
+        if pos + 20 > rr.rdata.len() {
+            return None; // bad packet, matching C's CHECK_LEN failure (rfc1035.c:589-594)
+        }
+        let minimum = u32::from_be_bytes([
+            rr.rdata[pos + 16],
+            rr.rdata[pos + 17],
+            rr.rdata[pos + 18],
+            rr.rdata[pos + 19],
+        ]);
+
+        let mut rdata = BytesMut::new();
+        write_name(&mut rdata, &mname);
+        write_name(&mut rdata, &rname);
+        rdata.extend_from_slice(&rr.rdata[pos..pos + 20]);
+
+        return Some(SoaMatch {
+            neg_ttl: rr.ttl.min(minimum),
+            owner,
+            rr_ttl: rr.ttl,
+            rdata: rdata.to_vec(),
+        });
     }
     None
 }
@@ -681,19 +799,25 @@ pub fn extract_addresses(
     cache: &mut DnsCache,
     now: Instant,
     config: &ExtractConfig,
-) -> ExtractResult {
+) -> ExtractOutcome {
     // Staged inserts, committed together at the end.  C builds the same list in
     // `new_chain` and commits it in `cache_end_insert()` (`rfc1035.c:1128`).
     let mut staged: Vec<CacheRecord> = Vec::new();
+    let mut ipset_hits: Vec<IpsetHit> = Vec::new();
+
+    let bad_packet = |ipset_hits| ExtractOutcome { result: ExtractResult::BadPacket, ipset_hits };
+    let rebind_blocked =
+        |ipset_hits| ExtractOutcome { result: ExtractResult::RebindBlocked, ipset_hits };
+    let cached = |ipset_hits| ExtractOutcome { result: ExtractResult::Cached, ipset_hits };
 
     // Only process replies with exactly one question.
     if packet.questions.len() != 1 {
-        return ExtractResult::BadPacket;
+        return bad_packet(ipset_hits);
     }
     let q = &packet.questions[0];
     // Only cache IN (class 1) answers.
     if q.qclass != 1 {
-        return ExtractResult::Cached;
+        return cached(ipset_hits);
     }
     let header = &packet.header;
 
@@ -718,7 +842,7 @@ pub fn extract_addresses(
                 let mut off = 0usize;
                 let target = match extract_name(&rr.rdata, &mut off) {
                     Ok(t)  => t,
-                    Err(_) => return ExtractResult::BadPacket,
+                    Err(_) => return bad_packet(ipset_hits),
                 };
                 let ttl = clamp_ttl(rr.ttl, config.max_ttl);
                 staged.push(CacheRecord {
@@ -734,11 +858,11 @@ pub fn extract_addresses(
             }
             if found {
                 commit_staged(cache, staged, header, now);
-                return ExtractResult::Cached;
+                return cached(ipset_hits);
             }
         }
         // For PTR queries with no PTR answer we do not cache a negative entry.
-        return ExtractResult::Cached;
+        return cached(ipset_hits);
     }
 
     // ── Forward lookup (A, AAAA, or arbitrary RR) ─────────────────────────────
@@ -761,6 +885,13 @@ pub fn extract_addresses(
         _ => (0, false),
     };
 
+    // `daemon->ipsets`/`daemon->nftsets` are matched once against the
+    // *original* question name (`forward.c:713,717` matches against
+    // `daemon->namebuff` before any CNAME-following), and applied to every
+    // A/AAAA address extracted below regardless of which name in the chain it
+    // belongs to (`rfc1035.c:1005-1028`).
+    let ipset_match = domain_find_sets(&config.ipsets, &qname_lower);
+
     // Follow the CNAME chain beginning at the question name.
     let mut current_name = qname_lower.clone();
     let mut cname_hops   = 0usize;
@@ -777,7 +908,7 @@ pub fn extract_addresses(
                 let mut off = 0usize;
                 let target = match extract_name(&rr.rdata, &mut off) {
                     Ok(t)  => t.to_lowercase(),
-                    Err(_) => return ExtractResult::BadPacket,
+                    Err(_) => return bad_packet(ipset_hits),
                 };
                 if insert {
                     staged.push(CacheRecord {
@@ -811,30 +942,39 @@ pub fn extract_addresses(
 
             let addr = match qtype {
                 1 /* A */ => {
-                    if rr.rdata.len() < 4 { return ExtractResult::BadPacket; }
+                    if rr.rdata.len() < 4 { return bad_packet(ipset_hits); }
                     let ip = Ipv4Addr::new(
                         rr.rdata[0], rr.rdata[1], rr.rdata[2], rr.rdata[3],
                     );
                     if config.check_rebind && private_net(ip, !config.local_rebind_ok) {
-                        return ExtractResult::RebindBlocked;
+                        return rebind_blocked(ipset_hits);
                     }
                     AllAddr::Addr4(ip)
                 }
                 28 /* AAAA */ => {
-                    if rr.rdata.len() < 16 { return ExtractResult::BadPacket; }
+                    if rr.rdata.len() < 16 { return bad_packet(ipset_hits); }
                     let mut b = [0u8; 16];
                     b.copy_from_slice(&rr.rdata[..16]);
                     let ip = Ipv6Addr::from(b);
                     if config.check_rebind && private_net6(&ip, !config.local_rebind_ok) {
-                        return ExtractResult::RebindBlocked;
+                        return rebind_blocked(ipset_hits);
                     }
                     AllAddr::Addr6(ip)
+                }
+                16 /* TXT */ => {
+                    log_txt(&current_name, &rr.rdata);
+                    AllAddr::RrData(RrDataAddr { rrtype: rr.rtype, data: rr.rdata.clone() })
                 }
                 _ => AllAddr::RrData(RrDataAddr {
                     rrtype: rr.rtype,
                     data:   rr.rdata.clone(),
                 }),
             };
+            if let (Some(set), Some(ip)) = (ipset_match, addr.as_ip()) {
+                for set_name in &set.sets {
+                    ipset_hits.push(IpsetHit { set_name: set_name.clone(), addr: ip });
+                }
+            }
             if insert {
                 staged.push(CacheRecord {
                     name:    current_name.clone(),
@@ -858,18 +998,36 @@ pub fn extract_addresses(
     // Gated on `insert` too, except NXDOMAIN overrides it: "Can store NXDOMAIN
     // reply for any qtype" (`rfc1035.c:1074-1076`) — a NODATA answer to an
     // uncacheable qtype is not negatively cached, but a true NXDOMAIN is.
+    //
+    // The SOA lookup uses `current_name` — the name after any CNAME chase —
+    // not the original question name: C reassigns its `name` local as it
+    // follows the chain, and `find_soa()` (like the negative cache entry
+    // itself, below) is keyed off that reassigned name (`rfc1035.c:1092`).
     if !found && !config.no_neg_cache && (insert || is_nxdomain) {
-        let neg_ttl = find_soa_minimum_ttl(&packet.authority)
-            .map(|t| clamp_ttl(t, config.max_ttl))
+        let soa = find_soa(&current_name, &packet.authority);
+        let ttl = soa.as_ref()
+            .map(|s| clamp_ttl(s.neg_ttl, config.max_ttl))
             .or_else(|| if config.neg_ttl > 0 { Some(config.neg_ttl) } else { None });
-        if let Some(ttl) = neg_ttl {
+        if let Some(ttl) = ttl {
+            if let Some(soa) = &soa {
+                let rr_ttl = clamp_ttl(soa.rr_ttl, config.max_ttl);
+                staged.push(CacheRecord {
+                    name:    soa.owner.clone(),
+                    flags:   F_FORWARD | F_RR | F_KEYTAG | secflag,
+                    ttl:     rr_ttl,
+                    expires: now + Duration::from_secs(u64::from(rr_ttl)),
+                    addr:    Some(AllAddr::RrBlock(RrBlockAddr { rrtype: 6, rrdata: soa.rdata.clone() })),
+                    rdata:   None,
+                    uid:     UID_NONE,
+                });
+            }
             let neg_flags = if is_nxdomain {
                 F_NXDOMAIN | F_NEG | F_FORWARD | secflag
             } else {
                 addr_flag | F_NEG | F_FORWARD | secflag
             };
             staged.push(CacheRecord {
-                name:    qname_lower,
+                name:    current_name.clone(),
                 flags:   neg_flags,
                 ttl,
                 expires: now + Duration::from_secs(u64::from(ttl)),
@@ -881,7 +1039,7 @@ pub fn extract_addresses(
     }
 
     commit_staged(cache, staged, header, now);
-    ExtractResult::Cached
+    cached(ipset_hits)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -901,6 +1059,11 @@ pub struct LocalConfig<'a> {
     pub host_records:  &'a [HostRecord],
     pub cnames:        &'a [Cname],
     pub naptr_records: &'a [Naptr],
+    /// `--interface-name` (`daemon->int_names`): domain names that resolve to
+    /// an interface's runtime address. Only the domain-suffix check in
+    /// [`check_for_local_domain`] consults this; answering the query with the
+    /// interface's actual address is not implemented (see `tasks.md`).
+    pub int_names:     &'a [InterfaceName],
     /// `--domain-needed` (`OPT_NODOTS_LOCAL`): don't forward A/AAAA queries
     /// for single-label names — answer them locally as NXDOMAIN, or NOERR if
     /// the name matches other local config (`forward.c:355-361`).
@@ -1323,7 +1486,7 @@ pub fn answer_request(
     // gate (rfc1035.c:1223) — include it here alongside A/AAAA.
     if !ans && config.nodots_local && (qtype == 1 || qtype == 28 || qtype == 255) && !name.contains('.') && !name.is_empty() {
         ans = true;
-        nxdomain = !check_for_local_domain(&name, config);
+        nxdomain = !check_for_local_domain(&name, config, &*cache, now);
     }
 
     // 6b. A domain with a `SERV_LITERAL_ADDRESS` server entry and no
@@ -1537,16 +1700,32 @@ pub fn check_for_ignored_address(packet: &DnsPacket, ignore_addrs: &[BogusAddr])
 
 /// Returns `true` if `name` matches any locally-configured record type.
 ///
-/// Checks NAPTR, MX/SRV, TXT, and PTR records for an exact match or subdomain
-/// relationship (mirrors C's `check_for_local_domain()`).
-pub fn check_for_local_domain(name: &str, config: &LocalConfig<'_>) -> bool {
+/// Checks NAPTR, MX/SRV, TXT, interface-name, and PTR records for an exact
+/// match or subdomain relationship, then falls back to any non-terminal cache
+/// entry or a synthesised (`--synth-domain`) name. Port of C's
+/// `check_for_local_domain()` (`rfc1035.c:1301-1338`).
+///
+/// Deliberately does *not* check `config.host_records`: upstream's version of
+/// this function never does, because a host record that matches `name`
+/// exactly for the queried type would already have been answered earlier in
+/// `answer_request`'s local-data pass — this function only decides NOERR vs
+/// NXDOMAIN for query types host records can't themselves answer (NAPTR, TXT,
+/// PTR, ...). Checking `host_records` here as well as upstream's checks would
+/// answer NOERR for combinations upstream answers NXDOMAIN.
+pub fn check_for_local_domain(
+    name:  &str,
+    config: &LocalConfig<'_>,
+    cache: &DnsCache,
+    now:   Instant,
+) -> bool {
     config.naptr_records.iter().any(|n| hostname_issubdomain(name, &n.name))
         || config.mx_records.iter().any(|m| hostname_issubdomain(name, &m.name))
         || config.txt_records.iter().any(|t| hostname_issubdomain(name, &t.name))
+        || config.int_names.iter().any(|i| hostname_issubdomain(name, &i.name))
         || config.ptr_records.iter().any(|p| hostname_issubdomain(name, &p.name))
-        || config.host_records.iter().any(|h| {
-            h.names.iter().any(|n| hostname_issubdomain(name, n))
-        })
+        || crate::cache::cache_find_non_terminal(name, now, cache)
+        || crate::domain::synthesize_ipv4(name, config.synth_domains).is_some()
+        || crate::domain::synthesize_ipv6(name, config.synth_domains).is_some()
 }
 
 /// Rewrite A-record addresses in `packet.answers` according to `doctors`.
@@ -1648,29 +1827,144 @@ pub fn safe_name(name: &str) -> bool {
     name.bytes().all(|b| b >= 0x20 && b < 0x7f)
 }
 
-/// Parse a TXT record payload into printable strings.
+/// Parse a TXT record payload into its counted strings, truncating each one
+/// at its first non-printable byte.
 ///
-/// TXT records contain length-prefixed strings. Non-printable characters are
-/// stripped. Returns the list of decoded strings.
-/// Port of `log_txt()` from rfc1035.c:653-682.
+/// TXT records contain length-prefixed strings. Port of the sanitisation loop
+/// in `log_txt()` (`rfc1035.c:653-682`): C shifts each string's bytes left in
+/// place, *stopping* (`break`, `rfc1035.c:668-671`) at the first byte that
+/// fails `isprint()`, so a non-printable byte truncates the string rather than
+/// being skipped over. Returns `None` for a malformed payload (a length byte
+/// that overruns `data`), matching C's `return 0`.
 pub fn parse_txt_record(data: &[u8]) -> Option<Vec<String>> {
     let mut result = Vec::new();
     let mut pos = 0;
     while pos < data.len() {
         let len = data[pos] as usize;
-        pos += 1;
-        if pos + len > data.len() {
+        if pos + 1 + len > data.len() {
             return None; // bad packet
         }
-        let s: String = data[pos..pos + len]
+        let s: String = data[pos + 1..pos + 1 + len]
             .iter()
-            .filter(|&&b| b >= 0x20 && b < 0x7f)
+            .take_while(|&&b| b == b' ' || b.is_ascii_graphic())
             .map(|&b| b as char)
             .collect();
         result.push(s);
-        pos += len;
+        pos += 1 + len;
     }
     Some(result)
+}
+
+/// Sanitise and log a TXT answer's counted strings, one `tracing::debug!` per
+/// string. Port of `log_txt()` (`rfc1035.c:653-682`) — C calls `log_query()`
+/// per string via the daemon's general query-logging facility, which this
+/// port does not otherwise have (see `tasks.md`); `tracing` is the nearest
+/// equivalent already used for reply-path diagnostics elsewhere in this crate.
+///
+/// Returns `false` for a malformed payload (nothing is logged), matching C's
+/// `return 0`.
+pub fn log_txt(name: &str, rdata: &[u8]) -> bool {
+    match parse_txt_record(rdata) {
+        Some(strings) => {
+            for s in strings {
+                tracing::debug!(name, txt = %s, "reply");
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// One CNAME/A/AAAA answer `report_addresses` decided is reportable: an owner
+/// name paired with its resolved target (a CNAME's target name, or a
+/// stringified A/AAAA address) and that record's TTL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportedAddress {
+    pub name:     String,
+    pub resolved: String,
+    pub ttl:      u32,
+}
+
+/// Decide which CNAME/A/AAAA answers in `packet` should be broadcast to ubus
+/// as connmark-allowlist-resolved events, for a client connection whose
+/// firewall mark is `mark`. Port of `report_addresses()`
+/// (`rfc1035.c:1148-1218`), driven from the reply-send path behind
+/// `--connmark-allowlist-enable` (`forward.c:604-611`, and the three
+/// analogous call sites at `forward.c:1447,1983,2744`).
+///
+/// Pure and always compiled — mirrors how `extract_addresses` reports
+/// `ipset_hits` for the caller to act on rather than reaching into the
+/// kernel itself. The actual ubus broadcast (`ubus_event_bcast_
+/// connmark_allowlist_resolved()`) is a caller concern, gated on the
+/// `conntrack`+`ubus` features the way upstream gates the whole function on
+/// `#if defined(HAVE_CONNTRACK) && defined(HAVE_UBUS)` (`rfc1035.c:1219`).
+///
+/// A wildcard (`"*"`) pattern in any allowlist entry whose `mark`/`mask`
+/// match this connection's mark suppresses the whole report
+/// (`rfc1035.c:1159-1163`) — that allowlist already permits everything, so
+/// there is nothing selective left to report.
+///
+/// Matches upstream's abort-on-malformed-record behavior: a CNAME whose
+/// rdata does not decode to a name, or an A/AAAA record whose rdata is not
+/// exactly 4/16 bytes, stops processing the rest of the answer section
+/// (`rfc1035.c:1172,1199,1208` all `return` rather than skip just that
+/// record).
+pub fn report_addresses(
+    packet: &DnsPacket,
+    mark: u32,
+    allowlists: &[crate::types::network::Allowlist],
+    allowlist_mask: u32,
+) -> Vec<ReportedAddress> {
+    let mut out = Vec::new();
+
+    if packet.header.rcode() != 0 /* NOERROR */ {
+        return out;
+    }
+
+    for al in allowlists {
+        if al.mark == (mark & allowlist_mask & al.mask) && al.patterns.iter().any(|p| p == "*") {
+            return out;
+        }
+    }
+
+    for rr in &packet.answers {
+        if rr.class != 1 /* C_IN */ {
+            continue;
+        }
+        match rr.rtype {
+            5 /* CNAME */ => match extract_name(&rr.rdata, &mut 0) {
+                Ok(target) => {
+                    if safe_name(&rr.name) && safe_name(&target) {
+                        out.push(ReportedAddress { name: rr.name.clone(), resolved: target, ttl: rr.ttl });
+                    }
+                }
+                Err(_) => return out,
+            },
+            1 /* A */ => {
+                if rr.rdata.len() != 4 {
+                    return out;
+                }
+                let addr = Ipv4Addr::new(rr.rdata[0], rr.rdata[1], rr.rdata[2], rr.rdata[3]);
+                if safe_name(&rr.name) {
+                    out.push(ReportedAddress { name: rr.name.clone(), resolved: addr.to_string(), ttl: rr.ttl });
+                }
+            }
+            28 /* AAAA */ => {
+                if rr.rdata.len() != 16 {
+                    return out;
+                }
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&rr.rdata);
+                let addr = Ipv6Addr::from(octets);
+                if safe_name(&rr.name) {
+                    out.push(ReportedAddress { name: rr.name.clone(), resolved: addr.to_string(), ttl: rr.ttl });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out
 }
 
 /// Check if a cache record is stale (TTL expired).
@@ -2272,6 +2566,127 @@ mod tests {
 
         let rec = cache.lookup_by_name("noexist.example.com", F_NXDOMAIN | F_NEG, now).expect("NXDOMAIN not cached");
         assert_eq!(rec.ttl, 300); // clamp to SOA minimum
+
+        // The SOA RR itself must now also be cached, as F_RR (`rfc1035.c:620`).
+        let soa = cache.lookup_by_name("example.com", F_RR, now).expect("SOA not cached");
+        assert_eq!(soa.ttl, 600); // the SOA's own TTL, not capped by `minimum`
+    }
+
+    /// A SOA in the authority section whose owner name is *not* a suffix of
+    /// the queried name must be ignored — `find_soa()`'s "SOA must be for the
+    /// name we're interested in" check (`rfc1035.c:554-556`).
+    #[test]
+    fn find_soa_ignores_soa_for_an_unrelated_zone() {
+        let mut soa_rdata = BytesMut::new();
+        write_name(&mut soa_rdata, "ns.other.com");
+        write_name(&mut soa_rdata, "admin.other.com");
+        soa_rdata.put_u32(1);
+        soa_rdata.put_u32(3600);
+        soa_rdata.put_u32(900);
+        soa_rdata.put_u32(86400);
+        soa_rdata.put_u32(300);
+
+        let mut pkt = vec![
+            0x00, 0x05, 0x84, 0x83, // QR=1 AA=1 RA=1 NXDOMAIN
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+        ];
+        push_question(&mut pkt, "noexist.example.com", 1);
+        push_rr(&mut pkt, "other.com", 6, 600, &soa_rdata); // unrelated zone
+
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        // No `neg_ttl` fallback configured, so the unrelated SOA must not be
+        // used and nothing gets negatively cached.
+        assert_eq!(
+            extract_addresses(&dp, &mut cache, now, &ExtractConfig::default()),
+            ExtractResult::Cached
+        );
+        assert!(cache.lookup_by_name("noexist.example.com", F_NXDOMAIN | F_NEG, now).is_none());
+        assert!(cache.lookup_by_name("other.com", F_RR, now).is_none());
+    }
+
+    /// When a query CNAME-chains to a target with NODATA, the negative cache
+    /// entry (and the `find_soa()` lookup that produces its TTL) must key off
+    /// the CNAME *target*, not the original question name — otherwise it lands
+    /// on the same cache key as the CNAME record just inserted a few lines
+    /// above (`rfc1035.c:1092` re-derives `name` from the CNAME chase before
+    /// calling `find_soa`).
+    #[test]
+    fn negative_cache_lands_under_cname_target_not_original_qname() {
+        let mut soa_rdata = BytesMut::new();
+        write_name(&mut soa_rdata, "ns.example.com");
+        write_name(&mut soa_rdata, "admin.example.com");
+        soa_rdata.put_u32(1);
+        soa_rdata.put_u32(3600);
+        soa_rdata.put_u32(900);
+        soa_rdata.put_u32(86400);
+        soa_rdata.put_u32(120);
+
+        let mut pkt = reply_header(7, 1, 1, 1, 0);
+        push_question(&mut pkt, "foo.com", 1); // A
+        let mut cname_rdata = BytesMut::new();
+        write_name(&mut cname_rdata, "bar.com");
+        push_rr(&mut pkt, "foo.com", 5 /* CNAME */, 300, &cname_rdata);
+        push_rr(&mut pkt, "bar.com", 6 /* SOA */, 600, &soa_rdata); // authority
+
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+        assert_eq!(
+            extract_addresses(&dp, &mut cache, now, &ExtractConfig::default()),
+            ExtractResult::Cached
+        );
+
+        // The CNAME record for foo.com must survive untouched.
+        let cname_rec = cache.lookup_by_name("foo.com", F_CNAME, now).expect("CNAME not cached");
+        assert_eq!(cname_rec.ttl, 300);
+
+        // The negative entry belongs to bar.com (the chase target), not foo.com.
+        assert!(cache.lookup_by_name("foo.com", F_IPV4 | F_NEG, now).is_none());
+        let neg = cache.lookup_by_name("bar.com", F_IPV4 | F_NEG, now).expect("negative entry on target");
+        assert_eq!(neg.ttl, 120);
+    }
+
+    #[test]
+    fn extract_addresses_reports_ipset_hits_for_a_matching_domain() {
+        let mut pkt = reply_header(8, 1, 1, 0, 0);
+        push_question(&mut pkt, "www.example.com", 1);
+        push_rr(&mut pkt, "www.example.com", 1, 300, &[10, 20, 30, 40]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+
+        let cfg = ExtractConfig {
+            ipsets: vec![Ipsets { domain: "example.com".into(), sets: vec!["blocked".into(), "logged".into()] }],
+            ..Default::default()
+        };
+        let outcome = extract_addresses(&dp, &mut cache, now, &cfg);
+        assert_eq!(outcome, ExtractResult::Cached);
+        assert_eq!(
+            outcome.ipset_hits,
+            vec![
+                IpsetHit { set_name: "blocked".into(), addr: IpAddr::V4(Ipv4Addr::new(10, 20, 30, 40)) },
+                IpsetHit { set_name: "logged".into(), addr: IpAddr::V4(Ipv4Addr::new(10, 20, 30, 40)) },
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_addresses_reports_no_ipset_hits_for_a_non_matching_domain() {
+        let mut pkt = reply_header(9, 1, 1, 0, 0);
+        push_question(&mut pkt, "www.other.com", 1);
+        push_rr(&mut pkt, "www.other.com", 1, 300, &[10, 20, 30, 40]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+
+        let cfg = ExtractConfig {
+            ipsets: vec![Ipsets { domain: "example.com".into(), sets: vec!["blocked".into()] }],
+            ..Default::default()
+        };
+        let outcome = extract_addresses(&dp, &mut cache, now, &cfg);
+        assert!(outcome.ipset_hits.is_empty());
     }
 
     #[test]
@@ -2505,6 +2920,7 @@ mod tests {
             host_records: &[],
             cnames:       &[],
             naptr_records: &[],
+            int_names:    &[],
             nodots_local: false,
             synth_domains: &[],
             literal_domains: &[],
@@ -2713,7 +3129,25 @@ mod tests {
     }
 
     #[test]
-    fn check_for_local_domain_matches() {
+    fn check_for_local_domain_matches_naptr_subdomain() {
+        let n = Naptr {
+            name: "myhost.local".into(), replace: "r.test".into(), regexp: String::new(),
+            services: "SIP+D2U".into(), flags: "s".into(), order: 1, pref: 2,
+        };
+        let cfg = LocalConfig { naptr_records: std::slice::from_ref(&n), ..empty_config() };
+        let cache = DnsCache::new(16);
+        let now = Instant::now();
+        assert!(check_for_local_domain("myhost.local", &cfg, &cache, now));
+        assert!(check_for_local_domain("sub.myhost.local", &cfg, &cache, now));
+        assert!(!check_for_local_domain("other.example.com", &cfg, &cache, now));
+    }
+
+    /// Upstream's `check_for_local_domain()` never checks host records
+    /// (`rfc1035.c:1301-1338` has no `daemon->hosts` walk) — a single-label
+    /// name reachable *only* via `--host-record`, queried with a type host
+    /// records can't answer, must stay NXDOMAIN, not become NOERR.
+    #[test]
+    fn check_for_local_domain_does_not_match_host_records() {
         let hr = HostRecord {
             ttl: -1, flags: 0,
             names: vec!["myhost.local".into()],
@@ -2721,9 +3155,57 @@ mod tests {
             addr6: None,
         };
         let cfg = LocalConfig { host_records: std::slice::from_ref(&hr), ..empty_config() };
-        assert!(check_for_local_domain("myhost.local", &cfg));
-        assert!(check_for_local_domain("sub.myhost.local", &cfg));
-        assert!(!check_for_local_domain("other.example.com", &cfg));
+        let cache = DnsCache::new(16);
+        let now = Instant::now();
+        assert!(!check_for_local_domain("myhost.local", &cfg, &cache, now));
+    }
+
+    #[test]
+    fn check_for_local_domain_matches_interface_name_subdomain() {
+        let intr = InterfaceName {
+            name: "router.lan".into(), intr: "eth0".into(), flags: 0,
+            proto4: None, proto6: None, addrs: vec![],
+        };
+        let cfg = LocalConfig { int_names: std::slice::from_ref(&intr), ..empty_config() };
+        let cache = DnsCache::new(16);
+        let now = Instant::now();
+        assert!(check_for_local_domain("router.lan", &cfg, &cache, now));
+        assert!(check_for_local_domain("sub.router.lan", &cfg, &cache, now));
+        assert!(!check_for_local_domain("other.lan", &cfg, &cache, now));
+    }
+
+    #[test]
+    fn check_for_local_domain_matches_non_terminal_cache_entry() {
+        let cfg = empty_config();
+        let mut cache = DnsCache::new(16);
+        let now = Instant::now();
+        let future = now + Duration::from_secs(300);
+        cache.insert(CacheRecord {
+            name:    "cached.example.com".into(),
+            flags:   F_IPV4 | F_FORWARD,
+            ttl:     300,
+            expires: future,
+            addr:    Some(AllAddr::Addr4(Ipv4Addr::new(9, 9, 9, 9))),
+            rdata:   None,
+            uid:     UID_NONE,
+        });
+        assert!(check_for_local_domain("cached.example.com", &cfg, &cache, now));
+        assert!(!check_for_local_domain("uncached.example.com", &cfg, &cache, now));
+    }
+
+    #[test]
+    fn check_for_local_domain_matches_synthetic_name() {
+        let sd = CondDomain {
+            domain: "synth.test".into(), prefix: None, interface: None,
+            start: Ipv4Addr::new(10, 0, 0, 0), end: Ipv4Addr::new(10, 0, 0, 255),
+            start6: Ipv6Addr::UNSPECIFIED, end6: Ipv6Addr::UNSPECIFIED,
+            is6: false, indexed: false, prefixlen: 0,
+        };
+        let cfg = LocalConfig { synth_domains: std::slice::from_ref(&sd), ..empty_config() };
+        let cache = DnsCache::new(16);
+        let now = Instant::now();
+        assert!(check_for_local_domain("10-0-0-5.synth.test", &cfg, &cache, now));
+        assert!(!check_for_local_domain("not-an-address.synth.test", &cfg, &cache, now));
     }
 
     // ── domain-needed / OPT_NODOTS_LOCAL (forward.c:355-361) ────────────────
@@ -3183,10 +3665,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_txt_record_strips_control() {
+    fn parse_txt_record_truncates_at_first_non_printable() {
+        // C's log_txt() breaks the sanitisation loop at the first
+        // non-printable byte rather than skipping it, so "b" after the 0x01
+        // is dropped entirely, not just the 0x01 (rfc1035.c:668-671).
         let data = [3, b'a', 0x01, b'b'];
         let result = parse_txt_record(&data).unwrap();
-        assert_eq!(result, vec!["ab"]); // 0x01 stripped
+        assert_eq!(result, vec!["a"]);
     }
 
     #[test]
@@ -3196,9 +3681,186 @@ mod tests {
     }
 
     #[test]
+    fn parse_txt_record_exact_length_is_not_bad() {
+        // len == remaining bytes exactly must succeed (off-by-one boundary).
+        let data = [5, b'h', b'e', b'l', b'l', b'o'];
+        assert_eq!(parse_txt_record(&data).unwrap(), vec!["hello"]);
+    }
+
+    #[test]
     fn parse_txt_record_empty() {
         let result = parse_txt_record(&[]).unwrap();
         assert!(result.is_empty());
+    }
+
+    // ── log_txt ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn log_txt_returns_true_for_well_formed_payload() {
+        let data = [5, b'h', b'e', b'l', b'l', b'o'];
+        assert!(log_txt("example.com", &data));
+    }
+
+    #[test]
+    fn log_txt_returns_false_for_malformed_payload() {
+        let data = [10, b'x'];
+        assert!(!log_txt("example.com", &data));
+    }
+
+    // ── report_addresses ────────────────────────────────────────────────────
+
+    use crate::types::network::Allowlist;
+
+    fn cname_rdata(target: &str) -> Vec<u8> {
+        let mut bm = BytesMut::new();
+        write_name(&mut bm, target);
+        bm.to_vec()
+    }
+
+    #[test]
+    fn report_addresses_returns_empty_for_non_noerror_rcode() {
+        let mut pkt = reply_header(1, 1, 1, 0, 2 /* SERVFAIL */);
+        push_question(&mut pkt, "example.com", 1);
+        push_rr(&mut pkt, "example.com", 1, 300, &[1, 2, 3, 4]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        assert!(report_addresses(&dp, 6, &[], 0).is_empty());
+    }
+
+    #[test]
+    fn report_addresses_reports_an_a_record() {
+        let mut pkt = reply_header(1, 1, 1, 0, 0);
+        push_question(&mut pkt, "example.com", 1);
+        push_rr(&mut pkt, "example.com", 1, 300, &[93, 184, 216, 34]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        let out = report_addresses(&dp, 6, &[], 0);
+        assert_eq!(
+            out,
+            vec![ReportedAddress {
+                name:     "example.com".to_string(),
+                resolved: "93.184.216.34".to_string(),
+                ttl:      300,
+            }]
+        );
+    }
+
+    #[test]
+    fn report_addresses_reports_an_aaaa_record() {
+        let ip6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let mut pkt = reply_header(1, 1, 1, 0, 0);
+        push_question(&mut pkt, "example.com", 28);
+        push_rr(&mut pkt, "example.com", 28, 300, &ip6.octets());
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        let out = report_addresses(&dp, 6, &[], 0);
+        assert_eq!(out, vec![ReportedAddress {
+            name:     "example.com".to_string(),
+            resolved: "2001:db8::1".to_string(),
+            ttl:      300,
+        }]);
+    }
+
+    #[test]
+    fn report_addresses_reports_a_cname_target() {
+        let mut pkt = reply_header(1, 1, 1, 0, 0);
+        push_question(&mut pkt, "alias.example.com", 5);
+        push_rr(&mut pkt, "alias.example.com", 5, 300, &cname_rdata("target.example.com"));
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        let out = report_addresses(&dp, 6, &[], 0);
+        assert_eq!(out, vec![ReportedAddress {
+            name:     "alias.example.com".to_string(),
+            resolved: "target.example.com".to_string(),
+            ttl:      300,
+        }]);
+    }
+
+    #[test]
+    fn report_addresses_wildcard_allowlist_suppresses_the_whole_report() {
+        let mut pkt = reply_header(1, 1, 1, 0, 0);
+        push_question(&mut pkt, "example.com", 1);
+        push_rr(&mut pkt, "example.com", 1, 300, &[1, 2, 3, 4]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        let allowlists = vec![Allowlist { mark: 6, mask: 0xff, patterns: vec!["*".to_string()] }];
+        assert!(report_addresses(&dp, 6, &allowlists, 0xff).is_empty());
+    }
+
+    #[test]
+    fn report_addresses_non_wildcard_allowlist_does_not_suppress() {
+        let mut pkt = reply_header(1, 1, 1, 0, 0);
+        push_question(&mut pkt, "example.com", 1);
+        push_rr(&mut pkt, "example.com", 1, 300, &[1, 2, 3, 4]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        let allowlists = vec![Allowlist {
+            mark: 6,
+            mask: 0xff,
+            patterns: vec!["*.example.com".to_string()],
+        }];
+        assert_eq!(report_addresses(&dp, 6, &allowlists, 0xff).len(), 1);
+    }
+
+    #[test]
+    fn report_addresses_a_non_matching_allowlist_mark_does_not_suppress() {
+        let mut pkt = reply_header(1, 1, 1, 0, 0);
+        push_question(&mut pkt, "example.com", 1);
+        push_rr(&mut pkt, "example.com", 1, 300, &[1, 2, 3, 4]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        // Allowlist matches mark 7, not the connection's mark of 6.
+        let allowlists = vec![Allowlist { mark: 7, mask: 0xff, patterns: vec!["*".to_string()] }];
+        assert_eq!(report_addresses(&dp, 6, &allowlists, 0xff).len(), 1);
+    }
+
+    #[test]
+    fn report_addresses_ignores_non_in_class_records() {
+        let mut pkt = reply_header(1, 1, 1, 0, 0);
+        push_question(&mut pkt, "example.com", 1);
+        let mut bm = BytesMut::new();
+        write_name(&mut bm, "example.com");
+        pkt.extend_from_slice(&bm);
+        pkt.extend_from_slice(&1u16.to_be_bytes()); // type A
+        pkt.extend_from_slice(&3u16.to_be_bytes()); // class CH, not IN
+        pkt.extend_from_slice(&300u32.to_be_bytes());
+        pkt.extend_from_slice(&4u16.to_be_bytes());
+        pkt.extend_from_slice(&[1, 2, 3, 4]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        assert!(report_addresses(&dp, 6, &[], 0).is_empty());
+    }
+
+    #[test]
+    fn report_addresses_aborts_the_rest_of_the_answer_on_a_malformed_a_record() {
+        // A well-formed CNAME first, then an A record with a truncated
+        // address — upstream returns outright rather than skipping just the
+        // bad record (`rfc1035.c:1198-1199`), so only the CNAME survives.
+        let mut pkt = reply_header(1, 1, 2, 0, 0);
+        push_question(&mut pkt, "alias.example.com", 1);
+        push_rr(&mut pkt, "alias.example.com", 5, 300, &cname_rdata("target.example.com"));
+        push_rr(&mut pkt, "target.example.com", 1, 300, &[1, 2, 3]); // only 3 bytes
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        let out = report_addresses(&dp, 6, &[], 0);
+        assert_eq!(out, vec![ReportedAddress {
+            name:     "alias.example.com".to_string(),
+            resolved: "target.example.com".to_string(),
+            ttl:      300,
+        }]);
+    }
+
+    #[test]
+    fn report_addresses_filters_unsafe_names() {
+        // A name containing a raw control byte fails `safe_name` and must not
+        // be reported (`rfc1035.c:1201,1211`), even though the record itself
+        // is otherwise well-formed.
+        let mut pkt = reply_header(1, 1, 1, 0, 0);
+        push_question(&mut pkt, "example.com", 1);
+        push_rr(&mut pkt, "b\u{01}d.example.com", 1, 300, &[1, 2, 3, 4]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+
+        assert!(report_addresses(&dp, 6, &[], 0).is_empty());
     }
 
     // ── crec_isstale ─────────────────────────────────────────────────────────

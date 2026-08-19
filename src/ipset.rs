@@ -136,6 +136,82 @@ pub fn build_ipset_msg(msg: &IpsetMsg) -> Vec<u8> {
     buf
 }
 
+/// Open a `NETLINK_NETFILTER` socket for ipset control, the new-kernel path of
+/// `ipset_init()` (`ipset.c:88-99`). The pre-2.6.32 `SOL_IP`/`getsockopt`
+/// fallback for `old_kernel` is not ported — this crate does not track a
+/// `daemon->kernel_version` anywhere, so there is nothing to gate that
+/// fallback on; every kernel this port targets is well past 2.6.32.
+#[cfg(target_os = "linux")]
+fn open_ipset_socket() -> std::io::Result<std::os::unix::io::RawFd> {
+    const NETLINK_NETFILTER: libc::c_int = 12;
+
+    let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, NETLINK_NETFILTER) };
+    if fd == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // sockaddr_nl: u16 nl_family, u16 nl_pad, u32 nl_pid, u32 nl_groups
+    let mut addr = [0u8; 12];
+    addr[0..2].copy_from_slice(&(libc::AF_NETLINK as u16).to_ne_bytes());
+    let bind_ret = unsafe {
+        libc::bind(fd, addr.as_ptr() as *const libc::sockaddr, addr.len() as libc::socklen_t)
+    };
+    if bind_ret == -1 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
+    Ok(fd)
+}
+
+/// Add (or remove) an address in a kernel ipset over netlink.
+///
+/// Mirrors `add_to_ipset()` / `new_add_to_ipset()` (`ipset.c:104-141,177-193`):
+/// fire-and-forget, like upstream — the message is handed to the kernel socket
+/// and this returns without waiting for or parsing an ACK, since upstream's own
+/// `new_add_to_ipset()` never reads a reply either (it only checks `errno` from
+/// the `sendto()` itself, `ipset.c:139`). A failure here (no `ip_set` kernel
+/// module, missing set, no permission) is `Err` for the caller to log, matching
+/// `add_to_ipset()`'s `my_syslog(LOG_ERR, ...)` (`ipset.c:172-173`).
+#[cfg(target_os = "linux")]
+pub fn add_to_ipset(setname: &str, addr: IpAddr, remove: bool) -> std::io::Result<()> {
+    let family = match addr {
+        IpAddr::V4(_) => 2,  // AF_INET
+        IpAddr::V6(_) => 10, // AF_INET6
+    };
+    let msg = IpsetMsg {
+        family,
+        set_name: setname.to_string(),
+        addr,
+        command: if remove { IpsetCommand::Del } else { IpsetCommand::Add },
+    };
+    let buf = build_ipset_msg(&msg);
+
+    let fd = open_ipset_socket()?;
+    // Destination: sockaddr_nl for the kernel (pid = 0).
+    let mut dest = [0u8; 12];
+    dest[0..2].copy_from_slice(&(libc::AF_NETLINK as u16).to_ne_bytes());
+    let sent = unsafe {
+        libc::sendto(
+            fd,
+            buf.as_ptr() as *const libc::c_void,
+            buf.len(),
+            0,
+            dest.as_ptr() as *const libc::sockaddr,
+            dest.len() as libc::socklen_t,
+        )
+    };
+    let result = if sent == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) };
+    unsafe { libc::close(fd) };
+    result
+}
+
+/// No-op stub on non-Linux targets — ipset is a Linux kernel facility, same
+/// gate `conntrack::get_incoming_mark` and `forward::set_outgoing_mark` use.
+#[cfg(not(target_os = "linux"))]
+pub fn add_to_ipset(_setname: &str, _addr: IpAddr, _remove: bool) -> std::io::Result<()> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "ipset is a Linux-only facility"))
+}
+
 /// Parse an ipset name list from `/proc/net/ip_set` format.
 /// Each line looks like: `<index> <name> ...` — we return the name tokens.
 pub fn parse_ipset_list(text: &str) -> Vec<String> {
@@ -205,5 +281,33 @@ Name
     fn test_parse_ipset_list_empty() {
         assert!(parse_ipset_list("").is_empty());
         assert!(parse_ipset_list("Name\n").is_empty());
+    }
+
+    /// Capability-dependent: creating a `NETLINK_NETFILTER` socket needs no
+    /// special privilege, but the sandbox this runs in may still deny it (no
+    /// `ip_set` kernel module, no netlink support at all). Either way
+    /// `add_to_ipset` must not panic — a fabricated set name never matches a
+    /// real set, so both `Ok` (kernel accepted the datagram) and `Err` (socket
+    /// or send failed) are valid outcomes; only a panic would be a bug.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn add_to_ipset_does_not_panic() {
+        let _ = add_to_ipset(
+            "dnsmasq_rs_test_set_that_does_not_exist",
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+            false,
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn add_to_ipset_is_unsupported_off_linux() {
+        let err = add_to_ipset(
+            "myset",
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
     }
 }

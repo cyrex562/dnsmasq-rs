@@ -111,11 +111,33 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   - The DNSSEC-retry mark copy (`forward.c:1072-1074`) — the DNSSEC
     sub-query retry path in `forward_query`'s C equivalent has no Rust
     counterpart yet.
-  - The `HAVE_UBUS`-gated connmark-allowlist branches (`forward.c:605-613`,
-    `1441-1447`, `1902-1997`, `2546-2555`) that call `get_incoming_mark()` to
-    decide `report_addresses()`/`is_query_allowed_for_mark()` — these need
-    the (non-default) `ubus` feature and its own call sites, not just
-    `conntrack`.
+  - The `HAVE_UBUS`-gated connmark-allowlist branch at the main UDP fan-out
+    reply path (`forward.c:1429-1447`, i.e. `accept_reply`'s per-target
+    delivery loop in `run_forward_loop`) is now wired up: `rfc1035::
+    report_addresses` (a pure port of `rfc1035.c:1148-1218`, returning
+    `Vec<ReportedAddress>` rather than reaching into ubus itself — mirrors
+    how `extract_addresses` reports `ipset_hits` for the caller to act on)
+    is called per `ReplyTarget` behind `ForwardConfig::cmark_alst_en`
+    (`OPT_CMARK_ALST_EN`), gated on `feature = "conntrack"` +
+    `feature = "ubus"`, using `conntrack::get_incoming_mark` for the
+    per-client mark exactly as `forward.c:1439-1444` does. Each reported
+    name/target pair is broadcast via the new `ubus::
+    ubus_event_bcast_connmark_allowlist_resolved`, which sends this crate's
+    existing simplified project-defined wire encoding (see `ubus.rs`'s module
+    doc — not OpenWrt's real binary ubus protocol) to a `UnixStream` at the
+    well-known `/var/run/ubus.sock` path, best-effort (silently dropped if
+    nothing is listening).
+
+    Still not ported: the other three `report_addresses` call sites
+    (`forward.c:604-613` synchronous local-answer reply, `1902-1997` and
+    `2546-2555`, both inside DNSSEC-validation-retry/failure paths) — none
+    of those reply paths have a Rust counterpart yet to hang the call off of.
+    Also not ported: `is_query_allowed_for_mark()` (`forward.c:1526`), a
+    distinct query-*admission* filter (should this query even be forwarded,
+    based on the connmark allowlist patterns) that is unrelated to
+    `report_addresses`'s reply-*reporting* role and out of this ticket's
+    rfc1035.c-depth scope. The TCP reply path has no `report_addresses` call
+    either, for the same reason noted above (no Rust TCP DNS listener yet).
   - Reload staleness (partially fixed). SIGHUP reload (`dnsmasq::on_sighup` /
     `clear_cache_and_reload`) now flushes and rebuilds the *live* `DnsCache` — it is a
     `cache::SharedDnsCache` threaded into `run_forward_loop_on` rather than a task-local
@@ -326,7 +348,53 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   - `--add-subnet` reply verification (`check_source()`, `forward.c:727-731`) and the
     `FREC_NO_CACHE` handling that goes with it. `edns0::check_source_subnet` and
     `verify_ecs_reply` exist and are still uncalled.
-  - ipset / nftset population. `domain_find_sets` is ported; nothing consumes it.
+  - ipset kernel population is now wired end to end: `rfc1035::extract_addresses` matches the
+    query name against `ExtractConfig::ipsets` (a local `domain_find_sets`, duplicating
+    `forward::domain_find_sets`/`IpSet` — nothing constructs an `IpSet` from parsed config,
+    so unifying the two types is still follow-up work) and reports every matched A/AAAA address
+    via `ExtractOutcome::ipset_hits`; `forward::cache_upstream_reply` now calls
+    `ipset::add_to_ipset` for each hit (feature = `ipset`, Linux only), which opens a
+    `NETLINK_NETFILTER` socket and sends the `IPSET_CMD_ADD` built by the existing
+    `ipset::build_ipset_msg`, mirroring `add_to_ipset()`/`new_add_to_ipset()`
+    (`ipset.c:104-141,177-193`) fire-and-forget (no ACK is awaited, matching upstream). Off
+    Linux or without the `ipset` feature, the match is still logged via `tracing::debug!` so it
+    stays observable. Not ported: the pre-2.6.32 `SOL_IP`/`getsockopt` fallback (`old_kernel` in
+    `ipset.c` — this crate tracks no `kernel_version` to gate it on) and reusing a single
+    persistent socket across calls the way `ipset_init()` does (a socket is opened and closed
+    per call here instead; correctness is unaffected, only efficiency).
+
+    **nftset is explicitly out of scope**, and differently so than ipset: upstream's
+    `add_to_nftset()` (`nftset.c:41-93`) does not build a raw netlink message at all — it shells
+    out to `libnftables` (`nft_run_cmd_from_buffer()`) with a textual `add element <set> { <ip> }`
+    command. That is an FFI dependency this crate does not have (no `libnftables`/`nftables`
+    binding in `Cargo.toml`), so `nftset.rs`'s existing raw-`NEWSETELEM`-netlink builder does not
+    actually match upstream's mechanism and could not be wired to real behavior without adding a
+    new C library dependency — a materially bigger change than this ticket's scope. `nftset=`
+    directive parsing is also still explicitly rejected
+    (`option::apply_nftset_is_explicitly_unsupported`), so there is no config path that could
+    reach it yet either; `ExtractConfig`/`ForwardConfig` carry `ipsets` only, matching what can
+    actually be configured today.
+  - `find_soa` (`rfc1035.rs`, port of `rfc1035.c:519-650`) does not apply DNSSEC TTL capping
+    from a per-answer signature-validity array (`daemon->rr_status[i + ancount]`,
+    `rfc1035.c:609-618`) — that array does not exist anywhere in the DNSSEC path yet
+    (`grep rr_status` finds nothing outside upstream C), so capping it here in isolation would
+    be unverifiable. It does now: verify the SOA's owner name is a byte suffix of the queried
+    name before using it (`rfc1035.c:554-556`), and cache the SOA RR itself as `F_RR|F_KEYTAG`
+    (`rfc1035.c:620`).
+  - `log_txt` (`rfc1035.rs`, port of `rfc1035.c:653-682`) truncates each TXT string at its first
+    non-printable byte and logs via `tracing::debug!` per string, called from
+    `extract_addresses`'s TXT branch. C logs through its general `log_query()` facility, which
+    this crate does not have (`grep -rn "fn log_query"` finds nothing outside
+    `forward::log_query_mysockaddr`, an unrelated helper) — `answer_request`'s local-config TXT
+    branch (`rfc1035.c`'s second `log_txt` call site, serving from cache/local data) does not
+    call `log_txt` yet, so TXT answers built from `--txt-record` are not logged the way a
+    forwarded TXT reply now is.
+  - `check_for_local_domain` now checks `daemon->int_names` (`--interface-name`) for a
+    domain-suffix match, matching upstream — but only for the domain-needed NOERR/NXDOMAIN
+    decision. Actually *answering* an A/AAAA/PTR query for an interface-name domain with the
+    interface's runtime address (upstream's other `int_names` consumers) is not implemented
+    anywhere in this crate; `daemon.int_names` is parsed and now read once, but never turned
+    into a real answer.
   - The reply is not sized against each client's advertised `udp_pkt_size`, so C's
     per-`frec_src` truncation fallback (`forward.c:1463-1475`) has no equivalent — this port
     also never rewrites the payload size on the *outgoing* query, so it forwards whatever the
