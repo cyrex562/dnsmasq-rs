@@ -34,6 +34,19 @@ class TestRecord(unittest.TestCase):
         self.assertFalse(r.reverted)
         self.assertEqual(r.outcome, "started")
 
+    def test_current_stage_defaults_empty(self):
+        r = CycleRecord(key="K", number=1, title="t")
+        self.assertEqual(r.current_stage, "")
+
+    def test_current_stage_round_trips_to_disk(self):
+        d = tempfile.mkdtemp()
+        r = CycleRecord(key="T0-1", number=2, title="t")
+        r.current_stage = "judge (sonnet)"
+        path = save_record(r, d)
+        with open(path) as f:
+            back = json.load(f)
+        self.assertEqual(back["current_stage"], "judge (sonnet)")
+
 
 if __name__ == "__main__":
     unittest.main()

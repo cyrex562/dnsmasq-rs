@@ -44,7 +44,7 @@ LOG_FILE = os.path.join(HERE, "state", "harness.log")
 HEARTBEAT_SECS = 60
 
 
-def log(msg):
+def log(msg, record=None):
     line = f"[harness] {msg}"
     print(line, flush=True)
     try:
@@ -54,9 +54,16 @@ def log(msg):
             f.write(f"{ts} {line}\n")
     except OSError:
         pass  # the stdout line above is the primary record; this is a convenience
+    # The text log above is for a human tailing the file. `record`, when given,
+    # is the structured, per-issue state a monitor can poll instead of
+    # regex-matching human phrasing — every field on it (verdict, pr_url,
+    # merged, ...) is current as of this call, not just current_stage.
+    if record is not None:
+        record.current_stage = msg.strip()
+        save_record(record)
 
 
-def _heartbeat(label):
+def _heartbeat(label, record=None):
     """Returns a stop function. Logs a liveness line every HEARTBEAT_SECS
     until stopped, so a long-running stage doesn't look identical to a hang."""
     stop = threading.Event()
@@ -64,7 +71,7 @@ def _heartbeat(label):
 
     def beat():
         while not stop.wait(HEARTBEAT_SECS):
-            log(f"    ...{label} still running ({int(time.monotonic() - start)}s)")
+            log(f"    ...{label} still running ({int(time.monotonic() - start)}s)", record=record)
 
     thread = threading.Thread(target=beat, daemon=True)
     thread.start()
@@ -121,12 +128,13 @@ def summarize_gate(result):
 
 
 def _record_stage(record, name, model, fn):
-    log(f"  {name} ({model})")
-    stop_heartbeat = _heartbeat(name)
+    log(f"  {name} ({model})", record=record)
+    stop_heartbeat = _heartbeat(name, record=record)
     try:
         out = fn()
     except Exception as e:  # noqa: BLE001 — recorded, then re-raised
         record.stages.append({"stage": name, "model": model, "ok": False, "error": str(e)})
+        save_record(record)
         raise
     finally:
         stop_heartbeat()
@@ -138,6 +146,7 @@ def _record_stage(record, name, model, fn):
         "output": text[:MAX_STORED_OUTPUT],
         "truncated": len(text) > MAX_STORED_OUTPUT,
     })
+    save_record(record)
     return out
 
 
@@ -178,8 +187,8 @@ def _implement_until_gate_passes(meta, record, worktree, common, research,
             raise NoChangesNeeded(implement_output)
         gitops.commit_all(worktree, f"{meta.title}\n\nCloses #{meta.number}")
 
-        log("  gate")
-        stop_heartbeat = _heartbeat("gate")
+        log("  gate", record=record)
+        stop_heartbeat = _heartbeat("gate", record=record)
         try:
             result = run_gate(worktree, parity=meta.wants_parity)
         finally:
@@ -187,9 +196,9 @@ def _implement_until_gate_passes(meta, record, worktree, common, research,
         record.gate_failures = result.failures
         gate_output = summarize_gate(result)
         if result.ok:
-            log(f"  gate clean | {_parity_line(result.raw)}")
+            log(f"  gate clean | {_parity_line(result.raw)}", record=record)
             return result, gate_output
-        log(f"  gate failed: {'; '.join(result.failures)[:200]}")
+        log(f"  gate failed: {'; '.join(result.failures)[:200]}", record=record)
 
     return None, gate_output
 
@@ -200,7 +209,7 @@ def _merge_and_verify(meta, record, worktree, branch, judgement, review):
             f"## Review\n\n{review}\n")
     pr = gitops.push_and_pr(worktree, branch, meta.title, body)
     record.pr_url = pr
-    log(f"  pr {pr}")
+    log(f"  pr {pr}", record=record)
 
     gitops.squash_merge(worktree, pr)
     record.merged = True
@@ -216,21 +225,21 @@ def _verify_or_revert(meta, record):
     verification and leaves master unchecked.
     """
     gitops.sync_master(REPO)
-    log("  post-merge gate")
-    stop_heartbeat = _heartbeat("post-merge gate")
+    log("  post-merge gate", record=record)
+    stop_heartbeat = _heartbeat("post-merge gate", record=record)
     try:
         post = run_gate(REPO, parity=meta.wants_parity)
     finally:
         stop_heartbeat()
     if post.ok:
         record.outcome = "merged"
-        log("  merged and verified")
+        log("  merged and verified", record=record)
         return
 
     sha = gitops.revert_head(REPO)
     record.reverted = True
     record.outcome = "reverted"
-    log(f"  POST-MERGE RED — reverted as {sha}")
+    log(f"  POST-MERGE RED — reverted as {sha}", record=record)
     _park(meta, "Auto-reverted: the post-merge gate failed on master.\n\n"
                 + "\n".join(post.failures))
 
@@ -255,13 +264,12 @@ def run_cycle(meta, dry_run=False):
 
     if dry_run:
         record.outcome = "dry-run"
-        save_record(record)
-        log("  dry run — stopping before implement")
+        log("  dry run — stopping before implement", record=record)
         return record
 
     branch = gitops.branch_name(meta.key)
     worktree = gitops.make_worktree(REPO, branch)
-    log(f"  worktree {worktree}")
+    log(f"  worktree {worktree}", record=record)
 
     objections = ""
     try:
@@ -288,14 +296,14 @@ def run_cycle(meta, dry_run=False):
             complete, objections = claude_runner.parse_verdict(judgement)
             record.verdict = "complete" if complete else "incomplete"
             record.objections = objections
-            log(f"  judge: {record.verdict}")
+            log(f"  judge: {record.verdict}", record=record)
 
             if complete:
                 _merge_and_verify(meta, record, worktree, branch, judgement, review)
                 break
 
             if judge_attempt < MAX_JUDGE_RETRIES:
-                log(f"  retrying with objections ({judge_attempt + 1}/{MAX_JUDGE_RETRIES})")
+                log(f"  retrying with objections ({judge_attempt + 1}/{MAX_JUDGE_RETRIES})", record=record)
         else:
             record.outcome = "judge-exhausted"
 
@@ -312,11 +320,11 @@ def run_cycle(meta, dry_run=False):
                         + ("\n".join(record.gate_failures) or "none"))
     except NoChangesNeeded as e:
         record.outcome = "no-changes-needed"
-        log("  implementer found no gap to fix — flagging for human verification")
+        log("  implementer found no gap to fix — flagging for human verification", record=record)
         _flag_no_changes(meta, e.output)
     except Exception as e:  # noqa: BLE001
         record.outcome = f"error: {e}"
-        log(f"  ERROR {e}")
+        log(f"  ERROR {e}", record=record)
         # A merge may have landed before the failure. Verification is the only
         # thing protecting an unprotected master, so it must survive any
         # exception raised after the merge — not just the ones we predicted.
@@ -324,10 +332,10 @@ def run_cycle(meta, dry_run=False):
             try:
                 if gitops.pr_state(REPO, record.pr_url) == "MERGED":
                     record.merged = True
-                    log("  merge landed despite the error — verifying anyway")
+                    log("  merge landed despite the error — verifying anyway", record=record)
                     _verify_or_revert(meta, record)
             except Exception as verify_err:  # noqa: BLE001
-                log(f"  POST-MERGE VERIFICATION FAILED TO RUN: {verify_err}")
+                log(f"  POST-MERGE VERIFICATION FAILED TO RUN: {verify_err}", record=record)
                 record.outcome = f"unverified-merge: {verify_err}"
     finally:
         gitops.remove_worktree(REPO, worktree)

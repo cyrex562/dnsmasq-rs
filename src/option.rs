@@ -23,7 +23,7 @@ use crate::domain::CondDomain;
 #[cfg(feature = "dhcp")]
 use crate::types::dhcp::{
     CONFIG_ADDR, CONFIG_CLID, CONFIG_DISABLE, CONFIG_NAME, CONTEXT_DHCP, DhcpBoot, DhcpConfig,
-    DhcpContext, DhcpMacRule, DhcpNetid, DhcpOpt, DhcpRelayIdRule, DhcpReplyDelay, DhcpUserClassRule, DhcpVendorRule,
+    DhcpContext, DhcpMacRule, DhcpNetid, DhcpOpt, DhcpRelay, DhcpRelayIdRule, DhcpReplyDelay, DhcpUserClassRule, DhcpVendorRule,
     HwaddrConfig,
 };
 
@@ -1496,6 +1496,22 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             #[cfg(feature = "dhcp")]
             {
                 daemon.dhcp_reply_delays.push(parse_dhcp_reply_delay(v, cl)?);
+            }
+            #[cfg(not(feature = "dhcp"))]
+            {
+                let _ = v;
+            }
+        }
+
+        "dhcp-relay" | "dhcp-split-relay" => {
+            let v = require_value(key)?;
+            #[cfg(feature = "dhcp")]
+            {
+                match parse_dhcp_relay(v, cl, key == "dhcp-split-relay")? {
+                    RelayEntry::V4(r) => daemon.relay4.push(r),
+                    #[cfg(feature = "dhcp6")]
+                    RelayEntry::V6(r) => daemon.relay6.push(r),
+                }
             }
             #[cfg(not(feature = "dhcp"))]
             {
@@ -3850,6 +3866,160 @@ fn parse_dhcp_relay_id(
         subopt,
         data,
     })
+}
+
+/// Result of parsing a `dhcp-relay` / `dhcp-split-relay` directive: either an
+/// IPv4 entry (destined for `Daemon.relay4`) or an IPv6 entry (`Daemon.relay6`,
+/// gated on the `dhcp6` feature exactly like upstream's `#ifdef HAVE_DHCP6`).
+#[cfg(feature = "dhcp")]
+enum RelayEntry {
+    V4(DhcpRelay),
+    #[cfg(feature = "dhcp6")]
+    V6(DhcpRelay),
+}
+
+#[cfg(feature = "dhcp")]
+fn new_dhcp_relay(split_mode: bool) -> DhcpRelay {
+    DhcpRelay {
+        local_addr:  AllAddr::Addr4(Ipv4Addr::UNSPECIFIED),
+        server_addr: AllAddr::Addr4(Ipv4Addr::UNSPECIFIED),
+        uplink_addr: AllAddr::Addr4(Ipv4Addr::UNSPECIFIED),
+        interface:   None,
+        iface_index: 0,
+        port:        0,
+        split_mode:  i32::from(split_mode),
+        warned:      0,
+        matchcount:  0,
+    }
+}
+
+/// Split an optional `addr#port` token into its address and port parts.
+fn split_relay_port(token: &str) -> (&str, Option<&str>) {
+    match token.split_once('#') {
+        Some((addr, port)) => (addr, Some(port)),
+        None => (token, None),
+    }
+}
+
+/// Parse `dhcp-relay`/`dhcp-split-relay` (`LOPT_RELAY`/`LOPT_SPLIT_RELAY`,
+/// `option.c:4729-4809`).
+///
+/// Forms:
+/// - `<local-addr>,<server>[#port][,<iface>]` — relay (IPv4 or, outside split
+///   mode, IPv6) requests arriving on the interface owning `local-addr` to
+///   `server`.
+/// - `<local-addr>,<iface>` — broadcast form: relay via `iface` instead of a
+///   specific server.
+/// - `dhcp-split-relay=<local-addr>,<server>[#port],<iface-or-uplink-addr>` —
+///   split mode; requires a non-wildcard third argument (interface name, or
+///   an address to use directly as the uplink `giaddr`).
+#[cfg(feature = "dhcp")]
+fn parse_dhcp_relay(value: &str, cl: &ConfigLine, split_relay: bool) -> Result<RelayEntry, ConfigError> {
+    let key = if split_relay { "dhcp-split-relay" } else { "dhcp-relay" };
+    let bad = || invalid_value_for(cl, key, value, "Bad dhcp-relay");
+
+    let parts = split_csv(value);
+    if parts.is_empty() || parts.len() > 3 {
+        return Err(bad());
+    }
+    let arg = parts[0];
+    let mut two: Option<&str> = parts.get(1).copied();
+    let mut three: Option<&str> = parts.get(2).copied();
+
+    if split_relay {
+        // Split mode must have two addresses and a non-wildcard interface name.
+        if three.is_none() || three.is_some_and(|t| t.contains('*')) {
+            two = None;
+        }
+    }
+
+    let mut relay = new_dhcp_relay(split_relay);
+    let mut is_v6 = false;
+
+    if let Some(two_val) = two {
+        if let Ok(local4) = arg.parse::<Ipv4Addr>() {
+            relay.local_addr = AllAddr::Addr4(local4);
+
+            let (server_part, port_part) = split_relay_port(two_val);
+            relay.port = port_part
+                .and_then(|p| p.parse::<u16>().ok())
+                .map_or(i32::from(crate::dhcp_protocol::DHCP_SERVER_PORT), i32::from);
+
+            if let Ok(server4) = server_part.parse::<Ipv4Addr>() {
+                relay.server_addr = AllAddr::Addr4(server4);
+                if split_relay {
+                    if let Some(three_val) = three {
+                        if let Ok(uplink4) = three_val.parse::<Ipv4Addr>() {
+                            relay.uplink_addr = AllAddr::Addr4(uplink4);
+                            three = None;
+                        }
+                    }
+                }
+            } else {
+                relay.server_addr = AllAddr::Addr4(Ipv4Addr::UNSPECIFIED);
+                // Fail for the three-arg form where there aren't two addresses;
+                // also fail when broadcasting to a wildcard "address".
+                if three.is_some() || two_val.contains('*') {
+                    two = None;
+                } else {
+                    three = Some(server_part);
+                }
+            }
+        } else if !split_relay {
+            #[cfg(feature = "dhcp6")]
+            {
+                if let Ok(local6) = arg.parse::<Ipv6Addr>() {
+                    is_v6 = true;
+                    relay.local_addr = AllAddr::Addr6(local6);
+
+                    let (server_part, port_part) = split_relay_port(two_val);
+                    relay.port = port_part
+                        .and_then(|p| p.parse::<u16>().ok())
+                        .map_or(i32::from(crate::dhcp6_protocol::DHCPV6_SERVER_PORT), i32::from);
+
+                    if let Ok(server6) = server_part.parse::<Ipv6Addr>() {
+                        relay.server_addr = AllAddr::Addr6(server6);
+                    } else {
+                        relay.server_addr = AllAddr::Addr6("ff05::1:3".parse().unwrap());
+                        if three.is_some() || two_val.contains('*') {
+                            two = None;
+                        } else {
+                            three = Some(server_part);
+                        }
+                    }
+                } else {
+                    two = None;
+                }
+            }
+            #[cfg(not(feature = "dhcp6"))]
+            {
+                two = None;
+            }
+        } else {
+            two = None;
+        }
+
+        if two.is_some() {
+            relay.interface = three.map(str::to_string);
+        }
+    }
+
+    if two.is_none() {
+        return Err(bad());
+    }
+
+    if is_v6 {
+        #[cfg(feature = "dhcp6")]
+        {
+            return Ok(RelayEntry::V6(relay));
+        }
+        #[cfg(not(feature = "dhcp6"))]
+        {
+            unreachable!("is_v6 can only be set when the dhcp6 feature is enabled");
+        }
+    }
+
+    Ok(RelayEntry::V4(relay))
 }
 
 #[cfg(feature = "dhcp")]
@@ -7318,6 +7488,142 @@ mod tests {
         let lines = parse_config_text("tag-if=tag:b,tag:c", "test").unwrap();
         let err = apply_config(&mut d, &lines).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "tag-if"));
+    }
+
+    #[test]
+    fn apply_dhcp_relay_two_address_form() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-relay=192.168.1.1,10.0.0.1", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        #[cfg(feature = "dhcp")]
+        {
+            assert_eq!(d.relay4.len(), 1);
+            let relay = &d.relay4[0];
+            assert!(matches!(relay.local_addr, AllAddr::Addr4(a) if a == "192.168.1.1".parse::<Ipv4Addr>().unwrap()));
+            assert!(matches!(relay.server_addr, AllAddr::Addr4(a) if a == "10.0.0.1".parse::<Ipv4Addr>().unwrap()));
+            assert_eq!(relay.port, i32::from(crate::dhcp_protocol::DHCP_SERVER_PORT));
+            assert_eq!(relay.split_mode, 0);
+            assert_eq!(relay.interface, None);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn apply_dhcp_relay_with_port_and_interface() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-relay=192.168.1.1,10.0.0.1#5300,eth0", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.relay4.len(), 1);
+        let relay = &d.relay4[0];
+        assert!(matches!(relay.server_addr, AllAddr::Addr4(a) if a == "10.0.0.1".parse::<Ipv4Addr>().unwrap()));
+        assert_eq!(relay.port, 5300);
+        assert_eq!(relay.interface.as_deref(), Some("eth0"));
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn apply_dhcp_relay_broadcast_two_arg_form() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-relay=192.168.1.1,eth0", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.relay4.len(), 1);
+        let relay = &d.relay4[0];
+        assert!(matches!(relay.server_addr, AllAddr::Addr4(a) if a == Ipv4Addr::UNSPECIFIED));
+        assert_eq!(relay.interface.as_deref(), Some("eth0"));
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn apply_dhcp_relay_broadcast_two_arg_form_strips_port_suffix() {
+        // Regression test: upstream truncates `two` in place at '#' before
+        // reusing it as the interface name (option.c's split_chr(two, '#')
+        // mutates the buffer), so `dhcp-relay=<addr>,<iface>#<port>` in
+        // broadcast form must store the interface without the port suffix.
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-relay=192.168.1.1,eth0#67", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.relay4.len(), 1);
+        let relay = &d.relay4[0];
+        assert!(matches!(relay.server_addr, AllAddr::Addr4(a) if a == Ipv4Addr::UNSPECIFIED));
+        assert_eq!(relay.interface.as_deref(), Some("eth0"));
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn apply_dhcp_relay_repeatable() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text(
+            "dhcp-relay=192.168.1.1,10.0.0.1\ndhcp-relay=192.168.2.1,10.0.0.2",
+            "test",
+        )
+        .unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.relay4.len(), 2);
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn apply_dhcp_split_relay_populates_split_mode() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-split-relay=192.168.1.1,10.0.0.1,eth0", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.relay4.len(), 1);
+        let relay = &d.relay4[0];
+        assert_eq!(relay.split_mode, 1);
+        assert_eq!(relay.interface.as_deref(), Some("eth0"));
+        assert!(matches!(relay.server_addr, AllAddr::Addr4(a) if a == "10.0.0.1".parse::<Ipv4Addr>().unwrap()));
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn apply_dhcp_split_relay_third_arg_as_uplink_address() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-split-relay=192.168.1.1,10.0.0.1,10.0.0.2", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.relay4.len(), 1);
+        let relay = &d.relay4[0];
+        assert!(matches!(relay.uplink_addr, AllAddr::Addr4(a) if a == "10.0.0.2".parse::<Ipv4Addr>().unwrap()));
+        assert_eq!(relay.interface, None);
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn apply_dhcp_split_relay_rejects_wildcard_interface() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-split-relay=192.168.1.1,10.0.0.1,eth*", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "dhcp-split-relay"));
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn apply_dhcp_split_relay_rejects_missing_interface() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-split-relay=192.168.1.1,10.0.0.1", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "dhcp-split-relay"));
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn apply_dhcp_relay_bad_value_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-relay=not-an-address,10.0.0.1", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "dhcp-relay"));
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp6")]
+    fn apply_dhcp_relay_ipv6_form() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-relay=1::1,2::1", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.relay6.len(), 1);
+        let relay = &d.relay6[0];
+        assert!(matches!(relay.local_addr, AllAddr::Addr6(a) if a == "1::1".parse::<Ipv6Addr>().unwrap()));
+        assert!(matches!(relay.server_addr, AllAddr::Addr6(a) if a == "2::1".parse::<Ipv6Addr>().unwrap()));
+        assert_eq!(relay.port, i32::from(crate::dhcp6_protocol::DHCPV6_SERVER_PORT));
     }
 
     #[test]

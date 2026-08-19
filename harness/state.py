@@ -13,6 +13,7 @@ class CycleRecord:
     key: str
     number: int
     title: str
+    current_stage: str = ""
     stages: list = field(default_factory=list)
     gate_failures: list = field(default_factory=list)
     verdict: str = ""

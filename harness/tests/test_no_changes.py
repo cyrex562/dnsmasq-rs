@@ -9,6 +9,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import harness as h  # noqa: E402
 from issue_meta import IssueMeta  # noqa: E402
+from state import CycleRecord  # noqa: E402
 
 
 def m():
@@ -166,6 +167,37 @@ class TestLogFile(unittest.TestCase):
             with open(fake_path) as f:
                 content = f.read()
             self.assertIn("distinctive test message", content)
+
+
+class TestLogUpdatesStateFile(unittest.TestCase):
+    """Progress used to be visible only by regex-matching human phrasing in
+    harness.log. A monitor should be able to poll the per-issue JSON record
+    instead: every log() call that names a `record` must persist that
+    record's current stage, not just append a log line."""
+
+    def test_log_with_record_sets_current_stage(self):
+        rec = CycleRecord(key="T1-3", number=12, title="t")
+        saved = []
+        with patch("harness.save_record", lambda r: saved.append(r)):
+            h.log("  judge (sonnet)", record=rec)
+        self.assertEqual(rec.current_stage, "judge (sonnet)")
+        self.assertEqual(saved, [rec])
+
+    def test_log_without_record_does_not_touch_state(self):
+        with patch("harness.save_record") as fake_save:
+            h.log("no record here")
+        fake_save.assert_not_called()
+
+    def test_record_stage_persists_after_each_stage(self):
+        rec = CycleRecord(key="T1-3", number=12, title="t")
+        saved = []
+        with patch("harness.save_record", lambda r: saved.append(len(r.stages))):
+            h._record_stage(rec, "research", "sonnet", lambda: "ok")
+        self.assertEqual(rec.stages[-1]["stage"], "research")
+        # save_record must have been called with the stage already appended,
+        # not before -- a monitor polling mid-write should never see a stale
+        # stages list.
+        self.assertIn(1, saved)
 
 
 if __name__ == "__main__":
