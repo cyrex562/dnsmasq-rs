@@ -796,7 +796,22 @@ pub fn dispatch_dhcp_with_meta(
             // below, gated on `msg_type == Discover` rather than on the
             // resulting reply type.
             if cfg.rapid_commit && find_option(&pkt.options, OPTION_RAPID_COMMIT).is_some() {
-                offer.map(|r| crate::rfc2131::make_rapid_commit_ack(r, cfg.server_ip))
+                offer.and_then(|r| {
+                    // rfc2131.c:1529-1530: reserved-for-another-client check,
+                    // re-run here the same way the `rapid_commit:` label
+                    // re-validates the offered address before committing to
+                    // an ACK — see `make_rapid_commit_ack`.
+                    let reserved_for_other = config_find_by_address(&cfg.configs, r.yiaddr)
+                        .is_some_and(|addr_cfg| !config.is_some_and(|c| std::ptr::eq(c, addr_cfg)));
+                    crate::rfc2131::make_rapid_commit_ack(
+                        r,
+                        cfg.server_ip,
+                        cfg.pool_start,
+                        cfg.pool_end,
+                        static_addr,
+                        reserved_for_other,
+                    )
+                })
             } else {
                 offer
             }
@@ -5002,6 +5017,31 @@ mod tests {
         let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe)
             .expect("leasequery should always reply once enabled+unicast");
         assert_eq!(dispatched.reply.msg_type, DhcpMsgType::LeaseUnassigned);
+        // rfc2131.c's `clear_packet` never touches `ciaddr` for
+        // DHCPLEASEUNASSIGNED (only DHCPLEASEUNKNOWN explicitly zeroes it,
+        // rfc2131.c:1173-1177), so the reply must echo back the queried
+        // address, not force it to 0.0.0.0.
+        assert_eq!(dispatched.reply.ciaddr_override, None);
+        assert_eq!(
+            dispatched.reply.ciaddr_override.unwrap_or(pkt.ciaddr),
+            Ipv4Addr::new(10, 0, 0, 150)
+        );
+    }
+
+    #[test]
+    fn leasequery_unknown_zeroes_ciaddr() {
+        // ciaddr == UNSPECIFIED and no lease found by client id: falls to
+        // DHCPLEASEUNKNOWN, which rfc2131.c:1173-1177 explicitly zeroes.
+        let pkt = leasequery_packet(Ipv4Addr::UNSPECIFIED);
+        let mut cfg = default_cfg();
+        cfg.leasequery_enabled = true;
+        cfg.leasequery_source = Ipv4Addr::new(192, 0, 2, 1);
+        cfg.contexts = vec![make_ctx(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 200), Ipv4Addr::UNSPECIFIED, 0)];
+
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe)
+            .expect("leasequery should always reply once enabled+unicast");
+        assert_eq!(dispatched.reply.msg_type, DhcpMsgType::LeaseUnknown);
+        assert_eq!(dispatched.reply.ciaddr_override, Some(Ipv4Addr::UNSPECIFIED));
     }
 
     #[test]

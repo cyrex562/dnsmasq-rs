@@ -1421,16 +1421,24 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   `dispatch_bootp`/`dispatch_leasequery`/`handle_leasequery` in `src/dhcp.rs`
   and `src/rfc2131.rs`, and `dhcp-rapid-commit` support in the `Discover` arm
   of `dispatch_dhcp_with_meta`):
-  - `pxe_uefi_workaround()` / `pxe_opts()` (rfc2131.c:2392-2556) and the
-    proxyDHCP reply branch that calls them (rfc2131.c:955-1050, gated on
-    `CONTEXT_PROXY` + DISCOVER/REQUEST) are not ported. Blocked on the
-    `pxe-service`/`pxe-prompt` no-ops above: there is no `PxeService`
-    type or `daemon.pxe_services` to build the PXE menu (PXE_MENU /
-    PXE_SERVERS / PXE_MENU_PROMPT / PXE_DISCOVERY_CONTROL) from, and no
-    `CONTEXT_PROXY` handling anywhere in `dispatch_dhcp_with_meta`. Port 4011
-    redirection (rfc2131.c:994-998) is unported for the same reason.
-    `apply_delay`'s PXE-proxy call site (rfc2131.c:1046) has nothing to call
-    it from yet.
+  - `pxe_uefi_workaround()` / `pxe_opts()` (rfc2131.c:2392-2556) are not
+    ported, and this gap is **not** limited to the proxyDHCP branch. Upstream
+    calls them from two places: (1) the proxyDHCP reply branch
+    (rfc2131.c:955-1050, gated on `CONTEXT_PROXY` + DISCOVER/REQUEST), and
+    (2) unconditionally from the shared `do_options()` (rfc2131.c:2934-2941,
+    `if (context && pxe_arch != -1)`) — i.e. for *any* ordinary OFFER/ACK
+    reply to a client that sent a PXE arch option (option 93), not just proxy
+    replies. This port's `do_options` (`src/rfc2131.rs`) only calls
+    `pxe_misc` — it never calls `pxe_uefi_workaround`/`pxe_opts` — so the core
+    DISCOVER/REQUEST reply path already in scope for this port is missing the
+    PXE menu, not just the unimplemented proxy branch. Both call sites are
+    blocked on the `pxe-service`/`pxe-prompt` no-ops above: there is no
+    `PxeService` type or `daemon.pxe_services` to build the PXE menu
+    (PXE_MENU / PXE_SERVERS / PXE_MENU_PROMPT / PXE_DISCOVERY_CONTROL) from,
+    and no `CONTEXT_PROXY` handling anywhere in `dispatch_dhcp_with_meta` for
+    call site (1). Port 4011 redirection (rfc2131.c:994-998) is unported for
+    the same reason. `apply_delay`'s PXE-proxy call site (rfc2131.c:1046) has
+    nothing to call it from yet.
   - Upstream's `known`/`known-othernet` netid tagging (rfc2131.c:544-560,
     based on whether `find_config` matches with vs. without the arriving
     `context`) is not derived for any message type, BOOTP included — this
