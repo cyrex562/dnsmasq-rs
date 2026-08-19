@@ -541,7 +541,16 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   Root-gated test `create_helper_drops_privileges_in_child` asserts the forked child's
   reported uid/gid actually differ from root; `parent_is_not_blocked_by_a_hanging_script`
   and `parent_survives_helper_child_crashing` assert the caller only ever does a pipe
-  `write()` and is never blocked on or brought down by the script it queued.
+  `write()` and is never blocked on or brought down by the script it queued. The child
+  also closes every fd it inherited from the main process (sockets, log files, ...)
+  before touching the pipe or exec'ing anything — `close_inherited_fds`, a port of
+  `close_fds()` (util.c:789) called at helper.c:134 — so a compromised script can't reach
+  those fds even though it inherits the process's open-fd table across `fork()`;
+  `create_helper_child_does_not_leak_unrelated_fds_to_script` asserts this end-to-end and
+  `close_inherited_fds_closes_unrelated_descriptors` covers the helper in isolation.
+  `DNSMASQ_LOG_DHCP` (helper.c:667, `option_bool(OPT_LOG_OPTS)`) is threaded through as a
+  `log_dhcp: bool` parameter on `create_helper`/`run_helper_loop`/`run_script_child` and
+  set last in the lease-action env block, matching upstream's ordering.
 
   Explicitly **not** covered — upstream behavior still missing:
 

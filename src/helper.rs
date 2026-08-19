@@ -453,7 +453,10 @@ impl HelperHandle {
 /// ordering (`setgroups`/`setgid`/`setuid` at :109-127, *before*
 /// `close_fds` and the read loop). `uid == 0` is treated as "no drop",
 /// exactly as `create_helper`'s `uid != 0` guard.
-pub fn create_helper(command: Option<String>, drop_to: Option<(Uid, Gid)>) -> io::Result<HelperHandle> {
+///
+/// `log_dhcp` mirrors `option_bool(OPT_LOG_OPTS)` (helper.c:667): when set,
+/// every lease-action script invocation gets `DNSMASQ_LOG_DHCP=1`.
+pub fn create_helper(command: Option<String>, drop_to: Option<(Uid, Gid)>, log_dhcp: bool) -> io::Result<HelperHandle> {
     let (read_fd, write_fd) = pipe()?;
 
     match unsafe { fork() }? {
@@ -489,8 +492,42 @@ pub fn create_helper(command: Option<String>, drop_to: Option<(Uid, Gid)>) -> io
                 }
             }
 
-            run_helper_loop(std::fs::File::from(read_fd), command.as_deref());
+            // Close every other fd we inherited from the main process — DNS
+            // listening sockets, DHCP raw sockets, log files — before we
+            // read anything off the pipe or exec any script. Port of
+            // `close_fds(max_fd, pipefd[0], event_fd, err_fd)` (helper.c:134);
+            // we have no `event_fd`/`err_fd` yet (tracked in tasks.md), so
+            // the only fd kept is the pipe's read end.
+            close_inherited_fds(std::os::unix::io::AsRawFd::as_raw_fd(&read_fd));
+
+            run_helper_loop(std::fs::File::from(read_fd), command.as_deref(), log_dhcp);
             unsafe { libc::_exit(0) };
+        }
+    }
+}
+
+/// Close every open fd except stdin/stdout/stderr and `keep`, so a
+/// privilege-dropped script can never reach the daemon's listening sockets,
+/// log files, or other fds it inherited across `fork()`. Port of
+/// `close_fds()` (util.c:789), called at helper.c:134.
+///
+/// Uses `/proc/self/fd` (Linux-only, matching this file's existing use of
+/// `nix`/`libc` platform APIs); if that can't be read, this silently does
+/// nothing rather than failing the helper child outright.
+fn close_inherited_fds(keep: std::os::unix::io::RawFd) {
+    use std::os::unix::io::RawFd;
+
+    let fds: Vec<RawFd> = match std::fs::read_dir("/proc/self/fd") {
+        Ok(entries) => entries
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<RawFd>().ok()))
+            .collect(),
+        Err(_) => return,
+    };
+
+    for fd in fds {
+        if fd > 2 && fd != keep {
+            unsafe { libc::close(fd) };
         }
     }
 }
@@ -594,7 +631,7 @@ fn set_extradata_env(cmd: &mut Command, extradata: &[u8], is6: bool) {
 /// in helper.c:504-689 does — except here `std::process::Command` handles
 /// the fork+exec+wait itself, since we already are the privilege-dropped
 /// process the script must inherit from (no second privilege drop needed).
-fn run_script_child(command: &str, action_str: &str, data: &ScriptData) {
+fn run_script_child(command: &str, action_str: &str, data: &ScriptData, log_dhcp: bool) {
     let is6 = is6(data);
     let (hostname, domain) = hostname_and_domain(data);
 
@@ -648,6 +685,9 @@ fn run_script_child(command: &str, action_str: &str, data: &ScriptData) {
                 cmd.env("DNSMASQ_OLD_HOSTNAME", h);
             }
         }
+        if log_dhcp {
+            cmd.env("DNSMASQ_LOG_DHCP", "1");
+        }
     }
 
     let output = match cmd.output() {
@@ -683,7 +723,7 @@ fn run_script_child(command: &str, action_str: &str, data: &ScriptData) {
 ///
 /// Returns when the pipe hits EOF (helper.c:199: "we read zero bytes when
 /// pipe closed: this is our signal to exit").
-fn run_helper_loop(mut read: std::fs::File, command: Option<&str>) {
+fn run_helper_loop(mut read: std::fs::File, command: Option<&str>, log_dhcp: bool) {
     loop {
         let mut header_buf = [0u8; ScriptData::HEADER_LEN];
         if read.read_exact(&mut header_buf).is_err() {
@@ -720,7 +760,7 @@ fn run_helper_loop(mut read: std::fs::File, command: Option<&str>) {
         // discarded.
         let Some(command) = command else { continue };
 
-        run_script_child(command, action_str, &data);
+        run_script_child(command, action_str, &data, log_dhcp);
     }
 }
 
@@ -918,6 +958,7 @@ mod tests {
         let mut helper = create_helper(
             Some(script.to_str().unwrap().to_string()),
             Some((target_uid, target_gid)),
+            false,
         )
         .unwrap();
 
@@ -982,7 +1023,7 @@ mod tests {
         std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
 
-        let mut helper = create_helper(Some(script.to_str().unwrap().to_string()), None).unwrap();
+        let mut helper = create_helper(Some(script.to_str().unwrap().to_string()), None, false).unwrap();
         let lease = sample_lease();
         let data = ScriptData::for_lease(ACTION_ADD, &lease, None, SystemTime::now());
 
@@ -1005,7 +1046,7 @@ mod tests {
     /// caller — no panics, no `SIGPIPE`-default process death.
     #[test]
     fn parent_survives_helper_child_crashing() {
-        let mut helper = create_helper(None, None).unwrap();
+        let mut helper = create_helper(None, None, false).unwrap();
         let _ = nix::sys::signal::kill(helper.child_pid, nix::sys::signal::Signal::SIGKILL);
         let _ = nix::sys::wait::waitpid(helper.child_pid, None);
 
@@ -1023,7 +1064,7 @@ mod tests {
 
     #[test]
     fn create_helper_no_script_configured_does_not_panic() {
-        let mut helper = create_helper(None, None).unwrap();
+        let mut helper = create_helper(None, None, false).unwrap();
         let lease = sample_lease();
         let data = ScriptData::for_lease(ACTION_ADD, &lease, None, SystemTime::now());
         helper.send(&data).unwrap();
@@ -1031,5 +1072,118 @@ mod tests {
         // Dropping closes our write end, which is the EOF shutdown signal
         // the helper loop watches for (helper.c:199).
         drop(helper);
+    }
+
+    // ── close_fds: the script must not inherit the daemon's other fds ────
+
+    /// Unit-level check of [`close_inherited_fds`] in isolation, run inside a
+    /// throwaway forked child so it can't touch the test binary's own open
+    /// fds (sockets, temp files, etc. belonging to other concurrently
+    /// running tests).
+    #[test]
+    fn close_inherited_fds_closes_unrelated_descriptors() {
+        let (result_r, result_w) = pipe().unwrap();
+        match unsafe { fork() }.unwrap() {
+            ForkResult::Child => {
+                drop(result_r);
+                let extra = std::fs::File::open("/dev/null").unwrap();
+                let extra_fd = std::os::unix::io::AsRawFd::as_raw_fd(&extra);
+                let keep_fd = std::os::unix::io::AsRawFd::as_raw_fd(&result_w);
+
+                close_inherited_fds(keep_fd);
+
+                let still_open = unsafe { libc::fcntl(extra_fd, libc::F_GETFD) } != -1;
+                let mut f = std::fs::File::from(result_w);
+                let _ = f.write_all(&[u8::from(still_open)]);
+                unsafe { libc::_exit(0) };
+            }
+            ForkResult::Parent { child } => {
+                drop(result_w);
+                let mut f = std::fs::File::from(result_r);
+                let mut buf = [0u8; 1];
+                f.read_exact(&mut buf).unwrap();
+                nix::sys::wait::waitpid(child, None).unwrap();
+                assert_eq!(buf[0], 0, "close_inherited_fds left an unrelated fd open");
+            }
+        }
+    }
+
+    /// End-to-end acceptance check: a script run via the real
+    /// `create_helper` child must not be able to reach an fd that was open
+    /// in the main process before the fork — otherwise a compromised script
+    /// could read/write the daemon's listening sockets or log files despite
+    /// running under a dropped uid/gid, exactly the regression this issue
+    /// flags. No root required: this checks fd inheritance, not privilege
+    /// drop.
+    #[test]
+    fn create_helper_child_does_not_leak_unrelated_fds_to_script() {
+        let (leak_r, leak_w) = pipe().unwrap();
+        let leak_w_fd = std::os::unix::io::AsRawFd::as_raw_fd(&leak_w);
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("leak_out");
+        let script = dir.path().join("check_leak.sh");
+        // `:` is a POSIX *special* builtin: a redirection error on it aborts
+        // the whole non-interactive shell script rather than just failing
+        // the command, so this can't be a simple `if : >&FD; then ... fi` —
+        // that would leave `out` unwritten (and the test failing with ENOENT)
+        // whenever the fd is correctly closed. Write the default outcome
+        // first, then only overwrite it if a redirect to the leaked fd
+        // (run in a subshell, so an abort there doesn't touch the parent
+        // script) actually succeeds.
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho CLOSED > {out}\n(: >&{fd}) 2>/dev/null && echo LEAKED > {out}\n",
+                fd = leak_w_fd,
+                out = out_path.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+        let mut helper = create_helper(Some(script.to_str().unwrap().to_string()), None, false).unwrap();
+        let lease = sample_lease();
+        let data = ScriptData::for_lease(ACTION_ADD, &lease, None, SystemTime::now());
+        helper.send(&data).unwrap();
+
+        std::thread::sleep(Duration::from_millis(500));
+        drop(helper);
+        drop(leak_w);
+        drop(leak_r);
+
+        let contents = std::fs::read_to_string(&out_path).unwrap();
+        assert_eq!(contents.trim(), "CLOSED");
+    }
+
+    // ── DNSMASQ_LOG_DHCP env var ──────────────────────────────────────────
+
+    fn run_env_check_script(log_dhcp: bool) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("env_out");
+        let script = dir.path().join("check_env.sh");
+        std::fs::write(&script, format!("#!/bin/sh\nenv | grep ^DNSMASQ_LOG_DHCP= > {0} 2>&1 || true\n", out_path.display())).unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+        let mut helper = create_helper(Some(script.to_str().unwrap().to_string()), None, log_dhcp).unwrap();
+        let lease = sample_lease();
+        let data = ScriptData::for_lease(ACTION_ADD, &lease, None, SystemTime::now());
+        helper.send(&data).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        drop(helper);
+
+        std::fs::read_to_string(&out_path).unwrap_or_default()
+    }
+
+    #[test]
+    fn log_dhcp_env_var_set_when_enabled() {
+        let contents = run_env_check_script(true);
+        assert_eq!(contents.trim(), "DNSMASQ_LOG_DHCP=1");
+    }
+
+    #[test]
+    fn log_dhcp_env_var_absent_when_disabled() {
+        let contents = run_env_check_script(false);
+        assert_eq!(contents.trim(), "");
     }
 }
