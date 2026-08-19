@@ -436,6 +436,44 @@ pub fn set_ipv6pktinfo(_fd: i32) -> std::io::Result<bool> {
     Ok(false)
 }
 
+/// Enable `IP_PKTINFO` on an IPv4 UDP socket so that `recvmsg` populates the
+/// incoming packet-info control message (destination address + arrival
+/// interface index). [`recv_with_dest`] reads it back out via [`parse_pktinfo`].
+///
+/// Returns `Ok(true)` if the option was set, `Ok(false)` if the kernel does
+/// not support it, or an `io::Error` on a hard failure. Unlike the inline
+/// `IP_PKTINFO` set in `create_listeners_checked` (DNS wildcard sockets),
+/// this is for sockets bound to one specific address — such as the DHCP
+/// socket — that still want per-datagram arrival-interface metadata.
+#[cfg(all(unix, target_os = "linux"))]
+pub fn set_ipv4pktinfo(fd: std::os::unix::io::RawFd) -> std::io::Result<bool> {
+    let opt: libc::c_int = 1;
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_PKTINFO,
+            &opt as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&opt) as libc::socklen_t,
+        )
+    };
+    Ok(rc == 0)
+}
+
+// BSD's equivalent is `IP_RECVDSTADDR` + `IP_RECVIF`, but `parse_pktinfo`
+// only decodes Linux's `IP_PKTINFO` control message for IPv4 today, so
+// enabling it here would set a socket option nothing reads back. Left
+// unimplemented rather than silently misleading; see `tasks.md`.
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn set_ipv4pktinfo(_fd: std::os::unix::io::RawFd) -> std::io::Result<bool> {
+    Ok(false)
+}
+
+#[cfg(not(unix))]
+pub fn set_ipv4pktinfo(_fd: i32) -> std::io::Result<bool> {
+    Ok(false)
+}
+
 /// Determine the interface index of the local end of a TCP connection.
 ///
 /// Uses `IP_PKTOPTIONS` (IPv4) or `IPV6_2292PKTOPTIONS` (IPv6) to retrieve

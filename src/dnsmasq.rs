@@ -1015,6 +1015,19 @@ pub fn bind_listeners(daemon: &Daemon) -> Result<Listeners, DnsmasqError> {
             if let Some(device) = runtime.bind_interface.as_deref() {
                 bind_dhcp_socket_to_device(&sock, device)?;
             }
+            // Best-effort: enables per-datagram arrival-interface metadata
+            // (`run_dhcp_loop` reads it via `recv_with_dest`/`IP_PKTINFO` to
+            // restrict `dhcp-range` context selection to the interface the
+            // request actually arrived on, dhcp.c:296-365's `complete_context`
+            // call). A failure here just means every packet dispatches with
+            // no arrival interface known, same as before this existed.
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd as _;
+                if let Err(e) = crate::network::set_ipv4pktinfo(sock.as_raw_fd()) {
+                    tracing::warn!("failed to enable IP_PKTINFO on DHCP socket: {e}");
+                }
+            }
             Some(sock)
         }
         None => None,

@@ -279,11 +279,12 @@ fn select_reply_delay(
 /// `CONTEXT_STATIC`/`CONTEXT_PROXY`) first, then a static context on the same
 /// subnet, then any context on the same subnet — instead of the previous
 /// "first pool match or else the first context regardless of subnet"
-/// heuristic. This is `narrow_context()`'s upstream role (dhcp.c:717-752);
-/// it does not yet restrict candidates to the arriving interface's linked
-/// chain (`complete_context()`'s `->current` list, dhcp.c:589-660) because
-/// nothing upstream of this call knows which interface the request arrived
-/// on yet — see [`link_contexts_for_interface`] and `tasks.md`.
+/// heuristic. This is `narrow_context()`'s upstream role (dhcp.c:717-752).
+/// `cfg.contexts` is `narrow_context`'s whole search domain here; when the
+/// caller is [`dispatch_dhcp_with_arrival`], that list has already been
+/// restricted to the arriving interface's linked chain
+/// (`complete_context()`'s `->current` list, dhcp.c:589-660) — see
+/// [`link_contexts_for_interface`].
 fn context_for_reply<'a>(
     cfg: &'a DhcpServerConfig,
     reply: &DhcpReply,
@@ -877,7 +878,7 @@ pub async fn send_dhcp_reply(
 /// caller; it is written back to that file whenever a dispatch marks it dirty.
 pub async fn run_dhcp_loop(
     socket: std::sync::Arc<tokio::net::UdpSocket>,
-    cfg: DhcpServerConfig,
+    mut cfg: DhcpServerConfig,
     opts: DhcpLoopOptions,
     mut lease_db: LeaseDb,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -898,8 +899,9 @@ pub async fn run_dhcp_loop(
                     Err(_) => return Ok(()),
                 }
             }
-            recv = socket.recv_from(&mut buf) => {
-                let (len, src) = recv?;
+            recv = recv_dhcp_datagram(&socket, &mut buf) => {
+                let meta = recv?;
+                let (len, src) = (meta.len, meta.src);
                 let Some(mut pkt) = parse_dhcp_packet(&buf[..len]) else {
                     debug!("ignoring malformed DHCP packet from {src}");
                     continue;
@@ -944,7 +946,10 @@ pub async fn run_dhcp_loop(
                     }
                 }
 
-                let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db, &mut ping_cache, probe.as_ref());
+                let arrival = arrival_interface(meta.if_index);
+                let dispatched = dispatch_dhcp_with_arrival(
+                    &pkt, &mut cfg, &mut lease_db, &mut ping_cache, probe.as_ref(), arrival.as_ref(),
+                );
 
                 if lease_db.file_dirty {
                     if let Some(path) = cfg.lease_file.as_deref() {
@@ -966,6 +971,94 @@ pub async fn run_dhcp_loop(
             }
         }
     }
+}
+
+/// Receive one DHCP datagram, with the `IP_PKTINFO` arrival-interface
+/// metadata [`bind_listeners`] enables on the socket via
+/// [`crate::network::set_ipv4pktinfo`].
+///
+/// Mirrors `recv_datagram` in `forward.rs`: `try_io` after the socket
+/// reports readable, retrying on `WouldBlock` since readiness can be a false
+/// positive under `tokio`'s edge-triggered polling.
+#[cfg(unix)]
+async fn recv_dhcp_datagram(
+    socket: &tokio::net::UdpSocket,
+    buf: &mut [u8],
+) -> std::io::Result<crate::network::RecvMeta> {
+    use std::os::unix::io::AsRawFd;
+    loop {
+        socket.readable().await?;
+        let fd = socket.as_raw_fd();
+        match socket.try_io(tokio::io::Interest::READABLE, || crate::network::recv_with_dest(fd, buf)) {
+            Ok(meta) => return Ok(meta),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Non-Unix fallback: no control messages, so no arrival metadata.
+#[cfg(not(unix))]
+async fn recv_dhcp_datagram(
+    socket: &tokio::net::UdpSocket,
+    buf: &mut [u8],
+) -> std::io::Result<crate::network::RecvMeta> {
+    let (len, src) = socket.recv_from(buf).await?;
+    Ok(crate::network::RecvMeta { len, src, dest: None, if_index: 0 })
+}
+
+/// Resolve an `IP_PKTINFO` arrival interface index into the
+/// local/netmask/broadcast triple [`link_contexts_for_interface`] needs.
+///
+/// Returns `None` when the index is `0` (no control message — an unbound
+/// socket, a platform without `IP_PKTINFO` support, or a permission failure
+/// setting it) or when the interface has since disappeared or carries no
+/// IPv4 netmask; callers treat that the same as "arrival interface unknown"
+/// and fall back to searching every configured context, same as before this
+/// existed.
+fn arrival_interface(if_index: u32) -> Option<ArrivalInterface> {
+    if if_index == 0 {
+        return None;
+    }
+    let interfaces = crate::network::enumerate_interfaces().ok()?;
+    let iface = interfaces.into_iter().find(|i| i.index == if_index)?;
+    let IpAddr::V4(local) = iface.addr else { return None };
+    let Some(IpAddr::V4(netmask)) = iface.netmask else { return None };
+    let broadcast = Ipv4Addr::from(u32::from(local) | !u32::from(netmask));
+    Some(ArrivalInterface { local, netmask, broadcast })
+}
+
+/// [`dispatch_dhcp_with_meta`], restricted to the `dhcp-range` contexts that
+/// share a subnet with `arrival` (upstream's `context->current` chain, built
+/// by `complete_context()`/`guess_range_netmask()`, dhcp.c:296-365).
+///
+/// [`link_contexts_for_interface`] both fills in any netmask/broadcast/router
+/// the matched contexts are missing *and* mutates `cfg.contexts` in place —
+/// matching upstream, which persists the same fill-in across calls — and
+/// returns which contexts are valid for a host on `arrival`. When at least
+/// one context links, [`dispatch_dhcp_with_meta`] only sees that narrowed
+/// set. When `arrival` is `None`, or links to nothing (an unknown interface,
+/// or a relayed request from a subnet with no matching local `dhcp-range`),
+/// this falls back to the full context list — [`narrow_context`]'s original,
+/// permissive behavior — rather than refusing to answer.
+pub fn dispatch_dhcp_with_arrival(
+    pkt: &DhcpPacket,
+    cfg: &mut DhcpServerConfig,
+    lease_db: &mut LeaseDb,
+    ping_cache: &mut PingCache,
+    probe: &dyn AddressProbe,
+    arrival: Option<&ArrivalInterface>,
+) -> Option<DispatchedDhcpReply> {
+    let Some(iface) = arrival else {
+        return dispatch_dhcp_with_meta(pkt, cfg, lease_db, ping_cache, probe);
+    };
+    let linked = link_contexts_for_interface(&mut cfg.contexts, iface);
+    if linked.is_empty() {
+        return dispatch_dhcp_with_meta(pkt, cfg, lease_db, ping_cache, probe);
+    }
+    let mut narrowed = cfg.clone();
+    narrowed.contexts = linked.iter().map(|&i| cfg.contexts[i].clone()).collect();
+    dispatch_dhcp_with_meta(pkt, &narrowed, lease_db, ping_cache, probe)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1088,9 +1181,11 @@ pub fn config_find_by_address(configs: &[DhcpConfig], addr: Ipv4Addr) -> Option<
 /// arrived on, as `IP_PKTINFO` would report it. Mirrors the per-arrival
 /// inputs `dhcp_packet()` feeds to `complete_context()` (dhcp.c:296-365).
 ///
-/// Not yet populated from a real socket read — [`bind_listeners`] doesn't
-/// request `IP_PKTINFO` on the DHCP socket, so nothing in `run_dhcp_loop`
-/// can construct one today. See `tasks.md`.
+/// Built by [`arrival_interface`] from the `IP_PKTINFO` control message
+/// `crate::network::recv_with_dest` reads off the DHCP socket in
+/// `run_dhcp_loop` (`bind_listeners` enables it via
+/// `crate::network::set_ipv4pktinfo`), then consumed by
+/// [`dispatch_dhcp_with_arrival`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArrivalInterface {
     pub local: Ipv4Addr,
@@ -1107,9 +1202,9 @@ pub struct ArrivalInterface {
 /// daemon-wide state this function doesn't have and isn't ported.
 ///
 /// Returns the indices into `contexts` that are valid for a host directly
-/// connected to this interface (upstream's `context->current` chain);
-/// [`narrow_context`] should be restricted to just those indices once a
-/// caller has this, instead of scanning every context.
+/// connected to this interface (upstream's `context->current` chain).
+/// [`dispatch_dhcp_with_arrival`] restricts context selection to just those
+/// indices for the rest of that packet's dispatch.
 pub fn link_contexts_for_interface(contexts: &mut [DhcpContext], iface: &ArrivalInterface) -> Vec<usize> {
     for ctx in contexts.iter_mut() {
         if ctx.flags & CONTEXT_NETMASK == 0
@@ -2867,6 +2962,71 @@ mod tests {
         assert_eq!(get_message_type(&reply.options), Some(DhcpMsgType::Offer));
     }
 
+    /// End-to-end: a real socket, real `IP_PKTINFO`, real `recvmsg` — proving
+    /// `run_dhcp_loop` actually resolves the arrival interface off the wire
+    /// and restricts context selection to it, not just in the pure
+    /// `dispatch_dhcp_with_arrival` unit tests above (which pass a
+    /// hand-built `ArrivalInterface` and never touch a socket).
+    #[tokio::test]
+    async fn run_dhcp_loop_restricts_offer_to_arriving_interfaces_subnet() {
+        let Some(server) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+        let Some(client) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+        let Some(receiver) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+
+        {
+            use std::os::unix::io::AsRawFd as _;
+            if !crate::network::set_ipv4pktinfo(server.as_raw_fd()).unwrap_or(false) {
+                eprintln!("skipping: IP_PKTINFO not supported in this sandbox");
+                return;
+            }
+        }
+        if crate::network::nametoindex("lo") == 0 {
+            eprintln!("skipping: could not resolve 'lo' interface index");
+            return;
+        }
+
+        let receiver_addr = receiver.local_addr().unwrap();
+        let server = std::sync::Arc::new(server);
+        // 10.0.0.0/24 comes first: address_allocate would offer from it if
+        // arrival restriction weren't wired up. 127.0.0.0/8 is second, but is
+        // the only range on the interface (lo) the request actually arrives
+        // on, so a correctly-wired loop must offer from it instead.
+        let cfg = DhcpServerConfig {
+            contexts: vec![
+                make_ctx(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 200), Ipv4Addr::UNSPECIFIED, 0),
+                make_ctx(Ipv4Addr::new(127, 0, 0, 50), Ipv4Addr::new(127, 0, 0, 60), Ipv4Addr::UNSPECIFIED, 0),
+            ],
+            ..default_cfg()
+        };
+        let opts = DhcpLoopOptions {
+            reply_port_override: Some(receiver_addr.port()),
+            ..Default::default()
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, LeaseDb::new(), shutdown_rx, Box::new(NullProbe)));
+
+        let pkt = base_packet();
+        let wire = packet_to_wire(&pkt);
+        client.send_to(&wire, server.local_addr().unwrap()).await.unwrap();
+
+        let mut buf = [0u8; 512];
+        let (len, _) = tokio::time::timeout(Duration::from_millis(250), receiver.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for DHCP loop reply")
+            .unwrap();
+        let reply = parse_dhcp_packet(&buf[..len]).expect("loop reply should parse");
+        assert_eq!(get_message_type(&reply.options), Some(DhcpMsgType::Offer));
+        assert!(
+            is_same_net(reply.yiaddr, Ipv4Addr::new(127, 0, 0, 0), Ipv4Addr::new(255, 0, 0, 0)),
+            "expected an offer from the arriving (lo) interface's 127.0.0.0/8 range, got {}",
+            reply.yiaddr,
+        );
+
+        shutdown_tx.send(true).unwrap();
+        loop_task.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn run_dhcp_loop_receives_and_replies() {
         let Some(server) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
@@ -3354,6 +3514,147 @@ mod tests {
         };
         link_contexts_for_interface(&mut contexts, &iface);
         assert_eq!(contexts[0].broadcast, Ipv4Addr::new(10, 0, 0, 254));
+    }
+
+    // ── arrival_interface ────────────────────────────────────────────────────
+
+    #[test]
+    fn arrival_interface_zero_index_is_none() {
+        assert!(arrival_interface(0).is_none());
+    }
+
+    #[test]
+    fn arrival_interface_unknown_index_is_none() {
+        // No real interface has this index outside of pathological setups.
+        assert!(arrival_interface(u32::MAX).is_none());
+    }
+
+    #[test]
+    fn arrival_interface_resolves_a_real_interface() {
+        // Environment-dependent: skip if `lo` can't be resolved by index
+        // (sandboxes without loopback enumeration support) rather than
+        // asserting a specific outcome.
+        let idx = crate::network::nametoindex("lo");
+        if idx == 0 {
+            eprintln!("skipping: could not resolve 'lo' interface index");
+            return;
+        }
+        let Some(iface) = arrival_interface(idx) else {
+            eprintln!("skipping: 'lo' has no IPv4 address/netmask in this sandbox");
+            return;
+        };
+        assert_eq!(iface.local, Ipv4Addr::LOCALHOST);
+        assert_eq!(iface.broadcast, Ipv4Addr::from(u32::from(iface.local) | !u32::from(iface.netmask)));
+    }
+
+    // ── dispatch_dhcp_with_arrival ───────────────────────────────────────────
+
+    /// Two `dhcp-range`s on unrelated subnets, as if configured for two
+    /// different interfaces on the same box.
+    fn two_subnet_cfg() -> DhcpServerConfig {
+        let subnet_a = make_ctx(
+            Ipv4Addr::new(10, 0, 0, 100),
+            Ipv4Addr::new(10, 0, 0, 200),
+            Ipv4Addr::UNSPECIFIED,
+            0,
+        );
+        let subnet_b = make_ctx(
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 200),
+            Ipv4Addr::UNSPECIFIED,
+            0,
+        );
+        DhcpServerConfig {
+            contexts: vec![subnet_a, subnet_b],
+            ..default_cfg()
+        }
+    }
+
+    #[test]
+    fn dispatch_with_arrival_restricts_offer_to_arriving_subnet() {
+        let cfg0 = two_subnet_cfg();
+        let mut cfg = cfg0.clone();
+        let pkt = base_packet();
+
+        // Arrives on the 192.168.1.0/24 interface: only that subnet's
+        // dhcp-range may be used, even though it's second in cfg.contexts
+        // and address_allocate would otherwise offer from the first
+        // (10.0.0.0/24) context.
+        let iface = ArrivalInterface {
+            local: Ipv4Addr::new(192, 168, 1, 1),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::new(192, 168, 1, 255),
+        };
+        let dispatched = dispatch_dhcp_with_arrival(
+            &pkt, &mut cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe, Some(&iface),
+        )
+        .expect("discover should produce an offer");
+
+        assert!(is_same_net(dispatched.reply.yiaddr, Ipv4Addr::new(192, 168, 1, 0), Ipv4Addr::new(255, 255, 255, 0)));
+    }
+
+    #[test]
+    fn dispatch_with_arrival_none_falls_back_to_full_context_search() {
+        // No arrival interface known (e.g. IP_PKTINFO unavailable): behaves
+        // exactly like dispatch_dhcp_with_meta over the whole context list.
+        let mut cfg = two_subnet_cfg();
+        let mut cfg_baseline = two_subnet_cfg();
+        let pkt = base_packet();
+
+        let via_arrival = dispatch_dhcp_with_arrival(
+            &pkt, &mut cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe, None,
+        )
+        .expect("discover should produce an offer");
+        let via_meta = dispatch_dhcp_with_meta(
+            &pkt, &mut cfg_baseline, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe,
+        )
+        .expect("discover should produce an offer");
+
+        assert_eq!(via_arrival.reply.yiaddr, via_meta.reply.yiaddr);
+    }
+
+    #[test]
+    fn dispatch_with_arrival_unmatched_interface_falls_back_to_full_search() {
+        // Arrival interface shares no subnet with any configured dhcp-range
+        // (e.g. a relayed request from elsewhere): link_contexts_for_interface
+        // links nothing, so dispatch must still answer from the full list
+        // rather than silently dropping the request.
+        let mut cfg = two_subnet_cfg();
+        let pkt = base_packet();
+        let iface = ArrivalInterface {
+            local: Ipv4Addr::new(172, 16, 0, 1),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::new(172, 16, 0, 255),
+        };
+        let dispatched = dispatch_dhcp_with_arrival(
+            &pkt, &mut cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe, Some(&iface),
+        );
+        assert!(dispatched.is_some());
+    }
+
+    #[test]
+    fn dispatch_with_arrival_fills_router_from_interface() {
+        // The linked context's router/netmask (unset in two_subnet_cfg) is
+        // filled in from the arrival interface, then surfaces in the offer's
+        // OPTION_ROUTER (3) reply option — proof link_contexts_for_interface's
+        // mutation actually reaches the wire, not just cfg.contexts in place.
+        let mut cfg = two_subnet_cfg();
+        let pkt = base_packet();
+        let iface = ArrivalInterface {
+            local: Ipv4Addr::new(10, 0, 0, 1),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::new(10, 0, 0, 255),
+        };
+        let dispatched = dispatch_dhcp_with_arrival(
+            &pkt, &mut cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe, Some(&iface),
+        )
+        .expect("discover should produce an offer");
+
+        let router_opt = find_option(&dispatched.reply.options, 3).expect("router option present");
+        assert_eq!(router_opt, &iface.local.octets());
+        // The mutation also persists on cfg.contexts itself (matching
+        // upstream's complete_context, which is not undone after the call).
+        assert_eq!(cfg.contexts[0].router, iface.local);
     }
 
     // ── config_find_by_address ───────────────────────────────────────────────

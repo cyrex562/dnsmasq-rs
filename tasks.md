@@ -944,15 +944,46 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   it fills in netmask for ranges missing `CONTEXT_NETMASK`, computes
   router/local/broadcast for every context on that subnet, and returns which
   contexts are valid for a host on that interface.
-  Covered by `dhcp::tests::link_contexts_for_interface_*`.
+
+  `link_contexts_for_interface` now has a real runtime caller:
+  `bind_listeners` enables `IP_PKTINFO` on the DHCP socket
+  (`network::set_ipv4pktinfo`), `run_dhcp_loop` reads it back per datagram
+  via `recv_dhcp_datagram` → `network::recv_with_dest`/`parse_pktinfo`
+  (already used by the DNS wildcard-listener path in `forward.rs`), resolves
+  the `if_index` to an `ArrivalInterface` via `dhcp::arrival_interface`
+  (`network::enumerate_interfaces`), and dispatches through the new
+  `dispatch_dhcp_with_arrival` instead of `dispatch_dhcp_with_meta` directly.
+  `dispatch_dhcp_with_arrival` links/completes `cfg.contexts` for that
+  interface and, when at least one context links, restricts *both*
+  `context_for_reply`/`narrow_context` and `address_allocate`'s pool scan to
+  just that linked subset for the rest of the packet's dispatch — so a
+  DISCOVER arriving on an interface with its own `dhcp-range` can no longer
+  be offered an address from an unrelated interface's range. When nothing
+  links (unknown interface, or a relayed request from a subnet with no local
+  `dhcp-range`), it falls back to the full context list, same as before.
+  `dispatch_dhcp_with_meta`'s own signature and every existing call site
+  (tests included) are unchanged — `dispatch_dhcp_with_arrival` is a thin
+  wrapper that narrows `cfg.contexts` before delegating.
+  Covered by `dhcp::tests::{link_contexts_for_interface_*, arrival_interface_*,
+  dispatch_with_arrival_*, run_dhcp_loop_restricts_offer_to_arriving_interfaces_subnet}`
+  — the last one exercises the real socket/`IP_PKTINFO`/`recvmsg` path
+  end-to-end, not just `dispatch_dhcp_with_arrival` called directly with a
+  hand-built `ArrivalInterface`.
 
   Deliberate simplifications, still open:
-  - **`link_contexts_for_interface` has no caller.** Restricting it to the
-    real arrival interface needs `IP_PKTINFO` on the DHCP socket
-    (`bind_listeners`/`make_fd` below) and threading the resulting interface
-    index through `run_dhcp_loop`'s receive path, neither of which exists
-    yet. `context_for_reply`/`narrow_context` still search every configured
-    context rather than just the arriving interface's linked chain.
+  - **Only meaningful with one bound DHCP address per box.** `bind_listeners`
+    still binds the DHCP socket to a single specific address
+    (`daemon_dhcp_runtime`'s `bind_ip`, the first configured listen address),
+    not a wildcard `INADDR_ANY` socket serving several interfaces at once —
+    that's the `make_fd`/multi-interface bind gap described elsewhere in this
+    file. `IP_PKTINFO` still reports a real, correct arrival interface index
+    for every datagram on a single-address-bound socket (the kernel doesn't
+    care how the socket was bound), so the wiring above is real production
+    code, not test-only — but until the daemon can bind more than one
+    interface for DHCP, every packet it receives arrives on the same
+    interface, so `link_contexts_for_interface` only ever narrows to
+    whichever `dhcp-range`s share that one interface's subnet. True
+    multi-interface selection needs the wildcard-bind work landed first.
   - **`complete_context`'s `shared_networks`/`dhcp-relay` linking is not
     ported** — only the local-subnet half. Shared-network address pools and
     `relay->iface_index` assignment (already handled separately by
