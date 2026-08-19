@@ -25,6 +25,7 @@ use crate::types::constants::{F_IPV4, F_IPV6, F_SERVER};
 use crate::types::dns_records::{
     BogusAddr, Cname, HostRecord, MxSrvRecord, Naptr, PtrRecord, TxtRecord,
 };
+use crate::domain::CondDomain;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Types
@@ -988,6 +989,11 @@ pub struct LocalData {
     pub naptr_records: Vec<Naptr>,
     /// `--domain-needed` (`OPT_NODOTS_LOCAL`).
     pub nodots_local:  bool,
+    /// `--synth-domain` (`daemon->synth_domains`).
+    pub synth_domains: Vec<CondDomain>,
+    /// Domains with a `SERV_LITERAL_ADDRESS` server entry and no upstream —
+    /// see [`crate::rfc1035::LocalConfig::literal_domains`].
+    pub literal_domains: Vec<String>,
 }
 
 impl Default for LocalData {
@@ -1005,6 +1011,8 @@ impl Default for LocalData {
             cnames:        Vec::new(),
             naptr_records: Vec::new(),
             nodots_local:  false,
+            synth_domains: Vec::new(),
+            literal_domains: Vec::new(),
         }
     }
 }
@@ -1023,6 +1031,8 @@ impl LocalData {
             cnames:        &self.cnames,
             naptr_records: &self.naptr_records,
             nodots_local:  self.nodots_local,
+            synth_domains: &self.synth_domains,
+            literal_domains: &self.literal_domains,
         }
     }
 
@@ -1044,6 +1054,13 @@ impl LocalData {
 pub struct ForwardConfig {
     /// Ordered list of upstream resolver addresses.
     pub upstreams: Vec<SocketAddr>,
+    /// Per-upstream domain restriction, parallel to `upstreams` (same index,
+    /// same length): the `.domain` of the `Server` each entry came from
+    /// (`server=/domain/ip`, `rev-server`, ...). An empty string means "no
+    /// restriction" — a general resolver usable for any query that no
+    /// domain-scoped entry claims. Mirrors upstream's per-server domain
+    /// match in `forward.c`'s server selection.
+    pub server_domains: Vec<String>,
     /// Per-query timeout.
     pub timeout: Duration,
     /// Maximum number of retries per query.
@@ -1113,6 +1130,7 @@ impl Default for ForwardConfig {
     fn default() -> Self {
         Self {
             upstreams:     Vec::new(),
+            server_domains: Vec::new(),
             timeout:       Duration::from_secs(QUERY_TIMEOUT_SECS),
             max_retries:   2,
             local:         LocalData::default(),
@@ -1287,8 +1305,8 @@ impl ForwardEngine {
         if self.config.upstreams.is_empty() {
             return ForwardOutcome::Dropped;
         }
-        let Some(server_idx) = next_server(&self.upstream_order, &HashSet::new(), usize::MAX)
-        else {
+        let candidates = self.candidate_servers(pkt);
+        let Some(server_idx) = next_server(&candidates, &HashSet::new(), usize::MAX) else {
             return ForwardOutcome::Dropped;
         };
 
@@ -1549,7 +1567,56 @@ impl ForwardEngine {
         if frec.retries >= self.config.max_retries {
             return None;
         }
-        next_server(&self.upstream_order, &frec.tried, frec.sentto?)
+        let candidates = match &frec.stash {
+            Some(pkt) => self.candidate_servers(pkt),
+            None => self.upstream_order.clone(),
+        };
+        next_server(&candidates, &frec.tried, frec.sentto?)
+    }
+
+    /// Restrict `self.upstream_order` to the servers eligible for `pkt`'s
+    /// question name: the longest domain-suffix match among
+    /// `config.server_domains`, or every server with no domain restriction
+    /// (`""`) when nothing matches or `pkt`'s question can't be read.
+    /// Mirrors upstream's per-server `.domain` scoping — the mechanism
+    /// `server=/domain/ip` and `rev-server` both rely on for their upstream
+    /// to actually be used. Returns `self.upstream_order` unmodified — no
+    /// allocation, no behaviour change — when no server is domain-restricted.
+    pub(crate) fn candidate_servers(&self, pkt: &[u8]) -> Vec<usize> {
+        if !self.config.server_domains.iter().any(|d| !d.is_empty()) {
+            return self.upstream_order.clone();
+        }
+
+        let qname = query_name_lower(pkt);
+
+        let mut best_len: usize = 0;
+        let mut candidates: Vec<usize> = Vec::new();
+        for &idx in &self.upstream_order {
+            let domain = self.config.server_domains.get(idx).map(String::as_str).unwrap_or("");
+            if domain.is_empty() || !domain_matches_suffix(&qname, domain) {
+                continue;
+            }
+            let dlen = domain.len();
+            if candidates.is_empty() || dlen > best_len {
+                best_len = dlen;
+                candidates.clear();
+                candidates.push(idx);
+            } else if dlen == best_len {
+                candidates.push(idx);
+            }
+        }
+
+        if !candidates.is_empty() {
+            return candidates;
+        }
+
+        // No domain-scoped server matches this name: fall back to the
+        // general (unrestricted-domain) resolvers, if any.
+        self.upstream_order
+            .iter()
+            .copied()
+            .filter(|&idx| self.config.server_domains.get(idx).is_none_or(|d| d.is_empty()))
+            .collect()
     }
 
     /// Expire timed-out queries, releasing their source sockets.  Returns how
@@ -2403,6 +2470,33 @@ fn make_refused_answer(query: &[u8], edns_pktsz: u16) -> Option<Vec<u8>> {
     )
 }
 
+// ─── Server domain matching ────────────────────────────────────────────────────
+
+/// Read the (lower-cased) question name out of a raw query packet, or `""`
+/// if the question can't be parsed.  Used only for domain-scoped server
+/// selection — a query that fails to parse here already failed
+/// `hash_questions()` earlier and was refused before reaching this code.
+fn query_name_lower(pkt: &[u8]) -> String {
+    let mut offset = 12;
+    match crate::rfc1035::parse_question(pkt, &mut offset) {
+        Ok(q) => q.name.to_lowercase(),
+        Err(_) => String::new(),
+    }
+}
+
+/// Case-insensitive, label-boundary-aware suffix match: `name` equals
+/// `domain` or is a subdomain of it.
+fn domain_matches_suffix(name: &str, domain: &str) -> bool {
+    let dlen = domain.len();
+    if dlen == 0 || name.len() < dlen {
+        return false;
+    }
+    let start = name.len() - dlen;
+    let suffix = &name[start..];
+    suffix.eq_ignore_ascii_case(domain)
+        && (name.len() == dlen || name.as_bytes().get(start.wrapping_sub(1)) == Some(&b'.'))
+}
+
 // ─── Reply processing helpers ─────────────────────────────────────────────────
 
 /// A rebind-exclusion domain entry — the same type `Daemon::no_rebind` holds,
@@ -3079,6 +3173,71 @@ mod tests {
         let servers: Vec<usize> = vec![];
         let tried = HashSet::new();
         assert_eq!(next_server(&servers, &tried, 0), None);
+    }
+
+    // ── candidate_servers (domain-scoped server selection) ──────────────────
+
+    /// A `rev-server=192.168.1.0/24,10.0.0.1`-shaped config: a general
+    /// resolver at index 0, and a reverse-zone-scoped resolver at index 1.
+    fn engine_with_domain_scoped_server() -> ForwardEngine {
+        let config = ForwardConfig {
+            upstreams: vec!["10.0.0.9:53".parse().unwrap(), "10.0.0.1:53".parse().unwrap()],
+            server_domains: vec![String::new(), "1.168.192.in-addr.arpa".to_string()],
+            ..Default::default()
+        };
+        ForwardEngine::new(config)
+    }
+
+    #[test]
+    fn candidate_servers_routes_matching_reverse_query_to_its_scoped_upstream() {
+        let engine = engine_with_domain_scoped_server();
+        let pkt = make_dns_query("1.1.168.192.in-addr.arpa", 12);
+        assert_eq!(engine.candidate_servers(&pkt), vec![1]);
+    }
+
+    #[test]
+    fn candidate_servers_falls_back_to_general_resolver_for_unmatched_name() {
+        let engine = engine_with_domain_scoped_server();
+        let pkt = make_dns_query("example.com", 1);
+        assert_eq!(engine.candidate_servers(&pkt), vec![0]);
+    }
+
+    #[test]
+    fn candidate_servers_prefers_the_longest_domain_match() {
+        let config = ForwardConfig {
+            upstreams: vec![
+                "10.0.0.1:53".parse().unwrap(),
+                "10.0.0.2:53".parse().unwrap(),
+            ],
+            server_domains: vec!["in-addr.arpa".to_string(), "1.168.192.in-addr.arpa".to_string()],
+            ..Default::default()
+        };
+        let engine = ForwardEngine::new(config);
+        let pkt = make_dns_query("1.1.168.192.in-addr.arpa", 12);
+        assert_eq!(engine.candidate_servers(&pkt), vec![1]);
+    }
+
+    #[test]
+    fn candidate_servers_is_the_full_order_when_nothing_is_domain_scoped() {
+        let config = ForwardConfig {
+            upstreams: vec!["10.0.0.1:53".parse().unwrap(), "10.0.0.2:53".parse().unwrap()],
+            ..Default::default()
+        };
+        let engine = ForwardEngine::new(config);
+        let pkt = make_dns_query("example.com", 1);
+        assert_eq!(engine.candidate_servers(&pkt), vec![0, 1]);
+    }
+
+    #[test]
+    fn candidate_servers_with_no_match_and_no_general_resolver_is_empty() {
+        let config = ForwardConfig {
+            upstreams: vec!["10.0.0.1:53".parse().unwrap()],
+            server_domains: vec!["1.168.192.in-addr.arpa".to_string()],
+            ..Default::default()
+        };
+        let engine = ForwardEngine::new(config);
+        let pkt = make_dns_query("example.com", 1);
+        assert!(engine.candidate_servers(&pkt).is_empty());
     }
 
     // ── reply_matches_query ───────────────────────────────────────────────────

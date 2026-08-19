@@ -889,6 +889,53 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   Done when: `run_tag_if` participates in the same decision points as
   upstream, or the narrowing above is still accurate and current.
 
+- [ ] Issue #20 `rev-server`/`synth-domain`/`shared-network`/`bridge-interface`:
+  all four now parse, populate `Daemon` state, and affect runtime behavior
+  (`src/option.rs`, `src/types/daemon.rs`, `src/domain.rs`). `rev-server`
+  reuses the existing `Server`/`daemon.servers` machinery (`SERV_LITERAL_ADDRESS`
+  when no upstream is given); `synth-domain` populates `Daemon::synth_domains`
+  and is wired into `rfc1035.rs::answer_request` for both forward (A/AAAA)
+  and reverse (PTR) synthesis. `forward.rs::ForwardEngine::candidate_servers`
+  now does domain-suffix-scoped upstream selection (longest match wins,
+  falling back to domain-less "general" resolvers), so `rev-server` and the
+  pre-existing `server=/domain/ip` both actually restrict which upstream a
+  query can use — this was previously entirely unwired (`daemon_forward_config`
+  discarded `Server.domain` outright). Known narrowings, left deliberate:
+  - `synth-domain`'s `local` shorthand (upstream: `local=/xxx.in-addr.arpa/`
+    + `local=/<domain>/` generated automatically) is a `--domain`-only
+    feature upstream (`option.c`'s `option != 's'` check) and is correctly
+    *not* implemented for `synth-domain` — only `rev-server` and the bare
+    `--domain` directive have a "no address" shorthand, and `--domain`'s own
+    subnet form (`daemon->cond_domain`) is still unparsed (only the plain
+    `domain=<suffix>` form works; see `src/option.rs`'s `"domain"` arm).
+  - `synth-domain`'s subnet-from-interface form (`synth-domain=<domain>,<iface>`)
+    is **not implemented** — upstream restricts that fallback to `option=='s'`
+    (bare `--domain`) too, so a non-address, non-CIDR second field is
+    rejected as invalid for `synth-domain`, matching upstream exactly.
+    `CondDomain.interface` exists for structural parity (and so a future
+    `--domain` subnet-from-interface implementation has a home) but nothing
+    currently populates or consults it.
+  - `bridge-interface` and `shared-network` populate `Daemon::bridges` /
+    `Daemon::shared_networks`, but nothing in `src/dhcp.rs`/`src/rfc2131.rs`
+    consults either yet — upstream uses `bridges` to remap an arriving
+    DHCP request's interface to the bridge's primary interface for context
+    matching, and `shared_networks` to treat two interfaces/subnets as one
+    broadcast domain. That DHCP-side consumption is unimplemented; both
+    directives are parse-and-store only until DHCP context matching grows
+    an interface-remap/shared-domain step.
+  - `forward.rs`'s new domain-scoped selection is longest-suffix-match only
+    (no `SERV_FOR_NODOTS` wildcard-for-bare-names support, since nothing
+    currently produces such an entry — `server=//ip` isn't implemented
+    either). Retries reuse the same candidate set as the initial send
+    (recomputed from `Frec.stash`), so a query only ever retries within the
+    domain it was scoped to.
+  Required tests: once addressed, add a `--domain` subnet-form test, a
+  `synth-domain=...,<iface>` acceptance test, and a DHCP-request test where
+  `bridge-interface`/`shared-network` change context selection.
+  Done when: `--domain`'s subnet form populates `cond_domain` and is wired
+  the same way `synth_domains` now is, and DHCP context matching consumes
+  `bridges`/`shared_networks`.
+
 ## P3 Feature-Specific Completion
 
 - [ ] Finish behavior-critical gaps in DNS forwarding and cache interaction.

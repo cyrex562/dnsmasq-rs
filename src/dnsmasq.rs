@@ -529,7 +529,23 @@ pub fn daemon_local_data(daemon: &Daemon) -> crate::forward::LocalData {
         cnames:        daemon.cnames.clone(),
         naptr_records: daemon.naptr.clone(),
         nodots_local:  daemon.option_bool(crate::types::constants::OPT_NODOTS_LOCAL),
+        synth_domains: daemon.synth_domains.clone(),
+        literal_domains: literal_server_domains(daemon),
     }
+}
+
+/// Domains from `daemon.servers` entries with `SERV_LITERAL_ADDRESS` set
+/// (no real upstream) — these are never forwarded.  Shared by
+/// [`daemon_local_data`] (answers them NXDOMAIN) and [`daemon_forward_config`]
+/// (excludes them from the upstream list).
+fn literal_server_domains(daemon: &Daemon) -> Vec<String> {
+    use crate::types::server::SERV_LITERAL_ADDRESS;
+    daemon
+        .servers
+        .iter()
+        .filter(|s| s.flags & SERV_LITERAL_ADDRESS != 0 && !s.domain.is_empty())
+        .map(|s| s.domain.clone())
+        .collect()
 }
 
 /// Resolve the answer-cache size from `cache-size`.  Upstream treats a negative
@@ -565,12 +581,22 @@ pub fn daemon_forward_config(daemon: &Daemon) -> crate::forward::ForwardConfig {
         OPT_NO_REBIND,
     };
 
+    // `SERV_LITERAL_ADDRESS` entries (`local=/domain/` with no address,
+    // `rev-server` with the server part omitted) carry a dummy address and
+    // are never forwarded to — `literal_server_domains` routes them to a
+    // local NXDOMAIN answer instead (see `daemon_local_data`).
+    let forwardable: Vec<&crate::types::server::Server> = daemon
+        .servers
+        .iter()
+        .filter(|s| s.flags & crate::types::server::SERV_LITERAL_ADDRESS == 0)
+        .collect();
+
     crate::forward::ForwardConfig {
-        upstreams: daemon
-            .servers
+        upstreams: forwardable
             .iter()
             .map(|s| SocketAddr::from(s.addr.clone()))
             .collect(),
+        server_domains: forwardable.iter().map(|s| s.domain.clone()).collect(),
         local:         daemon_local_data(daemon),
         cache_size:    daemon_cache_size(daemon),
         min_cache_ttl: daemon.min_cache_ttl,
@@ -1911,6 +1937,41 @@ mod tests {
         assert!(config.dnssec_valid, "--dnssec gates the reply-side DNSSEC handling");
         assert!(config.dnssec_proxy, "--proxy-dnssec must be readable");
         assert!(config.check_rebind);
+    }
+
+    /// End-to-end: `rev-server=192.168.1.0/24,10.0.0.1` must make a
+    /// `ForwardEngine` built from `daemon_forward_config` actually pick
+    /// `10.0.0.1` for a PTR query in that subnet — not round-robin it
+    /// against whatever other upstream happens to be configured.  This is
+    /// the acceptance bar for `rev-server`: parsing into `Daemon.servers`
+    /// alone is not enough without this wiring.
+    #[test]
+    fn rev_server_delegates_reverse_lookups_to_its_own_upstream() {
+        let lines = crate::option::parse_config_text(
+            "server=8.8.8.8\nrev-server=192.168.1.0/24,10.0.0.1\n",
+            "test",
+        )
+        .unwrap();
+        let mut daemon = Daemon::default();
+        crate::option::apply_config(&mut daemon, &lines).unwrap();
+
+        let config = daemon_forward_config(&daemon);
+        assert_eq!(config.upstreams.len(), 2);
+        assert_eq!(config.server_domains, vec![String::new(), "1.168.192.in-addr.arpa".to_string()]);
+
+        let mut engine = crate::forward::ForwardEngine::new(config);
+        let mut ptr_query: Vec<u8> = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        for label in "1.1.168.192.in-addr.arpa".split('.') {
+            ptr_query.push(label.len() as u8);
+            ptr_query.extend_from_slice(label.as_bytes());
+        }
+        ptr_query.push(0);
+        ptr_query.extend_from_slice(&12u16.to_be_bytes()); // PTR
+        ptr_query.extend_from_slice(&1u16.to_be_bytes());  // IN
+
+        let candidates = engine.candidate_servers(&ptr_query);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(engine.config.upstreams[candidates[0]], "10.0.0.1:53".parse::<std::net::SocketAddr>().unwrap());
     }
 
     #[test]

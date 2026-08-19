@@ -10,9 +10,49 @@ use crate::types::addr::MySockAddr;
 use crate::types::dns_records::*;
 use crate::types::network::*;
 use crate::types::server::*;
+use crate::domain::CondDomain;
 
 #[cfg(feature = "dhcp")]
 use crate::types::dhcp::*;
+
+/// A bridged DHCP interface (`struct dhcp_bridge`, `dnsmasq.h:1035-1038`).
+///
+/// `--bridge-interface=<iface>,<alias>...` remaps DHCP requests arriving on
+/// `aliases` to be treated as if they arrived on `iface` for context
+/// matching.  C represents `alias` as a linked list of single-field nodes;
+/// here it is a `Vec<String>`.
+#[derive(Debug, Clone, Default)]
+pub struct DhcpBridge {
+    pub iface:   String,
+    pub aliases: Vec<String>,
+}
+
+/// An extra network sharing a DHCP broadcast domain (`struct shared_network`,
+/// `dnsmasq.h:1075-1083`), from `--shared-network`.
+#[derive(Debug, Clone)]
+pub struct SharedNetwork {
+    /// Set when the directive's first field was an interface name rather
+    /// than a literal address (`if_nametoindex()`, `option.c:3730`).
+    pub if_index:    u32,
+    pub is6:         bool,
+    pub match_addr:  Ipv4Addr,
+    pub shared_addr: Ipv4Addr,
+    pub match_addr6: Ipv6Addr,
+    pub shared_addr6: Ipv6Addr,
+}
+
+impl Default for SharedNetwork {
+    fn default() -> Self {
+        Self {
+            if_index:    0,
+            is6:         false,
+            match_addr:  Ipv4Addr::UNSPECIFIED,
+            shared_addr: Ipv4Addr::UNSPECIFIED,
+            match_addr6: Ipv6Addr::UNSPECIFIED,
+            shared_addr6: Ipv6Addr::UNSPECIFIED,
+        }
+    }
+}
 
 /// Default advertised EDNS0 UDP payload size (`EDNS_PKTSZ` in `dnsmasq.h`),
 /// overridable with `edns-packet-max`.
@@ -32,6 +72,16 @@ pub struct Daemon {
     pub servers:        Vec<Server>,
     pub server_has_wildcard: bool,
     pub no_rebind:      Vec<RebindDomain>,
+    /// `--synth-domain` (`daemon->synth_domains`, `dnsmasq.h:1196`): IP-range
+    /// to domain-name synthesis rules, distinct from the plain `--domain`
+    /// subnet form (`daemon->cond_domain`), which this port does not yet
+    /// populate — see `tasks.md`.
+    pub synth_domains:  Vec<CondDomain>,
+    /// `--bridge-interface` (`daemon->bridges`, `dnsmasq.h:1316`). Declared
+    /// unconditionally upstream (not gated on `HAVE_DHCP`).
+    pub bridges:        Vec<DhcpBridge>,
+    /// `--shared-network` (`daemon->shared_networks`, `dnsmasq.h:1317`).
+    pub shared_networks: Vec<SharedNetwork>,
 
     // ── DNS record configuration ──────────────────────────────────────────────
     pub mxnames:       Vec<MxSrvRecord>,
@@ -255,6 +305,9 @@ impl Default for Daemon {
             servers: vec![],
             server_has_wildcard: false,
             no_rebind: vec![],
+            synth_domains: vec![],
+            bridges: vec![],
+            shared_networks: vec![],
             mxnames: vec![],
             naptr: vec![],
             txt: vec![],
