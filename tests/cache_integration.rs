@@ -206,6 +206,7 @@ fn empty_local() -> LocalConfig<'static> {
         host_records: &[],
         cnames: &[],
         naptr_records: &[],
+        int_names: &[],
         nodots_local: false,
         synth_domains: &[],
         literal_domains: &[],

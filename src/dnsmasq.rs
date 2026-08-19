@@ -528,6 +528,7 @@ pub fn daemon_local_data(daemon: &Daemon) -> crate::forward::LocalData {
         host_records:  daemon.host_records.clone(),
         cnames:        daemon.cnames.clone(),
         naptr_records: daemon.naptr.clone(),
+        int_names:     daemon.int_names.clone(),
         nodots_local:  daemon.option_bool(crate::types::constants::OPT_NODOTS_LOCAL),
         synth_domains: daemon.synth_domains.clone(),
         literal_domains: literal_server_domains(daemon),
@@ -623,6 +624,7 @@ pub fn daemon_forward_config(daemon: &Daemon) -> crate::forward::ForwardConfig {
         randport_limit: daemon.randport_limit.max(1) as usize,
         port:           daemon.port,
         conntrack:      daemon.option_bool(OPT_CONNTRACK),
+        ipsets:         daemon.ipsets.clone(),
         ..Default::default()
     }
 }
@@ -1885,7 +1887,9 @@ mod tests {
 
     #[test]
     fn daemon_local_data_carries_every_record_kind() {
-        use crate::types::dns_records::{Cname, HostRecord, MxSrvRecord, Naptr, PtrRecord, TxtRecord};
+        use crate::types::dns_records::{
+            Cname, HostRecord, InterfaceName, MxSrvRecord, Naptr, PtrRecord, TxtRecord,
+        };
 
         let mut daemon = Daemon { local_ttl: 60, ..Default::default() };
         daemon.host_records.push(HostRecord {
@@ -1915,6 +1919,10 @@ mod tests {
             name: "naptr.test".into(), replace: "r.test".into(), regexp: String::new(),
             services: "SIP+D2U".into(), flags: "s".into(), order: 1, pref: 2,
         });
+        daemon.int_names.push(InterfaceName {
+            name: "router.lan".into(), intr: "eth0".into(), flags: 0,
+            proto4: None, proto6: None, addrs: vec![],
+        });
 
         let local = daemon_local_data(&daemon);
         assert_eq!(local.local_ttl, 60);
@@ -1925,6 +1933,7 @@ mod tests {
         assert_eq!(local.mx_records.len(), 1);
         assert_eq!(local.ptr_records.len(), 1);
         assert_eq!(local.naptr_records.len(), 1);
+        assert_eq!(local.int_names.len(), 1);
         assert!(!local.is_empty());
     }
 

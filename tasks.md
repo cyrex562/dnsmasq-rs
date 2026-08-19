@@ -326,7 +326,39 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   - `--add-subnet` reply verification (`check_source()`, `forward.c:727-731`) and the
     `FREC_NO_CACHE` handling that goes with it. `edns0::check_source_subnet` and
     `verify_ecs_reply` exist and are still uncalled.
-  - ipset / nftset population. `domain_find_sets` is ported; nothing consumes it.
+  - ipset / nftset kernel population. `rfc1035::extract_addresses` now matches the query
+    name against `ExtractConfig::ipsets` (a local `domain_find_sets`, duplicating
+    `forward::domain_find_sets`/`IpSet` — nothing constructs an `IpSet` from parsed config,
+    so unifying the two types is follow-up work) and reports every matched A/AAAA address via
+    `ExtractOutcome::ipset_hits`; `forward::cache_upstream_reply` logs each hit via
+    `tracing::debug!`. What is still missing: actually adding the address to the kernel
+    ipset/nftset (`add_to_ipset`/`add_to_nftset`, `rfc1035.c:1016,1027`) — this needs a raw
+    `NETLINK_NETFILTER` socket send built on the existing `ipset::build_ipset_msg`/
+    `nftset::build_nft_add_msg` wire-format builders (both message-builders only, no socket
+    I/O today). `nftset=` directive parsing is also still explicitly rejected
+    (`option::apply_nftset_is_explicitly_unsupported`), so `ExtractConfig` has no `nftsets`
+    field yet either — `ipsets` only, matching what can actually be configured.
+  - `find_soa` (`rfc1035.rs`, port of `rfc1035.c:519-650`) does not apply DNSSEC TTL capping
+    from a per-answer signature-validity array (`daemon->rr_status[i + ancount]`,
+    `rfc1035.c:609-618`) — that array does not exist anywhere in the DNSSEC path yet
+    (`grep rr_status` finds nothing outside upstream C), so capping it here in isolation would
+    be unverifiable. It does now: verify the SOA's owner name is a byte suffix of the queried
+    name before using it (`rfc1035.c:554-556`), and cache the SOA RR itself as `F_RR|F_KEYTAG`
+    (`rfc1035.c:620`).
+  - `log_txt` (`rfc1035.rs`, port of `rfc1035.c:653-682`) truncates each TXT string at its first
+    non-printable byte and logs via `tracing::debug!` per string, called from
+    `extract_addresses`'s TXT branch. C logs through its general `log_query()` facility, which
+    this crate does not have (`grep -rn "fn log_query"` finds nothing outside
+    `forward::log_query_mysockaddr`, an unrelated helper) — `answer_request`'s local-config TXT
+    branch (`rfc1035.c`'s second `log_txt` call site, serving from cache/local data) does not
+    call `log_txt` yet, so TXT answers built from `--txt-record` are not logged the way a
+    forwarded TXT reply now is.
+  - `check_for_local_domain` now checks `daemon->int_names` (`--interface-name`) for a
+    domain-suffix match, matching upstream — but only for the domain-needed NOERR/NXDOMAIN
+    decision. Actually *answering* an A/AAAA/PTR query for an interface-name domain with the
+    interface's runtime address (upstream's other `int_names` consumers) is not implemented
+    anywhere in this crate; `daemon.int_names` is parsed and now read once, but never turned
+    into a real answer.
   - The reply is not sized against each client's advertised `udp_pkt_size`, so C's
     per-`frec_src` truncation fallback (`forward.c:1463-1475`) has no equivalent — this port
     also never rewrites the payload size on the *outgoing* query, so it forwards whatever the

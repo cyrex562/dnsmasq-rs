@@ -23,8 +23,9 @@ use crate::rfc1035::{
 };
 use crate::types::constants::{F_IPV4, F_IPV6, F_SERVER};
 use crate::types::dns_records::{
-    BogusAddr, Cname, HostRecord, MxSrvRecord, Naptr, PtrRecord, TxtRecord,
+    BogusAddr, Cname, HostRecord, InterfaceName, MxSrvRecord, Naptr, PtrRecord, TxtRecord,
 };
+use crate::types::network::Ipsets;
 use crate::domain::CondDomain;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -987,6 +988,8 @@ pub struct LocalData {
     pub host_records:  Vec<HostRecord>,
     pub cnames:        Vec<Cname>,
     pub naptr_records: Vec<Naptr>,
+    /// `--interface-name` (`daemon->int_names`).
+    pub int_names:     Vec<InterfaceName>,
     /// `--domain-needed` (`OPT_NODOTS_LOCAL`).
     pub nodots_local:  bool,
     /// `--synth-domain` (`daemon->synth_domains`).
@@ -1010,6 +1013,7 @@ impl Default for LocalData {
             host_records:  Vec::new(),
             cnames:        Vec::new(),
             naptr_records: Vec::new(),
+            int_names:     Vec::new(),
             nodots_local:  false,
             synth_domains: Vec::new(),
             literal_domains: Vec::new(),
@@ -1030,6 +1034,7 @@ impl LocalData {
             host_records:  &self.host_records,
             cnames:        &self.cnames,
             naptr_records: &self.naptr_records,
+            int_names:     &self.int_names,
             nodots_local:  self.nodots_local,
             synth_domains: &self.synth_domains,
             literal_domains: &self.literal_domains,
@@ -1046,6 +1051,7 @@ impl LocalData {
             && self.host_records.is_empty()
             && self.cnames.is_empty()
             && self.naptr_records.is_empty()
+            && self.int_names.is_empty()
     }
 }
 
@@ -1124,6 +1130,8 @@ pub struct ForwardConfig {
     /// incoming client connection onto the outgoing upstream socket
     /// (`forward.c:531-535`).
     pub conntrack: bool,
+    /// `--ipset` (`daemon->ipsets`). See [`ExtractConfig::ipsets`].
+    pub ipsets: Vec<Ipsets>,
 }
 
 impl Default for ForwardConfig {
@@ -1153,6 +1161,7 @@ impl Default for ForwardConfig {
             randport_limit: RANDPORT_LIMIT,
             port:          53,
             conntrack:     false,
+            ipsets:        Vec::new(),
         }
     }
 }
@@ -1175,6 +1184,7 @@ impl ForwardConfig {
             // reply is ever marked authenticated.  See `tasks.md`.
             secure:       false,
             cache_rr:     self.cache_rr.clone(),
+            ipsets:       self.ipsets.clone(),
         }
     }
 }
@@ -2187,7 +2197,15 @@ fn cache_upstream_reply(
         return Ede::Blocked;
     }
 
-    match crate::cache::cache_reply(pkt, cache, &config.extract_config(&qname)) {
+    let outcome = crate::cache::cache_reply(pkt, cache, &config.extract_config(&qname));
+    // Actually sending these to the kernel ipset/nftset is not yet
+    // implemented (raw netlink I/O) — see `tasks.md`. Logging them keeps the
+    // match observable and mirrors upstream's `log_query(F_IPSET, ...)`
+    // (`rfc1035.c:1017`), which fires on every successful add.
+    for hit in &outcome.ipset_hits {
+        tracing::debug!(set = %hit.set_name, addr = %hit.addr, "matched configured ipset/nftset");
+    }
+    match outcome.result {
         ExtractResult::Cached => Ede::Unset,
         ExtractResult::RebindBlocked => {
             // Sections cleared, rcode left alone: C logs and blocks but does
@@ -2667,7 +2685,8 @@ fn attach_ede(pkt: &[u8], ede: Ede) -> Option<Vec<u8>> {
 /// `bogusanswer`/`cache_secure` are always false here and the AD bit is never
 /// *set*), `--alias` address rewriting (`do_doctor`), the NXDOMAIN→NODATA
 /// conversion for locally-known names, `--add-subnet` reply verification, and
-/// ipset/nftset population.
+/// actually sending a matched `--ipset` address to the kernel (the matching
+/// itself now happens in `extract_addresses` — see `cache_upstream_reply`).
 pub fn process_reply(
     pkt:    &mut Vec<u8>,
     cache:  &mut DnsCache,

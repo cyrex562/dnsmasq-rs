@@ -1070,10 +1070,12 @@ pub fn dump_cache(cache: &DnsCache, now: Instant) -> Vec<String> {
 /// 1. Parsing the wire-format packet.
 /// 2. Calling [`crate::rfc1035::extract_addresses`] to populate `cache`.
 ///
-/// Returns the [`ExtractResult`](crate::rfc1035::ExtractResult) so the caller
-/// can act on it the way C's `process_reply()` acts on `extract_addresses()`'s
-/// return code (`forward.c:824-841`): a non-zero code clears the RR sections,
-/// `1` (rebind) is logged, `2` (bad packet) also becomes SERVFAIL.
+/// Returns the [`ExtractOutcome`](crate::rfc1035::ExtractOutcome) so the
+/// caller can act on its `result` the way C's `process_reply()` acts on
+/// `extract_addresses()`'s return code (`forward.c:824-841`): a non-zero code
+/// clears the RR sections, `1` (rebind) is logged, `2` (bad packet) also
+/// becomes SERVFAIL — and on its `ipset_hits` the way C calls
+/// `add_to_ipset()`/`add_to_nftset()` inline (`rfc1035.c:1009-1028`).
 ///
 /// This is the integration point between the forwarding engine and the DNS
 /// cache; `forward::cache_upstream_reply` calls it for every accepted upstream
@@ -1082,13 +1084,13 @@ pub fn cache_reply(
     wire: &[u8],
     cache: &mut DnsCache,
     config: &crate::rfc1035::ExtractConfig,
-) -> crate::rfc1035::ExtractResult {
+) -> crate::rfc1035::ExtractOutcome {
     use std::time::Instant;
-    use crate::rfc1035::{extract_addresses, ExtractResult, DnsPacket};
+    use crate::rfc1035::{extract_addresses, ExtractOutcome, ExtractResult, DnsPacket};
 
     let packet = match DnsPacket::parse(wire) {
         Ok(p) => p,
-        Err(_) => return ExtractResult::BadPacket,
+        Err(_) => return ExtractOutcome { result: ExtractResult::BadPacket, ipset_hits: Vec::new() },
     };
 
     extract_addresses(&packet, cache, Instant::now(), config)
