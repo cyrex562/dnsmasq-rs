@@ -479,6 +479,7 @@ pub fn handle_leasequery(
             config_opts,
             boot: None,
             dns_port: 53,
+            leasequery: true,
         };
         do_options(&mut tmp_pkt, &mut opt_cfg);
         options = tmp_pkt.options;
@@ -1364,6 +1365,12 @@ pub struct DoOptionsConfig<'a> {
     pub boot:             Option<&'a crate::types::dhcp::DhcpBoot>,
     /// DNS port (53 = standard, triggers auto-DNS option).
     pub dns_port:         u16,
+    /// Set for a DHCPLEASEQUERY reply (rfc2131.c's `leasequery` param,
+    /// :2621). Gates netmask/broadcast and `DHOPT_FORCE` options behind the
+    /// client's requested-options list even when they'd otherwise be sent
+    /// unconditionally, and skips vendor-encapsulated options entirely
+    /// (rfc2131.c:2787-2797, :2878, :2945).
+    pub leasequery:       bool,
 }
 
 /// Apply all configured DHCP options to `pkt`.
@@ -1425,10 +1432,15 @@ pub fn do_options(pkt: &mut DhcpPacket, cfg: &mut DoOptionsConfig<'_>) {
 
     // ── Context-derived options ──────────────────────────────────────────────
     if let Some(ctx) = cfg.context {
-        if !has_opt_raw(opts, OPTION_NETMASK) {
+        if (!cfg.leasequery || in_list(cfg.req_options, OPTION_NETMASK))
+            && !has_opt_raw(opts, OPTION_NETMASK)
+        {
             option_put(opts, OPTION_NETMASK, u32::from(ctx.netmask), 4);
         }
-        if ctx.broadcast != Ipv4Addr::UNSPECIFIED && !has_opt_raw(opts, OPTION_BROADCAST) {
+        if ctx.broadcast != Ipv4Addr::UNSPECIFIED
+            && (!cfg.leasequery || in_list(cfg.req_options, OPTION_BROADCAST))
+            && !has_opt_raw(opts, OPTION_BROADCAST)
+        {
             option_put(opts, OPTION_BROADCAST, u32::from(ctx.broadcast), 4);
         }
         if ctx.router != Ipv4Addr::UNSPECIFIED
@@ -1493,7 +1505,7 @@ pub fn do_options(pkt: &mut DhcpPacket, cfg: &mut DoOptionsConfig<'_>) {
     for opt in &config_opts_snapshot {
         let code = opt.opt as u8;
         if (opt.flags & DHOPT_TAGOK) == 0 { continue; }
-        if (opt.flags & DHOPT_FORCE) == 0 && !in_list(cfg.req_options, code) { continue; }
+        if ((opt.flags & DHOPT_FORCE) == 0 || cfg.leasequery) && !in_list(cfg.req_options, code) { continue; }
         if skip_set.contains(&code) { continue; }
         if code == OPTION_VENDOR_ID && cfg.pxe_arch != -1 { continue; }
 
@@ -1522,9 +1534,10 @@ pub fn do_options(pkt: &mut DhcpPacket, cfg: &mut DoOptionsConfig<'_>) {
 
     // ── Vendor-encapsulated options ──────────────────────────────────────────
     let force_encap = prune_vendor_opts(cfg.config_opts, cfg.netid);
-    if force_encap
-        || in_list(cfg.req_options, OPTION_VENDOR_CLASS_OPT)
-        || in_list(cfg.req_options, OPTION_VENDOR_ID)
+    if !cfg.leasequery
+        && (force_encap
+            || in_list(cfg.req_options, OPTION_VENDOR_CLASS_OPT)
+            || in_list(cfg.req_options, OPTION_VENDOR_ID))
     {
         do_encap_opts(cfg.config_opts, OPTION_VENDOR_CLASS_OPT, DHOPT_VENDOR_MATCH, opts, cfg.null_term);
     }
@@ -2452,6 +2465,7 @@ mod tests {
             config_opts: &mut config_opts,
             boot: None,
             dns_port: 53,
+            leasequery: false,
         };
         do_options(&mut pkt, &mut cfg);
         assert!(has_opt_raw(&pkt.options, crate::dhcp_protocol::OPTION_T1));
@@ -2479,6 +2493,7 @@ mod tests {
             config_opts: &mut config_opts,
             boot: None,
             dns_port: 53,
+            leasequery: false,
         };
         do_options(&mut pkt, &mut cfg);
         assert!(!has_opt_raw(&pkt.options, crate::dhcp_protocol::OPTION_T1));
@@ -2509,6 +2524,7 @@ mod tests {
             config_opts: &mut config_opts,
             boot: None,
             dns_port: 53,
+            leasequery: false,
         };
         do_options(&mut pkt, &mut cfg);
         assert!(has_opt_raw(&pkt.options, OPTION_HOSTNAME));
@@ -2535,6 +2551,7 @@ mod tests {
             config_opts: &mut config_opts,
             boot: None,
             dns_port: 53,
+            leasequery: false,
         };
         do_options(&mut pkt, &mut cfg);
         assert!(has_opt_raw(&pkt.options, crate::dhcp_protocol::OPTION_VENDOR_ID));

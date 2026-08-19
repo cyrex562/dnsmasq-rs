@@ -18,8 +18,8 @@ use crate::dhcp_common::{find_option, get_message_type, match_netid_wild};
 use crate::dhcp_protocol::{
     DhcpMsgType, DhcpPacket, BOOTREPLY, DHCP_CHADDR_MAX, DHCP_CLIENT_PORT, DHCP_COOKIE,
     DHCP_SERVER_PORT, OPTION_AGENT_ID, OPTION_ARCH, OPTION_CLIENT_ID, OPTION_END,
-    OPTION_HOSTNAME, OPTION_LEASE_TIME, OPTION_RAPID_COMMIT, OPTION_REQUESTED_OPTIONS,
-    OPTION_USER_CLASS, OPTION_VENDOR_ID,
+    OPTION_HOSTNAME, OPTION_LEASE_TIME, OPTION_MESSAGE_TYPE, OPTION_RAPID_COMMIT,
+    OPTION_REQUESTED_OPTIONS, OPTION_USER_CLASS, OPTION_VENDOR_ID,
 };
 use crate::lease::LeaseDb;
 use crate::metrics::{inc_metric, Metric};
@@ -413,8 +413,15 @@ fn decorate_reply(
     let is_inform = get_message_type(&pkt.options) == Some(DhcpMsgType::Inform);
     // do_options() only emits T1/T2 when the lease time isn't "infinite"; C
     // calls do_options() for DHCPINFORM with time == 0xffffffff precisely so
-    // it never sends T1/T2 there (rfc2131.c:1817).
-    let do_options_lease_time = if is_inform { u32::MAX } else { lease_time };
+    // it never sends T1/T2 there (rfc2131.c:1817). The BOOTP call site
+    // (rfc2131.c:684-685) unconditionally passes 0xffffffff too, regardless
+    // of the actual lease time recorded — that's how upstream suppresses
+    // T1/T2 for BOOTP.
+    let do_options_lease_time = if is_inform || reply.msg_type == DhcpMsgType::Bootp {
+        u32::MAX
+    } else {
+        lease_time
+    };
     let mut opt_cfg = DoOptionsConfig {
         context,
         req_options: find_option(&pkt.options, OPTION_REQUESTED_OPTIONS),
@@ -435,6 +442,7 @@ fn decorate_reply(
         config_opts: &mut config_opts,
         boot,
         dns_port: 53,
+        leasequery: false,
     };
 
     // OPTION_LEASE_TIME (51) is written unconditionally for OFFER and for the
@@ -747,6 +755,13 @@ pub fn dispatch_dhcp_with_meta(
     debug!("DHCP {msg_type:?}");
 
     let Some(msg_type) = msg_type else {
+        // Only a genuinely absent option 53 is BOOTP (`mess_type == 0`,
+        // rfc2131.c:564). A present-but-unrecognized option-53 byte falls
+        // through C's `switch` with no matching `case` and is silently
+        // dropped (rfc2131.c:1237-1239) — it must not be answered as BOOTP.
+        if find_option(&pkt.options, OPTION_MESSAGE_TYPE).is_some() {
+            return None;
+        }
         return dispatch_bootp(pkt, cfg, lease_db, ping_cache, probe, &tags, config, static_addr, lease_by_client.as_ref(), hw_len, clid, hostname);
     };
 
@@ -4903,6 +4918,41 @@ mod tests {
     }
 
     #[test]
+    fn unrecognized_message_type_value_is_dropped_not_answered_as_bootp() {
+        // rfc2131.c:564 only takes the BOOTP branch when `mess_type == 0`,
+        // i.e. option 53 is genuinely absent. A present-but-garbage option
+        // 53 byte falls through C's `switch` with no matching `case` and
+        // gets no reply at all — it must not be treated as BOOTP, even when
+        // a nailed dhcp-host would otherwise make BOOTP dispatch succeed.
+        use crate::types::dhcp::{DhcpConfig, HwaddrConfig, CONFIG_ADDR};
+
+        let mut pkt = bootp_packet(); // htype/hlen/chaddr are valid
+        pkt.options = vec![OPTION_MESSAGE_TYPE, 1, 99, OPTION_END];
+        let nailed_cfg = DhcpConfig {
+            flags: CONFIG_ADDR,
+            clid: None,
+            hostname: None,
+            domain: None,
+            netid: vec![],
+            filter: vec![],
+            addr: Ipv4Addr::new(10, 0, 0, 150),
+            decline_time: None,
+            lease_time: 0,
+            hwaddrs: vec![HwaddrConfig {
+                hwaddr: pkt.chaddr,
+                hwaddr_len: 6,
+                hwaddr_type: 1,
+                wildcard_mask: 0,
+            }],
+            #[cfg(feature = "dhcp6")]
+            addr6: vec![],
+        };
+        let mut cfg = default_cfg();
+        cfg.configs.push(nailed_cfg);
+        assert!(dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new()).is_none());
+    }
+
+    #[test]
     fn bootp_request_without_mac_is_dropped() {
         let mut pkt = bootp_packet();
         pkt.htype = 0;
@@ -4965,6 +5015,52 @@ mod tests {
     }
 
     #[test]
+    fn bootp_reply_has_no_t1_t2_options() {
+        // rfc2131.c:684-685 fixes the lease time passed to do_options() at
+        // 0xffffffff for BOOTP unless dhcp-host sets an explicit CONFIG_TIME
+        // — do_options() only ever emits T1/T2 when the lease time isn't
+        // that "infinite" sentinel (rfc2131.c:2745-2746), so a BOOTP reply
+        // must never carry them.
+        use crate::types::dhcp::{DhcpConfig, HwaddrConfig, CONFIG_ADDR};
+
+        let pkt = bootp_packet();
+        let nailed_cfg = DhcpConfig {
+            flags: CONFIG_ADDR,
+            clid: None,
+            hostname: None,
+            domain: None,
+            netid: vec![],
+            filter: vec![],
+            addr: Ipv4Addr::new(10, 0, 0, 150),
+            decline_time: None,
+            lease_time: 0,
+            hwaddrs: vec![HwaddrConfig {
+                hwaddr: pkt.chaddr,
+                hwaddr_len: 6,
+                hwaddr_type: 1,
+                wildcard_mask: 0,
+            }],
+            #[cfg(feature = "dhcp6")]
+            addr6: vec![],
+        };
+        let mut cfg = default_cfg();
+        cfg.configs.push(nailed_cfg);
+
+        let mut lease_db = LeaseDb::new();
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db, &mut PingCache::new(), &NullProbe)
+            .expect("BOOTP client with a nailed dhcp-host should get a reply");
+
+        assert!(
+            find_option(&dispatched.reply.options, crate::dhcp_protocol::OPTION_T1).is_none(),
+            "a BOOTP reply must not carry OPTION_T1"
+        );
+        assert!(
+            find_option(&dispatched.reply.options, crate::dhcp_protocol::OPTION_T2).is_none(),
+            "a BOOTP reply must not carry OPTION_T2"
+        );
+    }
+
+    #[test]
     fn bootp_request_gated_by_bootp_dynamic_tag() {
         let pkt = bootp_packet();
         let mut cfg = default_cfg();
@@ -4986,6 +5082,18 @@ mod tests {
         let mut pkt = base_packet();
         pkt.ciaddr = ciaddr;
         pkt.options = vec![OPTION_MESSAGE_TYPE, 1, DhcpMsgType::LeaseQuery as u8, OPTION_END];
+        pkt
+    }
+
+    fn leasequery_packet_with_req_options(ciaddr: Ipv4Addr, req: &[u8]) -> DhcpPacket {
+        let mut pkt = base_packet();
+        pkt.ciaddr = ciaddr;
+        pkt.options = vec![
+            OPTION_MESSAGE_TYPE, 1, DhcpMsgType::LeaseQuery as u8,
+            OPTION_REQUESTED_OPTIONS, req.len() as u8,
+        ];
+        pkt.options.extend_from_slice(req);
+        pkt.options.push(OPTION_END);
         pkt
     }
 
@@ -5063,6 +5171,73 @@ mod tests {
         assert_eq!(dispatched.reply.msg_type, DhcpMsgType::LeaseActive);
         assert_eq!(dispatched.reply.ciaddr_override, Some(addr));
         assert!(find_option(&dispatched.reply.options, OPTION_LEASE_TIME).is_some());
+    }
+
+    #[test]
+    fn leasequery_active_lease_omits_unrequested_netmask_and_broadcast() {
+        // Netmask/broadcast are normally sent unconditionally, but
+        // rfc2131.c:2787-2797 gates that on the requesting manager actually
+        // having asked for them via OPTION_REQUESTED_OPTIONS once
+        // `leasequery` is true.
+        let mut lease_db = LeaseDb::new();
+        let addr = Ipv4Addr::new(10, 0, 0, 150);
+        lease_db.allocate_v4(addr);
+        lease_db.set_hwaddr(addr, &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff], 1, None);
+        lease_db.set_expires(addr, 3600);
+
+        // Request only OPTION_LEASE_TIME — not netmask or broadcast.
+        let pkt = leasequery_packet_with_req_options(addr, &[OPTION_LEASE_TIME]);
+        let mut cfg = default_cfg();
+        cfg.leasequery_enabled = true;
+        cfg.leasequery_source = Ipv4Addr::new(192, 0, 2, 1);
+        cfg.contexts = vec![make_ctx(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 200), Ipv4Addr::UNSPECIFIED, 0)];
+
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db, &mut PingCache::new(), &NullProbe)
+            .expect("leasequery for an active lease should reply");
+        assert_eq!(dispatched.reply.msg_type, DhcpMsgType::LeaseActive);
+        assert!(
+            find_option(&dispatched.reply.options, crate::dhcp_protocol::OPTION_NETMASK).is_none(),
+            "leasequery reply must not carry netmask unless requested"
+        );
+        assert!(
+            find_option(&dispatched.reply.options, crate::dhcp_protocol::OPTION_BROADCAST).is_none(),
+            "leasequery reply must not carry broadcast unless requested"
+        );
+    }
+
+    #[test]
+    fn leasequery_active_lease_omits_unrequested_force_option() {
+        // DHOPT_FORCE options are normally sent regardless of the client's
+        // requested-options list, but rfc2131.c:2878 additionally gates that
+        // on `in_list(req_options, ...)` once `leasequery` is true.
+        let mut lease_db = LeaseDb::new();
+        let addr = Ipv4Addr::new(10, 0, 0, 150);
+        lease_db.allocate_v4(addr);
+        lease_db.set_hwaddr(addr, &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff], 1, None);
+        lease_db.set_expires(addr, 3600);
+
+        const CUSTOM_OPT: u8 = 200;
+        let pkt = leasequery_packet_with_req_options(addr, &[OPTION_LEASE_TIME]);
+        let mut cfg = default_cfg();
+        cfg.leasequery_enabled = true;
+        cfg.leasequery_source = Ipv4Addr::new(192, 0, 2, 1);
+        cfg.contexts = vec![make_ctx(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 200), Ipv4Addr::UNSPECIFIED, 0)];
+        cfg.dhcp_opts = vec![crate::types::dhcp::DhcpOpt {
+            opt: i32::from(CUSTOM_OPT),
+            flags: crate::types::dhcp::DHOPT_TAGOK | crate::types::dhcp::DHOPT_FORCE,
+            val: Some(vec![7]),
+            netid: vec![],
+            encap: 0,
+            vendor_class: None,
+        }];
+
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db, &mut PingCache::new(), &NullProbe)
+            .expect("leasequery for an active lease should reply");
+        assert_eq!(dispatched.reply.msg_type, DhcpMsgType::LeaseActive);
+        assert!(
+            find_option(&dispatched.reply.options, CUSTOM_OPT).is_none(),
+            "leasequery reply must not carry a DHOPT_FORCE option unless requested"
+        );
     }
 
     #[test]
