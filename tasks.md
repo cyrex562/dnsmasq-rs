@@ -1214,6 +1214,31 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   otherwise unchanged. Like upstream, a script that fails to spawn does not get retried
   — the pending flags/queue entry are cleared regardless of `run_script`'s result.
 
+  Follow-up fix: `run_lease_scripts` originally took `command: &str` and was only called
+  from `run_dhcp_loop` inside `if let Some(command) = cfg.lease_change_command...` — so
+  with no `dhcp-script=` configured (the default), `remove_by_addr` kept pushing onto
+  `old_leases` on every RELEASE/DECLINE but nothing ever drained it, leaking one
+  `DhcpLease` per release for the life of the process. Upstream avoids this because
+  `do_script_run()` is called unconditionally from the main loop regardless of
+  `HAVE_SCRIPT`/script configuration — draining the queue and clearing per-lease flags
+  isn't gated on a script existing, only the `queue_script()` spawn is. Fixed by changing
+  the signature to `run_lease_scripts(command: Option<&str>)` and calling it
+  unconditionally from `run_dhcp_loop`; `run_script` is only invoked when `command` is
+  `Some`, but the drain/clear always happens. Covered by
+  `lease::tests::{run_lease_scripts_drains_old_leases_without_command_configured,
+  run_lease_scripts_clears_lease_flags_without_command_configured}`.
+
+  Also added: `write_to_file` now `fsync`s the containing directory (Unix only) after
+  the `rename`, so the rename entry itself is durable across a crash/power loss —
+  previously only the temp file's contents were fsync'd, which protects against a torn
+  file but not against ext4/xfs losing the rename itself on power loss.
+
+  Still open: `helper::run_script` calls `Command::status()`, a blocking wait, from
+  inside `run_dhcp_loop`'s async select arm. A slow/hung dhcp-script now stalls that
+  loop's DHCP dispatch for its duration (this was pre-existing in `helper.rs` but had no
+  caller until this change gave it one). Moving the call behind `spawn_blocking` (or
+  otherwise off the async task) is unaddressed.
+
   Still not ported: `lease_ping_reply`, `lease_update_slaac`, `lease_find_interfaces`,
   `lease_make_duid` (lease.c:497-556) have no Rust equivalents — these are
   SLAAC/RA-adjacent (periodic ping-before-assign for SLAAC addresses, interface

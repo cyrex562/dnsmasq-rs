@@ -489,46 +489,65 @@ impl LeaseDb {
     /// Fire the configured dhcp-script hook for every lease change queued
     /// since the last call, then clear the flags/queue that generated them.
     ///
-    /// Port of `do_script_run()` (lease.c:1216-1308). Upstream fires one
-    /// event per call and relies on the main loop invoking it repeatedly
-    /// (its return value signals "more work pending"); this port drains
-    /// every pending event in a single call since the caller here is a
-    /// single `run_dhcp_loop` iteration rather than a busy-poll main loop.
-    /// The ordering and action semantics are preserved: leases queued on
-    /// `old_leases` (from `prune`/`remove_by_addr`) fire `old` (for a
-    /// leftover `old_hostname`) then `del`; live leases with a pending
+    /// Port of `do_script_run()` (lease.c:1216-1308). Upstream calls
+    /// `do_script_run()` from the main loop unconditionally — even the
+    /// `#else` branch compiled without `HAVE_SCRIPT` calls it, "need this
+    /// for other side-effects" (dnsmasq.c) — because draining `old_leases`
+    /// and clearing per-lease flags is not itself gated on a script being
+    /// configured; only the `queue_script()` spawn is. `command` being
+    /// `None` mirrors that: every event queued on `old_leases` (from
+    /// `prune`/`remove_by_addr`) and every `LEASE_NEW`/`LEASE_CHANGED` lease
+    /// still has its flags/queue entry cleared, just without spawning a
+    /// script. Callers must invoke this every dispatch regardless of
+    /// whether `command` is set, or `old_leases` grows without bound.
+    ///
+    /// Upstream fires one event per call and relies on the main loop
+    /// invoking it repeatedly (its return value signals "more work
+    /// pending"); this port drains every pending event in a single call
+    /// since the caller here is a single `run_dhcp_loop` iteration rather
+    /// than a busy-poll main loop. The ordering and action semantics are
+    /// preserved: leases queued on `old_leases` fire `old` (for a leftover
+    /// `old_hostname`) then `del`; live leases with a pending
     /// `old_hostname` fire `old` first so a lost name is announced before
     /// any new one; then leases flagged `LEASE_NEW`/`LEASE_CHANGED` fire
     /// `add`/`old` and have those flags (plus `LEASE_AUX_CHANGED` /
     /// `LEASE_EXP_CHANGED`) cleared.
-    pub fn run_lease_scripts(&mut self, command: &str) {
+    pub fn run_lease_scripts(&mut self, command: Option<&str>) {
         use crate::types::dhcp::{LEASE_AUX_CHANGED, LEASE_CHANGED, LEASE_EXP_CHANGED, LEASE_NEW};
 
         for mut lease in self.old_leases.drain(..) {
             if let Some(old_hostname) = lease.old_hostname.take() {
-                let ev = build_script_event(&lease, LeaseAction::Old, Some(&old_hostname));
+                if let Some(command) = command {
+                    let ev = build_script_event(&lease, LeaseAction::Old, Some(&old_hostname));
+                    let _ = run_script(command, &ev);
+                }
+            }
+            if let Some(command) = command {
+                let ev = build_script_event(&lease, LeaseAction::Del, None);
                 let _ = run_script(command, &ev);
             }
-            let ev = build_script_event(&lease, LeaseAction::Del, None);
-            let _ = run_script(command, &ev);
         }
 
         for lease in self.leases.values_mut() {
             if let Some(old_hostname) = lease.old_hostname.take() {
-                let ev = build_script_event(lease, LeaseAction::Old, Some(&old_hostname));
-                let _ = run_script(command, &ev);
+                if let Some(command) = command {
+                    let ev = build_script_event(lease, LeaseAction::Old, Some(&old_hostname));
+                    let _ = run_script(command, &ev);
+                }
             }
         }
 
         for lease in self.leases.values_mut() {
             if lease.flags & (LEASE_NEW | LEASE_CHANGED) != 0 {
-                let action = if lease.flags & LEASE_NEW != 0 {
-                    LeaseAction::Add
-                } else {
-                    LeaseAction::Old
-                };
-                let ev = build_script_event(lease, action, None);
-                let _ = run_script(command, &ev);
+                if let Some(command) = command {
+                    let action = if lease.flags & LEASE_NEW != 0 {
+                        LeaseAction::Add
+                    } else {
+                        LeaseAction::Old
+                    };
+                    let ev = build_script_event(lease, action, None);
+                    let _ = run_script(command, &ev);
+                }
                 lease.flags &= !(LEASE_NEW | LEASE_CHANGED | LEASE_AUX_CHANGED | LEASE_EXP_CHANGED);
             }
         }
@@ -536,16 +555,17 @@ impl LeaseDb {
 
     /// Write all leases to the given file path (using [`serialize`]).
     ///
-    /// Writes to a temp file in the same directory, `fsync`s it, then
-    /// `rename`s it over `path`. The rename is atomic on the same filesystem,
-    /// so a crash or write failure part-way through never leaves `path`
-    /// truncated or half-written — readers always see either the old
-    /// complete file or the new one. This is stronger than upstream's
-    /// `lease_update_file` (lease.c:278-446), which truncates and rewrites
-    /// a single long-lived fd in place and relies on `fsync` alone; the
-    /// observable guarantee upstream cares about — durable data survives a
-    /// clean write, and a failed write doesn't corrupt the file — is
-    /// preserved here.
+    /// Writes to a temp file in the same directory, `fsync`s it, `rename`s
+    /// it over `path`, then (on Unix) `fsync`s the containing directory so
+    /// the rename entry itself is durable. The rename is atomic on the same
+    /// filesystem, so a crash or write failure part-way through never
+    /// leaves `path` truncated or half-written — readers always see either
+    /// the old complete file or the new one. This is stronger than
+    /// upstream's `lease_update_file` (lease.c:278-446), which truncates
+    /// and rewrites a single long-lived fd in place and relies on `fsync`
+    /// alone; the observable guarantee upstream cares about — durable data
+    /// survives a clean write, and a failed write doesn't corrupt the file
+    /// — is preserved here.
     pub fn write_to_file(&self, path: &str) -> Result<(), LeaseError> {
         use std::io::Write;
 
@@ -561,6 +581,18 @@ impl LeaseDb {
         drop(f);
 
         std::fs::rename(&tmp_path, target)?;
+
+        // fsync the containing directory so the rename itself is durable
+        // across a crash/power loss, not just the temp file's contents —
+        // without this, ext4/xfs may still lose the rename (leaving the old
+        // file, or nothing) even though the temp file's data was flushed.
+        #[cfg(unix)]
+        {
+            if let Ok(dir_file) = std::fs::File::open(dir) {
+                let _ = dir_file.sync_all();
+            }
+        }
+
         Ok(())
     }
 
@@ -1661,7 +1693,7 @@ mod tests {
         let (contents, _db) = run_scripts_until_marker_written(&marker, || {
             let mut db = LeaseDb::new();
             db.allocate_v4(addr);
-            db.run_lease_scripts(script_path.to_str().unwrap());
+            db.run_lease_scripts(Some(script_path.to_str().unwrap()));
             db
         });
 
@@ -1681,7 +1713,7 @@ mod tests {
         let (_contents, db) = run_scripts_until_marker_written(&marker, || {
             let mut db = LeaseDb::new();
             db.allocate_v4(addr);
-            db.run_lease_scripts(script_path.to_str().unwrap());
+            db.run_lease_scripts(Some(script_path.to_str().unwrap()));
             db
         });
 
@@ -1700,7 +1732,7 @@ mod tests {
             let mut db = LeaseDb::new();
             db.insert(make_lease(addr, [0x01, 0, 0, 0, 0, 0], None)); // hostname "host1"
             db.set_hostname(addr, Some("renamed"), false); // LEASE_CHANGED + old_hostname="host1"
-            db.run_lease_scripts(script_path.to_str().unwrap());
+            db.run_lease_scripts(Some(script_path.to_str().unwrap()));
             db
         });
 
@@ -1723,7 +1755,7 @@ mod tests {
             let mut db = LeaseDb::new();
             db.insert(make_lease(addr, [0x01, 0, 0, 0, 0, 0], None));
             db.remove_by_addr(addr);
-            db.run_lease_scripts(script_path.to_str().unwrap());
+            db.run_lease_scripts(Some(script_path.to_str().unwrap()));
             db
         });
 
@@ -1743,7 +1775,7 @@ mod tests {
             db.insert(make_lease(addr, [0x01, 0, 0, 0, 0, 0], None)); // hostname "host1"
             db.set_hostname(addr, None, false); // clears hostname, sets old_hostname = "host1"
             db.remove_by_addr(addr);
-            db.run_lease_scripts(script_path.to_str().unwrap());
+            db.run_lease_scripts(Some(script_path.to_str().unwrap()));
             db
         });
 
@@ -1765,15 +1797,51 @@ mod tests {
             let mut db = LeaseDb::new();
             db.insert(make_lease(addr, [0x01, 0, 0, 0, 0, 0], None));
             db.remove_by_addr(addr);
-            db.run_lease_scripts(script_path.to_str().unwrap());
+            db.run_lease_scripts(Some(script_path.to_str().unwrap()));
             db
         });
 
         // A second call should be a no-op: the old_leases queue was drained
         // and no lease is left with pending flags, so nothing is spawned.
-        db.run_lease_scripts(script_path.to_str().unwrap());
+        db.run_lease_scripts(Some(script_path.to_str().unwrap()));
         let contents_after = std::fs::read_to_string(&marker).unwrap();
         assert_eq!(contents_before, contents_after);
+    }
+
+    /// Upstream calls `do_script_run()` unconditionally from the main loop
+    /// (dnsmasq.c: even the `#else` branch without `HAVE_SCRIPT` calls it,
+    /// "need this for other side-effects") because draining `old_leases` and
+    /// clearing per-lease flags happens regardless of whether a script is
+    /// configured; only the `queue_script()` spawn itself is conditional.
+    /// With no `dhcp-script` set, `old_leases` must still drain here or it
+    /// grows without bound for the life of the process.
+    #[test]
+    fn run_lease_scripts_drains_old_leases_without_command_configured() {
+        let mut db = LeaseDb::new();
+        let addr = Ipv4Addr::new(10, 0, 0, 9);
+        db.insert(make_lease(addr, [0x01, 0, 0, 0, 0, 0], None));
+        db.remove_by_addr(addr);
+        assert_eq!(db.old_leases.len(), 1);
+
+        db.run_lease_scripts(None);
+
+        assert!(
+            db.old_leases.is_empty(),
+            "old_leases must drain even when no dhcp-script command is configured"
+        );
+    }
+
+    #[test]
+    fn run_lease_scripts_clears_lease_flags_without_command_configured() {
+        use crate::types::dhcp::{LEASE_CHANGED, LEASE_NEW};
+        let mut db = LeaseDb::new();
+        let addr = Ipv4Addr::new(10, 0, 0, 5);
+        db.allocate_v4(addr);
+
+        db.run_lease_scripts(None);
+
+        let lease = db.find_by_addr(addr).unwrap();
+        assert_eq!(lease.flags & (LEASE_NEW | LEASE_CHANGED), 0);
     }
 
     // ── write_to_file / load_from_file tests ──

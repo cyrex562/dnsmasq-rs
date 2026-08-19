@@ -1388,12 +1388,19 @@ pub async fn run_dhcp_loop(
                 // in this dispatch. Port of `do_script_run()`'s call site in
                 // the upstream main loop (dnsmasq.c), invoked here once per
                 // dispatch rather than looped on a "more work" return value
-                // — see `LeaseDb::run_lease_scripts` for why.
-                if let Some(command) = cfg.lease_change_command.as_deref() {
-                    if !command.is_empty() {
-                        lease_db.run_lease_scripts(command);
-                    }
-                }
+                // — see `LeaseDb::run_lease_scripts` for why. Called
+                // unconditionally, even with no dhcp-script configured:
+                // upstream calls `do_script_run()` unconditionally too,
+                // since draining the `old_leases` queue and clearing
+                // per-lease flags must happen regardless of whether a
+                // script is configured to actually spawn — skipping this
+                // call when `lease_change_command` is unset would leak
+                // every released/declined lease into `old_leases` forever.
+                let command = cfg
+                    .lease_change_command
+                    .as_deref()
+                    .filter(|c| !c.is_empty());
+                lease_db.run_lease_scripts(command);
 
                 let Some(dispatched) = dispatched else {
                     continue;
