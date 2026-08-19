@@ -18,6 +18,8 @@ use crate::types::dns_records::{
 };
 use crate::types::network::{Allowlist, DynDir, HostsFile, Iname, Ipsets, MySubnet, AH_DHCP_HST, AH_DHCP_OPT, AH_HOSTS, INAME_4, INAME_6};
 use crate::types::server::{Server, SERV_4ADDR, SERV_6ADDR, SERV_LITERAL_ADDRESS};
+use crate::types::daemon::{DhcpBridge, SharedNetwork};
+use crate::domain::CondDomain;
 #[cfg(feature = "dhcp")]
 use crate::types::dhcp::{
     CONFIG_ADDR, CONFIG_CLID, CONFIG_DISABLE, CONFIG_NAME, CONTEXT_DHCP, DhcpBoot, DhcpConfig,
@@ -241,6 +243,22 @@ pub struct CliArgs {
     /// Add an upstream DNS server. May be repeated.
     #[arg(long = "server", value_name = "SPEC")]
     pub server: Vec<String>,
+
+    /// Delegate reverse DNS for a subnet to an upstream server. May be repeated.
+    #[arg(long = "rev-server", value_name = "SPEC")]
+    pub rev_server: Vec<String>,
+
+    /// Synthesise forward/reverse names for an IP range. May be repeated.
+    #[arg(long = "synth-domain", value_name = "SPEC")]
+    pub synth_domain: Vec<String>,
+
+    /// Treat DHCP requests on aliases as arriving from interface. May be repeated.
+    #[arg(long = "bridge-interface", value_name = "SPEC")]
+    pub bridge_interface: Vec<String>,
+
+    /// Specify extra networks sharing a broadcast domain for DHCP. May be repeated.
+    #[arg(long = "shared-network", value_name = "SPEC")]
+    pub shared_network: Vec<String>,
 }
 
 /// Finalized configuration produced by normalizing raw config directives.
@@ -456,6 +474,22 @@ pub fn config_lines_from_cli(args: &CliArgs) -> Vec<ConfigLine> {
 
     for server in &args.server {
         push_line("server", Some(server.clone()));
+    }
+
+    for rev_server in &args.rev_server {
+        push_line("rev-server", Some(rev_server.clone()));
+    }
+
+    for synth_domain in &args.synth_domain {
+        push_line("synth-domain", Some(synth_domain.clone()));
+    }
+
+    for bridge_interface in &args.bridge_interface {
+        push_line("bridge-interface", Some(bridge_interface.clone()));
+    }
+
+    for shared_network in &args.shared_network {
+        push_line("shared-network", Some(shared_network.clone()));
     }
 
     lines
@@ -1210,6 +1244,46 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
         "server" | "local" | "address" => {
             let v = require_value(key)?;
             parse_server_or_address(daemon, key, v, cl)?;
+        }
+
+        // ── rev-server ─────────────────────────────────────────────────────
+        //
+        // Format: rev-server=<addr>/<prefix>,<ipaddr>[#port]
+        // Delegates reverse (PTR) lookups for the subnet to the given
+        // upstream, or answers them locally with no forwarding when the
+        // server part is omitted.  Port of `option.c:3161` (`LOPT_REV_SERV`).
+        "rev-server" => {
+            let v = require_value("rev-server")?;
+            parse_rev_server(daemon, v, cl)?;
+        }
+
+        // ── synth-domain ───────────────────────────────────────────────────
+        //
+        // Format: synth-domain=<domain>,<addr>/<prefix>[,<prefix-string>]
+        //      or synth-domain=<domain>,<start>[,<end>][,<prefix-string>]
+        // Port of `option.c:2622` (`LOPT_SYNTH`, the non-`--domain` half of
+        // the shared `'s'`/`LOPT_SYNTH` case).
+        "synth-domain" => {
+            let v = require_value("synth-domain")?;
+            parse_synth_domain(daemon, v, cl)?;
+        }
+
+        // ── bridge-interface ───────────────────────────────────────────────
+        //
+        // Format: bridge-interface=<iface>,<alias>[,<alias>...]
+        // Port of `option.c:3673` (`LOPT_BRIDGE`).
+        "bridge-interface" => {
+            let v = require_value("bridge-interface")?;
+            parse_bridge_interface(daemon, v, cl)?;
+        }
+
+        // ── shared-network ─────────────────────────────────────────────────
+        //
+        // Format: shared-network=<iface>|<addr>,<addr>
+        // Port of `option.c:3709` (`LOPT_SHARED_NET`).
+        "shared-network" => {
+            let v = require_value("shared-network")?;
+            parse_shared_network(daemon, v, cl)?;
         }
 
         // ── DHCP options (stubs) ────────────────────────────────────────────
@@ -2022,6 +2096,290 @@ fn invalid_value_for(cl: &ConfigLine, key: &str, val: &str, reason: &str) -> Con
         cl.line,
         reason.to_string(),
     )
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// rev-server / synth-domain / bridge-interface / shared-network
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Parse an `address[#port]` pair, ignoring an optional trailing `@source`
+/// spec (upstream's `server_details` source-binding, which this port does
+/// not carry through here).  Shared by `rev-server` and by `synth-domain`'s
+/// generated `local=/domain/` entries.
+fn parse_addr_port(v: &str) -> Result<(IpAddr, u16), &'static str> {
+    let (addr_and_at, port_str) = if let Some(hash) = v.find('#') {
+        (&v[..hash], Some(&v[hash + 1..]))
+    } else {
+        (v, None)
+    };
+    let addr_str = addr_and_at.split('@').next().unwrap_or(addr_and_at);
+    let ip: IpAddr = addr_str.parse().map_err(|_| "expected an IP address")?;
+    let port: u16 = match port_str {
+        Some(ps) => {
+            let ps_clean = ps.split('@').next().unwrap_or(ps);
+            ps_clean.parse().map_err(|_| "expected a port number")?
+        }
+        None => 53,
+    };
+    Ok((ip, port))
+}
+
+/// Push one [`Server`] per generated reverse-zone `domain`: literal
+/// (`SERV_LITERAL_ADDRESS`, answer locally with no forwarding) when
+/// `server_part` is `None`, or forwarding to the parsed address otherwise.
+/// Port of the `add_update_server()` calls inside `domain_rev4()`/
+/// `domain_rev6()` (option.c).
+fn push_domain_servers(
+    daemon: &mut Daemon,
+    domains: &[String],
+    server_part: Option<&str>,
+    cl: &ConfigLine,
+    key: &str,
+    orig: &str,
+) -> Result<(), ConfigError> {
+    let dummy_addr = MySockAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0));
+    match server_part {
+        None => {
+            for d in domains {
+                daemon.servers.push(new_server(SERV_LITERAL_ADDRESS, d.clone(), dummy_addr.clone(), dummy_addr.clone()));
+            }
+        }
+        Some(s) => {
+            let (ip, port) = parse_addr_port(s).map_err(|e| invalid_value_for(cl, key, orig, e))?;
+            let sock = match ip {
+                IpAddr::V4(a) => MySockAddr::V4(SocketAddrV4::new(a, port)),
+                IpAddr::V6(a) => MySockAddr::V6(SocketAddrV6::new(a, port, 0, 0)),
+            };
+            let flags = match ip {
+                IpAddr::V4(_) => SERV_4ADDR,
+                IpAddr::V6(_) => SERV_6ADDR,
+            };
+            for d in domains {
+                daemon.servers.push(new_server(flags, d.clone(), sock.clone(), dummy_addr.clone()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `rev-server=<addr>/<prefix>,<ipaddr>[#port]`.  Port of `option.c:3161`.
+fn parse_rev_server(daemon: &mut Daemon, v: &str, cl: &ConfigLine) -> Result<(), ConfigError> {
+    let key = "rev-server";
+    let mut split = v.splitn(2, ',');
+    let net_part = split.next().unwrap_or("");
+    let server_part = split.next();
+
+    let (net_addr_str, size_opt) = match net_part.split_once('/') {
+        Some((addr, size_str)) => {
+            let size: u32 = size_str.parse().map_err(|_| invalid_value_for(cl, key, v, "bad prefix length"))?;
+            (addr, Some(size))
+        }
+        None => (net_part, None),
+    };
+
+    let domains = if let Ok(addr4) = net_addr_str.parse::<Ipv4Addr>() {
+        let size = size_opt.unwrap_or(32);
+        domain_rev4(addr4, size).map_err(|e| invalid_value_for(cl, key, v, e))?
+    } else if let Ok(addr6) = net_addr_str.parse::<Ipv6Addr>() {
+        let size = size_opt.unwrap_or(128);
+        domain_rev6(addr6, size).map_err(|e| invalid_value_for(cl, key, v, e))?
+    } else {
+        return Err(invalid_value_for(cl, key, v, "expected an IPv4 or IPv6 address"));
+    };
+
+    push_domain_servers(daemon, &domains, server_part, cl, key, v)
+}
+
+/// `synth-domain=<domain>,<addr>/<prefix>[,<prefix-string>]` or
+/// `synth-domain=<domain>,<start>[,<end>][,<prefix-string>]`.
+/// Port of `option.c:2622` (the `LOPT_SYNTH` half of the shared case).
+fn parse_synth_domain(daemon: &mut Daemon, v: &str, cl: &ConfigLine) -> Result<(), ConfigError> {
+    let key = "synth-domain";
+    let mut parts = v.splitn(2, ',');
+    let domain = parts.next().unwrap_or("").trim();
+    if domain.is_empty() {
+        return Err(invalid_value_for(cl, key, v, "missing domain"));
+    }
+    let rest = parts.next().ok_or_else(|| invalid_value_for(cl, key, v, "missing address range"))?;
+
+    let mut cd = CondDomain {
+        domain: domain.to_string(),
+        prefix: None,
+        interface: None,
+        start: Ipv4Addr::UNSPECIFIED,
+        end: Ipv4Addr::UNSPECIFIED,
+        start6: Ipv6Addr::UNSPECIFIED,
+        end6: Ipv6Addr::UNSPECIFIED,
+        is6: false,
+        indexed: false,
+        prefixlen: 0,
+    };
+
+    if let Some((net_part, tail)) = rest.split_once('/') {
+        // CIDR form.
+        let mut tail_parts = tail.splitn(2, ',');
+        let size_str = tail_parts.next().unwrap_or("");
+        let prefix_field = tail_parts.next();
+        let size: u32 = size_str.parse().map_err(|_| invalid_value_for(cl, key, v, "bad prefix length"))?;
+
+        if let Ok(addr4) = net_part.parse::<Ipv4Addr>() {
+            if size < 1 || size > 32 {
+                return Err(invalid_value_for(cl, key, v, "bad prefix length"));
+            }
+            let mask = (1u32 << (32 - size)) - 1;
+            let start = u32::from(addr4) & !mask;
+            cd.is6 = false;
+            cd.start = Ipv4Addr::from(start);
+            cd.end = Ipv4Addr::from(start | mask);
+            if let Some(p) = prefix_field {
+                cd.prefix = Some(p.to_string());
+            }
+        } else if let Ok(addr6) = net_part.parse::<Ipv6Addr>() {
+            if size < 1 || size > 128 {
+                return Err(invalid_value_for(cl, key, v, "bad prefix length"));
+            }
+            let addrpart = crate::domain::ipv6_low64(addr6);
+            // prefix==64 overflows the mask calculation (option.c comment).
+            let mask: u64 = if size <= 64 { u64::MAX } else { (1u64 << (128 - size)) - 1 };
+            cd.is6 = true;
+            cd.prefixlen = size;
+            cd.start6 = crate::domain::ipv6_set_low64(addr6, addrpart & !mask);
+            cd.end6 = crate::domain::ipv6_set_low64(addr6, addrpart | mask);
+            if let Some(p) = prefix_field {
+                cd.prefix = Some(p.to_string());
+            }
+        } else {
+            return Err(invalid_value_for(cl, key, v, "expected an IPv4 or IPv6 address"));
+        }
+    } else {
+        // Range form: <start>[,<end>][,<prefix-string>].  Unlike the bare
+        // `--domain` directive, `synth-domain` has no subnet-from-interface
+        // fallback here (`option.c`'s `else if (option == 's')` branch is
+        // specific to `'s'`) — a non-address first field is an error.
+        let mut range_parts = rest.splitn(3, ',');
+        let start_str = range_parts.next().unwrap_or("");
+        let end_str = range_parts.next();
+        let prefix_field = range_parts.next();
+
+        if let Ok(start4) = start_str.parse::<Ipv4Addr>() {
+            cd.is6 = false;
+            cd.start = start4;
+            cd.end = match end_str {
+                None | Some("") => start4,
+                Some(e) => e.parse().map_err(|_| invalid_value_for(cl, key, v, "expected an IPv4 address"))?,
+            };
+        } else if let Ok(start6) = start_str.parse::<Ipv6Addr>() {
+            cd.is6 = true;
+            cd.start6 = start6;
+            cd.end6 = match end_str {
+                None | Some("") => start6,
+                Some(e) => e.parse().map_err(|_| invalid_value_for(cl, key, v, "expected an IPv6 address"))?,
+            };
+        } else {
+            return Err(invalid_value_for(cl, key, v, "expected an IPv4 or IPv6 address"));
+        }
+
+        if let Some(p) = prefix_field {
+            cd.prefix = Some(p.to_string());
+        }
+    }
+
+    // A trailing '*' on the prefix marks the domain "indexed": names use a
+    // decimal offset from `start` instead of the dashed/hex address form.
+    if let Some(prefix) = cd.prefix.clone() {
+        if let Some(stripped) = prefix.strip_suffix('*') {
+            cd.indexed = true;
+            cd.prefix = Some(stripped.to_string());
+            if cd.is6 && cd.prefixlen < 64 {
+                return Err(invalid_value_for(cl, key, v, "prefix length too small"));
+            }
+        }
+    }
+
+    daemon.synth_domains.push(cd);
+    Ok(())
+}
+
+/// Interface name length limit mirroring Linux `IF_NAMESIZE`, used to
+/// silently drop over-long bridge aliases exactly as upstream does
+/// (`option.c:3673-3706`: `strlen(arg) <= IF_NAMESIZE - 1`).
+const BRIDGE_IF_NAMESIZE: usize = 16;
+
+/// `bridge-interface=<iface>,<alias>[,<alias>...]`.  Port of `option.c:3673`.
+fn parse_bridge_interface(daemon: &mut Daemon, v: &str, cl: &ConfigLine) -> Result<(), ConfigError> {
+    let key = "bridge-interface";
+    let mut parts = v.splitn(2, ',');
+    let iface = parts.next().unwrap_or("").trim();
+    let rest = parts.next();
+
+    if iface.is_empty() || iface.len() > BRIDGE_IF_NAMESIZE - 1 || rest.is_none() {
+        return Err(invalid_value_for(cl, key, v, "bad bridge-interface"));
+    }
+    let rest = rest.unwrap();
+
+    let idx = match daemon.bridges.iter().position(|b| b.iface == iface) {
+        Some(i) => i,
+        None => {
+            daemon.bridges.push(DhcpBridge { iface: iface.to_string(), aliases: vec![] });
+            daemon.bridges.len() - 1
+        }
+    };
+
+    for alias in rest.split(',') {
+        let alias = alias.trim();
+        if !alias.is_empty() && alias.len() <= BRIDGE_IF_NAMESIZE - 1 {
+            daemon.bridges[idx].aliases.push(alias.to_string());
+        }
+    }
+
+    Ok(())
+}
+
+/// `shared-network=<iface>|<addr>,<addr>`.  Port of `option.c:3709`
+/// (`LOPT_SHARED_NET`).
+fn parse_shared_network(daemon: &mut Daemon, v: &str, cl: &ConfigLine) -> Result<(), ConfigError> {
+    let key = "shared-network";
+    let mut parts = v.splitn(2, ',');
+    let first = parts.next().unwrap_or("").trim();
+    let second = parts.next().map(str::trim);
+
+    let second = second.ok_or_else(|| invalid_value_for(cl, key, v, "bad shared-network"))?;
+    if second.is_empty() {
+        return Err(invalid_value_for(cl, key, v, "bad shared-network"));
+    }
+
+    let mut sn = SharedNetwork::default();
+
+    if let Ok(shared4) = second.parse::<Ipv4Addr>() {
+        sn.is6 = false;
+        sn.shared_addr = shared4;
+        if let Ok(match4) = first.parse::<Ipv4Addr>() {
+            sn.match_addr = match4;
+        } else {
+            let idx = crate::network::nametoindex(first);
+            if idx == 0 {
+                return Err(invalid_value_for(cl, key, v, "bad shared-network"));
+            }
+            sn.if_index = idx;
+        }
+    } else if let Ok(shared6) = second.parse::<Ipv6Addr>() {
+        sn.is6 = true;
+        sn.shared_addr6 = shared6;
+        if let Ok(match6) = first.parse::<Ipv6Addr>() {
+            sn.match_addr6 = match6;
+        } else {
+            let idx = crate::network::nametoindex(first);
+            if idx == 0 {
+                return Err(invalid_value_for(cl, key, v, "bad shared-network"));
+            }
+            sn.if_index = idx;
+        }
+    } else {
+        return Err(invalid_value_for(cl, key, v, "expected an IPv4 or IPv6 address"));
+    }
+
+    daemon.shared_networks.push(sn);
+    Ok(())
 }
 
 fn split_csv(value: &str) -> Vec<&str> {
@@ -4118,51 +4476,89 @@ pub fn atoi_check8(s: &str) -> Option<u8> {
 
 // ── Reverse DNS zone generators (ported from option.c:1135-1307) ──────────────
 
-/// Generate the `in-addr.arpa` domain for an IPv4 CIDR block.
+/// Generate the `in-addr.arpa` domain names covering an IPv4 CIDR block.
 ///
-/// E.g. `10.0.0.0/24` → `"0.0.10.in-addr.arpa"`.
-/// Handles prefix lengths that are multiples of 8.
-/// Port of `domain_rev4()` from option.c:1135-1219.
-pub fn domain_rev4(addr: std::net::Ipv4Addr, prefix_len: u8) -> String {
-    let octets = addr.octets();
-    let full_octets = (prefix_len / 8) as usize;
-    // Build reversed octets for the prefix
-    let parts: Vec<String> = octets[..full_octets.min(4)]
-        .iter()
-        .rev()
-        .map(|o| o.to_string())
-        .collect();
-    if parts.is_empty() {
-        "in-addr.arpa".to_string()
-    } else {
-        format!("{}.in-addr.arpa", parts.join("."))
+/// Prefix lengths that are not a multiple of 8 split into multiple
+/// non-octet-aligned zones (RFC 2317 style) — e.g. `10.0.0.0/20` yields the
+/// 16 zones `0.0.10.in-addr.arpa` .. `15.0.10.in-addr.arpa`.  Byte-aligned
+/// prefixes (e.g. `/24`) yield exactly one.  Port of the IPv4 half of
+/// `domain_rev4()` from option.c:1135-1219.
+pub fn domain_rev4(addr: std::net::Ipv4Addr, prefix_len: u32) -> Result<Vec<String>, &'static str> {
+    let size = prefix_len;
+    if size > 32 || size < 1 {
+        return Err("bad IPv4 prefix length");
     }
+
+    let rem = size & 0x7;
+    let addrbytes = (32 - size) >> 3;
+    let addrbits = (32 - size) & 7;
+
+    let mut octets = addr.octets();
+    octets[3 - addrbytes as usize] &= !(((1u32 << addrbits) - 1) as u8);
+
+    let size = size & !0x7;
+    let count = if rem != 0 { 1u32 << (8 - rem) } else { 1 };
+    let msize = (size / 8) as i32;
+
+    let mut out = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let start_j = if rem == 0 { msize - 1 } else { msize };
+        let mut labels = Vec::new();
+        let mut j = start_j;
+        while j >= 0 {
+            let mut dig = octets[j as usize] as u32;
+            if j == msize {
+                dig += i;
+            }
+            labels.push(dig.to_string());
+            j -= 1;
+        }
+        labels.push("in-addr.arpa".to_string());
+        out.push(labels.join("."));
+    }
+    Ok(out)
 }
 
-/// Generate the `ip6.arpa` domain for an IPv6 CIDR block.
+/// Generate the `ip6.arpa` domain names covering an IPv6 CIDR block.
 ///
-/// E.g. `2001:db8::/32` → `"8.b.d.0.1.0.0.2.ip6.arpa"`.
-/// Port of `domain_rev6()` from option.c:1221-1307.
-pub fn domain_rev6(addr: std::net::Ipv6Addr, prefix_len: u8) -> String {
-    let octets = addr.octets();
-    // Each hex nibble = 4 bits of prefix
-    let nibble_count = (prefix_len / 4) as usize;
-    let mut nibbles = Vec::with_capacity(nibble_count);
-    for i in 0..nibble_count.min(32) {
-        let byte_idx = i / 2;
-        let nibble = if i % 2 == 0 {
-            (octets[byte_idx] >> 4) & 0x0f
-        } else {
-            octets[byte_idx] & 0x0f
-        };
-        nibbles.push(format!("{:x}", nibble));
+/// Prefix lengths that are not a multiple of 4 split into multiple
+/// non-nibble-aligned zones, mirroring [`domain_rev4`]'s octet splitting.
+/// Port of the IPv6 half of `domain_rev6()` from option.c:1221-1307.
+pub fn domain_rev6(addr: std::net::Ipv6Addr, prefix_len: u32) -> Result<Vec<String>, &'static str> {
+    let size = prefix_len;
+    if size > 128 || size < 1 {
+        return Err("bad IPv6 prefix length");
     }
-    nibbles.reverse();
-    if nibbles.is_empty() {
-        "ip6.arpa".to_string()
-    } else {
-        format!("{}.ip6.arpa", nibbles.join("."))
+
+    let rem = size & 0x3;
+    let addrbytes = (128 - size) >> 3;
+    let addrbits = (128 - size) & 7;
+
+    let mut octets = addr.octets();
+    octets[15 - addrbytes as usize] &= !(((1u32 << addrbits) - 1) as u8);
+
+    let size = size & !0x3;
+    let count = if rem != 0 { 1u32 << (4 - rem) } else { 1 };
+    let msize = (size / 4) as i32;
+
+    let mut out = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let start_j = if rem == 0 { msize - 1 } else { msize };
+        let mut labels = Vec::new();
+        let mut j = start_j;
+        while j >= 0 {
+            let byte = octets[(j as usize) >> 1];
+            let mut dig = if j & 1 == 1 { (byte & 0x0f) as u32 } else { (byte >> 4) as u32 };
+            if j == msize {
+                dig += i;
+            }
+            labels.push(format!("{dig:x}"));
+            j -= 1;
+        }
+        labels.push("ip6.arpa".to_string());
+        out.push(labels.join("."));
     }
+    Ok(out)
 }
 
 // ── DHCP tag helpers (ported from option.c:1322-1376) ─────────────────────────
@@ -4495,6 +4891,225 @@ mod tests {
         let lines = parse_config_text("enable-ubus", "test").unwrap();
         apply_config(&mut d, &lines).unwrap();
         assert!(d.option_bool(OPT_UBUS));
+    }
+
+    // ── rev-server ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn rev_server_octet_aligned_forwards_to_given_upstream() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("rev-server=192.168.1.0/24,10.0.0.1", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.servers.len(), 1);
+        let s = &d.servers[0];
+        assert_eq!(s.domain, "1.168.192.in-addr.arpa");
+        assert_eq!(s.flags & SERV_4ADDR, SERV_4ADDR);
+        assert_eq!(s.flags & SERV_LITERAL_ADDRESS, 0);
+        match &s.addr {
+            MySockAddr::V4(a) => {
+                assert_eq!(*a.ip(), "10.0.0.1".parse::<Ipv4Addr>().unwrap());
+                assert_eq!(a.port(), 53);
+            }
+            _ => panic!("expected an IPv4 socket address"),
+        }
+    }
+
+    #[test]
+    fn rev_server_defaults_to_32_when_no_prefix_given() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("rev-server=192.168.1.5,10.0.0.1", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.servers.len(), 1);
+        assert_eq!(d.servers[0].domain, "5.1.168.192.in-addr.arpa");
+    }
+
+    #[test]
+    fn rev_server_non_octet_aligned_prefix_generates_multiple_zones() {
+        let mut d = Daemon::default();
+        // A /20 splits into 16 non-aligned reverse zones (RFC 2317 style).
+        let lines = parse_config_text("rev-server=10.0.0.0/20,10.0.0.1", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.servers.len(), 16);
+        let domains: Vec<&str> = d.servers.iter().map(|s| s.domain.as_str()).collect();
+        assert!(domains.contains(&"0.0.10.in-addr.arpa"));
+        assert!(domains.contains(&"15.0.10.in-addr.arpa"));
+    }
+
+    #[test]
+    fn rev_server_without_upstream_is_literal_no_forward() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("rev-server=192.168.1.0/24", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.servers.len(), 1);
+        assert_eq!(d.servers[0].flags & SERV_LITERAL_ADDRESS, SERV_LITERAL_ADDRESS);
+    }
+
+    #[test]
+    fn rev_server_ipv6_forwards_to_given_upstream() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("rev-server=2001:db8::/64,fd00::1", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.servers.len(), 1);
+        assert!(d.servers[0].domain.ends_with(".ip6.arpa"));
+        assert_eq!(d.servers[0].flags & SERV_6ADDR, SERV_6ADDR);
+    }
+
+    #[test]
+    fn rev_server_bad_address_is_rejected() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("rev-server=not-an-addr,10.0.0.1", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(..)));
+    }
+
+    #[test]
+    fn rev_server_bad_upstream_address_is_rejected() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("rev-server=192.168.1.0/24,not-an-addr", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(..)));
+    }
+
+    #[test]
+    fn rev_server_bad_prefix_length_is_rejected() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("rev-server=192.168.1.0/33,10.0.0.1", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(..)));
+    }
+
+    // ── synth-domain ───────────────────────────────────────────────────────
+
+    #[test]
+    fn synth_domain_cidr_form_populates_range() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("synth-domain=example.com,10.0.0.0/24", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.synth_domains.len(), 1);
+        let sd = &d.synth_domains[0];
+        assert_eq!(sd.domain, "example.com");
+        assert!(!sd.is6);
+        assert_eq!(sd.start, "10.0.0.0".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(sd.end, "10.0.0.255".parse::<Ipv4Addr>().unwrap());
+    }
+
+    #[test]
+    fn synth_domain_range_form_with_prefix_resolves_a_query() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text(
+            "synth-domain=example.com,10.0.0.0,10.0.0.255,ip-",
+            "test",
+        )
+        .unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.synth_domains.len(), 1);
+        let addr = crate::domain::synthesize_ipv4("ip-10-0-0-7.example.com", &d.synth_domains);
+        assert_eq!(addr, Some("10.0.0.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn synth_domain_indexed_prefix_star() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("synth-domain=example.com,10.0.0.0,10.0.0.255,host*", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        let sd = &d.synth_domains[0];
+        assert!(sd.indexed);
+        assert_eq!(sd.prefix.as_deref(), Some("host"));
+    }
+
+    #[test]
+    fn synth_domain_ipv6_indexed_requires_prefixlen_64() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("synth-domain=example.com,2001:db8::/32,host*", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(..)));
+    }
+
+    #[test]
+    fn synth_domain_ipv6_indexed_ok_at_prefixlen_64() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("synth-domain=example.com,2001:db8::/64,host*", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.synth_domains[0].indexed);
+    }
+
+    #[test]
+    fn synth_domain_missing_range_is_rejected() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("synth-domain=example.com", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(..)));
+    }
+
+    #[test]
+    fn synth_domain_bad_address_is_rejected() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("synth-domain=example.com,not-an-addr", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(..)));
+    }
+
+    // ── bridge-interface ───────────────────────────────────────────────────
+
+    #[test]
+    fn bridge_interface_parses_aliases() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("bridge-interface=br0,eth0,eth1", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.bridges.len(), 1);
+        assert_eq!(d.bridges[0].iface, "br0");
+        assert_eq!(d.bridges[0].aliases, vec!["eth0".to_string(), "eth1".to_string()]);
+    }
+
+    #[test]
+    fn bridge_interface_merges_repeated_iface() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text(
+            "bridge-interface=br0,eth0\nbridge-interface=br0,eth1",
+            "test",
+        )
+        .unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.bridges.len(), 1);
+        assert_eq!(d.bridges[0].aliases, vec!["eth0".to_string(), "eth1".to_string()]);
+    }
+
+    #[test]
+    fn bridge_interface_missing_alias_is_rejected() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("bridge-interface=br0", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(..)));
+    }
+
+    // ── shared-network ─────────────────────────────────────────────────────
+
+    #[test]
+    fn shared_network_address_form() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("shared-network=192.168.1.1,192.168.2.1", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.shared_networks.len(), 1);
+        let sn = &d.shared_networks[0];
+        assert!(!sn.is6);
+        assert_eq!(sn.match_addr, "192.168.1.1".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(sn.shared_addr, "192.168.2.1".parse::<Ipv4Addr>().unwrap());
+    }
+
+    #[test]
+    fn shared_network_missing_field_is_rejected() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("shared-network=eth0", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(..)));
+    }
+
+    #[test]
+    fn shared_network_bad_second_field_is_rejected() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("shared-network=eth0,not-an-addr", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(..)));
     }
 
     /// `--umbrella` sets `OPT_UMBRELLA`; per-key sub-options (deviceid, orgid,
@@ -7175,46 +7790,56 @@ mod tests {
 
     #[test]
     fn domain_rev4_slash24() {
-        let s = domain_rev4("10.0.0.0".parse().unwrap(), 24);
-        assert_eq!(s, "0.0.10.in-addr.arpa");
+        let s = domain_rev4("10.0.0.0".parse().unwrap(), 24).unwrap();
+        assert_eq!(s, vec!["0.0.10.in-addr.arpa".to_string()]);
     }
 
     #[test]
     fn domain_rev4_slash16() {
-        let s = domain_rev4("172.16.0.0".parse().unwrap(), 16);
-        assert_eq!(s, "16.172.in-addr.arpa");
+        let s = domain_rev4("172.16.0.0".parse().unwrap(), 16).unwrap();
+        assert_eq!(s, vec!["16.172.in-addr.arpa".to_string()]);
     }
 
     #[test]
     fn domain_rev4_slash8() {
-        let s = domain_rev4("10.0.0.0".parse().unwrap(), 8);
-        assert_eq!(s, "10.in-addr.arpa");
+        let s = domain_rev4("10.0.0.0".parse().unwrap(), 8).unwrap();
+        assert_eq!(s, vec!["10.in-addr.arpa".to_string()]);
+    }
+
+    /// Upstream's `domain_rev4()` rejects `size < 1` (option.c:1163), so `/0`
+    /// is an error, not "the whole `in-addr.arpa` tree".
+    #[test]
+    fn domain_rev4_slash0_is_rejected() {
+        assert!(domain_rev4("0.0.0.0".parse().unwrap(), 0).is_err());
     }
 
     #[test]
-    fn domain_rev4_slash0() {
-        let s = domain_rev4("0.0.0.0".parse().unwrap(), 0);
-        assert_eq!(s, "in-addr.arpa");
+    fn domain_rev4_slash20_splits_into_16_non_aligned_zones() {
+        let s = domain_rev4("10.0.0.0".parse().unwrap(), 20).unwrap();
+        assert_eq!(s.len(), 16);
+        assert_eq!(s[0], "0.0.10.in-addr.arpa");
+        assert_eq!(s[15], "15.0.10.in-addr.arpa");
     }
 
     // ── domain_rev6 ──────────────────────────────────────────────────────────
 
     #[test]
     fn domain_rev6_slash32() {
-        let s = domain_rev6("2001:0db8::".parse().unwrap(), 32);
-        assert_eq!(s, "8.b.d.0.1.0.0.2.ip6.arpa");
+        let s = domain_rev6("2001:0db8::".parse().unwrap(), 32).unwrap();
+        assert_eq!(s, vec!["8.b.d.0.1.0.0.2.ip6.arpa".to_string()]);
     }
 
     #[test]
     fn domain_rev6_slash48() {
-        let s = domain_rev6("2001:0db8:abcd::".parse().unwrap(), 48);
-        assert_eq!(s, "d.c.b.a.8.b.d.0.1.0.0.2.ip6.arpa");
+        let s = domain_rev6("2001:0db8:abcd::".parse().unwrap(), 48).unwrap();
+        assert_eq!(s, vec!["d.c.b.a.8.b.d.0.1.0.0.2.ip6.arpa".to_string()]);
     }
 
+    /// Upstream's `domain_rev6()` rejects `size < 1` (option.c:1245), so `/0`
+    /// is an error, not "the whole `ip6.arpa` tree".
     #[test]
-    fn domain_rev6_slash0() {
-        let s = domain_rev6("::".parse().unwrap(), 0);
-        assert_eq!(s, "ip6.arpa");
+    fn domain_rev6_slash0_is_rejected() {
+        assert!(domain_rev6("::".parse().unwrap(), 0).is_err());
     }
 
     // ── is_tag_prefix / set_prefix ───────────────────────────────────────────

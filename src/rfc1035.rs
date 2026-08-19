@@ -16,6 +16,7 @@ use crate::types::constants::{
     F_REVERSE, F_RR,
 };
 use crate::types::dns_records::{BogusAddr, Cname, Doctor, HostRecord, MxSrvRecord, Naptr, PtrRecord, TxtRecord};
+use crate::domain::CondDomain;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Error type
@@ -904,6 +905,15 @@ pub struct LocalConfig<'a> {
     /// for single-label names — answer them locally as NXDOMAIN, or NOERR if
     /// the name matches other local config (`forward.c:355-361`).
     pub nodots_local:  bool,
+    /// `--synth-domain` (`daemon->synth_domains`): IP-range-to-domain-name
+    /// synthesis rules consulted for A/AAAA and PTR queries that have no
+    /// other local answer (`domain.c:is_name_synthetic`/`is_rev_synth`).
+    pub synth_domains: &'a [CondDomain],
+    /// Domains with a `SERV_LITERAL_ADDRESS` `server` entry and no upstream
+    /// address (`local=/domain/` with no address, or `rev-server` with the
+    /// server part omitted): never forwarded, and answered NXDOMAIN here
+    /// when nothing else matches, for any query type.
+    pub literal_domains: &'a [String],
 }
 
 /// Port of C's `setup_reply()`.  Sets standard response flags on a DnsHeader.
@@ -929,6 +939,21 @@ pub fn setup_reply(header: &mut DnsHeader, flags: u32) {
         // an empty answer caches a negative result we never established.
         header.set_rcode(5); // REFUSED
     }
+}
+
+/// True when `name` equals or is a subdomain of any entry in `domains`
+/// (case-insensitive, label-boundary-aware suffix match).
+fn domain_matches_any_suffix(name: &str, domains: &[String]) -> bool {
+    domains.iter().any(|domain| {
+        let dlen = domain.len();
+        if dlen == 0 || name.len() < dlen {
+            return false;
+        }
+        let start = name.len() - dlen;
+        let suffix = &name[start..];
+        suffix.eq_ignore_ascii_case(domain)
+            && (name.len() == dlen || name.as_bytes().get(start.wrapping_sub(1)) == Some(&b'.'))
+    })
 }
 
 /// Port of C's `answer_request()`.  Answers DNS queries from local config and cache.
@@ -1124,6 +1149,27 @@ pub fn answer_request(
                             });
                             ans = true;
                         }
+                        found_ptr = true;
+                    }
+                }
+                // `--synth-domain` reverse synthesis, tried after host
+                // records and cache both miss.  Port of `is_rev_synth()`
+                // (domain.c:153-215).
+                if !found_ptr {
+                    let synth_name = match addr {
+                        AllAddr::Addr4(a) => crate::domain::rev_synth_ipv4(a, config.synth_domains),
+                        AllAddr::Addr6(a) => crate::domain::rev_synth_ipv6(a, config.synth_domains),
+                        _ => None,
+                    };
+                    if let Some(hostname) = synth_name {
+                        let mut rd = BytesMut::new();
+                        write_name(&mut rd, &hostname);
+                        answers.push(DnsRr {
+                            name: name.clone(), rtype: 12, class: 1, ttl, rdata: rd.to_vec(),
+                        });
+                        ans       = true;
+                        auth      = true;
+                        found_ptr = true;
                     }
                 }
             }
@@ -1180,6 +1226,16 @@ pub fn answer_request(
                         });
                         ans = true;
                     }
+                } else if let Some(ip4) = crate::domain::synthesize_ipv4(&name, config.synth_domains) {
+                    // `--synth-domain` forward synthesis, tried only when the
+                    // name is uncached.  Port of `is_name_synthetic()`
+                    // (domain.c:24-140), gated the same way upstream gates it
+                    // (`rfc1035.c:2086`: only reached when `crecp` is NULL).
+                    answers.push(DnsRr {
+                        name: name.clone(), rtype: 1, class: 1, ttl, rdata: ip4.octets().to_vec(),
+                    });
+                    ans  = true;
+                    auth = true;
                 }
             }
             if want_aaaa {
@@ -1199,6 +1255,12 @@ pub fn answer_request(
                         });
                         ans = true;
                     }
+                } else if let Some(ip6) = crate::domain::synthesize_ipv6(&name, config.synth_domains) {
+                    answers.push(DnsRr {
+                        name: name.clone(), rtype: 28, class: 1, ttl, rdata: ip6.octets().to_vec(),
+                    });
+                    ans  = true;
+                    auth = true;
                 }
             }
         }
@@ -1263,6 +1325,15 @@ pub fn answer_request(
     if !ans && config.nodots_local && (qtype == 1 || qtype == 28 || qtype == 255) && !name.contains('.') && !name.is_empty() {
         ans = true;
         nxdomain = !check_for_local_domain(&name, config);
+    }
+
+    // 6b. A domain with a `SERV_LITERAL_ADDRESS` server entry and no
+    // upstream (`local=/domain/` with no address, or `rev-server` with the
+    // server part omitted) is never forwarded, for any query type — answer
+    // NXDOMAIN instead of falling through to forwarding.
+    if !ans && domain_matches_any_suffix(&name, config.literal_domains) {
+        ans      = true;
+        nxdomain = true;
     }
 
     if !ans {
@@ -2435,6 +2506,8 @@ mod tests {
             cnames:       &[],
             naptr_records: &[],
             nodots_local: false,
+            synth_domains: &[],
+            literal_domains: &[],
         }
     }
 
@@ -2727,6 +2800,97 @@ mod tests {
         let mut cache = DnsCache::new(100);
         let query = make_query("foo", 1);
         let cfg = LocalConfig { nodots_local: false, ..empty_config() };
+
+        assert!(answer_request(&query, &mut cache, now, &cfg).is_none());
+    }
+
+    // ── synth-domain wiring (domain.c: is_name_synthetic / is_rev_synth) ────
+
+    fn v4_synth_domain(domain: &str, prefix: Option<&str>, start: Ipv4Addr, end: Ipv4Addr) -> CondDomain {
+        CondDomain {
+            domain: domain.to_string(),
+            prefix: prefix.map(|s| s.to_string()),
+            interface: None,
+            start,
+            end,
+            start6: Ipv6Addr::UNSPECIFIED,
+            end6: Ipv6Addr::UNSPECIFIED,
+            is6: false,
+            indexed: false,
+            prefixlen: 0,
+        }
+    }
+
+    /// An A query for a dashed synthetic name resolves to the embedded
+    /// address when it matches a configured `synth-domain` range.
+    #[test]
+    fn synth_domain_answers_forward_a_query() {
+        let now = Instant::now();
+        let mut cache = DnsCache::new(100);
+        let query = make_query("10-0-0-7.example.com", 1);
+        let sd = v4_synth_domain("example.com", None, "10.0.0.0".parse().unwrap(), "10.0.0.255".parse().unwrap());
+        let cfg = LocalConfig { synth_domains: std::slice::from_ref(&sd), ..empty_config() };
+
+        let resp = answer_request(&query, &mut cache, now, &cfg).expect("should answer locally");
+        assert_eq!(resp.header.rcode(), 0); // NOERROR
+        assert_eq!(resp.answers.len(), 1);
+        assert_eq!(resp.answers[0].rdata, vec![10, 0, 0, 7]);
+    }
+
+    /// A PTR query for an address in a `synth-domain` range synthesises the
+    /// dashed hostname when there's no host record or cache entry.
+    #[test]
+    fn synth_domain_answers_reverse_ptr_query() {
+        let now = Instant::now();
+        let mut cache = DnsCache::new(100);
+        let query = make_query("7.0.0.10.in-addr.arpa", 12);
+        let sd = v4_synth_domain("example.com", None, "10.0.0.0".parse().unwrap(), "10.0.0.255".parse().unwrap());
+        let cfg = LocalConfig { synth_domains: std::slice::from_ref(&sd), ..empty_config() };
+
+        let resp = answer_request(&query, &mut cache, now, &cfg).expect("should answer locally");
+        assert_eq!(resp.header.rcode(), 0); // NOERROR
+        assert_eq!(resp.answers.len(), 1);
+        assert_eq!(resp.answers[0].rtype, 12);
+    }
+
+    /// A cached NODATA entry for the requested type takes precedence over
+    /// synth-domain synthesis (upstream only reaches `is_name_synthetic()`
+    /// when the per-type cache lookup finds nothing at all — mirrors the
+    /// `else if (is_name_synthetic(...))` in `rfc1035.c:2086`, reached only
+    /// when the preceding `cache_find_by_name(..., flag)` came up empty).
+    #[test]
+    fn synth_domain_does_not_override_a_cache_hit() {
+        let now = Instant::now();
+        let mut cache = DnsCache::new(100);
+        cache.really_insert(
+            CacheRecord {
+                name:    "10-0-0-7.example.com".to_string(),
+                flags:   F_IPV4 | F_NEG,
+                ttl:     60,
+                expires: now + Duration::from_secs(60),
+                addr:    None,
+                rdata:   None,
+                uid:     UID_NONE,
+            },
+            now,
+        );
+        let query = make_query("10-0-0-7.example.com", 1);
+        let sd = v4_synth_domain("example.com", None, "10.0.0.0".parse().unwrap(), "10.0.0.255".parse().unwrap());
+        let cfg = LocalConfig { synth_domains: std::slice::from_ref(&sd), ..empty_config() };
+
+        let resp = answer_request(&query, &mut cache, now, &cfg).expect("should answer locally");
+        assert_eq!(resp.header.rcode(), 0); // NOERROR/NODATA from the cache, not a synthesised answer
+        assert_eq!(resp.answers.len(), 0);
+    }
+
+    /// A name outside the configured range is still forwarded (`None`).
+    #[test]
+    fn synth_domain_out_of_range_still_forwards() {
+        let now = Instant::now();
+        let mut cache = DnsCache::new(100);
+        let query = make_query("192-168-1-1.example.com", 1);
+        let sd = v4_synth_domain("example.com", None, "10.0.0.0".parse().unwrap(), "10.0.0.255".parse().unwrap());
+        let cfg = LocalConfig { synth_domains: std::slice::from_ref(&sd), ..empty_config() };
 
         assert!(answer_request(&query, &mut cache, now, &cfg).is_none());
     }

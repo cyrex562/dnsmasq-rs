@@ -6,14 +6,23 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 /// A conditional domain mapping: maps a range of IP addresses to a domain.
 #[derive(Debug, Clone)]
 pub struct CondDomain {
-    pub domain:  String,
-    pub prefix:  Option<String>,
-    pub start:   Ipv4Addr,
-    pub end:     Ipv4Addr,
-    pub start6:  Ipv6Addr,
-    pub end6:    Ipv6Addr,
-    pub is6:     bool,
-    pub indexed: bool,
+    pub domain:    String,
+    pub prefix:    Option<String>,
+    /// Interface a subnet-form `synth-domain`/`domain` was sourced from
+    /// (`struct cond_domain.interface`, `dnsmasq.h:1042`).  Set only for the
+    /// `synth-domain=<domain>,<iface>` form; matching against the interface's
+    /// runtime address list is not implemented (see `tasks.md`).
+    pub interface: Option<String>,
+    pub start:     Ipv4Addr,
+    pub end:       Ipv4Addr,
+    pub start6:    Ipv6Addr,
+    pub end6:      Ipv6Addr,
+    pub is6:       bool,
+    pub indexed:   bool,
+    /// CIDR prefix length for the IPv6 CIDR form (`option.c:2622` `msize`).
+    /// `0` for the range form and for IPv4, matching upstream's
+    /// `new->prefixlen = 0` default.
+    pub prefixlen: u32,
 }
 
 /// Returns true if `addr` falls in the range `[start, end]` (inclusive).
@@ -105,6 +114,50 @@ fn strip_prefix<'a>(name: &'a str, prefix: Option<&str>) -> Option<&'a str> {
             }
         }
     }
+}
+
+/// Try to synthesise an IPv6 address from a name + list of conditional domains.
+///
+/// Port of the IPv6 path of `is_name_synthetic()` from domain.c:24-140.
+pub fn synthesize_ipv6(name: &str, domains: &[CondDomain]) -> Option<Ipv6Addr> {
+    for c in domains {
+        if !c.is6 {
+            continue;
+        }
+        if let Some(addr) = try_synth_ipv6(name, c) {
+            return Some(addr);
+        }
+    }
+    None
+}
+
+fn try_synth_ipv6(name: &str, c: &CondDomain) -> Option<Ipv6Addr> {
+    let tail = strip_prefix(name, c.prefix.as_deref())?;
+
+    if c.indexed {
+        let (idx_str, rest) = tail.split_once('.')?;
+        if !rest.eq_ignore_ascii_case(&c.domain) {
+            return None;
+        }
+        let idx: u64 = idx_str.parse().ok()?;
+        let start = ipv6_low64(c.start6);
+        let end = ipv6_low64(c.end6);
+        if idx <= end - start {
+            return Some(ipv6_set_low64(c.start6, start + idx));
+        }
+    } else {
+        let (addr_str, rest) = tail.split_once('.')?;
+        if !rest.eq_ignore_ascii_case(&c.domain) {
+            return None;
+        }
+        // Swap '-' for ':' and parse.
+        let colon_form = addr_str.replace('-', ":");
+        let addr: Ipv6Addr = colon_form.parse().ok()?;
+        if ipv6_in_range(addr, c.start6, c.end6) {
+            return Some(addr);
+        }
+    }
+    None
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -240,12 +293,14 @@ mod tests {
         CondDomain {
             domain: domain.to_string(),
             prefix: prefix.map(|s| s.to_string()),
+            interface: None,
             start,
             end,
             start6:  Ipv6Addr::UNSPECIFIED,
             end6:    Ipv6Addr::UNSPECIFIED,
             is6:     false,
             indexed: false,
+            prefixlen: 0,
         }
     }
 
@@ -413,12 +468,14 @@ mod tests {
         let d = CondDomain {
             domain: "example.com".to_string(),
             prefix: None,
+            interface: None,
             start: "10.0.0.0".parse().unwrap(),
             end: "10.0.0.255".parse().unwrap(),
             start6: Ipv6Addr::UNSPECIFIED,
             end6: Ipv6Addr::UNSPECIFIED,
             is6: true,
             indexed: false,
+            prefixlen: 0,
         };
         assert!(synthesize_ipv4("10-0-0-1.example.com", &[d]).is_none());
     }
@@ -464,6 +521,47 @@ mod tests {
         assert!(synthesize_ipv4("10-0-0-1.example.com", &[]).is_none());
     }
 
+    // ── synthesize_ipv6 ────────────────────────────────────────────────────
+
+    #[test]
+    fn synth_ipv6_hex_roundtrip_with_rev_synth() {
+        let d = make_v6_domain("example.com", None, "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(), false);
+        let addr: Ipv6Addr = "2001:db8::42".parse().unwrap();
+        let name = rev_synth_ipv6(addr, std::slice::from_ref(&d)).unwrap();
+        let result = synthesize_ipv6(&name, &[d]);
+        assert_eq!(result, Some(addr));
+    }
+
+    #[test]
+    fn synth_ipv6_indexed() {
+        let mut d = make_v6_domain("example.com", None, "2001:db8::100".parse().unwrap(), "2001:db8::200".parse().unwrap(), false);
+        d.indexed = true;
+        let result = synthesize_ipv6("5.example.com", &[d]);
+        assert_eq!(result, Some("2001:db8::105".parse().unwrap()));
+    }
+
+    #[test]
+    fn synth_ipv6_out_of_range() {
+        let d = make_v6_domain("example.com", None, "2001:db8::1".parse().unwrap(), "2001:db8::10".parse().unwrap(), false);
+        let addr: Ipv6Addr = "2001:db8::ff".parse().unwrap();
+        let name = rev_synth_ipv6(addr, &[make_v6_domain("example.com", None, addr, addr, false)]).unwrap();
+        assert!(synthesize_ipv6(&name, &[d]).is_none());
+    }
+
+    #[test]
+    fn synth_ipv6_skips_ipv4_domains() {
+        let d = make_domain("example.com", None, "10.0.0.0".parse().unwrap(), "10.0.0.255".parse().unwrap());
+        assert!(synthesize_ipv6("2001-0db8-0000-0000-0000-0000-0000-0042.example.com", &[d]).is_none());
+    }
+
+    #[test]
+    fn synth_ipv6_with_prefix() {
+        let d = make_v6_domain("example.com", Some("host-"), "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(), false);
+        let addr: Ipv6Addr = "2001:db8::7".parse().unwrap();
+        let name = rev_synth_ipv6(addr, std::slice::from_ref(&d)).unwrap();
+        assert_eq!(synthesize_ipv6(&name, &[d]), Some(addr));
+    }
+
     // ── rev_synth_ipv4 ──────────────────────────────────────────────────────
 
     #[test]
@@ -500,12 +598,14 @@ mod tests {
         CondDomain {
             domain: domain.to_string(),
             prefix: prefix.map(|s| s.to_string()),
+            interface: None,
             start: Ipv4Addr::UNSPECIFIED,
             end: Ipv4Addr::UNSPECIFIED,
             start6,
             end6,
             is6: true,
             indexed,
+            prefixlen: 0,
         }
     }
 
