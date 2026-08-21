@@ -1550,7 +1550,7 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             #[cfg(feature = "dhcp6")]
             {
                 daemon.duid_enterprise = enterprise;
-                daemon.duid = Some(id);
+                daemon.duid_config = Some(id);
             }
             #[cfg(not(feature = "dhcp6"))]
             {
@@ -5322,7 +5322,7 @@ mod tests {
         let lines = parse_config_text("dhcp-duid=9,00010203", "test").unwrap();
         apply_config(&mut d, &lines).unwrap();
         assert_eq!(d.duid_enterprise, 9);
-        assert_eq!(d.duid.as_deref(), Some(&[0x00, 0x01, 0x02, 0x03][..]));
+        assert_eq!(d.duid_config.as_deref(), Some(&[0x00, 0x01, 0x02, 0x03][..]));
     }
 
     #[test]

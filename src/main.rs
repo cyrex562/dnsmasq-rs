@@ -49,6 +49,8 @@ pub mod rfc2131;
 pub mod lease;
 
 #[cfg(feature = "dhcp6")]
+pub mod dhcp6;
+#[cfg(feature = "dhcp6")]
 pub mod rfc3315;
 #[cfg(feature = "dhcp6")]
 pub mod radv;

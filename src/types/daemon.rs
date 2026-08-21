@@ -232,8 +232,16 @@ pub struct Daemon {
     pub relay6:          Vec<DhcpRelay>,
     #[cfg(feature = "dhcp6")]
     pub ra_interfaces:   Vec<RaInterface>,
+    /// The constructed on-wire server DUID (upstream's `daemon->duid`,
+    /// `daemon->duid_len`), filled in by `dhcp6::make_duid()` at startup.
+    /// `None` until `make_duid()` has run.
     #[cfg(feature = "dhcp6")]
     pub duid:            Option<Vec<u8>>,
+    /// Raw `enterprise-number,hex-id` bytes from `--dhcp-duid=`, upstream's
+    /// `daemon->duid_config`/`duid_config_len`. Input to `make_duid()`, not
+    /// itself a valid wire-format DUID.
+    #[cfg(feature = "dhcp6")]
+    pub duid_config:     Option<Vec<u8>>,
     #[cfg(feature = "dhcp6")]
     pub duid_enterprise: u32,
 
@@ -443,6 +451,8 @@ impl Default for Daemon {
             ra_interfaces: vec![],
             #[cfg(feature = "dhcp6")]
             duid: None,
+            #[cfg(feature = "dhcp6")]
+            duid_config: None,
             #[cfg(feature = "dhcp6")]
             duid_enterprise: 0,
 

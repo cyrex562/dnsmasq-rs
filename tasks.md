@@ -1380,6 +1380,51 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   explicitly rejected (`DnssecAlgorithm::try_from` fails closed for 12;
   `parse_dnskey`/`verify_sig` fail closed for 16), not silently ignored.
 
+- [x] `dhcp6::dispatch_dhcp6` real allocation/DUID/context pipeline (Issue #34 / T3-dhcp6), partial.
+  Source of truth: `dhcp6.c:35-689` (`dhcp6_init`, `complete_context6`, `address6_allocate`,
+  `make_duid`/`make_duid1`, `dhcp_construct_contexts`/`construct_worker`).
+  Implemented, tested, real (no longer stubs):
+  - `make_duid`/`build_duid_en`/`build_duid_llt`/`build_duid_ll`: builds and persists a real
+    on-wire DUID into `daemon.duid` — DUID-EN from `--dhcp-duid=` (`daemon.duid_config`, renamed
+    from the old dual-purpose `daemon.duid` field so config input and constructed output don't
+    collide), else DUID-LLT/DUID-LL from a caller-supplied MAC (`DuidMacSource`).
+  - `complete_context6`: plain (non-shared-network) branch of the real algorithm — prefix/net
+    matching, `CONTEXT_CONSTRUCTED`-vs-fixed lifetime handling, chain ordering by preferred time.
+  - `address6_allocate`: the actual hash-seeded collision/DECLINE-retry scan (dhcp6.c:536-565),
+    replacing the old single-candidate `hash_to_addr6` call with no retry.
+  - `dhcp_construct_contexts`: the non-template branch of `construct_worker` — fills
+    `if_index`/`local6` on plain contexts from live interface prefixes.
+  - `dhcp6_init`: binds `[::]:547` via the existing `network::make_sock` (already sets
+    `IPV6_V6ONLY`/`IPV6_RECVPKTINFO`/`SO_REUSEADDR`).
+  - `dispatch_dhcp6`: now takes real `duid`/`contexts`/`in_use` state and returns a genuine
+    IA_NA/IAADDR-bearing Advertise/Reply (or a Status-Code NoAddrsAvail IA_NA when allocation
+    fails), instead of the old canned empty-options stub. Uses this module's own flat option
+    encoding rather than `rfc3315::Dhcp6Packet` — the crate's two DHCPv6 packet representations
+    were **not** unified in this change (still a follow-up item).
+  - `src/main.rs` was missing `pub mod dhcp6;` entirely (present in `lib.rs` only, so the release
+    binary never even compiled this file) — added, matching `rfc3315`/`radv`/`slaac`.
+  Still open / explicitly unsupported:
+  - **No production wiring.** Nothing calls `dhcp6_init`/`make_duid`/`dhcp_construct_contexts` at
+    daemon startup, and there is still no DHCPv6 receive loop anywhere (`run_main_loop_with` in
+    `dnsmasq.rs` has a `feature = "dhcp"` branch spawning `run_dhcp_loop`; no `feature = "dhcp6"`
+    counterpart exists). `dispatch_dhcp6` has no live caller. This mirrors the existing
+    `dhcp_construct_contexts`-is-unreachable note above (log_context/log_relay entry) — building
+    the actual socket loop, wiring it into `run_main_loop_with`, and sourcing a real MAC via
+    `netlink::iface_enumerate(AF_LOCAL, ...)` for `make_duid` at startup are separate follow-ups.
+  - `complete_context6`'s shared-network branch and DHCPv6-relay `iface_index`/duplicate-warning
+    bookkeeping (dhcp6.c:421-460) are not ported.
+  - `dhcp_construct_contexts`'s template branch (`--dhcp-range=...,constructor:IFACE,...`) is
+    still unreachable: no `template_interface` field on `DhcpContext` and no `constructor:` config
+    parsing exist (same gap the log_context/log_relay entry above already flagged). Fast-RA
+    kickoff and GC aging of constructed contexts are not ported either.
+  - `address6_allocate` is single-pass only — upstream's two-pass `plain_range` fallback (try
+    netid-matching contexts first, then any context) and `--consec-addresses` seeding mode are not
+    ported.
+  - `get_client_mac` (dhcp6.c:308-350, ICMPv6 neighbor-solicitation MAC resolution for
+    `--dhcp-host` MAC matching over DHCPv6) is not ported.
+  - `config_find_by_address6` still only matches exact `/128` addresses, not prefix/wildcard
+    address-list entries.
+
 - [ ] Treat DBus, UBus, BPF, ipset, nftset, and similar integrations as feature-gated completion tracks.
   Required tests: feature-gated compile checks, targeted integration tests, parity scenarios only when implementation is real.
   Done when: each optional feature is either implemented with tests or explicitly marked incomplete.
