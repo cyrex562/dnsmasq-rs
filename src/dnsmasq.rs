@@ -1555,6 +1555,7 @@ pub async fn run_main_loop_with(
                 bridges: d.bridges.clone(),
                 opt_ra: d.option_bool(crate::types::constants::OPT_RA),
                 is_dns_server: d.port == crate::dns_protocol::NAMESERVER_PORT,
+                quiet_ra: d.option_bool(crate::types::constants::OPT_QUIET_RA),
                 iface_check: iface_check_config(&d),
             })
         } else {
@@ -1823,7 +1824,7 @@ pub async fn run_main_loop_with(
         let task = tokio::spawn(async move {
             if let Err(e) = run_radv_loop(
                 socket, cfg.contexts, cfg.ra_interfaces, cfg.dhcp_except, cfg.bridges,
-                cfg.opt_ra, cfg.is_dns_server, cfg.iface_check, shutdown_rx,
+                cfg.opt_ra, cfg.is_dns_server, cfg.quiet_ra, cfg.iface_check, shutdown_rx,
             ).await {
                 error!("radv loop exited: {e}");
             }
@@ -2444,6 +2445,8 @@ pub struct RadvConfig {
     pub bridges: Vec<crate::types::daemon::DhcpBridge>,
     pub opt_ra: bool,
     pub is_dns_server: bool,
+    /// `--quiet-ra` — suppresses the `RTR-SOLICIT` log line (radv.c:222-223).
+    pub quiet_ra: bool,
     /// The `--interface`/`--except-interface`/`--listen-address` filter,
     /// applied via [`crate::network::iface_check_name`] to both the RA send
     /// path ([`crate::radv::periodic_ra`]) and the receive path
@@ -2750,6 +2753,7 @@ fn handle_icmp6_packet(
     iface_check: &crate::network::IfaceCheckConfig,
     opt_ra: bool,
     is_dns_server: bool,
+    quiet_ra: bool,
 ) {
     if data.len() < 8 || data[1] != 0 {
         return;
@@ -2765,6 +2769,18 @@ fn handle_icmp6_packet(
     }
     if crate::radv::blocked_by_dhcp_except(&name, dhcp_except) {
         return;
+    }
+
+    // radv.c:206-223 — link-layer address option, extracted for logging only.
+    // The scan (and its malformed-option bail-out) runs unconditionally
+    // upstream; only the resulting `my_syslog` call is gated on `quiet_ra`.
+    let mac = match crate::radv::parse_rs_source_mac(data) {
+        Ok(mac) => mac,
+        Err(_) => return, // malformed option — upstream bails out here too
+    };
+    if !quiet_ra {
+        let mac = mac.as_deref().map(crate::util::print_mac).unwrap_or_default();
+        tracing::info!("RTR-SOLICIT({name}) {mac}");
     }
 
     let dest = match src {
@@ -2817,6 +2833,7 @@ pub async fn run_radv_loop(
     bridges: Vec<crate::types::daemon::DhcpBridge>,
     opt_ra: bool,
     is_dns_server: bool,
+    quiet_ra: bool,
     iface_check: crate::network::IfaceCheckConfig,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
@@ -2867,7 +2884,7 @@ pub async fn run_radv_loop(
                     handle_icmp6_packet(
                         async_fd.get_ref(), &recv_buf[..meta.len], meta.if_index, meta.src,
                         &mut contexts, &ra_interfaces, &bridges, &dhcp_except, &iface_check,
-                        opt_ra, is_dns_server,
+                        opt_ra, is_dns_server, quiet_ra,
                     );
                 }
             }
@@ -4858,7 +4875,7 @@ mod tests {
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(run_radv_loop(
-            socket, vec![ctx], vec![], vec![], vec![], false, false,
+            socket, vec![ctx], vec![], vec![], vec![], false, false, false,
             crate::network::IfaceCheckConfig::default(), shutdown_rx,
         ));
 

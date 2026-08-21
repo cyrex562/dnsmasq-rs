@@ -1992,6 +1992,11 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     resolve (`if_nametoindex` fails) is skipped in favour of the next bridge, rather than
     unconditionally dropping the RS. Only when no bridge claims the RS does it fall through to a
     direct reply on the arrival interface.
+  Follow-up fix 2: `parse_rs_source_mac` was fully ported and unit-tested but never called from
+  `handle_icmp6_packet` — decorative. Wired in: `handle_icmp6_packet` now runs the source-LLA scan
+  unconditionally (matching radv.c:206-223's bail-out-on-malformed-option behavior regardless of
+  `--quiet-ra`) and only gates the resulting `RTR-SOLICIT(<iface>) <mac>` log line on
+  `--quiet-ra`/`OPT_QUIET_RA`, which `RadvConfig`/`run_radv_loop` now thread through end to end.
   Known gaps, left for a follow-up:
   - `--dhcp-option6=option6:dns-server/domain-search`-driven RDNSS/DNSSL tag-filtered substitution
     (radv.c:454-525) is not implemented; only the default "advertise ourselves" RDNSS fallback is.
@@ -2009,6 +2014,33 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     documented on `network::enumerate_live_addrs6`.
   - No parity-harness fixture exercises RA yet (the harness's own scope note already excludes
     DHCP/RA pending `NET_ADMIN`/`NET_RAW` in the container).
+  - `run_radv_loop`'s `contexts: Vec<DhcpContext>` is a one-time `.clone()` taken at startup
+    (`dnsmasq.rs`'s `radv_config` build, before `run_radv_loop` is spawned) and then owned solely
+    by the RA task for the life of the process — nothing feeds it updates afterward. Upstream
+    reconstructs contexts on netlink interface/address changes and marks stale ones `CONTEXT_OLD`
+    (the normal way an advertised prefix tracks a live interface); that reconstruction path
+    doesn't exist here at all (ties to the still-stub SIGHUP/reload path noted under "Architecture
+    > Runtime flow" in CLAUDE.md), so it never reaches the running RA loop. Concretely this means:
+    - `add_prefix_for_addr`'s `CONTEXT_RA_DONE`/`CONTEXT_OLD` bookkeeping only ever sees the
+      context set as it existed at startup.
+    - `ra_start_unsolicited_one` (radv.c:125-130, the per-context seed upstream uses when a *new*
+      context needs a timer after startup) has no call site — there is no path that ever adds a
+      context to the running RA loop's vector — and is currently exercised only by its own unit
+      test.
+    - Upstream's `new_timeout(parm.found_context, ...)` transfer, which hands an expiring
+      `CONTEXT_OLD` context's RA timer to the live context that replaced it (radv.c:342-343), has
+      no Rust counterpart: `build_ra_for_interface`'s `CONTEXT_OLD` branch just drops the expired
+      context once its `saved_valid` window elapses (`radv.rs`'s old-prefix drain loop). Restoring
+      this needs `RaParam.found_context` to go back from a `bool` to an index/reference into
+      `contexts`, which the current pure-function shape (`add_prefix_for_addr` taking `&mut
+      [DhcpContext]`) doesn't support without a larger signature change.
+    Net effect: "Prefix options reflect live interface addresses" holds for the addresses present
+    at startup, but an interface/subnet change afterward (add, remove, renumber) is not picked up
+    by the running daemon without a restart. Fixing this for real needs the DHCPv6 side to publish
+    context updates (e.g. via a shared `Arc<RwLock<Vec<DhcpContext>>>` or a watch channel) that
+    `run_radv_loop` consumes each tick, plus the `found_context` index change above — tracked here
+    rather than attempted in this pass to avoid a broad, risky refactor of both `radv.rs`'s pure
+    functions and the DHCPv6/RA startup wiring in the same change.
   Required tests: call-site tests proving RA scheduling and the router-lifetime wire field reflect
   per-interface `ra-param` config (interval, lifetime, including the lifetime=0 "no default route" case) — done, see `radv.rs` and `option.rs` test modules.
   Done when: RA interval/lifetime are actually derived from `RaInterface` at every upstream call site — done; remaining RA work is the gaps listed above.
