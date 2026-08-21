@@ -1,147 +1,162 @@
-//! DNS forwarding loop detection via probe queries.
+//! DNS forwarding-loop detection via probe queries.
+//!
+//! Port of `loop.c`. When `--dns-loop-detect` (`OPT_LOOP_DETECT`) is set, this
+//! resolver periodically sends an identifiable probe query to each general
+//! upstream server. If a probe ever comes back to us as an incoming client
+//! query, that upstream server is forwarding back to us — a loop — and it is
+//! marked [`SERV_LOOP`] so [`ForwardEngine`](crate::forward::ForwardEngine)
+//! stops selecting it.
 #![cfg(feature = "loop")]
 
-use std::time::Instant;
+use crate::types::server::{Server, SERV_FOR_NODOTS, SERV_LOOP};
+use std::net::SocketAddr;
 
 // ---------------------------------------------------------------------------
-// Types
+// Wire-format constants (config.h: LOOP_TEST_DOMAIN / LOOP_TEST_TYPE)
 // ---------------------------------------------------------------------------
 
-pub struct LoopProbe {
-    pub token: [u8; 8],
-    pub sent_at: Instant,
-}
+/// Domain used for loop-testing probes. `"test"` is reserved by RFC 2606 and
+/// therefore never clashes with a real name.
+pub const LOOP_TEST_DOMAIN: &str = "test";
+/// RR type used for loop-testing probes (`T_TXT`).
+pub const LOOP_TEST_TYPE: u16 = 16;
 
 // ---------------------------------------------------------------------------
-// DNS wire-format constants
+// Probe construction (loop_make_probe, loop.c:51-77)
 // ---------------------------------------------------------------------------
 
-const DNS_HDR_LEN: usize = 12;
-// Question section offsets relative to start of DNS message
-// Header: ID(2) QR/Opcode/… (2) QDCOUNT(2) ANCOUNT(2) NSCOUNT(2) ARCOUNT(2)
+/// Build a DNS query probe embedding `uid` in its qname, exactly as
+/// `loop_make_probe()` does: a first label of the 8 lowercase-hex digits of
+/// `uid` (`"%.8x"`), followed by the [`LOOP_TEST_DOMAIN`] label, querying
+/// [`LOOP_TEST_TYPE`]/IN with the RD bit set and no other header flags.
+pub fn loop_make_probe(uid: u32, id: u16) -> Vec<u8> {
+    let label = format!("{uid:08x}");
 
-/// Label under .invalid used for loop-detection probes.
-const PROBE_SUFFIX: &[u8] = b"\x07invalid\x00";
+    let mut pkt = Vec::new();
+    pkt.extend_from_slice(&id.to_be_bytes()); // ID
+    pkt.push(0x01); // hb3: RD=1, opcode=QUERY, QR=0
+    pkt.push(0x00); // hb4: no flags
+    pkt.extend_from_slice(&[0x00, 0x01]); // QDCOUNT = 1
+    pkt.extend_from_slice(&[0x00, 0x00]); // ANCOUNT
+    pkt.extend_from_slice(&[0x00, 0x00]); // NSCOUNT
+    pkt.extend_from_slice(&[0x00, 0x00]); // ARCOUNT
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+    pkt.push(label.len() as u8);
+    pkt.extend_from_slice(label.as_bytes());
+    pkt.push(LOOP_TEST_DOMAIN.len() as u8);
+    pkt.extend_from_slice(LOOP_TEST_DOMAIN.as_bytes());
+    pkt.push(0); // root label
 
-/// Encode 8 token bytes as a 16-character lowercase hex label.
-fn token_to_label(token: &[u8; 8]) -> [u8; 16] {
-    let hex = b"0123456789abcdef";
-    let mut out = [0u8; 16];
-    for (i, &b) in token.iter().enumerate() {
-        out[i * 2] = hex[(b >> 4) as usize];
-        out[i * 2 + 1] = hex[(b & 0xf) as usize];
-    }
-    out
-}
+    pkt.extend_from_slice(&LOOP_TEST_TYPE.to_be_bytes()); // QTYPE
+    pkt.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
 
-/// Decode a 16-char hex label back to 8 bytes.  Returns None on failure.
-fn label_to_token(label: &[u8]) -> Option<[u8; 8]> {
-    if label.len() != 16 {
-        return None;
-    }
-    let mut out = [0u8; 8];
-    for i in 0..8 {
-        let hi = from_hex(label[i * 2])?;
-        let lo = from_hex(label[i * 2 + 1])?;
-        out[i] = (hi << 4) | lo;
-    }
-    Some(out)
-}
-
-fn from_hex(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// Read a DNS question QNAME from `pkt` at offset `pos`.
-/// Returns the raw label bytes (each label prefixed with its length byte)
-/// for the first label only, and the full qname string for matching.
-fn read_qname_first_label(pkt: &[u8], pos: usize) -> Option<Vec<u8>> {
-    if pos >= pkt.len() {
-        return None;
-    }
-    let label_len = pkt[pos] as usize;
-    if label_len == 0 || pos + 1 + label_len > pkt.len() {
-        return None;
-    }
-    Some(pkt[pos + 1..pos + 1 + label_len].to_vec())
+    pkt
 }
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Generate a new random probe token using the system's pseudo-random source.
-pub fn new_probe_token() -> [u8; 8] {
-    // Use a simple time-seeded approach without `unsafe`.
-    // In production the caller would seed from a CSPRNG; here we mix
-    // the current time to get non-repeating values in tests.
-    let now = Instant::now();
-    let nanos = now.elapsed().subsec_nanos() as u64;
-    let seed = nanos ^ 0xdeadbeefcafe1234;
-    let mut t = [0u8; 8];
-    for (i, b) in seed.to_le_bytes().iter().enumerate() {
-        t[i] = *b;
-    }
-    t
+/// One probe ready to be sent to a server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeSend {
+    /// Index into the `servers` slice [`loop_send_probes`] was called with.
+    pub server_idx: usize,
+    /// The server's address, to send the probe to.
+    pub addr: SocketAddr,
+    /// The wire-format probe query.
+    pub packet: Vec<u8>,
 }
 
-/// Build a DNS probe query embedding `token` in the qname.
+/// Build one probe per eligible upstream server (`loop_send_probes()`,
+/// `loop.c:22-49`).
 ///
-/// qname format: `\x10<16-hex-label>\x07invalid\x00`
-/// Query type: A (1), class: IN (1).
-pub fn build_probe_query(token: &[u8; 8], id: u16) -> Vec<u8> {
-    let label = token_to_label(token);
-
-    let mut pkt = Vec::new();
-    // DNS header
-    pkt.extend_from_slice(&id.to_be_bytes());    // ID
-    pkt.extend_from_slice(&[0x01, 0x00]);         // QR=0 (query), RD=1
-    pkt.extend_from_slice(&[0x00, 0x01]);         // QDCOUNT = 1
-    pkt.extend_from_slice(&[0x00, 0x00]);         // ANCOUNT
-    pkt.extend_from_slice(&[0x00, 0x00]);         // NSCOUNT
-    pkt.extend_from_slice(&[0x00, 0x00]);         // ARCOUNT
-
-    // QNAME
-    pkt.push(16u8);                               // label length
-    pkt.extend_from_slice(&label);                // 16-char hex token
-    pkt.extend_from_slice(PROBE_SUFFIX);          // \x07invalid\x00
-
-    // QTYPE A = 1, QCLASS IN = 1
-    pkt.extend_from_slice(&[0x00, 0x01]);
-    pkt.extend_from_slice(&[0x00, 0x01]);
-    pkt
+/// A server is eligible when it is a general resolver: no per-domain
+/// restriction (`domain` empty) and not restricted to unqualified names
+/// (`SERV_FOR_NODOTS`). Each eligible server's [`SERV_LOOP`] flag is cleared
+/// before a fresh probe is built for it — exactly as C does — so a server
+/// that stops looping recovers on the next probe round.
+///
+/// This only builds the packets; sending them is the caller's job (see
+/// [`send_probes`]), matching how this module has no socket of its own to
+/// send from.
+pub fn loop_send_probes(servers: &mut [Server]) -> Vec<ProbeSend> {
+    let mut out = Vec::new();
+    for (idx, serv) in servers.iter_mut().enumerate() {
+        if !serv.domain.is_empty() || serv.flags & SERV_FOR_NODOTS != 0 {
+            continue;
+        }
+        serv.flags &= !SERV_LOOP;
+        let id = rand::random::<u16>();
+        out.push(ProbeSend {
+            server_idx: idx,
+            addr: SocketAddr::from(serv.addr.clone()),
+            packet: loop_make_probe(serv.uid, id),
+        });
+    }
+    out
 }
 
-/// Check whether a DNS reply `pkt` contains a question matching any active probe token.
+/// Actually send the probes [`loop_send_probes`] built, over throwaway
+/// ephemeral UDP sockets. Returns how many were sent successfully.
 ///
-/// Looks at the question section for a qname whose first label decodes to
-/// one of the active probe tokens.  Returns the matching token if found.
-pub fn check_loop_reply(pkt: &[u8], active_probes: &[LoopProbe]) -> Option<[u8; 8]> {
-    if pkt.len() < DNS_HDR_LEN {
-        return None;
+/// Mirrors `loop_send_probes()`'s `sendto()` calls (`loop.c:44-45`); C uses a
+/// pooled `randfd` per server, but nothing here ever needs to recognise which
+/// socket a reply arrived on — a looping probe comes back as an ordinary
+/// incoming client query, matched purely by the uid encoded in its qname (see
+/// [`detect_loop`]) — so a one-shot socket per probe is equivalent.
+pub async fn send_probes(servers: &mut [Server]) -> usize {
+    let probes = loop_send_probes(servers);
+    let mut sent = 0;
+    for probe in probes {
+        let bind_addr: SocketAddr = if probe.addr.is_ipv6() {
+            "[::]:0".parse().unwrap()
+        } else {
+            "0.0.0.0:0".parse().unwrap()
+        };
+        let Ok(sock) = tokio::net::UdpSocket::bind(bind_addr).await else { continue };
+        if sock.send_to(&probe.packet, probe.addr).await.is_ok() {
+            sent += 1;
+        }
     }
-    let qdcount = u16::from_be_bytes([pkt[4], pkt[5]]) as usize;
-    if qdcount == 0 {
-        return None;
+    sent
+}
+
+/// Check whether an incoming query `query`/`qtype` is one of our own loop
+/// probes coming back, and if so mark the offending server (`detect_loop()`,
+/// `loop.c:80-111`).
+///
+/// `query` is the extracted, dotted qname (as
+/// [`extract_request`](crate::rfc1035::extract_request) returns it) — C's
+/// `daemon->namebuff`. Returns `true` (and sets [`SERV_LOOP`] on the matching
+/// server) exactly when the query is a probe this resolver could have sent:
+/// right type, right shape (`"<8 hex digits>.test"`), and the embedded uid
+/// belongs to a general server not already marked as looping.
+pub fn detect_loop(query: &str, qtype: u16, servers: &mut [Server]) -> bool {
+    if qtype != LOOP_TEST_TYPE {
+        return false;
     }
 
-    // Walk question section — question starts at offset 12
-    let first_label = read_qname_first_label(pkt, DNS_HDR_LEN)?;
-    let tok = label_to_token(&first_label)?;
+    let bytes = query.as_bytes();
+    let suffix = LOOP_TEST_DOMAIN.as_bytes();
+    if bytes.len() != suffix.len() + 9 || &bytes[9..] != suffix {
+        return false;
+    }
+    if !bytes[..8].iter().all(u8::is_ascii_hexdigit) {
+        return false;
+    }
+    // Safe: the loop above just proved every byte in this range is an ASCII
+    // hex digit.
+    let hex = std::str::from_utf8(&bytes[..8]).unwrap();
+    let Ok(uid) = u32::from_str_radix(hex, 16) else { return false };
 
-    active_probes
-        .iter()
-        .find(|p| p.token == tok)
-        .map(|p| p.token)
+    for serv in servers.iter_mut() {
+        if serv.domain.is_empty() && serv.flags & SERV_LOOP == 0 && serv.uid == uid {
+            serv.flags |= SERV_LOOP;
+            return true;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -151,62 +166,172 @@ pub fn check_loop_reply(pkt: &[u8], active_probes: &[LoopProbe]) -> Option<[u8; 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::addr::MySockAddr;
+    use std::net::{Ipv4Addr, SocketAddrV4};
+
+    fn test_addr(port: u16) -> MySockAddr {
+        MySockAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port))
+    }
+
+    fn make_server(domain: &str, flags: u16, uid: u32) -> Server {
+        let mut s = crate::option::new_server(flags, domain.to_string(), test_addr(53), test_addr(0));
+        s.uid = uid;
+        s
+    }
+
+    // ── loop_make_probe ─────────────────────────────────────────────────────
 
     #[test]
-    fn test_new_probe_token_length() {
-        let t = new_probe_token();
-        assert_eq!(t.len(), 8);
+    fn loop_make_probe_wire_format() {
+        let pkt = loop_make_probe(0x1a2b3c4d, 0xbeef);
+        assert_eq!(&pkt[0..2], &0xbeefu16.to_be_bytes());
+        assert_eq!(pkt[2], 0x01); // RD set, opcode QUERY, QR=0
+        assert_eq!(pkt[3], 0x00);
+        assert_eq!(&pkt[4..6], &[0x00, 0x01]); // QDCOUNT
+        assert_eq!(&pkt[6..12], &[0, 0, 0, 0, 0, 0]); // AN/NS/AR counts
+
+        // Question: label "1a2b3c4d", label "test", root, QTYPE, QCLASS.
+        assert_eq!(pkt[12], 8);
+        assert_eq!(&pkt[13..21], b"1a2b3c4d");
+        assert_eq!(pkt[21], 4);
+        assert_eq!(&pkt[22..26], b"test");
+        assert_eq!(pkt[26], 0);
+        assert_eq!(&pkt[27..29], &LOOP_TEST_TYPE.to_be_bytes());
+        assert_eq!(&pkt[29..31], &1u16.to_be_bytes());
+        assert_eq!(pkt.len(), 31);
     }
 
     #[test]
-    fn test_build_probe_query_check_loop_reply_roundtrip() {
-        let token = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
-        let query = build_probe_query(&token, 0x1234);
+    fn loop_make_probe_roundtrips_through_extract_request() {
+        let pkt = loop_make_probe(0xdeadbeef, 42);
+        let (name, rtype) = crate::rfc1035::extract_request(&pkt).unwrap();
+        assert_eq!(name, "deadbeef.test");
+        assert_eq!(rtype as u16, LOOP_TEST_TYPE);
+    }
 
-        // Simulate a "reply" by setting QR bit
-        let mut reply = query.clone();
-        reply[2] |= 0x80; // QR = 1
+    // ── loop_send_probes ────────────────────────────────────────────────────
 
-        let probes = vec![LoopProbe {
-            token,
-            sent_at: Instant::now(),
-        }];
-
-        let result = check_loop_reply(&reply, &probes);
-        assert_eq!(result, Some(token));
+    #[test]
+    fn loop_send_probes_builds_one_probe_per_general_server() {
+        let mut servers = vec![
+            make_server("", 0, 111),
+            make_server("example.com", 0, 222),
+            make_server("", SERV_FOR_NODOTS, 333),
+        ];
+        let probes = loop_send_probes(&mut servers);
+        assert_eq!(probes.len(), 1);
+        assert_eq!(probes[0].server_idx, 0);
+        let (name, _) = crate::rfc1035::extract_request(&probes[0].packet).unwrap();
+        assert_eq!(name, "0000006f.test"); // 111 = 0x6f
     }
 
     #[test]
-    fn test_check_loop_reply_no_match() {
-        let token = [0xAA; 8];
-        let other_token = [0xBB; 8];
-        let query = build_probe_query(&other_token, 0x0001);
-
-        let probes = vec![LoopProbe {
-            token,
-            sent_at: Instant::now(),
-        }];
-
-        assert_eq!(check_loop_reply(&query, &probes), None);
+    fn loop_send_probes_clears_stale_serv_loop() {
+        let mut servers = vec![make_server("", SERV_LOOP, 1)];
+        let probes = loop_send_probes(&mut servers);
+        assert_eq!(probes.len(), 1);
+        assert_eq!(servers[0].flags & SERV_LOOP, 0);
     }
 
     #[test]
-    fn test_check_loop_reply_empty_probes() {
-        let token = [0x11; 8];
-        let pkt = build_probe_query(&token, 1);
-        assert_eq!(check_loop_reply(&pkt, &[]), None);
+    fn loop_send_probes_empty_when_no_eligible_servers() {
+        let mut servers = vec![make_server("example.com", 0, 1)];
+        assert!(loop_send_probes(&mut servers).is_empty());
+    }
+
+    // ── detect_loop ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn detect_loop_marks_the_matching_server() {
+        let mut servers = vec![make_server("", 0, 0x1a2b3c4d)];
+        assert!(detect_loop("1a2b3c4d.test", LOOP_TEST_TYPE, &mut servers));
+        assert_ne!(servers[0].flags & SERV_LOOP, 0);
     }
 
     #[test]
-    fn test_check_loop_reply_short_packet() {
-        assert_eq!(check_loop_reply(&[0, 1, 2], &[]), None);
+    fn detect_loop_wrong_type_does_not_match() {
+        let mut servers = vec![make_server("", 0, 0x1a2b3c4d)];
+        assert!(!detect_loop("1a2b3c4d.test", 1 /* T_A */, &mut servers));
+        assert_eq!(servers[0].flags & SERV_LOOP, 0);
     }
 
     #[test]
-    fn test_token_hex_roundtrip() {
-        let token = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
-        let label = token_to_label(&token);
-        let decoded = label_to_token(&label).unwrap();
-        assert_eq!(decoded, token);
+    fn detect_loop_wrong_domain_suffix_does_not_match() {
+        let mut servers = vec![make_server("", 0, 0x1a2b3c4d)];
+        assert!(!detect_loop("1a2b3c4d.nope", LOOP_TEST_TYPE, &mut servers));
+    }
+
+    #[test]
+    fn detect_loop_non_hex_uid_does_not_match() {
+        let mut servers = vec![make_server("", 0, 0)];
+        assert!(!detect_loop("zzzzzzzz.test", LOOP_TEST_TYPE, &mut servers));
+    }
+
+    #[test]
+    fn detect_loop_wrong_length_does_not_match() {
+        let mut servers = vec![make_server("", 0, 0x1a2b3c4d)];
+        assert!(!detect_loop("1a2b3c4.test", LOOP_TEST_TYPE, &mut servers));
+        assert!(!detect_loop("1a2b3c4dd.test", LOOP_TEST_TYPE, &mut servers));
+    }
+
+    #[test]
+    fn detect_loop_ignores_domain_scoped_servers() {
+        // A domain-scoped server can never have sent this probe, even if its
+        // uid happens to match (it wasn't eligible in loop_send_probes).
+        let mut servers = vec![make_server("example.com", 0, 0x1a2b3c4d)];
+        assert!(!detect_loop("1a2b3c4d.test", LOOP_TEST_TYPE, &mut servers));
+    }
+
+    #[test]
+    fn detect_loop_no_uid_match_returns_false() {
+        let mut servers = vec![make_server("", 0, 0xffffffff)];
+        assert!(!detect_loop("1a2b3c4d.test", LOOP_TEST_TYPE, &mut servers));
+    }
+
+    #[test]
+    fn detect_loop_already_looping_server_not_matched_again() {
+        let mut servers = vec![
+            make_server("", SERV_LOOP, 0x1a2b3c4d),
+            make_server("", 0, 0x1a2b3c4d),
+        ];
+        // The already-flagged server is skipped; the second, identical-uid
+        // server (a pathological config, but C's loop has no dedup either)
+        // is the one that ends up matched.
+        assert!(detect_loop("1a2b3c4d.test", LOOP_TEST_TYPE, &mut servers));
+        assert_ne!(servers[1].flags & SERV_LOOP, 0);
+    }
+
+    #[test]
+    fn detect_loop_empty_servers_returns_false() {
+        let mut servers: Vec<Server> = vec![];
+        assert!(!detect_loop("1a2b3c4d.test", LOOP_TEST_TYPE, &mut servers));
+    }
+
+    // ── send_probes (async, real UDP loopback) ──────────────────────────────
+
+    #[tokio::test]
+    async fn send_probes_delivers_to_a_real_loopback_listener() {
+        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut servers = vec![make_server("", 0, 0xcafef00d)];
+        servers[0].addr = test_addr(port);
+
+        let sent = send_probes(&mut servers).await;
+        assert_eq!(sent, 1);
+
+        let mut buf = [0u8; 512];
+        let (len, _) = tokio::time::timeout(std::time::Duration::from_secs(2), listener.recv_from(&mut buf))
+            .await
+            .expect("probe did not arrive")
+            .unwrap();
+        let (name, rtype) = crate::rfc1035::extract_request(&buf[..len]).unwrap();
+        assert_eq!(name, "cafef00d.test");
+        assert_eq!(rtype as u16, LOOP_TEST_TYPE);
+    }
+
+    #[tokio::test]
+    async fn send_probes_skips_domain_scoped_servers() {
+        let mut servers = vec![make_server("example.com", 0, 1)];
+        assert_eq!(send_probes(&mut servers).await, 0);
     }
 }

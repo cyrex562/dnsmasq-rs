@@ -2121,8 +2121,11 @@ pub(crate) fn new_server(flags: u16, domain: String, addr: MySockAddr, source_ad
         serial: 0,
         arrayposn: -1,
         last_server: 0,
+        // Upstream assigns this at the same construction site
+        // (`add_update_server()`, `domain-match.c:759: serv->uid = rand32();`)
+        // so loop-detection probes for distinct servers never collide.
         #[cfg(feature = "loop")]
-        uid: 0,
+        uid: rand::random::<u32>(),
     }
 }
 
@@ -5064,6 +5067,37 @@ mod tests {
         apply_config(&mut d, &lines).unwrap();
         assert!(d.option_bool(OPT_RAPID_COMMIT));
         assert!(d.option_bool(OPT_LOOP_DETECT));
+    }
+
+    /// Upstream assigns each server a fresh `rand32()` uid at the point it is
+    /// added (`add_update_server()`, `domain-match.c:759`), so loop probes for
+    /// two servers never collide. `new_server()` is the Rust equivalent of
+    /// that construction site.
+    #[cfg(feature = "loop")]
+    #[test]
+    fn new_server_assigns_a_random_uid() {
+        let dummy = crate::types::addr::MySockAddr::V4(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::UNSPECIFIED,
+            0,
+        ));
+        let a = new_server(0, String::new(), dummy.clone(), dummy.clone());
+        let b = new_server(0, String::new(), dummy.clone(), dummy);
+        assert_ne!(a.uid, b.uid);
+    }
+
+    /// `--dns-loop-detect` with a `server=` line ends up on `ForwardConfig`:
+    /// the gate that lets [`crate::forward::ForwardEngine`] actually probe
+    /// and detect a loop, not just parse the directive.
+    #[cfg(feature = "loop")]
+    #[test]
+    fn dns_loop_detect_reaches_forward_config() {
+        let mut d = Daemon::default();
+        let lines =
+            parse_config_text("dns-loop-detect\nserver=127.0.0.1#5353", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        let fwd = crate::dnsmasq::daemon_forward_config(&d);
+        assert!(fwd.loop_detect);
+        assert_eq!(fwd.loop_servers.len(), 1);
     }
 
     /// `--clear-on-reload` is the real upstream name sharing `OPT_RELOAD` with
