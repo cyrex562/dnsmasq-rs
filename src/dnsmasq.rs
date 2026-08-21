@@ -1165,6 +1165,14 @@ fn bind_dns_listeners(
     let enumerated  = network::enumerate_allowed_interfaces(&mut check, &allowed_cfg)
         .map_err(|e| DnsmasqError::BadNet(format!("failed to find list of interfaces: {e}")))?;
 
+    // `dnsmasq.c:969`: `warn_int_names` fires unconditionally, in every bind
+    // mode — the only Rust caller (`Daemon::int_names`), so it always warns
+    // today since nothing yet populates `InterfaceName::addrs`
+    // (`network.c:358-457`, tracked separately in `tasks.md`).
+    for msg in network::warn_int_names(&daemon.int_names) {
+        tracing::warn!("{msg}");
+    }
+
     if !nowild && !cleverbind {
         let listeners = network::create_wildcard_listeners_checked(port, kinds)
             .map_err(|e| DnsmasqError::Bind(format!("0.0.0.0:{port}"), e.to_string()))?;
@@ -1173,6 +1181,11 @@ fn bind_dns_listeners(
                 format!("0.0.0.0:{port}"),
                 "could not create any wildcard listener".to_string(),
             ));
+        }
+        // `dnsmasq.c:966-967`: plain wildcard mode warns about labelled
+        // aliases dnsmasq is folding into their base device.
+        for msg in network::warn_wild_labels(&enumerated.interfaces) {
+            tracing::warn!("{msg}");
         }
         let filter = network::ArrivalFilter::new(
             check, allowed_cfg, enumerated.interfaces, cleverbind,
@@ -1190,12 +1203,29 @@ fn bind_dns_listeners(
         }
     }
 
+    // `network.c:1298-1304`'s `is_dad_listeners()`: under `--bind-interfaces`
+    // an IPv6 address still completing Duplicate Address Detection is left
+    // unbound rather than bound prematurely — upstream's main loop retries it
+    // once DAD finishes (`dnsmasq.c:1104,1217-1223`). This Rust build binds
+    // once at startup and has no periodic re-check yet, so a DAD address
+    // deferred here stays unbound for the life of the process; that's a
+    // narrower port than upstream's retry loop, tracked in `tasks.md`.
+    if network::is_dad_listeners(&enumerated.interfaces, &[], nowild, port) {
+        for iface in enumerated.interfaces.iter().filter(|i| i.dad) {
+            tracing::warn!(
+                "waiting for DAD to complete on {} before binding {}",
+                iface.name, iface.addr
+            );
+        }
+    }
+
     // `listen_addr` carries the interface index into `sin6_scope_id` for
     // link-local addresses; without it the bind fails with EINVAL
     // (`network.c:617-620`).
     let iface_addrs: Vec<(SocketAddr, String)> = enumerated
         .interfaces
         .iter()
+        .filter(|i| !(nowild && i.dad))
         .map(|i| (i.listen_addr(port), i.name.clone()))
         .collect();
 

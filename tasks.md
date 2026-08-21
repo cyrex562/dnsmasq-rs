@@ -812,26 +812,81 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     `OPT_CLEVERBIND` branch of `enumerate_interfaces()` (`network.c:854-880`) by polling
     rather than by `RTM_NEWADDR`/`RTM_DELADDR` — up to ~1s of lag versus upstream's
     immediate netlink-driven rebind, and it still can't see an address change that
-    happens and reverts inside one tick. `is_dad_listeners`/DAD-tentative deferral
-    (`network.c:1300`) is still absent, so an IPv6 address still in DAD is bound or
-    skipped by whatever `getifaddrs` reports rather than retried. Covered by
-    `network::tests::diff_dynamic_interfaces_*`, `arrival_filter_refresh_dynamic_*`, and
-    `forward::tests::apply_dynamic_listener_diff_*`.
-  - **IPv6 link-local addresses are never enumerated, so no link-local listener is bound.**
-    `enumerate_interfaces()` goes through `if_addrs::get_if_addrs()`, which drops
-    `fe80::/10` addresses; upstream's `iface_enumerate` reports them and
-    `create_bound_listeners` binds one per interface. `IfaceRecord::listen_addr` already
-    carries the interface index into `sin6_scope_id` for link-local addresses as
-    `iface_allowed_v6` does (`network.c:617-620`) — without it Linux rejects the bind with
-    `EINVAL` — so only the enumeration source has to change. Pinned by
-    `enumeration_omits_ipv6_link_local_addresses` in
-    `tests/listener_binding_integration.rs`, which fails once enumeration reports them.
-  - **`clean_interfaces`/`Listener::release` (the bind-time types) still have no caller.**
-    The bind-dynamic reconciliation above operates on `forward::DnsListener` (the runtime,
-    tokio-socket representation used by `run_forward_loop_on`), not on the
-    `network::Listener`/`IfaceRecord` pair `clean_interfaces` and `Listener::release` were
-    written for — those stay dead code, reserved for whichever startup/reload path grows a
-    caller for the bind-time `Vec<Listener>` this runtime doesn't retain.
+    happens and reverts inside one tick. Covered by `network::tests::diff_dynamic_interfaces_*`,
+    `arrival_filter_refresh_dynamic_*`, and `forward::tests::apply_dynamic_listener_diff_*`.
+  - [x] **IPv6 link-local addresses are enumerated when netlink is available** (issue #39
+    follow-up). `network::enumerate_interfaces_netlink()` (Linux only, `#[cfg(target_os =
+    "linux")]`) queries `AF_INET`/`AF_INET6` over a fresh `NETLINK_ROUTE` socket via
+    `netlink::iface_enumerate` — the same backend issue #98 built for change notifications —
+    and does report `fe80::/10` addresses, unlike the `if-addrs`/`getifaddrs` backend.
+    `network::enumerate_interfaces_for_dns()` prefers it and falls back to
+    `enumerate_interfaces()` (`if-addrs`) on any error (non-Linux, sandboxed/no netlink
+    socket access, ENOBUFS, ...), matching this module's existing best-effort netlink
+    posture. `enumerate_allowed_interfaces` (the real caller `bind_dns_listeners` uses) now
+    calls the `_for_dns` wrapper. `IfaceRecord::listen_addr` already carried the interface
+    index into `sin6_scope_id` for link-local addresses (`network.c:617-620`), so no other
+    change was needed once the enumeration source could report them. Verified live (not just
+    unit-tested) by `enumerate_interfaces_netlink_matches_if_addrs_when_available`, which
+    skips rather than fails if the sandbox refuses an `AF_NETLINK` socket.
+  - [x] **`IFACE_TENTATIVE`/`IFACE_DEPRECATED` and interface labels are now sourced from
+    netlink** (issue #39 follow-up). `netlink::parse_newaddr_record` already parsed
+    `IFA_F_TENTATIVE`/`IFA_F_DEPRECATED` (IPv6) and `IFA_LABEL` (IPv4) for issue #98; nothing
+    consumed them for DNS listener enumeration until now. `IfaceInfo` gained
+    `label: Option<String>` / `dad: bool` / `deprecated: bool`; `enumerate_interfaces_netlink`
+    populates them, the `if-addrs` fallback always reports `None`/`false`/`false` (it can't
+    read extended `ifa_flags`). `iface_allowed_v4`/`_v6` both gained a `dad: bool` parameter
+    threaded into the new `IfaceRecord::dad` field (`iface->dad = !!(iface_flags &
+    IFACE_TENTATIVE)`, `network.c:494,577`); `iface_allowed_v4`'s pre-existing (but previously
+    always-`None`) `label` parameter is now fed `info.label` from real enumeration, so
+    `is_label`/`label_exception` can actually fire. `deprecated` is captured but has no
+    consumer yet — it only matters for `ADDRLIST_REVONLY` tagging in the `int_names`
+    population this module still doesn't do (see below); it's plumbed through now so that
+    gap doesn't also need an enumeration-backend change when it's tackled.
+    `network.c:358-487`'s `--interface-name`/`domain=<domain>,<iface>` address-list refresh —
+    the actual consumer of `deprecated` and of `daemon->auth_zones` subnet population — is
+    still not ported; `Daemon::int_names[i].addrs`/`Daemon::cond_domain[i].al` stay empty.
+  - [x] **`is_dad_listeners`** (issue #39 follow-up): ported as `network::is_dad_listeners`,
+    matching `network.c:1294-1304`'s `--bind-interfaces`-only gating. Upstream retains a
+    persistent `daemon->interfaces` list with a per-`irec` `done` flag set once a listener is
+    actually bound, and reuses `is_dad_listeners()` every main-loop tick to decide whether to
+    re-enumerate and bind newly-DAD-complete addresses (`dnsmasq.c:1104,1217-1223`). This
+    codebase converts each `network::Listener` to a raw socket immediately at bind time
+    (`listener_take_udp`) rather than keeping that persistent list, so `is_dad_listeners`
+    takes the already-bound listen-address set as an explicit `bound: &[SocketAddr]`
+    parameter instead of reading `iface->done` off shared state. Wired into
+    `bind_dns_listeners`: under `--bind-interfaces`, an address still mid-DAD is excluded from
+    the initial `create_bound_listeners_checked` call and a warning is logged instead of
+    attempting (and likely failing) the bind. **Not ported**: upstream's periodic re-check
+    that binds the address once DAD completes (`dnsmasq.c:1104,1217-1223`) — this build has no
+    equivalent main-loop tick for `--bind-interfaces` mode (only `--bind-dynamic` has a
+    ticker, via `ArrivalFilter::refresh_dynamic`), so a DAD-deferred address under plain
+    `--bind-interfaces` stays unbound for the life of the process. Extending
+    `ArrivalFilter`'s existing ticker to also cover the nowild+DAD case is the natural next
+    step and is still open.
+  - [x] **`warn_wild_labels` / `warn_int_names`** (issue #39 follow-up): ported as
+    `network::warn_wild_labels` (`network.c:1276-1283`) and `network::warn_int_names`
+    (`network.c:1285-1292`). Wired into `bind_dns_listeners`: `warn_wild_labels` fires in
+    plain wildcard mode only (`!nowild && !cleverbind`, matching `dnsmasq.c:966-967`) and can
+    now produce real output since labels are sourced from netlink (see above);
+    `warn_int_names` fires unconditionally (`dnsmasq.c:969`) and — because `int_names[i].addrs`
+    population is still unported — warns for every `--interface-name` entry every time, which
+    is accurate given the directive currently resolves no addresses.
+  - **`clean_interfaces`/`Listener::release` (the bind-time types) still have no direct
+    caller**, and that is by design rather than an oversight: this codebase converts every
+    `network::Listener` to a raw `std`/`tokio` socket immediately at bind time
+    (`listener_take_udp`), so there is no long-lived `Vec<Listener>` for `release()` to prune.
+    The equivalent teardown upstream gets from `release_listener`'s explicit `close()` +
+    `free()` happens here via Rust's `Drop` on `DnsListener`/`Arc<UdpSocket>` when
+    `apply_dynamic_listener_diff`'s `listeners.retain(still_present)`
+    (`forward.rs:2641`) drops a vanished address's listener — verified by
+    `apply_dynamic_listener_diff_releases_removed_addresses`. `clean_interfaces` (operating on
+    `Vec<IfaceRecord>`, not `Vec<Listener>`) would matter for a persistent, mutated-in-place
+    interface list; this codebase rebuilds `Vec<IfaceRecord>` fresh on every enumeration pass
+    instead (`enumerate_allowed_interfaces`), so there's nothing for it to prune either. If a
+    future change gives listeners a persistent, explicitly-reference-counted lifetime (e.g. to
+    port `release_listener`'s `used`-refcount sharing when multiple interfaces resolve to one
+    physical socket), that's when `Listener::release()` gets a real caller — today's
+    one-socket-per-address model doesn't need refcounting.
   - **`--local-service` (net) is not enforced.** `--local-service=host` works, because
     `option.rs` lowers it to a NULL-named `--interface` plus `OPT_NOWILD` as upstream does,
     and that path now reaches real listeners. Plain `--local-service` needs the
@@ -856,21 +911,26 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     to match `network.c:1251-1272` exactly, including the auth-DNS exemption. Wired into
     `bind_dns_listeners` under plain `--bind-interfaces` (not `--bind-dynamic`), matching
     `dnsmasq.c:963-964`.
-  - **Interface labels/aliases (`eth0:0`) are not enumerated.** `if-addrs` reports no label,
-    so `iface_allowed_v4` is always called with `label: None` and `is_label` is always
-    false. `label_exception` is wired into the arrival check but can only match on index +
-    address, never on a genuine alias name. `warn_wild_labels`/`warn_int_names` (log-only,
-    `network.c:1276-1292`) still have no Rust equivalent — low risk once labels exist, but
-    blocked on the same enumeration-backend gap.
-  - **`iface_allowed`'s remaining ports are still open**: bridge-interface alias resolution
-    (`--bridge-interface`, not the `iface_allowed` address-list refresh at `network.c:358-487`
-    for `--interface-name`/`domain=<domain>,<iface>`, tracked separately above), IPv6
-    `IFACE_TENTATIVE`/`IFACE_DEPRECATED` skip-and-reverse-only handling (`network.c:443-446,
-    494,577`, needs a netlink-based enumeration source — `if-addrs` doesn't expose DAD or
-    deprecated state), and `--local-service`'s address-list population (`network.c:272-301`,
-    tracked above). `local_bind`/`allocate_sfd`/`pre_allocate_sfds`/`check_servers`/
-    `newaddress` (outbound-socket and dynamic-reconfiguration lifecycle) remain unported —
-    see the `reload_servers`/`RandFdPool` notes elsewhere in this file.
+  - **Interface labels/aliases (`eth0:0`) are enumerated when netlink is available, still
+    absent on the `if-addrs` fallback.** See the `enumerate_interfaces_netlink` /
+    `is_dad_listeners` / `warn_wild_labels` bullets above (issue #39 follow-up) — this used to
+    be one combined gap; it is now split three ways (enumeration source, DAD/deprecated
+    flags, labels) and each has its own status there. `label_exception` (the per-datagram
+    arrival check) still only matches on index + address, not on a genuine alias name; that
+    remains open regardless of the enumeration source.
+  - **`iface_allowed`'s remaining ports are still open**: `--bridge-interface`
+    (`daemon->bridges`, unrelated to the interface-label/alias handling above despite the
+    similar name — this remaps DHCP request source interfaces, not DNS listener enumeration)
+    has no consumer in `network.rs`; the `network.c:358-487` address-list refresh for
+    `--interface-name`/`domain=<domain>,<iface>` (tracked separately above, and now also the
+    consumer of the `deprecated` flag `enumerate_interfaces_netlink` captures but nothing
+    reads yet); and `--local-service`'s address-list population (`network.c:272-301`, tracked
+    above). `local_bind`/`allocate_sfd`/`pre_allocate_sfds`/`check_servers`/`newaddress`
+    (outbound-socket and dynamic-reconfiguration lifecycle) remain unported — see the
+    `reload_servers`/`RandFdPool` notes elsewhere in this file. These are cross-file with
+    `forward.rs`'s `RandFdPool` and deliberately out of scope for this pass, which focused on
+    the `iface_allowed`/enumeration/warning gaps a straight `network.rs` port could close
+    without touching the outbound-query path.
   - **DHCP socket binding is unchanged.** `bind_dhcp_socket_to_device` still picks the
     first non-wildcard `--interface` name itself rather than going through the enumerated
     set; `whichdevice`/`bind_dhcp_devices` (`dnsmasq.c:400-405`) are not ported.
