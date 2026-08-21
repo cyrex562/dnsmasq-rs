@@ -252,10 +252,17 @@ pub fn tftp_err_oops(filename: &str, err: &std::io::Error) -> Vec<u8> {
 // tftp_request() (tftp.c:381-423)
 // ---------------------------------------------------------------------------
 
-/// RFC 2348's stated maximum `blksize`. Stands in for
-/// `daemon->packet_buff_sz - 4`, upstream's other clamp: this port has no
-/// equivalent dynamically-sized EDNS packet buffer to size against.
+/// RFC 2348's stated maximum `blksize` — the ceiling `blksize` can never
+/// exceed regardless of `daemon->packet_buff_sz`.
 pub const TFTP_MAX_BLKSIZE: usize = 65464;
+
+/// Compute `daemon->packet_buff_sz` (`dnsmasq.c:128`:
+/// `edns_pktsz + MAXDNAME + RRFIXEDSZ`), the buffer upstream's `blksize`
+/// option loop clamps against (`val > packet_buff_sz - 4`) ahead of, and
+/// independently of, the MTU clamp.
+pub fn packet_buff_sz(edns_pktsz: u16) -> usize {
+    edns_pktsz as usize + crate::dns_protocol::MAXDNAME + crate::dns_protocol::RRFIXEDSZ
+}
 
 /// `TFTP_MAX_WINDOW` (config.h) — max `windowsize` to negotiate.
 pub const TFTP_MAX_WINDOW: u32 = 32;
@@ -325,13 +332,18 @@ fn atoi_like(s: &str) -> i64 {
 ///
 /// `mtu` is the outgoing interface's MTU (`None` when unknown); `family_v4`
 /// picks the 32-byte (IPv4) vs 52-byte (IPv6) header overhead subtracted
-/// from it for the `blksize` clamp.
+/// from it for the `blksize` clamp. `packet_buff_sz` is
+/// `daemon->packet_buff_sz` (see [`packet_buff_sz`]) — upstream clamps
+/// `blksize` to `packet_buff_sz - 4` unconditionally, before the MTU clamp,
+/// so a wide blksize can never be negotiated just because the MTU is
+/// unknown.
 pub fn parse_request_options(
     options: &[(String, String)],
     netascii: bool,
     family_v4: bool,
     mtu: Option<i32>,
     no_blocksize_option: bool,
+    packet_buff_sz: usize,
 ) -> RequestOptions {
     let mut opts = RequestOptions::default();
     let overhead: i64 = if family_v4 { 32 } else { 52 };
@@ -343,6 +355,10 @@ pub fn parse_request_options(
                 let mut v = val.max(1);
                 if v > TFTP_MAX_BLKSIZE as i64 {
                     v = TFTP_MAX_BLKSIZE as i64;
+                }
+                let buff_max = (packet_buff_sz as i64 - 4).max(1);
+                if v > buff_max {
+                    v = buff_max;
                 }
                 if let Some(mtu) = mtu {
                     if mtu != 0 && v > (mtu as i64 - overhead) {
@@ -879,7 +895,7 @@ pub struct TftpListenerHandle {
 /// Daemon-derived TFTP configuration the runtime loop needs; assembled once
 /// by `dnsmasq::daemon_tftp_config` from `Daemon`'s `tftp_*` fields and
 /// `OPT_TFTP_*` flags.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TftpConfig {
     pub prefix: Option<String>,
     pub secure: bool,
@@ -899,6 +915,32 @@ pub struct TftpConfig {
     /// The dedicated `--enable-tftp=iface,...` list; empty means "every
     /// interface DNS/DHCP would also serve is allowed".
     pub interfaces: Vec<String>,
+    /// `daemon->packet_buff_sz` (see [`packet_buff_sz`]) — the unconditional
+    /// `blksize` ceiling upstream applies ahead of the MTU clamp.
+    pub packet_buff_sz: usize,
+}
+
+impl Default for TftpConfig {
+    fn default() -> Self {
+        TftpConfig {
+            prefix: None,
+            secure: false,
+            no_blocksize_option: false,
+            lowercase: false,
+            single_port: false,
+            apref_ip: false,
+            apref_mac: false,
+            quiet: false,
+            max_transfers: 0,
+            mtu_override: 0,
+            start_port: 0,
+            end_port: 0,
+            interfaces: Vec::new(),
+            // Upstream's own default absent `--edns-packet-max`
+            // (`option.c:5980`: `daemon->edns_pktsz = EDNS_PKTSZ` = 1232).
+            packet_buff_sz: packet_buff_sz(1232),
+        }
+    }
 }
 
 fn effective_max(config: &TftpConfig) -> i32 {
@@ -990,6 +1032,20 @@ async fn process_transfer_packet(transfer: &mut TftpTransfer, data: &[u8], confi
             // any negotiated option resets it there), so `send_window` would
             // resend the OACK/prior block instead of the next window.
             transfer.block = transfer.lastack;
+            // Also mirror the retransmit-timer bookkeeping the same branch
+            // does (tftp.c:684-686) immediately before sending: without this,
+            // `transfer.retransmit` is left at the ACK-arrival instant (set
+            // by `handle_tftp_packet` above), so the very next sweep tick
+            // would see it as overdue and resend this same window a second
+            // time. Upstream never double-sends here because the ACK-driven
+            // send and the timeout-driven resend are the same code path
+            // (`check_tftp_listeners`'s single retransmit branch); this keeps
+            // that invariant for the immediate-send path used here.
+            let backoff = transfer.backoff;
+            let shift = (backoff / 2).min(20);
+            transfer.retransmit =
+                now + Duration::from_secs(transfer.timeout as u64) + Duration::from_secs(1u64 << shift);
+            transfer.backoff = backoff.saturating_add(1);
             let (endcon, _error) = send_window(transfer).await;
             if endcon {
                 return true;
@@ -1164,7 +1220,14 @@ async fn handle_new_request(
     }
     let mtu_opt = if mtu != 0 { Some(mtu) } else { None };
 
-    let opts = parse_request_options(&options, netascii, peer.is_ipv4(), mtu_opt, config.no_blocksize_option);
+    let opts = parse_request_options(
+        &options,
+        netascii,
+        peer.is_ipv4(),
+        mtu_opt,
+        config.no_blocksize_option,
+        config.packet_buff_sz,
+    );
     let any_opt = any_option_negotiated(&opts);
 
     let namebuff = build_tftp_path(
@@ -1605,7 +1668,7 @@ mod tests {
 
     #[test]
     fn options_blksize_basic() {
-        let opts = parse_request_options(&[("blksize".into(), "1024".into())], false, true, None, false);
+        let opts = parse_request_options(&[("blksize".into(), "1024".into())], false, true, None, false, 65536);
         assert_eq!(opts.blocksize, 1024);
         assert!(opts.opt_blocksize);
     }
@@ -1613,75 +1676,90 @@ mod tests {
     #[test]
     fn options_blksize_floor_is_one_not_eight() {
         // Upstream's floor is `if (val < 1) val = 1;` — not 8.
-        let opts = parse_request_options(&[("blksize".into(), "0".into())], false, true, None, false);
+        let opts = parse_request_options(&[("blksize".into(), "0".into())], false, true, None, false, 65536);
         assert_eq!(opts.blocksize, 1);
     }
 
     #[test]
     fn options_blksize_clamped_to_rfc2348_max() {
-        let opts = parse_request_options(&[("blksize".into(), "999999".into())], false, true, None, false);
+        let opts =
+            parse_request_options(&[("blksize".into(), "999999".into())], false, true, None, false, 1_000_000);
         assert_eq!(opts.blocksize, TFTP_MAX_BLKSIZE);
     }
 
     #[test]
+    fn options_blksize_clamped_by_packet_buff_sz() {
+        // Port of tftp.c:391-392: `val > packet_buff_sz - 4` clamps
+        // unconditionally, before (and independent of) the MTU clamp — the
+        // default `packet_buff_sz` (edns_pktsz 1232 + MAXDNAME + RRFIXEDSZ)
+        // caps blksize around 2263 even when the MTU is unknown.
+        let buff = packet_buff_sz(1232);
+        let opts = parse_request_options(&[("blksize".into(), "9999".into())], false, true, None, false, buff);
+        assert_eq!(opts.blocksize, buff - 4);
+        assert!(opts.blocksize < TFTP_MAX_BLKSIZE);
+    }
+
+    #[test]
     fn options_blksize_clamped_by_mtu_v4_overhead() {
-        let opts = parse_request_options(&[("blksize".into(), "2000".into())], false, true, Some(1500), false);
+        let opts =
+            parse_request_options(&[("blksize".into(), "2000".into())], false, true, Some(1500), false, 65536);
         assert_eq!(opts.blocksize, 1500 - 32);
     }
 
     #[test]
     fn options_blksize_clamped_by_mtu_v6_overhead() {
-        let opts = parse_request_options(&[("blksize".into(), "2000".into())], false, false, Some(1500), false);
+        let opts =
+            parse_request_options(&[("blksize".into(), "2000".into())], false, false, Some(1500), false, 65536);
         assert_eq!(opts.blocksize, 1500 - 52);
     }
 
     #[test]
     fn options_blksize_ignored_when_no_block_option_set() {
-        let opts = parse_request_options(&[("blksize".into(), "1024".into())], false, true, None, true);
+        let opts = parse_request_options(&[("blksize".into(), "1024".into())], false, true, None, true, 65536);
         assert!(!opts.opt_blocksize);
         assert_eq!(opts.blocksize, 512);
     }
 
     #[test]
     fn options_tsize_set_opt_flag_octet_mode() {
-        let opts = parse_request_options(&[("tsize".into(), "0".into())], false, true, None, false);
+        let opts = parse_request_options(&[("tsize".into(), "0".into())], false, true, None, false, 65536);
         assert!(opts.opt_transize);
     }
 
     #[test]
     fn options_tsize_ignored_in_netascii_mode() {
-        let opts = parse_request_options(&[("tsize".into(), "0".into())], true, true, None, false);
+        let opts = parse_request_options(&[("tsize".into(), "0".into())], true, true, None, false, 65536);
         assert!(!opts.opt_transize);
     }
 
     #[test]
     fn options_windowsize_ignored_in_netascii_mode() {
-        let opts = parse_request_options(&[("windowsize".into(), "4".into())], true, true, None, false);
+        let opts = parse_request_options(&[("windowsize".into(), "4".into())], true, true, None, false, 65536);
         assert!(!opts.opt_windowsize);
         assert_eq!(opts.windowsize, 1);
     }
 
     #[test]
     fn options_windowsize_clamped_to_max() {
-        let opts = parse_request_options(&[("windowsize".into(), "999".into())], false, true, None, false);
+        let opts = parse_request_options(&[("windowsize".into(), "999".into())], false, true, None, false, 65536);
         assert_eq!(opts.windowsize, TFTP_MAX_WINDOW);
     }
 
     #[test]
     fn options_timeout_clamped_to_255() {
-        let opts = parse_request_options(&[("timeout".into(), "9999".into())], false, true, None, false);
+        let opts = parse_request_options(&[("timeout".into(), "9999".into())], false, true, None, false, 65536);
         assert_eq!(opts.timeout, 255);
     }
 
     #[test]
     fn options_case_insensitive() {
-        let opts = parse_request_options(&[("BLKSIZE".into(), "1024".into())], false, true, None, false);
+        let opts = parse_request_options(&[("BLKSIZE".into(), "1024".into())], false, true, None, false, 65536);
         assert!(opts.opt_blocksize);
     }
 
     #[test]
     fn options_unknown_ignored() {
-        let opts = parse_request_options(&[("frobnicate".into(), "1".into())], false, true, None, false);
+        let opts = parse_request_options(&[("frobnicate".into(), "1".into())], false, true, None, false, 65536);
         assert_eq!(opts, RequestOptions::default());
     }
 
@@ -1692,7 +1770,7 @@ mod tests {
 
     #[test]
     fn options_any_negotiated_true_when_present() {
-        let opts = parse_request_options(&[("timeout".into(), "5".into())], false, true, None, false);
+        let opts = parse_request_options(&[("timeout".into(), "5".into())], false, true, None, false, 65536);
         assert!(any_option_negotiated(&opts));
     }
 
@@ -1879,6 +1957,46 @@ mod tests {
         );
         t.blocksize = blocksize;
         t
+    }
+
+    #[tokio::test]
+    async fn ack_advance_pushes_retransmit_into_the_future_no_duplicate_resend() {
+        // Regression test: an ACK-driven send used to leave `transfer.retransmit`
+        // at the ACK-arrival instant (set by `handle_tftp_packet`), so the very
+        // next sweep tick would see it as overdue and resend the same window a
+        // second time. `process_transfer_packet` must advance
+        // `retransmit`/`backoff` the same way `sweep_transfers`' own retransmit
+        // branch does, immediately after the ACK-driven send.
+        let contents = vec![0x42u8; 1200]; // 3 blocks at blocksize 512
+        let mut t = transfer_over(&contents, 512).await;
+        t.timeout = 2;
+        t.windowsize = 1;
+        // Simulate block 1 already sent, awaiting its ACK.
+        t.block = 1;
+        t.lastack = 0;
+
+        let ack = build_ack(1);
+        let config = TftpConfig::default();
+        let before = Instant::now();
+        let finished = process_transfer_packet(&mut t, &ack, &config).await;
+
+        assert!(!finished, "3-block transfer must not finish after ACKing block 1 of 3");
+        assert_eq!(t.backoff, 1);
+        assert!(
+            t.retransmit > before,
+            "retransmit deadline must be pushed into the future after an ACK-driven \
+             send, not left at (or before) the ACK-arrival instant, or the next sweep \
+             tick will resend the same window a second time"
+        );
+
+        // Directly assert the no-double-send invariant: an immediate sweep,
+        // with no simulated time passing, must not treat the transfer as
+        // overdue for retransmission.
+        let mut transfers = vec![t];
+        let mut ids = vec![0u64];
+        sweep_transfers(&mut transfers, &mut ids, &config).await;
+        assert_eq!(transfers.len(), 1, "transfer must still be active");
+        assert_eq!(transfers[0].backoff, 1, "sweep must not have re-sent (which would bump backoff again)");
     }
 
     #[tokio::test]

@@ -1143,6 +1143,7 @@ fn daemon_tftp_config(daemon: &Daemon) -> crate::tftp::TftpConfig {
         start_port: start_port.clamp(0, u16::MAX as i32) as u16,
         end_port: end_port.clamp(0, u16::MAX as i32) as u16,
         interfaces: daemon.tftp_interfaces.iter().filter_map(|i| i.name.clone()).collect(),
+        packet_buff_sz: crate::tftp::packet_buff_sz(daemon.edns_pktsz),
     }
 }
 
