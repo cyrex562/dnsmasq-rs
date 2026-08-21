@@ -1523,6 +1523,49 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     iterator is likewise not ported 1:1; `canonicalize_rdata` (already in this
     file before this issue) is the parsed-`DnsRr` equivalent used instead.
 
+- [ ] `src/dump.rs`: `--dump-file`/`--dump-mask` now have a real, live-wired writer
+  instead of an in-memory `Vec` with no callers (Issue #43 / T3-dump).
+  Source of truth: `dump.c:46-303`.
+  Implemented, tested:
+  - `DumpHandle::init` (`dump.c:46-92`): opens a real file — creates a new one and
+    writes the 24-byte global header; reopens a FIFO for append and writes the
+    header (no read-back, matching the wireshark-over-a-pipe case); reopens an
+    existing regular file for append, validates the existing header's magic
+    number, and scans forward through existing records (seeking by each
+    `incl_len`) to recover `packet_count` so numbering continues on restart.
+  - `DumpHandle::dump_packet_udp`/`dump_packet_icmp` (`dump.c:94-129`): named
+    hooks gated on `mask & dump_mask`, reusing the already-correct
+    `frame_udp_ipv4`/`frame_udp_ipv6`/`frame_icmp_ipv4`/`frame_icmpv6` framing.
+  - `DumpFallback::Local` implements the `fd >= 0` half of upstream's
+    `getsockname()` fallback (`dump.c:109-118`) — Rust callers already hold the
+    socket's local address (`UdpSocket::local_addr()`), so no syscall is needed.
+  - Wired into `run_main_loop_with` (`src/dnsmasq.rs`): `DumpHandle::init` is
+    called once at startup when `dump_file` is configured, mirroring upstream's
+    single `dump_init()` call from `main()` (`dnsmasq.c:450`); failure is fatal
+    (`RunResult::IoError`), matching upstream's `die()`.
+  - Wired into `run_forward_loop_on` (`src/forward.rs`): `DUMP_QUERY` on every
+    client query received, `DUMP_REPLY` on every reply sent to a client —
+    local answers, REFUSED answers (both the connmark-allowlist and
+    forward-table-full paths), and forwarded upstream replies. Covers this
+    issue's acceptance criteria (`--dump-file` produces a pcap with query and
+    reply traffic); end-to-end tested in
+    `dnsmasq::tests::run_main_loop_writes_query_and_reply_to_the_dump_file`.
+  Still open (tracked, not silently dropped):
+  - `DumpFallback`'s `fd < 0` case (a bare port number, no address at all —
+    used by upstream callers with no socket handle, e.g. TFTP) is not
+    implemented; only the `getsockname()`-equivalent `Local` fallback exists.
+  - `DUMP_UP_QUERY`/`DUMP_UP_REPLY` (queries sent to / replies received from
+    upstream servers, as distinct from the client-facing `DUMP_QUERY`/
+    `DUMP_REPLY` this issue wires up) are not called anywhere.
+  - `DUMP_SEC_QUERY`/`DUMP_SEC_REPLY`/`DUMP_BOGUS`/`DUMP_SEC_BOGUS` (DNSSEC
+    dump points) and `DUMP_DHCP`/`DUMP_DHCPV6`/`DUMP_RA`/`DUMP_TFTP` (the
+    `dhcp.rs`/`rfc2131.rs`/`dhcp6.rs`/`rfc3315.rs`/`radv.rs`/`tftp.rs` call
+    sites) are unwired — none of those modules call into `dump.rs` at all.
+  - ICMP dumping (`dump_packet_icmp`, used by upstream's DHCP/ARP conflict
+    detection) has a working, tested `DumpHandle::dump_packet_icmp`, but no
+    live caller yet — the `icmp`-adjacent code in `src/arp.rs`/`src/dhcp.rs`
+    doesn't call it.
+
 - [ ] `src/auth.rs`: `answer_auth` now answers from real `Daemon`/`DnsCache` state instead of
   the synthetic `AuthZoneConfig`/`LocalRecords` structs (Issue #41 / T3-auth).
   Source of truth: `auth.c:21-916`.

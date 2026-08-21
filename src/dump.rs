@@ -10,7 +10,12 @@
 //!   — convenience wrappers that frame and record in one call.
 #![cfg(feature = "dump")]
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// pcap magic number (little-endian native, microsecond timestamps).
 pub const PCAP_MAGIC: u32 = 0xa1b2c3d4;
@@ -223,6 +228,33 @@ pub fn frame_icmpv6(src: Ipv6Addr, dst: Ipv6Addr, payload: &[u8]) -> Vec<u8> {
 // PcapWriter
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Build the 24-byte pcap global header (all fields little-endian).
+///
+/// Shared by [`PcapWriter::new`] (in-memory, tests) and [`DumpHandle::init`]
+/// (real file, mirrors `dump_init()` at `dump.c:54-60`).
+fn global_header_bytes(snaplen: u32, link_type: u32) -> [u8; PCAP_GLOBAL_HEADER_LEN] {
+    let mut buf = [0u8; PCAP_GLOBAL_HEADER_LEN];
+    buf[0..4].copy_from_slice(&PCAP_MAGIC.to_le_bytes());
+    buf[4..6].copy_from_slice(&PCAP_VERSION_MAJOR.to_le_bytes());
+    buf[6..8].copy_from_slice(&PCAP_VERSION_MINOR.to_le_bytes());
+    buf[8..12].copy_from_slice(&0i32.to_le_bytes()); // thiszone (UTC)
+    buf[12..16].copy_from_slice(&0u32.to_le_bytes()); // sigfigs
+    buf[16..20].copy_from_slice(&snaplen.to_le_bytes());
+    buf[20..24].copy_from_slice(&link_type.to_le_bytes());
+    buf
+}
+
+/// Build a 16-byte pcap record header for a packet captured "now".
+fn record_header_bytes(len: u32) -> [u8; 16] {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let mut buf = [0u8; 16];
+    buf[0..4].copy_from_slice(&(now.as_secs() as u32).to_le_bytes());
+    buf[4..8].copy_from_slice(&now.subsec_micros().to_le_bytes());
+    buf[8..12].copy_from_slice(&len.to_le_bytes());  // incl_len
+    buf[12..16].copy_from_slice(&len.to_le_bytes()); // orig_len
+    buf
+}
+
 /// Streaming pcap writer that accumulates records in memory.
 pub struct PcapWriter {
     buf: Vec<u8>,
@@ -231,16 +263,7 @@ pub struct PcapWriter {
 impl PcapWriter {
     /// Create a new writer and emit the pcap global header.
     pub fn new(snaplen: u32, link_type: u32) -> Self {
-        let mut buf = Vec::with_capacity(PCAP_GLOBAL_HEADER_LEN);
-        // Global header (all fields little-endian)
-        buf.extend_from_slice(&PCAP_MAGIC.to_le_bytes());          // magic
-        buf.extend_from_slice(&PCAP_VERSION_MAJOR.to_le_bytes());  // version major
-        buf.extend_from_slice(&PCAP_VERSION_MINOR.to_le_bytes());  // version minor
-        buf.extend_from_slice(&0i32.to_le_bytes());                // thiszone (UTC)
-        buf.extend_from_slice(&0u32.to_le_bytes());                // sigfigs
-        buf.extend_from_slice(&snaplen.to_le_bytes());             // snaplen
-        buf.extend_from_slice(&link_type.to_le_bytes());           // network (link type)
-        Self { buf }
+        Self { buf: global_header_bytes(snaplen, link_type).to_vec() }
     }
 
     /// Append a raw packet record with the given timestamp.
@@ -300,6 +323,214 @@ impl PcapWriter {
     /// Return all accumulated bytes (global header + all packet records).
     pub fn bytes(&self) -> &[u8] {
         &self.buf
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DumpHandle — real-file pcap writer, mirrors dump_init()/dump_packet_*()
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Read exactly `buf.len()` bytes, or report a clean/torn end-of-file.
+///
+/// Returns `Ok(true)` once `buf` is fully filled, `Ok(false)` if `read()`
+/// returned `0` before `buf` was full (whether that happens at the very start
+/// or partway through) — matching upstream's `read_write()` helper, which
+/// upstream's `dump_init()` scan loop treats as "no more records" rather than
+/// an error (`dump.c:86-90`).
+fn try_read_exact(file: &mut File, buf: &mut [u8]) -> io::Result<bool> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match file.read(&mut buf[filled..])? {
+            0 => return Ok(false),
+            n => filled += n,
+        }
+    }
+    Ok(true)
+}
+
+/// Address fallback used when `src` or `dst` is not directly known — the Rust
+/// equivalent of `dump_packet_udp()`'s `fd` parameter (`dump.c:94-121`).
+/// `Local` corresponds to upstream's `fd >= 0` branch, which calls
+/// `getsockname(fd)` to recover the local address of the socket a packet
+/// arrived on or is about to be sent on; callers here already hold that
+/// address (e.g. `UdpSocket::local_addr()`), so no syscall is needed.
+///
+/// Upstream's `fd < 0` branch (a bare port number, used by callers with no
+/// socket at hand, e.g. TFTP) is not implemented — those call sites are
+/// outside this port's current scope, tracked in `tasks.md`.
+#[derive(Debug, Clone, Copy)]
+pub enum DumpFallback {
+    /// No fallback — a missing `src`/`dst` leaves the packet undumped.
+    None,
+    /// Fill a missing `src` and/or `dst` with this address.
+    Local(SocketAddr),
+}
+
+/// An open pcap dump file plus the mask that gates which packet classes are
+/// written to it — the Rust equivalent of `daemon->dumpfd`/`daemon->dump_mask`
+/// plus the module-level `packet_count` static in `dump.c`.
+///
+/// Cheaply `Clone`-able: clones share the same underlying file and counter,
+/// mirroring the single process-wide file descriptor upstream writes through.
+#[derive(Debug, Clone)]
+pub struct DumpHandle {
+    file: Arc<Mutex<File>>,
+    mask: i32,
+    packet_count: Arc<AtomicU32>,
+}
+
+impl DumpHandle {
+    /// Open (or create) `path` as a pcap dump file, mirroring `dump_init()`
+    /// (`dump.c:46-92`):
+    ///
+    /// - path doesn't exist → create it and write the global header.
+    /// - path is a FIFO → open for append and write the header (the
+    ///   wireshark-over-a-pipe case; no read-back).
+    /// - path is a regular file → open for append, read back and validate the
+    ///   existing header's magic number, then scan forward through the
+    ///   existing records (seeking by each `incl_len`) to recover
+    ///   `packet_count` so numbering continues rather than restarting.
+    pub fn init(path: &str, edns_pktsz: u16, mask: i32) -> io::Result<Self> {
+        use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+
+        let snaplen = edns_pktsz as u32 + 200; // slop for IP/UDP headers, dump.c:59
+        let header = global_header_bytes(snaplen, LINKTYPE_RAW);
+
+        let (file, packet_count) = match std::fs::metadata(path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let mut f = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path)?;
+                f.write_all(&header)?;
+                (f, 0)
+            }
+            Err(e) => return Err(e),
+            Ok(meta) if meta.file_type().is_fifo() => {
+                let mut f = OpenOptions::new().append(true).read(true).open(path)?;
+                f.write_all(&header)?;
+                (f, 0)
+            }
+            Ok(_) => {
+                let mut f = OpenOptions::new().append(true).read(true).open(path)?;
+                let mut existing = [0u8; PCAP_GLOBAL_HEADER_LEN];
+                if !try_read_exact(&mut f, &mut existing)? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "dump file too short for a pcap header",
+                    ));
+                }
+                if u32::from_le_bytes(existing[0..4].try_into().unwrap()) != PCAP_MAGIC {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "bad pcap magic number in existing dump file",
+                    ));
+                }
+                let mut count = 0u32;
+                loop {
+                    let mut rec = [0u8; 16];
+                    if !try_read_exact(&mut f, &mut rec)? {
+                        break;
+                    }
+                    let incl_len = u32::from_le_bytes(rec[8..12].try_into().unwrap());
+                    f.seek(SeekFrom::Current(incl_len as i64))?;
+                    count += 1;
+                }
+                (f, count)
+            }
+        };
+
+        Ok(Self {
+            file: Arc::new(Mutex::new(file)),
+            mask,
+            packet_count: Arc::new(AtomicU32::new(packet_count)),
+        })
+    }
+
+    /// Number of packet records written (or recovered on reopen) so far.
+    pub fn packet_count(&self) -> u32 {
+        self.packet_count.load(Ordering::Relaxed)
+    }
+
+    /// Record a UDP datagram, mirroring `dump_packet_udp()` (`dump.c:94-122`).
+    ///
+    /// A no-op unless `mask` intersects the dump mask this handle was opened
+    /// with. `fallback` fills in whichever of `src`/`dst` is `None`; if either
+    /// is still unknown afterwards, nothing is written (see [`DumpFallback`]).
+    pub fn dump_packet_udp(
+        &self,
+        mask: u32,
+        payload: &[u8],
+        mut src: Option<SocketAddr>,
+        mut dst: Option<SocketAddr>,
+        fallback: DumpFallback,
+    ) {
+        if self.mask & (mask as i32) == 0 {
+            return;
+        }
+        if let DumpFallback::Local(addr) = fallback {
+            if src.is_none() {
+                src = Some(addr);
+            }
+            if dst.is_none() {
+                dst = Some(addr);
+            }
+        }
+        let (src, dst) = match (src, dst) {
+            (Some(s), Some(d)) => (s, d),
+            _ => return,
+        };
+        let framed = match (src, dst) {
+            (SocketAddr::V4(s), SocketAddr::V4(d)) => {
+                frame_udp_ipv4(*s.ip(), s.port(), *d.ip(), d.port(), payload)
+            }
+            (SocketAddr::V6(s), SocketAddr::V6(d)) => {
+                frame_udp_ipv6(*s.ip(), s.port(), *d.ip(), d.port(), payload)
+            }
+            // Mixed v4/v6 can't happen for a real UDP flow.
+            _ => return,
+        };
+        self.write_record(&framed);
+    }
+
+    /// Record an ICMP/ICMPv6 message, mirroring `dump_packet_icmp()`
+    /// (`dump.c:124-129`).
+    pub fn dump_packet_icmp(
+        &self,
+        mask: u32,
+        payload: &[u8],
+        src: Option<SocketAddr>,
+        dst: Option<SocketAddr>,
+    ) {
+        if self.mask & (mask as i32) == 0 {
+            return;
+        }
+        let (src, dst) = match (src, dst) {
+            (Some(s), Some(d)) => (s, d),
+            _ => return,
+        };
+        let framed = match (src, dst) {
+            (SocketAddr::V4(s), SocketAddr::V4(d)) => frame_icmp_ipv4(*s.ip(), *d.ip(), payload),
+            (SocketAddr::V6(s), SocketAddr::V6(d)) => frame_icmpv6(*s.ip(), *d.ip(), payload),
+            _ => return,
+        };
+        self.write_record(&framed);
+    }
+
+    fn write_record(&self, framed: &[u8]) {
+        let header = record_header_bytes(framed.len() as u32);
+        let mut file = match self.file.lock() {
+            Ok(f) => f,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let result = file.write_all(&header).and_then(|_| file.write_all(framed));
+        match result {
+            Ok(()) => {
+                self.packet_count.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => tracing::warn!("failed to write packet dump: {e}"),
+        }
     }
 }
 
@@ -509,5 +740,185 @@ mod tests {
         let b = w.bytes();
         let incl_len = read_u32_le(b, 24 + 8);
         assert_eq!(incl_len as usize, 20 + icmp_payload.len());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DumpHandle tests — real-file I/O, mirroring dump_init()/dump_packet_*()
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod dump_handle_tests {
+    use super::*;
+    use crate::types::constants::{DUMP_QUERY, DUMP_REPLY};
+    use std::fs;
+    use std::io::Read;
+    use std::net::SocketAddr;
+
+    fn read_u32_le(buf: &[u8], off: usize) -> u32 {
+        u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+    }
+    fn read_u16_le(buf: &[u8], off: usize) -> u16 {
+        u16::from_le_bytes(buf[off..off + 2].try_into().unwrap())
+    }
+
+    fn read_file(path: &std::path::Path) -> Vec<u8> {
+        let mut buf = Vec::new();
+        fs::File::open(path).unwrap().read_to_end(&mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn dump_init_creates_new_file_with_pcap_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.pcap");
+
+        let handle = DumpHandle::init(path.to_str().unwrap(), 1232, -1).unwrap();
+        drop(handle);
+
+        let bytes = read_file(&path);
+        assert_eq!(bytes.len(), 24, "a freshly created dump file has only the global header");
+        assert_eq!(read_u32_le(&bytes, 0), PCAP_MAGIC);
+        assert_eq!(read_u16_le(&bytes, 4), 2);
+        assert_eq!(read_u16_le(&bytes, 6), 4);
+        // snaplen = edns_pktsz + 200, mirroring dump.c:59
+        assert_eq!(read_u32_le(&bytes, 16), 1232 + 200);
+        assert_eq!(read_u32_le(&bytes, 20), LINKTYPE_RAW);
+    }
+
+    #[test]
+    fn dump_init_rejects_bad_magic_in_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.pcap");
+        fs::write(&path, [0u8; 24]).unwrap();
+
+        let result = DumpHandle::init(path.to_str().unwrap(), 1232, -1);
+        assert!(result.is_err(), "a regular file with a bad magic number must be rejected");
+    }
+
+    #[test]
+    fn dump_init_recovers_packet_count_from_existing_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.pcap");
+
+        let handle = DumpHandle::init(path.to_str().unwrap(), 1232, -1).unwrap();
+        let src: SocketAddr = "192.168.1.1:5300".parse().unwrap();
+        let dst: SocketAddr = "192.168.1.2:53".parse().unwrap();
+        handle.dump_packet_udp(DUMP_QUERY, b"one", Some(src), Some(dst), DumpFallback::None);
+        handle.dump_packet_udp(DUMP_QUERY, b"two", Some(src), Some(dst), DumpFallback::None);
+        drop(handle);
+
+        let reopened = DumpHandle::init(path.to_str().unwrap(), 1232, -1).unwrap();
+        assert_eq!(reopened.packet_count(), 2, "dump_init must recover the count of existing records");
+    }
+
+    #[test]
+    fn dump_packet_udp_respects_mask() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.pcap");
+        // Only DUMP_REPLY is enabled.
+        let handle = DumpHandle::init(path.to_str().unwrap(), 1232, DUMP_REPLY as i32).unwrap();
+
+        let src: SocketAddr = "192.168.1.1:5300".parse().unwrap();
+        let dst: SocketAddr = "192.168.1.2:53".parse().unwrap();
+        handle.dump_packet_udp(DUMP_QUERY, b"masked out", Some(src), Some(dst), DumpFallback::None);
+        assert_eq!(handle.packet_count(), 0, "a mask bit that isn't enabled must not be recorded");
+
+        handle.dump_packet_udp(DUMP_REPLY, b"recorded", Some(src), Some(dst), DumpFallback::None);
+        assert_eq!(handle.packet_count(), 1);
+    }
+
+    #[test]
+    fn dump_packet_udp_writes_a_valid_ipv4_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.pcap");
+        let handle = DumpHandle::init(path.to_str().unwrap(), 1232, -1).unwrap();
+
+        let src: SocketAddr = "10.0.0.1:5300".parse().unwrap();
+        let dst: SocketAddr = "10.0.0.2:53".parse().unwrap();
+        let payload = b"dns payload";
+        handle.dump_packet_udp(DUMP_QUERY, payload, Some(src), Some(dst), DumpFallback::None);
+        drop(handle);
+
+        let bytes = read_file(&path);
+        // global header (24) + pcap record header (16) + IPv4 (20) + UDP (8) + payload
+        let expected_frame = frame_udp_ipv4(
+            std::net::Ipv4Addr::new(10, 0, 0, 1), 5300,
+            std::net::Ipv4Addr::new(10, 0, 0, 2), 53,
+            payload,
+        );
+        assert_eq!(bytes.len(), 24 + 16 + expected_frame.len());
+        let incl_len = read_u32_le(&bytes, 24 + 8);
+        assert_eq!(incl_len as usize, expected_frame.len());
+        assert_eq!(&bytes[24 + 16..], &expected_frame[..]);
+    }
+
+    #[test]
+    fn dump_packet_icmp_writes_a_valid_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.pcap");
+        let handle = DumpHandle::init(path.to_str().unwrap(), 1232, -1).unwrap();
+
+        let src: SocketAddr = "10.0.0.1:0".parse().unwrap();
+        let dst: SocketAddr = "10.0.0.2:0".parse().unwrap();
+        let icmp_payload = vec![0x08u8, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01];
+        handle.dump_packet_icmp(crate::types::constants::DUMP_BOGUS, &icmp_payload, Some(src), Some(dst));
+        drop(handle);
+
+        let bytes = read_file(&path);
+        let incl_len = read_u32_le(&bytes, 24 + 8);
+        assert_eq!(incl_len as usize, 20 + icmp_payload.len());
+    }
+
+    #[test]
+    fn dump_packet_udp_local_fallback_fills_missing_addresses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.pcap");
+        let handle = DumpHandle::init(path.to_str().unwrap(), 1232, -1).unwrap();
+
+        let local: SocketAddr = "10.0.0.9:53".parse().unwrap();
+        let client: SocketAddr = "10.0.0.5:5300".parse().unwrap();
+        // dst omitted — must be filled from the fallback, mirroring the
+        // getsockname() fallback in dump_packet_udp() (dump.c:109-118).
+        handle.dump_packet_udp(DUMP_QUERY, b"x", Some(client), None, DumpFallback::Local(local));
+        drop(handle);
+
+        let bytes = read_file(&path);
+        let frame_off = 24 + 16;
+        // dst address lives at IPv4 header bytes 16..20 within the frame.
+        assert_eq!(&bytes[frame_off + 16..frame_off + 20], &[10, 0, 0, 9]);
+    }
+
+    #[test]
+    fn dump_packet_udp_no_addresses_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.pcap");
+        let handle = DumpHandle::init(path.to_str().unwrap(), 1232, -1).unwrap();
+        handle.dump_packet_udp(DUMP_QUERY, b"x", None, None, DumpFallback::None);
+        assert_eq!(handle.packet_count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dump_init_on_fifo_writes_header_without_reading_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.fifo");
+        if nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).is_err() {
+            // FIFOs aren't available in every sandboxed environment — skip
+            // rather than fail spuriously.
+            return;
+        }
+        let path_str = path.to_str().unwrap().to_string();
+        let reader = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut f = fs::File::open(&path_str).unwrap();
+            let mut buf = [0u8; 24];
+            f.read_exact(&mut buf).unwrap();
+            buf
+        });
+        let handle = DumpHandle::init(path.to_str().unwrap(), 1232, -1).unwrap();
+        let header = reader.join().unwrap();
+        drop(handle);
+        assert_eq!(read_u32_le(&header, 0), PCAP_MAGIC);
     }
 }
