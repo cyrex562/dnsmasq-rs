@@ -69,18 +69,6 @@ pub fn slaac_address(prefix: Ipv6Addr, prefix_len: u8, mac: &[u8; 6]) -> Ipv6Add
     Ipv6Addr::from(octets)
 }
 
-/// Return `true` if `addr` was likely synthesized from the given prefix + MAC
-/// using the EUI-64 SLAAC method.
-#[cfg(feature = "dhcp6")]
-pub fn is_slaac_for(
-    addr: Ipv6Addr,
-    prefix: Ipv6Addr,
-    prefix_len: u8,
-    mac: &[u8; 6],
-) -> bool {
-    slaac_address(prefix, prefix_len, mac) == addr
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // slaac_add_addrs (slaac.c:25-116)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -475,29 +463,6 @@ mod tests {
         assert_eq!(&octets[8..16], &eui);
     }
 
-    #[test]
-    fn is_slaac_for_match() {
-        let prefix = Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0);
-        let addr = slaac_address(prefix, 64, &MAC);
-        assert!(is_slaac_for(addr, prefix, 64, &MAC));
-    }
-
-    #[test]
-    fn is_slaac_for_no_match_wrong_mac() {
-        let prefix = Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0);
-        let addr = slaac_address(prefix, 64, &MAC);
-        let other_mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
-        assert!(!is_slaac_for(addr, prefix, 64, &other_mac));
-    }
-
-    #[test]
-    fn is_slaac_for_no_match_wrong_prefix() {
-        let prefix1 = Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0);
-        let prefix2 = Ipv6Addr::new(0xfd00, 0, 0, 1, 0, 0, 0, 0);
-        let addr = slaac_address(prefix1, 64, &MAC);
-        assert!(!is_slaac_for(addr, prefix2, 64, &MAC));
-    }
-
     // ── slaac_add_addrs ─────────────────────────────────────────────────────
 
     fn make_ra_ctx(start6: Ipv6Addr, if_index: i32) -> DhcpContext {
@@ -564,7 +529,7 @@ mod tests {
         // forced reset, not for brand-new entries.
         assert!(!dirty);
         assert_eq!(lease.slaac_address.len(), 1);
-        assert!(is_slaac_for(lease.slaac_address[0].addr, "2001:db8::".parse().unwrap(), 64, &MAC));
+        assert_eq!(lease.slaac_address[0].addr, slaac_address("2001:db8::".parse().unwrap(), 64, &MAC));
         assert_eq!(lease.slaac_address[0].backoff, 1);
         assert_eq!(lease.slaac_address[0].ping_time, Some(now));
     }
@@ -617,7 +582,7 @@ mod tests {
         let dirty = slaac_add_addrs(&mut lease, now, false, std::slice::from_ref(&ctx2), |_| {});
         assert!(dirty);
         assert_eq!(lease.slaac_address.len(), 1);
-        assert!(is_slaac_for(lease.slaac_address[0].addr, "2001:db8:2::".parse().unwrap(), 64, &MAC));
+        assert_eq!(lease.slaac_address[0].addr, slaac_address("2001:db8:2::".parse().unwrap(), 64, &MAC));
     }
 
     #[test]

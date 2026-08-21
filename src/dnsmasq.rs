@@ -780,6 +780,11 @@ fn daemon_dhcp_runtime(daemon: &Daemon) -> Option<DhcpDaemonRuntime> {
             relay_iface_addr: bind_ip,
             relay_iface_index,
             relay_iface_name,
+            // Filled in by the caller once the DHCPv6 "current" RA-name
+            // context chain is available (`run_main_loop_with` builds both
+            // runtimes; this function only sees `daemon`'s DHCPv4 half).
+            #[cfg(feature = "dhcp6")]
+            slaac_contexts: Vec::new(),
         },
     })
 }
@@ -1356,7 +1361,18 @@ pub async fn run_main_loop_with(
     });
 
     #[cfg(feature = "dhcp")]
-    let (dhcp_task, dhcp_shutdown_tx) = if let Some(dhcp_runtime) = dhcp_runtime {
+    let (dhcp_task, dhcp_shutdown_tx) = if let Some(mut dhcp_runtime) = dhcp_runtime {
+        // Feed the DHCPv6 "current" RA-name context chain to the DHCPv4 loop
+        // so it can recompute SLAAC addresses (`slaac_add_addrs`) for the
+        // leases it actually commits — see `DhcpLoopOptions::slaac_contexts`.
+        // `dhcp6_runtime` is still `Some` here (its contexts aren't moved
+        // into `run_dhcp6_loop` until the block below), so this is the last
+        // point that can clone them.
+        #[cfg(feature = "dhcp6")]
+        {
+            dhcp_runtime.loop_opts.slaac_contexts =
+                dhcp6_runtime.as_ref().map(|rt| rt.contexts.clone()).unwrap_or_default();
+        }
         let bind_addr = dhcp_runtime.bind_addr;
         #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
         let already_bound = prebound_dhcp.is_some();

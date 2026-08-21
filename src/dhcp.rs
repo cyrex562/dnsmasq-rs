@@ -133,6 +133,18 @@ pub struct DhcpLoopOptions {
     /// Name of the bound interface, used for `relay_reply4`'s wildcard
     /// interface match against a relay's configured `interface`.
     pub relay_iface_name: Option<String>,
+    /// The `daemon->dhcp6` "current" RA-name context chain, needed to
+    /// recompute SLAAC addresses (`slaac_add_addrs`, slaac.c:25-116) against
+    /// leases this (DHCPv4) loop commits. Upstream shares a single lease
+    /// list between the DHCPv4 and DHCPv6 servers and relies on
+    /// `slaac_add_addrs`'s own `LEASE_TA|LEASE_NA` guard (slaac.c:32) to
+    /// skip DHCPv6-stateful leases; this port keeps separate `LeaseDb`
+    /// instances per protocol, so this loop — not the DHCPv6 one, whose
+    /// leases are always `LEASE_NA`-flagged and so can never pass that
+    /// guard — is where SLAAC tracking for real (DHCPv4-committed) leases
+    /// actually happens. Empty when DHCPv6/RA-names aren't configured.
+    #[cfg(feature = "dhcp6")]
+    pub slaac_contexts: Vec<crate::types::dhcp::DhcpContext>,
 }
 
 impl Default for DhcpLoopOptions {
@@ -142,6 +154,8 @@ impl Default for DhcpLoopOptions {
             relay_iface_addr: Ipv4Addr::UNSPECIFIED,
             relay_iface_index: 0,
             relay_iface_name: None,
+            #[cfg(feature = "dhcp6")]
+            slaac_contexts: Vec::new(),
         }
     }
 }
@@ -890,6 +904,18 @@ pub async fn run_dhcp_loop(
     // re-pinging addresses within `PING_CACHE_TIME` of each other.
     let mut ping_cache = PingCache::new();
 
+    // SLAAC DAD probing (slaac.c:119-213). `SlaacDad` is always constructed
+    // (its `Inactive` variant is a permanently-pending no-op) so the extra
+    // `tokio::select!` branch below can be written unconditionally —
+    // `tokio::select!` branches can't themselves be `#[cfg]`-gated, unlike a
+    // plain `match` arm, which is why the dhcp6/non-dhcp6 split lives inside
+    // `SlaacDad` rather than around the branch.
+    let mut slaac_dad = SlaacDad::new(opts_slaac_enabled(&opts));
+    #[cfg(feature = "dhcp6")]
+    let slaac_contexts: &[crate::types::dhcp::DhcpContext] = &opts.slaac_contexts;
+    #[cfg(not(feature = "dhcp6"))]
+    let slaac_contexts: &[crate::types::dhcp::DhcpContext] = &[];
+
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -951,6 +977,19 @@ pub async fn run_dhcp_loop(
                     &pkt, &mut cfg, &mut lease_db, &mut ping_cache, probe.as_ref(), arrival.as_ref(),
                 );
 
+                // Port of the slaac_add_addrs() call chain that upstream
+                // triggers from lease_set_hwaddr()/lease_set_interface()
+                // (lease.c:992-993,1157-1158) every time a commit could have
+                // changed a lease's hwaddr, hostname, or interface — applied
+                // here across the whole db, once per packet, rather than
+                // per-setter.
+                #[cfg(feature = "dhcp6")]
+                if !opts.slaac_contexts.is_empty() {
+                    lease_db.refresh_slaac(
+                        std::time::SystemTime::now(), &opts.slaac_contexts, false, |_ctx| {},
+                    );
+                }
+
                 if lease_db.file_dirty {
                     if let Some(path) = cfg.lease_file.as_deref() {
                         if let Err(err) = lease_db.write_to_file(path) {
@@ -967,6 +1006,121 @@ pub async fn run_dhcp_loop(
                 let dest = loop_reply_dest(&pkt, src, &opts);
                 if let Err(err) = send_dhcp_reply_to(&socket, &pkt, &dispatched, dest).await {
                     warn!("failed to send DHCP reply to {dest}: {err}");
+                }
+            }
+            _ = slaac_dad.poll_tick_or_recv(&mut lease_db, slaac_contexts), if slaac_dad.active() => {}
+        }
+    }
+}
+
+/// Whether `run_dhcp_loop` should stand up SLAAC DAD probing at all: only
+/// when `dhcp6` is compiled in and at least one RA-name context was handed
+/// down (no point opening a raw ICMPv6 socket otherwise).
+fn opts_slaac_enabled(opts: &DhcpLoopOptions) -> bool {
+    #[cfg(feature = "dhcp6")]
+    {
+        !opts.slaac_contexts.is_empty()
+    }
+    #[cfg(not(feature = "dhcp6"))]
+    {
+        let _ = opts;
+        false
+    }
+}
+
+/// SLAAC DAD probe/reply state for [`run_dhcp_loop`] (slaac.c:119-213).
+///
+/// Always constructed, even when `dhcp6` isn't compiled in or no RA-name
+/// context was configured, so the loop's extra `tokio::select!` branch can
+/// be written once, unconditionally — `tokio::select!` branches don't
+/// support `#[cfg(...)]` the way ordinary `match` arms do, so the
+/// dhcp6/non-dhcp6 (and enabled/disabled) split has to live inside this
+/// type instead of around the branch. `Inactive` polls as permanently
+/// pending, matching the `, if slaac_dad.active()` guard that keeps it from
+/// ever being selected.
+enum SlaacDad {
+    Inactive,
+    #[cfg(feature = "dhcp6")]
+    Active {
+        ping_id: u16,
+        icmp6: crate::slaac::Icmp6Socket,
+        probe_tick: tokio::time::Interval,
+        buf: [u8; 1500],
+    },
+}
+
+impl SlaacDad {
+    #[cfg(feature = "dhcp6")]
+    fn new(enabled: bool) -> Self {
+        if !enabled {
+            return Self::Inactive;
+        }
+        // Nonzero, process-lifetime ping identifier (`while (ping_id == 0)
+        // ping_id = rand16();`, slaac.c:134-135).
+        let mut ping_id: u16 = crate::util::rand16();
+        while ping_id == 0 {
+            ping_id = crate::util::rand16();
+        }
+        // Opening a raw ICMPv6 socket needs CAP_NET_RAW; probing is
+        // disabled rather than treated as a startup failure when the
+        // process lacks it — "DAD probing works where permissions allow"
+        // is the acceptance bar, not "the DHCP server requires it".
+        match crate::slaac::Icmp6Socket::create() {
+            Ok(icmp6) => Self::Active {
+                ping_id,
+                icmp6,
+                probe_tick: tokio::time::interval(std::time::Duration::from_secs(1)),
+                buf: [0u8; 1500],
+            },
+            Err(e) => {
+                debug!("SLAAC DAD probing disabled (no ICMPv6 raw socket: {e})");
+                Self::Inactive
+            }
+        }
+    }
+
+    #[cfg(not(feature = "dhcp6"))]
+    fn new(_enabled: bool) -> Self {
+        Self::Inactive
+    }
+
+    fn active(&self) -> bool {
+        match self {
+            Self::Inactive => false,
+            #[cfg(feature = "dhcp6")]
+            Self::Active { .. } => true,
+        }
+    }
+
+    /// Send a due DAD probe or handle an inbound ICMPv6 echo reply,
+    /// mutating `lease_db` in place (`periodic_slaac`/`slaac_ping_reply`,
+    /// slaac.c:119-213). Never resolves when `Inactive` — callers must gate
+    /// on [`Self::active`], matching how this is used in `run_dhcp_loop`.
+    #[cfg_attr(not(feature = "dhcp6"), allow(unused_variables))]
+    async fn poll_tick_or_recv(
+        &mut self,
+        lease_db: &mut LeaseDb,
+        contexts: &[crate::types::dhcp::DhcpContext],
+    ) {
+        match self {
+            Self::Inactive => std::future::pending::<()>().await,
+            #[cfg(feature = "dhcp6")]
+            Self::Active { ping_id, icmp6, probe_tick, buf } => {
+                tokio::select! {
+                    _ = probe_tick.tick() => {
+                        let id = *ping_id;
+                        lease_db.tick_slaac(std::time::SystemTime::now(), contexts, id, |dest, packet| {
+                            icmp6.send_echo_sync(dest, packet)
+                        });
+                    }
+                    r = icmp6.recv(buf) => {
+                        match r {
+                            Ok((n, sender)) => {
+                                lease_db.confirm_slaac_ping(sender, &buf[..n], *ping_id, "", false);
+                            }
+                            Err(e) => debug!("SLAAC DAD probe ICMPv6 recv error: {e}"),
+                        }
+                    }
                 }
             }
         }
@@ -1025,7 +1179,7 @@ fn arrival_interface(if_index: u32) -> Option<ArrivalInterface> {
     let IpAddr::V4(local) = iface.addr else { return None };
     let Some(IpAddr::V4(netmask)) = iface.netmask else { return None };
     let broadcast = Ipv4Addr::from(u32::from(local) | !u32::from(netmask));
-    Some(ArrivalInterface { local, netmask, broadcast })
+    Some(ArrivalInterface { local, netmask, broadcast, if_index: if_index as i32 })
 }
 
 /// [`dispatch_dhcp_with_meta`], restricted to the `dhcp-range` contexts that
@@ -1053,12 +1207,28 @@ pub fn dispatch_dhcp_with_arrival(
         return dispatch_dhcp_with_meta(pkt, cfg, lease_db, ping_cache, probe);
     };
     let linked = link_contexts_for_interface(&mut cfg.contexts, iface);
-    if linked.is_empty() {
-        return dispatch_dhcp_with_meta(pkt, cfg, lease_db, ping_cache, probe);
+    let dispatched = if linked.is_empty() {
+        dispatch_dhcp_with_meta(pkt, cfg, lease_db, ping_cache, probe)
+    } else {
+        let mut narrowed = cfg.clone();
+        narrowed.contexts = linked.iter().map(|&i| cfg.contexts[i].clone()).collect();
+        dispatch_dhcp_with_meta(pkt, &narrowed, lease_db, ping_cache, probe)
+    };
+
+    // Port of lease_set_interface() (lease.c:1148-1159), called from
+    // rfc2131.c:1717/:1789 right after a REQUEST/INFORM ACK commits a lease.
+    // This is the interface-index half of slaac_add_addrs's
+    // `lease->last_interface == context->if_index` match (slaac.c:43) — the
+    // hwaddr/hostname half is already set inside record_lease via
+    // set_hwaddr/set_hostname. Only known here, at the arrival-metadata
+    // boundary, since dispatch_dhcp_with_meta has no IP_PKTINFO to work with.
+    if let Some(d) = &dispatched {
+        if d.reply.msg_type == DhcpMsgType::Ack && d.reply.yiaddr != Ipv4Addr::UNSPECIFIED {
+            lease_db.set_interface(d.reply.yiaddr, iface.if_index);
+        }
     }
-    let mut narrowed = cfg.clone();
-    narrowed.contexts = linked.iter().map(|&i| cfg.contexts[i].clone()).collect();
-    dispatch_dhcp_with_meta(pkt, &narrowed, lease_db, ping_cache, probe)
+
+    dispatched
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1191,6 +1361,12 @@ pub struct ArrivalInterface {
     pub local: Ipv4Addr,
     pub netmask: Ipv4Addr,
     pub broadcast: Ipv4Addr,
+    /// Numeric index of the arrival interface (`if_index` from `IP_PKTINFO`).
+    /// Fed to `LeaseDb::set_interface` — the missing half of
+    /// `slaac_add_addrs`'s `lease->last_interface == context->if_index`
+    /// match (slaac.c:43), which without this was always `0` for every
+    /// lease `record_lease` ever committed.
+    pub if_index: i32,
 }
 
 /// Link every context that shares a subnet with the arriving interface,
@@ -3429,6 +3605,7 @@ mod tests {
             local: Ipv4Addr::new(10, 0, 0, 1),
             netmask: Ipv4Addr::new(255, 255, 255, 0),
             broadcast: Ipv4Addr::new(10, 0, 0, 255),
+            if_index: 1,
         };
         let linked = link_contexts_for_interface(&mut contexts, &iface);
         assert_eq!(linked, vec![0]);
@@ -3449,6 +3626,7 @@ mod tests {
             local: Ipv4Addr::new(10, 0, 0, 1),
             netmask: Ipv4Addr::new(255, 255, 255, 0),
             broadcast: Ipv4Addr::new(10, 0, 0, 255),
+            if_index: 1,
         };
         let linked = link_contexts_for_interface(&mut contexts, &iface);
         assert!(linked.is_empty());
@@ -3470,6 +3648,7 @@ mod tests {
             local: Ipv4Addr::new(10, 0, 0, 1),
             netmask: Ipv4Addr::new(255, 255, 255, 0),
             broadcast: Ipv4Addr::new(10, 0, 0, 255),
+            if_index: 1,
         };
         let linked = link_contexts_for_interface(&mut contexts, &iface);
         assert_eq!(contexts[0].netmask, iface.netmask);
@@ -3492,6 +3671,7 @@ mod tests {
             local: Ipv4Addr::new(10, 0, 0, 1),
             netmask: Ipv4Addr::new(255, 255, 255, 0),
             broadcast: Ipv4Addr::new(10, 0, 0, 255),
+            if_index: 1,
         };
         link_contexts_for_interface(&mut contexts, &iface);
         assert_eq!(contexts[0].netmask, Ipv4Addr::new(255, 255, 0, 0));
@@ -3511,6 +3691,7 @@ mod tests {
             local: Ipv4Addr::new(10, 0, 0, 1),
             netmask: Ipv4Addr::new(255, 255, 255, 0),
             broadcast: Ipv4Addr::new(10, 0, 0, 255),
+            if_index: 1,
         };
         link_contexts_for_interface(&mut contexts, &iface);
         assert_eq!(contexts[0].broadcast, Ipv4Addr::new(10, 0, 0, 254));
@@ -3584,6 +3765,7 @@ mod tests {
             local: Ipv4Addr::new(192, 168, 1, 1),
             netmask: Ipv4Addr::new(255, 255, 255, 0),
             broadcast: Ipv4Addr::new(192, 168, 1, 255),
+            if_index: 1,
         };
         let dispatched = dispatch_dhcp_with_arrival(
             &pkt, &mut cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe, Some(&iface),
@@ -3625,6 +3807,7 @@ mod tests {
             local: Ipv4Addr::new(172, 16, 0, 1),
             netmask: Ipv4Addr::new(255, 255, 255, 0),
             broadcast: Ipv4Addr::new(172, 16, 0, 255),
+            if_index: 1,
         };
         let dispatched = dispatch_dhcp_with_arrival(
             &pkt, &mut cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe, Some(&iface),
@@ -3644,6 +3827,7 @@ mod tests {
             local: Ipv4Addr::new(10, 0, 0, 1),
             netmask: Ipv4Addr::new(255, 255, 255, 0),
             broadcast: Ipv4Addr::new(10, 0, 0, 255),
+            if_index: 1,
         };
         let dispatched = dispatch_dhcp_with_arrival(
             &pkt, &mut cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe, Some(&iface),
@@ -3655,6 +3839,121 @@ mod tests {
         // The mutation also persists on cfg.contexts itself (matching
         // upstream's complete_context, which is not undone after the call).
         assert_eq!(cfg.contexts[0].router, iface.local);
+    }
+
+    #[test]
+    fn dispatch_with_arrival_sets_last_interface_on_committed_lease() {
+        // Port of lease_set_interface() (lease.c:1148-1159), called from
+        // rfc2131.c:1717 right after a REQUEST is ACK'd. Without this,
+        // lease.last_interface stays 0 forever, and slaac_add_addrs's
+        // `lease->last_interface == 0` guard (slaac.c:33) means no DHCPv4
+        // lease could ever grow a SLAAC address, regardless of what RA-name
+        // contexts are configured.
+        let mut cfg = default_cfg();
+        let mut lease_db = LeaseDb::new();
+        let mut pkt = base_packet();
+        pkt.options = vec![
+            OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Request as u8,
+            crate::dhcp_protocol::OPTION_REQUESTED_IP, 4, 10, 0, 0, 123,
+            OPTION_END,
+        ];
+        let iface = ArrivalInterface {
+            local: Ipv4Addr::new(10, 0, 0, 1),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::new(10, 0, 0, 255),
+            if_index: 7,
+        };
+
+        let dispatched = dispatch_dhcp_with_arrival(
+            &pkt, &mut cfg, &mut lease_db, &mut PingCache::new(), &NullProbe, Some(&iface),
+        )
+        .expect("request should produce an ack");
+        assert_eq!(dispatched.reply.msg_type, DhcpMsgType::Ack);
+
+        let lease = lease_db.find_by_addr(Ipv4Addr::new(10, 0, 0, 123)).expect("lease committed");
+        assert_eq!(lease.last_interface, 7);
+    }
+
+    #[test]
+    fn dispatch_with_arrival_leaves_last_interface_unset_without_arrival() {
+        // No IP_PKTINFO arrival metadata (arrival == None): there is no
+        // interface index to record, so last_interface must stay 0 rather
+        // than being set to some stale/default value.
+        let mut cfg = default_cfg();
+        let mut lease_db = LeaseDb::new();
+        let mut pkt = base_packet();
+        pkt.options = vec![
+            OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Request as u8,
+            crate::dhcp_protocol::OPTION_REQUESTED_IP, 4, 10, 0, 0, 123,
+            OPTION_END,
+        ];
+
+        dispatch_dhcp_with_arrival(&pkt, &mut cfg, &mut lease_db, &mut PingCache::new(), &NullProbe, None)
+            .expect("request should produce an ack");
+
+        let lease = lease_db.find_by_addr(Ipv4Addr::new(10, 0, 0, 123)).expect("lease committed");
+        assert_eq!(lease.last_interface, 0);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn dispatch_then_refresh_slaac_populates_address_for_real_v4_lease() {
+        // The exact sequence run_dhcp_loop performs after every packet:
+        // dispatch_dhcp_with_arrival (commits the lease: hwaddr, hostname,
+        // and now last_interface) then LeaseDb::refresh_slaac across the
+        // whole db. This is the T3-slaac production-wiring gap: a real
+        // DHCPv4-committed lease is never LEASE_NA/LEASE_TA-flagged (only
+        // DHCPv6 stateful leases are), so slaac_add_addrs's guards can
+        // actually pass for it — unlike leases in the DHCPv6 loop's own
+        // LeaseDb, which are always LEASE_NA-flagged and so never qualify.
+        use crate::types::dhcp::{DhcpContext, DhcpNetid, CONTEXT_RA_NAME};
+        use std::net::Ipv6Addr;
+
+        let mut cfg = default_cfg();
+        let mut lease_db = LeaseDb::new();
+        let mut pkt = base_packet();
+        pkt.options = vec![
+            OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Request as u8,
+            crate::dhcp_protocol::OPTION_REQUESTED_IP, 4, 10, 0, 0, 123,
+            OPTION_HOSTNAME, 4, b'h', b'o', b's', b't',
+            OPTION_END,
+        ];
+        let iface = ArrivalInterface {
+            local: Ipv4Addr::new(10, 0, 0, 1),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::new(10, 0, 0, 255),
+            if_index: 7,
+        };
+
+        dispatch_dhcp_with_arrival(
+            &pkt, &mut cfg, &mut lease_db, &mut PingCache::new(), &NullProbe, Some(&iface),
+        )
+        .expect("request should produce an ack");
+
+        let ra_ctx = DhcpContext {
+            lease_time: 0,
+            addr_epoch: 0,
+            netmask: Ipv4Addr::UNSPECIFIED,
+            broadcast: Ipv4Addr::UNSPECIFIED,
+            local: Ipv4Addr::UNSPECIFIED,
+            router: Ipv4Addr::UNSPECIFIED,
+            start: Ipv4Addr::UNSPECIFIED,
+            end: Ipv4Addr::UNSPECIFIED,
+            flags: CONTEXT_RA_NAME,
+            netid: DhcpNetid { net: String::new() },
+            filter: vec![],
+            start6: "2001:db8::".parse().unwrap(),
+            end6: Ipv6Addr::UNSPECIFIED,
+            local6: Ipv6Addr::UNSPECIFIED,
+            prefix: 64,
+            if_index: 7,
+            valid: 0,
+            preferred: 0,
+        };
+        lease_db.refresh_slaac(std::time::SystemTime::now(), &[ra_ctx], false, |_ctx| {});
+
+        let lease = lease_db.find_by_addr(Ipv4Addr::new(10, 0, 0, 123)).expect("lease committed");
+        assert_eq!(lease.slaac_address.len(), 1, "SLAAC address should be derived and tracked for this lease");
     }
 
     // ── config_find_by_address ───────────────────────────────────────────────
