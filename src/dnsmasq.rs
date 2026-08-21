@@ -784,6 +784,94 @@ fn daemon_dhcp_runtime(daemon: &Daemon) -> Option<DhcpDaemonRuntime> {
     })
 }
 
+/// Everything [`run_main_loop_with`]'s DHCPv6 branch needs to run
+/// [`crate::dhcp6::run_dhcp6_loop`]: where to listen, the server's DUID, and
+/// the "current" context chain built from config plus live interface
+/// prefixes.
+#[cfg(feature = "dhcp6")]
+#[derive(Debug, Clone)]
+pub struct Dhcp6DaemonRuntime {
+    pub bind_addr: SocketAddr,
+    pub duid: Vec<u8>,
+    pub contexts: Vec<crate::types::dhcp::DhcpContext>,
+    pub configs: Vec<crate::types::dhcp::DhcpConfig>,
+}
+
+/// Build the DHCPv6 runtime: generate/persist the server DUID if it isn't
+/// already set, fold live interface prefixes into `daemon.dhcp6` via
+/// [`crate::dhcp6::dhcp_construct_contexts`], and build the "current" match
+/// chain via [`crate::dhcp6::complete_context6`] the same way upstream's
+/// `iface_enumerate(AF_INET6, ..., complete_context6)` does per packet
+/// (dhcp6.c:250) — here done once at startup rather than per-arrival-interface
+/// per packet, a scope simplification tracked in `tasks.md`.
+///
+/// Split from [`daemon_dhcp6_runtime`] so tests can inject `live`/`mac_source`
+/// instead of depending on the host's real interfaces and MAC addresses.
+///
+/// Returns `None` when no `dhcp-range`-equivalent DHCPv6 context is
+/// configured, or when a DUID could not be built at all (upstream's
+/// `make_duid()` calls `die(EC_MISC)` in this case, dhcp6.c:643; this crate
+/// logs and disables the DHCPv6 service instead of aborting the whole
+/// daemon).
+#[cfg(feature = "dhcp6")]
+fn daemon_dhcp6_runtime_with(
+    daemon: &mut Daemon,
+    live: &[crate::dhcp6::LiveAddr6],
+    mac_source: Option<crate::dhcp6::DuidMacSource>,
+    now_secs: u64,
+) -> Option<Dhcp6DaemonRuntime> {
+    use std::net::{Ipv6Addr, SocketAddrV6};
+
+    if daemon.dhcp6.is_empty() {
+        return None;
+    }
+
+    if daemon.duid.is_none() {
+        // Upstream picks DUID-LLT ("stable RTC") when a persistent lease
+        // database exists, DUID-LL otherwise (dhcp6.c:635-666) — a configured
+        // `--dhcp-leasefile` is the same signal this crate already has.
+        let use_llt = daemon.lease_file.is_some();
+        if let Err(e) = crate::dhcp6::make_duid(daemon, mac_source, use_llt, now_secs) {
+            tracing::error!("cannot start DHCPv6 server: {e}");
+            return None;
+        }
+    }
+    let duid = daemon.duid.clone()?;
+
+    let mut contexts = daemon.dhcp6.clone();
+    crate::dhcp6::dhcp_construct_contexts(&mut contexts, live);
+
+    let mut current = Vec::new();
+    for addr in live {
+        current.extend(crate::dhcp6::complete_context6(addr, &contexts));
+    }
+
+    Some(Dhcp6DaemonRuntime {
+        bind_addr: SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::UNSPECIFIED,
+            crate::dhcp6_protocol::DHCPV6_SERVER_PORT,
+            0,
+            0,
+        )),
+        duid,
+        contexts: current,
+        configs: daemon.dhcp_conf.clone(),
+    })
+}
+
+/// Production entry point for [`daemon_dhcp6_runtime_with`]: sources live
+/// interface addresses and a MAC for DUID generation from the real host.
+#[cfg(feature = "dhcp6")]
+fn daemon_dhcp6_runtime(daemon: &mut Daemon) -> Option<Dhcp6DaemonRuntime> {
+    let live = crate::network::enumerate_live_addrs6().unwrap_or_default();
+    let mac_source = crate::network::first_dhcp6_mac_source();
+    let now_secs = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    daemon_dhcp6_runtime_with(daemon, &live, mac_source, now_secs)
+}
+
 /// Sockets bound up-front by [`bind_listeners`].
 ///
 /// Upstream creates its listeners (dnsmasq.c:393-409) and DHCP sockets
@@ -801,6 +889,8 @@ pub struct Listeners {
     arrival_filter: Option<crate::network::ArrivalFilter>,
     #[cfg(feature = "dhcp")]
     dhcp: Option<std::net::UdpSocket>,
+    #[cfg(feature = "dhcp6")]
+    dhcp6: Option<std::net::UdpSocket>,
 }
 
 /// A DNS socket bound before the fork, plus what the query loop needs to know
@@ -1059,11 +1149,31 @@ pub fn bind_listeners(daemon: &Daemon) -> Result<Listeners, DnsmasqError> {
         None => None,
     };
 
+    // DUID generation and context construction need a write lock on the
+    // running `Daemon` ([`daemon_dhcp6_runtime`]), which isn't available yet
+    // at this pre-fork, still-synchronous stage — only decide *whether* to
+    // claim the privileged port here; `run_main_loop_with` builds the actual
+    // runtime once the daemon handle exists.
+    #[cfg(all(feature = "dhcp6", unix))]
+    let dhcp6 = if !daemon.dhcp6.is_empty() {
+        use std::os::unix::io::FromRawFd;
+        let nowild = daemon.option_bool(crate::types::constants::OPT_NOWILD);
+        let fd = crate::dhcp6::dhcp6_init(nowild)
+            .map_err(|e| DnsmasqError::Bind("[::]:547".to_string(), e.to_string()))?;
+        Some(unsafe { std::net::UdpSocket::from_raw_fd(fd) })
+    } else {
+        None
+    };
+    #[cfg(all(feature = "dhcp6", not(unix)))]
+    let dhcp6: Option<std::net::UdpSocket> = None;
+
     Ok(Listeners {
         dns,
         arrival_filter,
         #[cfg(feature = "dhcp")]
         dhcp,
+        #[cfg(feature = "dhcp6")]
+        dhcp6,
     })
 }
 
@@ -1078,6 +1188,28 @@ async fn adopt_or_bind(
 ) -> std::io::Result<tokio::net::UdpSocket> {
     match prebound {
         Some(sock) => tokio::net::UdpSocket::from_std(sock),
+        None => tokio::net::UdpSocket::bind(bind_addr).await,
+    }
+}
+
+/// Adopt a pre-bound DHCPv6 socket from [`bind_listeners`], or bind `[::]:547`
+/// itself when none was pre-bound (the in-process/test path, which never
+/// runs [`bind_listeners`] before the privilege drop).
+#[cfg(feature = "dhcp6")]
+async fn adopt_or_bind_dhcp6(
+    prebound: Option<std::net::UdpSocket>,
+    #[cfg_attr(unix, allow(unused_variables))] bind_addr: SocketAddr,
+) -> std::io::Result<tokio::net::UdpSocket> {
+    match prebound {
+        Some(sock) => tokio::net::UdpSocket::from_std(sock),
+        #[cfg(unix)]
+        None => {
+            use std::os::unix::io::FromRawFd;
+            let fd = crate::dhcp6::dhcp6_init(false)?;
+            let std_sock = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+            tokio::net::UdpSocket::from_std(std_sock)
+        }
+        #[cfg(not(unix))]
         None => tokio::net::UdpSocket::bind(bind_addr).await,
     }
 }
@@ -1161,6 +1293,14 @@ pub async fn run_main_loop_with(
         (fwd_config, dhcp_runtime)
     };
 
+    // DUID generation mutates `daemon.duid`, so this needs a write lock —
+    // taken and released here, separate from the read lock above.
+    #[cfg(feature = "dhcp6")]
+    let dhcp6_runtime = {
+        let mut d = daemon_handle.write().await;
+        daemon_dhcp6_runtime(&mut d)
+    };
+
     // ── Adopt sockets bound before the fork, or bind them now ────────────────
     //
     // `main` binds while still privileged and hands them over; the in-process
@@ -1182,6 +1322,8 @@ pub async fn run_main_loop_with(
 
     #[cfg(feature = "dhcp")]
     let prebound_dhcp = listeners.dhcp.take();
+    #[cfg(feature = "dhcp6")]
+    let prebound_dhcp6 = listeners.dhcp6.take();
     let bound_dns = std::mem::take(&mut listeners.dns);
     let arrival_filter = listeners.arrival_filter.take();
 
@@ -1259,6 +1401,53 @@ pub async fn run_main_loop_with(
         (None, None)
     };
 
+    #[cfg(feature = "dhcp6")]
+    let (dhcp6_task, dhcp6_shutdown_tx) = if let Some(rt) = dhcp6_runtime {
+        let dhcp6_sock = match adopt_or_bind_dhcp6(prebound_dhcp6, rt.bind_addr).await {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                error!("failed to bind DHCPv6 socket on {}: {e}", rt.bind_addr);
+                fwd_task.abort();
+                #[cfg(feature = "dhcp")]
+                {
+                    if let Some(tx) = dhcp_shutdown_tx.as_ref() {
+                        let _ = tx.send(true);
+                    }
+                    if let Some(task) = dhcp_task.as_ref() {
+                        task.abort();
+                    }
+                }
+                return RunResult::IoError;
+            }
+        };
+        info!("listening for DHCPv6 packets on {}", rt.bind_addr);
+        // A wildcard bind alone never receives multicast SOLICITs — real
+        // clients always multicast their first message, since they have no
+        // unicast address to send to yet. Best-effort: a sandboxed
+        // environment without the right capability, or an interface that
+        // can't do multicast, logs and keeps the rest of the daemon running
+        // rather than aborting startup (see `join_dhcp6_multicast_all_interfaces`).
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            crate::network::join_dhcp6_multicast_all_interfaces(dhcp6_sock.as_raw_fd());
+        }
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        // Kept in-memory only — see `run_dhcp6_loop`'s doc comment on why this
+        // doesn't share the v4 loop's lease file.
+        let task = tokio::spawn(async move {
+            if let Err(e) = crate::dhcp6::run_dhcp6_loop(
+                dhcp6_sock, rt.duid, rt.contexts, rt.configs,
+                crate::lease::LeaseDb::new(), shutdown_rx, None,
+            ).await {
+                error!("dhcp6 loop exited: {e}");
+            }
+        });
+        (Some(task), Some(shutdown_tx))
+    } else {
+        (None, None)
+    };
+
     // ── Signal handling ──────────────────────────────────────────────────────
     let mut sigterm = match signal(SignalKind::terminate()) {
         Ok(s) => s,
@@ -1269,6 +1458,15 @@ pub async fn run_main_loop_with(
                     let _ = tx.send(true);
                 }
                 if let Some(task) = dhcp_task.as_ref() {
+                    task.abort();
+                }
+            }
+            #[cfg(feature = "dhcp6")]
+            {
+                if let Some(tx) = dhcp6_shutdown_tx.as_ref() {
+                    let _ = tx.send(true);
+                }
+                if let Some(task) = dhcp6_task.as_ref() {
                     task.abort();
                 }
             }
@@ -1285,6 +1483,15 @@ pub async fn run_main_loop_with(
                     let _ = tx.send(true);
                 }
                 if let Some(task) = dhcp_task.as_ref() {
+                    task.abort();
+                }
+            }
+            #[cfg(feature = "dhcp6")]
+            {
+                if let Some(tx) = dhcp6_shutdown_tx.as_ref() {
+                    let _ = tx.send(true);
+                }
+                if let Some(task) = dhcp6_task.as_ref() {
                     task.abort();
                 }
             }
@@ -1319,6 +1526,15 @@ pub async fn run_main_loop_with(
             let _ = tx.send(true);
         }
         if let Some(task) = dhcp_task {
+            let _ = task.await;
+        }
+    }
+    #[cfg(feature = "dhcp6")]
+    {
+        if let Some(tx) = dhcp6_shutdown_tx {
+            let _ = tx.send(true);
+        }
+        if let Some(task) = dhcp6_task {
             let _ = task.await;
         }
     }
@@ -2074,6 +2290,81 @@ mod tests {
         task.abort();
     }
 
+    /// End-to-end: a `Daemon` with a configured DHCPv6 context makes
+    /// `run_main_loop_with` actually claim port 547 and persist a real DUID —
+    /// the two things Issue #34 / T3-dhcp6's review flagged as still missing
+    /// (a port-547 listener wired into the main loop, and `make_duid()` never
+    /// called at startup).
+    #[tokio::test]
+    #[cfg(feature = "dhcp6")]
+    async fn run_main_loop_with_dhcp6_context_binds_port_547_and_persists_duid() {
+        use crate::types::dhcp::{DhcpContext, DhcpNetid, CONTEXT_DHCP};
+
+        let listeners = bind_listeners(&Daemon { port: 0, ..Default::default() }).unwrap();
+        let dns_port = listeners
+            .dns_addrs()
+            .first()
+            .map(|a| a.port())
+            .expect("a DNS socket must be bound");
+
+        let ctx = DhcpContext {
+            start: Ipv4Addr::UNSPECIFIED,
+            end: Ipv4Addr::UNSPECIFIED,
+            router: Ipv4Addr::UNSPECIFIED,
+            flags: CONTEXT_DHCP,
+            netmask: Ipv4Addr::UNSPECIFIED,
+            broadcast: Ipv4Addr::UNSPECIFIED,
+            local: Ipv4Addr::UNSPECIFIED,
+            lease_time: 3600,
+            addr_epoch: 0,
+            netid: DhcpNetid { net: String::new() },
+            filter: vec![],
+            start6: "2001:db8::1".parse().unwrap(),
+            end6: "2001:db8::ff".parse().unwrap(),
+            local6: std::net::Ipv6Addr::UNSPECIFIED,
+            prefix: 64,
+            if_index: 0,
+            valid: 0,
+            preferred: 0,
+        };
+
+        let daemon = Daemon {
+            port: dns_port,
+            dhcp6: vec![ctx],
+            // Fixed so DUID generation doesn't depend on this host having a
+            // usable non-loopback MAC (make_duid's DUID-EN branch).
+            duid_config: Some(vec![0xAA, 0xBB]),
+            duid_enterprise: 9,
+            ..Default::default()
+        };
+        let daemon_handle = init_daemon_with(daemon);
+        let cache = build_shared_cache(&daemon_handle).await;
+        let task = tokio::spawn(run_main_loop_with(
+            daemon_handle.clone(),
+            None,
+            Some(listeners),
+            cache,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        if task.is_finished() {
+            // No permission to bind the privileged port 547 in this
+            // environment — same tolerance `dhcp6_init`'s own test allows.
+            return;
+        }
+
+        let duid = daemon_handle.read().await.duid.clone();
+        assert!(duid.is_some(), "make_duid() should have run and persisted a DUID at startup");
+
+        assert!(
+            std::net::UdpSocket::bind("[::]:547").is_err(),
+            "port 547 should be held by the running DHCPv6 loop"
+        );
+
+        task.abort();
+    }
+
     #[test]
     fn startup_pipe_disabled_has_no_write_end() {
         assert!(StartupPipe::disabled().write_fd.is_none());
@@ -2408,6 +2699,124 @@ mod tests {
         }
         assert_eq!(runtime.server.relay4[0].iface_index, expected_index);
         assert_eq!(runtime.server.relay4[1].iface_index, 0);
+    }
+
+    // ── daemon_dhcp6_runtime_with ────────────────────────────────────────────
+
+    #[cfg(feature = "dhcp6")]
+    fn dhcp6_ctx(start6: std::net::Ipv6Addr, end6: std::net::Ipv6Addr, prefix: i32) -> crate::types::dhcp::DhcpContext {
+        use crate::types::dhcp::{CONTEXT_DHCP, DhcpNetid};
+        crate::types::dhcp::DhcpContext {
+            start: Ipv4Addr::UNSPECIFIED,
+            end: Ipv4Addr::UNSPECIFIED,
+            router: Ipv4Addr::UNSPECIFIED,
+            flags: CONTEXT_DHCP,
+            netmask: Ipv4Addr::UNSPECIFIED,
+            broadcast: Ipv4Addr::UNSPECIFIED,
+            local: Ipv4Addr::UNSPECIFIED,
+            lease_time: 3600,
+            addr_epoch: 0,
+            netid: DhcpNetid { net: String::new() },
+            filter: vec![],
+            start6,
+            end6,
+            local6: std::net::Ipv6Addr::UNSPECIFIED,
+            prefix,
+            if_index: 0,
+            valid: 0,
+            preferred: 0,
+        }
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn daemon_dhcp6_runtime_none_without_context() {
+        let mut daemon = Daemon::default();
+        assert!(daemon_dhcp6_runtime_with(&mut daemon, &[], None, 0).is_none());
+    }
+
+    /// The core acceptance scenario: a configured `dhcp-range`-equivalent
+    /// context, folded with a live interface address on the same prefix,
+    /// produces a "current" chain `run_dhcp6_loop`/`address6_allocate` can
+    /// actually allocate from — not just the raw, unmatched config.
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn daemon_dhcp6_runtime_with_builds_current_chain_from_live_interface() {
+        use crate::dhcp6::LiveAddr6;
+
+        let mut daemon = Daemon::default();
+        daemon.lease_file = Some("/tmp/nonexistent-test.leases".into());
+        daemon.dhcp6.push(dhcp6_ctx(
+            "2001:db8::1".parse().unwrap(),
+            "2001:db8::ff".parse().unwrap(),
+            64,
+        ));
+        let live = LiveAddr6 {
+            addr: "2001:db8::42".parse().unwrap(),
+            prefix: 64,
+            if_index: 3,
+            preferred: 0xffff_ffff,
+            valid: 0xffff_ffff,
+            deprecated: false,
+        };
+
+        let mac = crate::dhcp6::DuidMacSource { hw_type: 1, mac: vec![1, 2, 3, 4, 5, 6] };
+        let runtime = daemon_dhcp6_runtime_with(&mut daemon, &[live], Some(mac), 1_000_000_000)
+            .expect("a configured context should produce a runtime");
+
+        assert_eq!(runtime.contexts.len(), 1, "the live address should match the configured context");
+        assert_eq!(runtime.contexts[0].if_index, 3);
+        assert!(runtime.duid.starts_with(&[0x00, 0x01]), "DUID-LLT type expected");
+        assert_eq!(daemon.duid, Some(runtime.duid));
+    }
+
+    /// No live interface matches the configured prefix: the runtime still
+    /// exists (DUID is generated either way) but the current chain is empty,
+    /// exactly like upstream refusing to offer from a range with no matching
+    /// live interface.
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn daemon_dhcp6_runtime_with_empty_current_chain_without_matching_interface() {
+        let mut daemon = Daemon::default();
+        daemon.dhcp6.push(dhcp6_ctx(
+            "2001:db8::1".parse().unwrap(),
+            "2001:db8::ff".parse().unwrap(),
+            64,
+        ));
+        daemon.duid_config = Some(vec![0xAA]);
+
+        let runtime = daemon_dhcp6_runtime_with(&mut daemon, &[], None, 0)
+            .expect("DUID-EN config means a runtime is still built");
+        assert!(runtime.contexts.is_empty());
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn daemon_dhcp6_runtime_with_reuses_existing_duid() {
+        let mut daemon = Daemon::default();
+        daemon.dhcp6.push(dhcp6_ctx(
+            "2001:db8::1".parse().unwrap(),
+            "2001:db8::ff".parse().unwrap(),
+            64,
+        ));
+        daemon.duid = Some(vec![9, 9, 9]);
+
+        let runtime = daemon_dhcp6_runtime_with(&mut daemon, &[], None, 0).unwrap();
+        assert_eq!(runtime.duid, vec![9, 9, 9]);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn daemon_dhcp6_runtime_with_none_when_duid_cannot_be_built() {
+        let mut daemon = Daemon::default();
+        daemon.dhcp6.push(dhcp6_ctx(
+            "2001:db8::1".parse().unwrap(),
+            "2001:db8::ff".parse().unwrap(),
+            64,
+        ));
+        // No duid_config, no mac_source: make_duid() has nothing to build from.
+        assert!(daemon_dhcp6_runtime_with(&mut daemon, &[], None, 0).is_none());
+        assert!(daemon.duid.is_none());
     }
 
     // ── SIGHUP reload ─────────────────────────────────────────────────────────

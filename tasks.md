@@ -1380,6 +1380,116 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   explicitly rejected (`DnssecAlgorithm::try_from` fails closed for 12;
   `parse_dnskey`/`verify_sig` fail closed for 16), not silently ignored.
 
+- [x] `dhcp6::dispatch_dhcp6` real allocation/DUID/context pipeline, wired into the main loop
+  (Issue #34 / T3-dhcp6).
+  Source of truth: `dhcp6.c:35-689` (`dhcp6_init`, `complete_context6`, `address6_allocate`,
+  `make_duid`/`make_duid1`, `dhcp_construct_contexts`/`construct_worker`).
+  Implemented, tested, real (no longer stubs):
+  - `make_duid`/`build_duid_en`/`build_duid_llt`/`build_duid_ll`: builds and persists a real
+    on-wire DUID into `daemon.duid` — DUID-EN from `--dhcp-duid=` (`daemon.duid_config`, renamed
+    from the old dual-purpose `daemon.duid` field so config input and constructed output don't
+    collide), else DUID-LLT/DUID-LL from a caller-supplied MAC (`DuidMacSource`).
+  - `complete_context6`: plain (non-shared-network) branch of the real algorithm — prefix/net
+    matching, `CONTEXT_CONSTRUCTED`-vs-fixed lifetime handling, chain ordering by preferred time.
+  - `address6_allocate`: the actual hash-seeded collision/DECLINE-retry scan (dhcp6.c:536-565),
+    replacing the old single-candidate `hash_to_addr6` call with no retry.
+  - `dhcp_construct_contexts`: the non-template branch of `construct_worker` — fills
+    `if_index`/`local6` on plain contexts from live interface prefixes.
+  - `dhcp6_init`: binds `[::]:547` via the existing `network::make_sock` (already sets
+    `IPV6_V6ONLY`/`IPV6_RECVPKTINFO`/`SO_REUSEADDR`).
+  - `dispatch_dhcp6`: takes real `duid`/`contexts`/`in_use` state and returns a genuine
+    IA_NA/IAADDR-bearing Advertise/Reply (or a Status-Code NoAddrsAvail IA_NA when allocation
+    fails), instead of the old canned empty-options stub. On a successful allocation, it now
+    delegates reply construction to `rfc3315::handle_solicit`/`handle_request6` — the exact pair
+    the issue named as taking `server_duid`/an address as opaque, generator-less parameters —
+    feeding them the real DUID (`make_duid`) and the real `address6_allocate` result instead of
+    leaving them unreachable dead code (confirmed by grep: previously `rfc3315::` had zero callers
+    anywhere outside its own doc comments and unit tests). `parse_dhcp6_packet`/`write_dhcp6_packet`
+    handle the conversion between this module's flat-bytes `Dhcp6Packet`/`Dhcp6Reply` and
+    `rfc3315::Dhcp6Packet`'s structured `Vec<Dhcp6Option>` (`flatten_dhcp6_options`); the two
+    representations are still not fully unified into one type (still a follow-up item), but the
+    success path is no longer a second, parallel, unwired implementation of the same logic — it's
+    a bytes-level adapter in front of the real handler. The no-address branch (Status Code
+    NoAddrsAvail) is still built locally in `dhcp6.rs`, since `handle_solicit`/`handle_request6`
+    always assume success (they take `Ipv6Addr`, not `Option<Ipv6Addr>`).
+    Covered by `dhcp6::tests::dispatch_dhcp6_solicit_success_delegates_to_rfc3315_handle_solicit`
+    (asserts the top-level Status-Code option only `rfc3315::handle_solicit`'s construction adds —
+    proof the reply came from that function, not `dhcp6.rs`'s old parallel encoder).
+  - `src/main.rs` was missing `pub mod dhcp6;` entirely (present in `lib.rs` only, so the release
+    binary never even compiled this file) — added, matching `rfc3315`/`radv`/`slaac`.
+  - **Production wiring (this pass):** `dhcp6::run_dhcp6_loop` is a real receive/dispatch loop —
+    parses each datagram, calls `dispatch_dhcp6`, commits an allocated address into a `LeaseDb`
+    only for Request/Renew/Rebind (never for Solicit/Advertise), and replies to the client.
+    `dnsmasq::daemon_dhcp6_runtime_with`/`daemon_dhcp6_runtime` generate/persist the DUID via
+    `make_duid` (skipped if `daemon.duid` is already set) and build the "current" context chain
+    via `dhcp_construct_contexts` + `complete_context6` fed by
+    `network::enumerate_live_addrs6()`/`network::first_dhcp6_mac_source()` (the latter reads
+    `/sys/class/net/*/{type,address}` on Linux; `None` elsewhere). `bind_listeners` claims
+    `[::]:547` pre-fork (mirroring the existing IPv4 DHCP socket's privileged-bind timing) when
+    `daemon.dhcp6` is non-empty, and `run_main_loop_with` spawns `run_dhcp6_loop` under
+    `#[cfg(feature = "dhcp6")]`, adopting that pre-bound socket or binding it itself for the
+    in-process/test path — the same pre-fork-bind-or-adopt pattern the IPv4 DHCP loop already
+    uses. Covered end-to-end by
+    `dnsmasq::tests::run_main_loop_with_dhcp6_context_binds_port_547_and_persists_duid` (a real
+    `Daemon` with a `dhcp6` context makes the running main loop actually claim port 547 and
+    persist a DUID) and `dhcp6::tests::run_dhcp6_loop_*` (Solicit → Advertise with an allocated
+    address over a real socket pair; a Request commits the lease so a second client requesting
+    the same single-address pool is refused; the loop stops on the shutdown signal).
+  - `network::join_dhcp6_multicast`/`join_dhcp6_multicast_all_interfaces` (port of the DHCPv6
+    portion of `join_multicast()`, network.c:1306-1360): a wildcard `[::]:547` bind does **not**
+    by itself receive multicast SOLICITs — IPv6 requires explicit `IPV6_JOIN_GROUP` membership per
+    interface even for a wildcard bind, and the kernel silently drops unjoined multicast, so a real
+    (non-relay, non-unicast-only) client could never have reached this server without it. Joins
+    `ALL_DHCP_RELAY_AGENTS_AND_SERVERS` (ff02::1:2) and `ALL_DHCP_SERVERS` (ff05::1:3) on every
+    live, non-loopback interface index from `enumerate_live_addrs6()`, deduplicated by index.
+    Called from `run_main_loop_with` right after the DHCPv6 socket is adopted/bound. Unlike
+    upstream, this doesn't track `iface->dhcp6_ok`/`relay6`-only join separately — it joins
+    unconditionally whenever `daemon.dhcp6` is non-empty (i.e. whenever the DHCPv6 loop is
+    started at all) — and a per-interface join failure is logged and skipped rather than
+    `die()`-ing the whole daemon (a sandboxed environment without `CAP_NET_ADMIN`, or an interface
+    that can't do multicast, must not prevent the rest of the daemon from starting). Upstream also
+    joins `ALL_ROUTERS` on the ICMPv6 socket for RA; this crate's RA support does not call the new
+    join helper. Covered by `network::tests::join_dhcp6_multicast_on_loopback_succeeds` (a real
+    `IPV6_JOIN_GROUP` setsockopt against the loopback interface).
+  Still open / explicitly unsupported:
+  - `complete_context6` classifies a live address as ULA (`classify_addr6` /
+    `Addr6Class::Ula`, matching upstream's `IN6_IS_ADDR_ULA(local)` at dhcp6.c:370) but does not
+    record it anywhere a DNS-server-option fallback could read: upstream's `iface_param.ula_addr`
+    (and `.ll_addr`/`.fallback`) exist specifically so `dhcp6_reply()` can offer a sensible
+    default `--dhcp-option=6,<addr>` when none is configured. This crate's `dispatch_dhcp6` does
+    not build a DNS-server option at all yet (DHCPv6 `--dhcp-option` support doesn't exist), so
+    plumbing the ULA/link-local/fallback addresses through today would have no consumer; the
+    classification is real but currently a dead end pending that larger feature.
+  - The "current" context chain is built **once at startup**, not re-derived per packet against
+    the packet's actual arrival interface the way upstream's `dhcp6_packet()` does (dhcp6.c:250).
+    A context only ever offers addresses if some live interface matched it at startup; an
+    interface that appears later (hotplug) won't be picked up without a restart. Re-running
+    `daemon_dhcp6_runtime` on a netlink address-change event is a follow-up.
+  - `run_dhcp6_loop` keeps its `LeaseDb` in-memory only — it does not load or write a shared
+    `--dhcp-leasefile`. Doing that safely needs one writer for the file the IPv4 loop already
+    owns (both loops independently loading/writing the same file would race), not two independent
+    in-memory copies of it.
+  - `complete_context6`'s shared-network branch and DHCPv6-relay `iface_index`/duplicate-warning
+    bookkeeping (dhcp6.c:421-460) are not ported.
+  - `dhcp_construct_contexts`'s template branch (`--dhcp-range=...,constructor:IFACE,...`) is
+    still unreachable: no `template_interface` field on `DhcpContext` and no `constructor:` config
+    parsing exist (same gap the log_context/log_relay entry above already flagged). Fast-RA
+    kickoff and GC aging of constructed contexts are not ported either.
+  - `address6_allocate` is single-pass only — upstream's two-pass `plain_range` fallback (try
+    netid-matching contexts first, then any context) and `--consec-addresses` seeding mode are not
+    ported.
+  - `get_client_mac` (dhcp6.c:308-350, ICMPv6 neighbor-solicitation MAC resolution for
+    `--dhcp-host` MAC matching over DHCPv6) is not ported. Not currently a silent dispatch gap:
+    neither `address6_allocate`/`address6_valid` nor `config_find_by_address6` take a MAC
+    parameter today, so no dispatch-path code assumes MAC-based host matching over DHCPv6 exists.
+  - `config_find_by_address6` still only matches exact `/128` addresses, not prefix/wildcard
+    address-list entries.
+  - `network::enumerate_live_addrs6()` reports every address as non-deprecated with maximal
+    preferred/valid lifetimes: `if-addrs` doesn't surface the kernel's actual lifetimes or the
+    `IFACE_DEPRECATED` flag the way `getifaddrs`'s `ifa_flags` does. Only affects lease lifetimes
+    offered from a `CONTEXT_CONSTRUCTED` context (`complete_context6` only reads those fields for
+    that case).
+
 - [ ] Treat DBus, UBus, BPF, ipset, nftset, and similar integrations as feature-gated completion tracks.
   Required tests: feature-gated compile checks, targeted integration tests, parity scenarios only when implementation is real.
   Done when: each optional feature is either implemented with tests or explicitly marked incomplete.

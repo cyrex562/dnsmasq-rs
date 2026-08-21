@@ -109,6 +109,109 @@ pub fn enumerate_interfaces() -> std::io::Result<Vec<IfaceInfo>> {
     Ok(result)
 }
 
+/// Count the leading one-bits of an IPv6 netmask, giving a prefix length.
+///
+/// `if_addrs` reports IPv6 netmasks the same shape as IPv4's (a mask, not a
+/// prefix length); DHCPv6 context matching (`complete_context6`,
+/// `dhcp_construct_contexts`) wants a plain prefix length instead.
+pub fn netmask_to_prefix6(mask: Ipv6Addr) -> i32 {
+    mask.segments().iter().map(|s| s.count_ones()).sum::<u32>() as i32
+}
+
+/// Enumerate live IPv6 addresses across all interfaces as
+/// [`crate::dhcp6::LiveAddr6`] values, for DHCPv6 context construction
+/// (`dhcp_construct_contexts`/`complete_context6`, dhcp6.c's
+/// `iface_enumerate(AF_INET6, ...)`).
+///
+/// `if-addrs` doesn't surface kernel preferred/valid lifetimes or the
+/// `IFACE_DEPRECATED` flag the way `getifaddrs`'s `ifa_flags` or a netlink
+/// `RTM_NEWADDR` does, so every address is reported as non-deprecated with
+/// maximal lifetimes — `complete_context6` only actually reads those fields
+/// for `CONTEXT_CONSTRUCTED` contexts, so this only affects lease lifetimes
+/// offered from a *constructed* context, not plain configured ranges.
+#[cfg(feature = "dhcp6")]
+pub fn enumerate_live_addrs6() -> std::io::Result<Vec<crate::dhcp6::LiveAddr6>> {
+    let ifaces = enumerate_interfaces()?;
+    Ok(ifaces
+        .into_iter()
+        .filter_map(|i| {
+            let IpAddr::V6(addr) = i.addr else { return None };
+            let prefix = match i.netmask {
+                Some(IpAddr::V6(mask)) => netmask_to_prefix6(mask),
+                _ => 128,
+            };
+            Some(crate::dhcp6::LiveAddr6 {
+                addr,
+                prefix,
+                if_index: i.index,
+                preferred: 0xffff_ffff,
+                valid: 0xffff_ffff,
+                deprecated: false,
+            })
+        })
+        .collect())
+}
+
+/// Parse a colon-separated hex MAC address string (`/sys/class/net/*/address`
+/// format) into raw bytes.
+fn parse_mac_addr_str(s: &str) -> Option<Vec<u8>> {
+    let bytes: Vec<u8> = s
+        .trim()
+        .split(':')
+        .map(|b| u8::from_str_radix(b, 16))
+        .collect::<Result<_, _>>()
+        .ok()?;
+    if bytes.is_empty() || bytes.iter().all(|&b| b == 0) {
+        return None;
+    }
+    Some(bytes)
+}
+
+/// Find the first non-loopback interface with a usable Ethernet-class MAC,
+/// for DHCPv6 DUID-LL/DUID-LLT generation (`make_duid1`, dhcp6.c:643-683).
+///
+/// Reads `/sys/class/net/<iface>/{type,address}`. Skips `lo` and any
+/// interface reporting an ARPHRD type `>= 256` (tunnels and other MAC-less
+/// link types), matching `make_duid1()`'s own cutoff (dhcp6.c:653).
+#[cfg(all(feature = "dhcp6", target_os = "linux"))]
+pub fn first_dhcp6_mac_source() -> Option<crate::dhcp6::DuidMacSource> {
+    let mut names: Vec<String> = std::fs::read_dir("/sys/class/net")
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    names.sort();
+
+    for name in names {
+        if name == "lo" {
+            continue;
+        }
+        let Some(hw_type): Option<u16> = std::fs::read_to_string(format!("/sys/class/net/{name}/type"))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+        else {
+            continue;
+        };
+        if hw_type >= 256 {
+            continue;
+        }
+        let Some(mac) = std::fs::read_to_string(format!("/sys/class/net/{name}/address"))
+            .ok()
+            .and_then(|s| parse_mac_addr_str(&s))
+        else {
+            continue;
+        };
+        return Some(crate::dhcp6::DuidMacSource { hw_type, mac });
+    }
+    None
+}
+
+/// Non-Linux stub: no `/sys/class/net` to read.
+#[cfg(all(feature = "dhcp6", not(target_os = "linux")))]
+pub fn first_dhcp6_mac_source() -> Option<crate::dhcp6::DuidMacSource> {
+    None
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Listener socket creation
 // ──────────────────────────────────────────────────────────────────────────────
@@ -952,6 +1055,99 @@ pub fn make_sock(
         std::io::ErrorKind::Unsupported,
         "make_sock not supported on this platform",
     ))
+}
+
+/// `ALL_RELAY_AGENTS_AND_SERVERS` (network.c) — ff02::1:2.
+pub const ALL_DHCP_RELAY_AGENTS_AND_SERVERS: &str = "ff02::1:2";
+/// `ALL_SERVERS` (network.c) — ff05::1:3.
+pub const ALL_DHCP_SERVERS: &str = "ff05::1:3";
+
+/// Join a single IPv6 multicast `group` on `if_index` for socket `fd`.
+#[cfg(all(unix, target_os = "linux"))]
+fn join_ipv6_group(
+    fd: std::os::unix::io::RawFd,
+    if_index: u32,
+    group: Ipv6Addr,
+) -> std::io::Result<()> {
+    let mreq = libc::ipv6_mreq {
+        ipv6mr_multiaddr: libc::in6_addr { s6_addr: group.octets() },
+        ipv6mr_interface: if_index,
+    };
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            // `IPV6_ADD_MEMBERSHIP` is Linux's name for the option upstream
+            // calls `IPV6_JOIN_GROUP`; both are value 20 and libc only
+            // exposes the former.
+            libc::IPV6_ADD_MEMBERSHIP,
+            &mreq as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::ipv6_mreq>() as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Join the DHCPv6 `ALL_DHCP_RELAY_AGENTS_AND_SERVERS` (ff02::1:2) and
+/// `ALL_DHCP_SERVERS` (ff05::1:3) multicast groups on `if_index` for the
+/// bound DHCPv6 socket `fd`.
+///
+/// A wildcard `[::]:547` bind does **not** by itself receive multicast
+/// datagrams — IPv6 requires explicit group membership per interface even
+/// for a wildcard-bound socket, and the kernel silently drops unjoined
+/// multicast. Real DHCPv6 clients always multicast their initial SOLICIT
+/// (they have no unicast address to send to yet), so without this join the
+/// server can never receive one.
+///
+/// Port of the DHCPv6 portion of `join_multicast()` (network.c:1306-1360).
+/// Upstream also joins `ALL_ROUTERS` on the ICMPv6 socket for `--enable-ra`,
+/// which this crate's RA support does not yet call — see `tasks.md`.
+#[cfg(all(unix, target_os = "linux"))]
+pub fn join_dhcp6_multicast(fd: std::os::unix::io::RawFd, if_index: u32) -> std::io::Result<()> {
+    let relay_agents: Ipv6Addr = ALL_DHCP_RELAY_AGENTS_AND_SERVERS.parse().unwrap();
+    let all_servers: Ipv6Addr = ALL_DHCP_SERVERS.parse().unwrap();
+    join_ipv6_group(fd, if_index, relay_agents)?;
+    join_ipv6_group(fd, if_index, all_servers)?;
+    Ok(())
+}
+
+/// Non-Linux stub: multicast group join for DHCPv6 is Linux-only in this
+/// crate today (mirrors [`set_ipv6pktinfo`]'s platform split).
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn join_dhcp6_multicast(_fd: std::os::unix::io::RawFd, _if_index: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn join_dhcp6_multicast(_fd: i32, _if_index: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Join DHCPv6 multicast groups on every live, non-loopback interface index
+/// discovered via [`enumerate_live_addrs6`], deduplicating by `if_index` the
+/// way upstream's `join_multicast()` does with its `multicast_done` flag.
+/// A per-interface join failure is logged and skipped rather than aborting —
+/// a container without `CAP_NET_ADMIN`, or an interface that doesn't support
+/// multicast, must not prevent the rest of the daemon from starting.
+#[cfg(feature = "dhcp6")]
+pub fn join_dhcp6_multicast_all_interfaces(fd: std::os::unix::io::RawFd) {
+    let Ok(live) = enumerate_live_addrs6() else { return };
+    let mut done = std::collections::HashSet::new();
+    for l in &live {
+        if l.if_index == 0 || !done.insert(l.if_index) {
+            continue;
+        }
+        if let Err(e) = join_dhcp6_multicast(fd, l.if_index) {
+            tracing::warn!(
+                "interface index {} failed to join DHCPv6 multicast group: {e}",
+                l.if_index
+            );
+        }
+    }
 }
 
 /// Which sockets a `Listener` should own.
@@ -2237,6 +2433,27 @@ mod tests {
         // We don't assert true/false since kernel support varies.
     }
 
+    // ── join_dhcp6_multicast ──────────────────────────────────────────────────
+
+    #[cfg(all(unix, target_os = "linux"))]
+    #[test]
+    fn join_dhcp6_multicast_on_loopback_succeeds() {
+        let addr: std::net::SocketAddr = "[::]:0".parse().unwrap();
+        let fd = match make_sock(addr, SockType::Udp, true) {
+            Ok(fd) => fd,
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => return,
+            Err(e) => panic!("make_sock UDP6 failed: {e}"),
+        };
+        let if_index = nametoindex("lo");
+        if if_index == 0 {
+            unsafe { libc::close(fd); }
+            return;
+        }
+        let result = join_dhcp6_multicast(fd, if_index);
+        unsafe { libc::close(fd); }
+        assert!(result.is_ok(), "expected loopback multicast join to succeed: {result:?}");
+    }
+
     // ── tcp_interface ─────────────────────────────────────────────────────────
 
     #[cfg(unix)]
@@ -2779,5 +2996,52 @@ mod tests {
     fn validate_server_addr_unspecified() {
         let addr: std::net::SocketAddr = "0.0.0.0:53".parse().unwrap();
         assert!(validate_server_addr(&addr).is_some());
+    }
+
+    // ── netmask_to_prefix6 ────────────────────────────────────────────────────
+
+    #[test]
+    fn netmask_to_prefix6_64() {
+        let mask: Ipv6Addr = "ffff:ffff:ffff:ffff::".parse().unwrap();
+        assert_eq!(netmask_to_prefix6(mask), 64);
+    }
+
+    #[test]
+    fn netmask_to_prefix6_128() {
+        assert_eq!(netmask_to_prefix6(Ipv6Addr::from([0xff; 16])), 128);
+    }
+
+    #[test]
+    fn netmask_to_prefix6_zero() {
+        assert_eq!(netmask_to_prefix6(Ipv6Addr::UNSPECIFIED), 0);
+    }
+
+    // ── parse_mac_addr_str ────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_mac_addr_str_valid() {
+        assert_eq!(
+            parse_mac_addr_str("aa:bb:cc:dd:ee:ff\n"),
+            Some(vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+        );
+    }
+
+    #[test]
+    fn parse_mac_addr_str_all_zero_rejected() {
+        assert_eq!(parse_mac_addr_str("00:00:00:00:00:00"), None);
+    }
+
+    #[test]
+    fn parse_mac_addr_str_malformed_rejected() {
+        assert_eq!(parse_mac_addr_str("not-a-mac"), None);
+    }
+
+    // ── enumerate_live_addrs6 smoke test ─────────────────────────────────────
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn enumerate_live_addrs6_does_not_error() {
+        let result = enumerate_live_addrs6();
+        assert!(result.is_ok(), "enumerate_live_addrs6 failed: {:?}", result.err());
     }
 }
