@@ -2131,6 +2131,14 @@ fn synthetic_pool_context(start: Ipv4Addr, end: Ipv4Addr) -> DhcpContext {
         valid: 0,
         #[cfg(feature = "dhcp6")]
         preferred: 0,
+        #[cfg(feature = "dhcp6")]
+        ra_time: 0,
+        #[cfg(feature = "dhcp6")]
+        ra_short_period_start: 0,
+        #[cfg(feature = "dhcp6")]
+        saved_valid: 0,
+        #[cfg(feature = "dhcp6")]
+        address_lost_time: 0,
     }
 }
 
@@ -3303,6 +3311,14 @@ mod tests {
             valid: 0,
             #[cfg(feature = "dhcp6")]
             preferred: 0,
+            #[cfg(feature = "dhcp6")]
+            ra_time: 0,
+            #[cfg(feature = "dhcp6")]
+            ra_short_period_start: 0,
+            #[cfg(feature = "dhcp6")]
+            saved_valid: 0,
+            #[cfg(feature = "dhcp6")]
+            address_lost_time: 0,
         });
         cfg.dhcp_opts.push(DhcpOpt {
             opt: crate::dhcp_protocol::OPTION_DOMAINNAME as i32,
@@ -3360,6 +3376,14 @@ mod tests {
             valid: 0,
             #[cfg(feature = "dhcp6")]
             preferred: 0,
+            #[cfg(feature = "dhcp6")]
+            ra_time: 0,
+            #[cfg(feature = "dhcp6")]
+            ra_short_period_start: 0,
+            #[cfg(feature = "dhcp6")]
+            saved_valid: 0,
+            #[cfg(feature = "dhcp6")]
+            address_lost_time: 0,
         });
         cfg.configs.push(DhcpConfig {
             flags: CONFIG_NAME,
@@ -4049,6 +4073,14 @@ mod tests {
             valid: 0,
             #[cfg(feature = "dhcp6")]
             preferred: 0,
+            #[cfg(feature = "dhcp6")]
+            ra_time: 0,
+            #[cfg(feature = "dhcp6")]
+            ra_short_period_start: 0,
+            #[cfg(feature = "dhcp6")]
+            saved_valid: 0,
+            #[cfg(feature = "dhcp6")]
+            address_lost_time: 0,
         }
     }
 

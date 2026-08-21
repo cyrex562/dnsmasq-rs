@@ -1499,6 +1499,10 @@ mod tests {
             if_index: 0,
             valid: 0,
             preferred: 0,
+            ra_time: 0,
+            ra_short_period_start: 0,
+            saved_valid: 0,
+            address_lost_time: 0,
         }
     }
 

@@ -26,6 +26,8 @@ use crate::types::dhcp::{
     DhcpBoot, DhcpConfig, DhcpContext, DhcpMacRule, DhcpNetid, DhcpNetidList, DhcpOpt, DhcpPxeVendor,
     DhcpRelay, DhcpRelayIdRule, DhcpReplyDelay, DhcpUserClassRule, DhcpVendorRule, HwaddrConfig, PxeService,
 };
+#[cfg(feature = "dhcp6")]
+use crate::types::dhcp::{RaInterface, CONTEXT_RA};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -599,8 +601,28 @@ fn normalize_config(daemon: &mut Daemon) -> Result<(), ConfigError> {
     apply_local_service_defaults(daemon);
     #[cfg(feature = "dhcp")]
     apply_dhcp_leasefile_default(daemon);
+    #[cfg(feature = "dhcp6")]
+    apply_doing_ra_default(daemon);
     validate_auth_config(daemon)?;
     Ok(())
+}
+
+/// Compute `daemon->doing_ra`: on whenever `--enable-ra` was given, or any
+/// DHCPv6 context has `CONTEXT_RA` set (a `dhcp-range` with `ra-only`,
+/// `ra-names`, `ra-stateless`, etc).
+///
+/// Port of `dnsmasq.c:289-305`.
+#[cfg(feature = "dhcp6")]
+fn apply_doing_ra_default(daemon: &mut Daemon) {
+    if daemon.dhcp6.is_empty() {
+        return;
+    }
+    daemon.doing_ra = daemon.option_bool(OPT_RA);
+    for context in &daemon.dhcp6 {
+        if context.flags & CONTEXT_RA != 0 {
+            daemon.doing_ra = true;
+        }
+    }
 }
 
 /// Fill in the default lease file when DHCP(v6) is configured and no
@@ -819,7 +841,13 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
         "authoritative" => daemon.set_option(OPT_AUTHORITATIVE),
         "dhcp-authoritative" => daemon.set_option(OPT_AUTHORITATIVE),
         "read-ethers" => daemon.set_option(OPT_ETHERS),
-        "ra-param"     => {} // skip; DHCP6 only
+        "ra-param"     => {
+            let v = require_value("ra-param")?;
+            #[cfg(feature = "dhcp6")]
+            parse_ra_param(daemon, v, cl)?;
+            #[cfg(not(feature = "dhcp6"))]
+            let _ = v;
+        }
         "dhcp-no-override" => daemon.set_option(OPT_NO_OVERRIDE),
         "dhcp-sequential-ip" => daemon.set_option(OPT_CONSEC_ADDR),
         "dhcp-ignore-clid" => daemon.set_option(OPT_IGNORE_CLID),
@@ -2646,6 +2674,65 @@ fn parse_bridge_interface(daemon: &mut Daemon, v: &str, cl: &ConfigLine) -> Resu
     Ok(())
 }
 
+/// `ra-param=<iface>,[mtu:<value>|<interface>|off,][high|low,]<intval>[,<lifetime>]`.
+/// Port of `option.c:4814-4855` (`LOPT_RA_PARAM`).
+#[cfg(feature = "dhcp6")]
+fn parse_ra_param(daemon: &mut Daemon, v: &str, cl: &ConfigLine) -> Result<(), ConfigError> {
+    let key = "ra-param";
+    let bad = || invalid_value_for(cl, key, v, "bad RA-params");
+
+    let mut parts = v.split(',').map(str::trim);
+    let name = parts.next().filter(|s| !s.is_empty()).ok_or_else(bad)?;
+
+    let mut new = RaInterface {
+        name: name.to_string(),
+        mtu_name: None,
+        interval: 0,
+        lifetime: -1,
+        prio: 0,
+        mtu: 0,
+    };
+
+    let mut next = parts.next();
+
+    if let Some(rest) = next {
+        if rest.len() >= 4 && rest.as_bytes()[..4].eq_ignore_ascii_case(b"mtu:") {
+            let val = &rest[4..];
+            if val.eq_ignore_ascii_case("off") {
+                new.mtu = -1;
+            } else if let Ok(n) = val.parse::<i32>() {
+                if n < 1280 {
+                    return Err(bad());
+                }
+                new.mtu = n;
+            } else {
+                new.mtu_name = Some(val.to_string());
+            }
+            next = parts.next();
+        }
+    }
+
+    if let Some(rest) = next {
+        if rest.eq_ignore_ascii_case("low") {
+            new.prio = 0x18;
+            next = parts.next();
+        } else if rest.eq_ignore_ascii_case("high") {
+            new.prio = 0x08;
+            next = parts.next();
+        }
+    }
+
+    let interval_str = next.ok_or_else(bad)?;
+    new.interval = interval_str.parse::<i32>().map_err(|_| bad())?;
+
+    if let Some(lifetime_str) = parts.next() {
+        new.lifetime = lifetime_str.parse::<i32>().map_err(|_| bad())?;
+    }
+
+    daemon.ra_interfaces.push(new);
+    Ok(())
+}
+
 /// `shared-network=<iface>|<addr>,<addr>`.  Port of `option.c:3709`
 /// (`LOPT_SHARED_NET`).
 fn parse_shared_network(daemon: &mut Daemon, v: &str, cl: &ConfigLine) -> Result<(), ConfigError> {
@@ -3786,6 +3873,14 @@ fn parse_dhcp_range(value: &str, cl: &ConfigLine) -> Result<DhcpContext, ConfigE
         valid: 0,
         #[cfg(feature = "dhcp6")]
         preferred: 0,
+        #[cfg(feature = "dhcp6")]
+        ra_time: 0,
+        #[cfg(feature = "dhcp6")]
+        ra_short_period_start: 0,
+        #[cfg(feature = "dhcp6")]
+        saved_valid: 0,
+        #[cfg(feature = "dhcp6")]
+        address_lost_time: 0,
     })
 }
 
@@ -5690,6 +5785,186 @@ mod tests {
         let lines = parse_config_text("dhcp-duid=9,zz", "test").unwrap();
         let err = apply_config(&mut d, &lines).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "dhcp-duid"));
+    }
+
+    // ── ra-param / enable-ra / doing_ra ──────────────────────────────────────
+
+    #[test]
+    #[cfg(feature = "dhcp6")]
+    fn apply_ra_param_basic_interval() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("ra-param=eth0,60", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.ra_interfaces.len(), 1);
+        let p = &d.ra_interfaces[0];
+        assert_eq!(p.name, "eth0");
+        assert_eq!(p.interval, 60);
+        assert_eq!(p.lifetime, -1);
+        assert_eq!(p.prio, 0);
+        assert_eq!(p.mtu, 0);
+        assert_eq!(p.mtu_name, None);
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp6")]
+    fn apply_ra_param_with_lifetime() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("ra-param=eth0,60,1800", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.ra_interfaces[0].interval, 60);
+        assert_eq!(d.ra_interfaces[0].lifetime, 1800);
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp6")]
+    fn apply_ra_param_with_prio_high_and_low() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("ra-param=eth0,high,60\nra-param=eth1,low,60", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.ra_interfaces[0].prio, 0x08);
+        assert_eq!(d.ra_interfaces[1].prio, 0x18);
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp6")]
+    fn apply_ra_param_with_mtu_value() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("ra-param=eth0,mtu:1500,60", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.ra_interfaces[0].mtu, 1500);
+        assert_eq!(d.ra_interfaces[0].mtu_name, None);
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp6")]
+    fn apply_ra_param_with_mtu_off() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("ra-param=eth0,mtu:off,60", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.ra_interfaces[0].mtu, -1);
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp6")]
+    fn apply_ra_param_with_mtu_interface_name() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("ra-param=eth0,mtu:eth1,60", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.ra_interfaces[0].mtu, 0);
+        assert_eq!(d.ra_interfaces[0].mtu_name.as_deref(), Some("eth1"));
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp6")]
+    fn apply_ra_param_mtu_below_1280_is_rejected() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("ra-param=eth0,mtu:1200,60", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "ra-param"));
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp6")]
+    fn apply_ra_param_missing_interval_is_rejected() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("ra-param=eth0", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "ra-param"));
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp6")]
+    fn apply_ra_param_non_numeric_interval_is_rejected() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("ra-param=eth0,high,notanumber", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "ra-param"));
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp6")]
+    fn apply_ra_param_full_form() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("ra-param=eth0,mtu:9000,high,120,3600", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        let p = &d.ra_interfaces[0];
+        assert_eq!(p.mtu, 9000);
+        assert_eq!(p.prio, 0x08);
+        assert_eq!(p.interval, 120);
+        assert_eq!(p.lifetime, 3600);
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp6")]
+    fn apply_enable_ra_without_dhcp6_contexts_leaves_doing_ra_false() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("enable-ra", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        // Upstream only computes doing_ra inside `if (daemon->dhcp6)`
+        // (dnsmasq.c:290), so with no DHCPv6 contexts at all it stays false.
+        assert!(!d.doing_ra);
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp6")]
+    fn apply_enable_ra_with_dhcp6_context_sets_doing_ra() {
+        use crate::types::dhcp::CONTEXT_DHCP;
+        let mut d = Daemon::default();
+        let lines = parse_config_text("enable-ra", "test").unwrap();
+        d.dhcp6.push(dhcp6_ctx_for_test(CONTEXT_DHCP));
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.doing_ra);
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp6")]
+    fn context_ra_flag_sets_doing_ra_without_enable_ra() {
+        use crate::types::dhcp::CONTEXT_RA;
+        let mut d = Daemon::default();
+        d.dhcp6.push(dhcp6_ctx_for_test(CONTEXT_RA));
+        apply_config(&mut d, &[]).unwrap();
+        assert!(d.doing_ra);
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp6")]
+    fn no_dhcp6_contexts_leaves_doing_ra_false_even_with_context_ra() {
+        // Sanity check on the guard itself: without any dhcp6 entries at all,
+        // normalize_config's `if daemon.dhcp6.is_empty() { return; }` should
+        // short-circuit regardless of OPT_RA.
+        let mut d = Daemon::default();
+        let lines = parse_config_text("enable-ra", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.dhcp6.is_empty());
+        assert!(!d.doing_ra);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    fn dhcp6_ctx_for_test(flags: u32) -> DhcpContext {
+        DhcpContext {
+            lease_time: 3600,
+            addr_epoch: 0,
+            netmask: Ipv4Addr::UNSPECIFIED,
+            broadcast: Ipv4Addr::UNSPECIFIED,
+            local: Ipv4Addr::UNSPECIFIED,
+            router: Ipv4Addr::UNSPECIFIED,
+            start: Ipv4Addr::UNSPECIFIED,
+            end: Ipv4Addr::UNSPECIFIED,
+            flags,
+            netid: DhcpNetid { net: String::new() },
+            filter: vec![],
+            start6: Ipv6Addr::UNSPECIFIED,
+            end6: Ipv6Addr::UNSPECIFIED,
+            local6: Ipv6Addr::UNSPECIFIED,
+            prefix: 64,
+            if_index: 0,
+            valid: 0,
+            preferred: 0,
+            ra_time: 0,
+            ra_short_period_start: 0,
+            saved_valid: 0,
+            address_lost_time: 0,
+        }
     }
 
     #[test]

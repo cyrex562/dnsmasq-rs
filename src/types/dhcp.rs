@@ -156,6 +156,23 @@ pub struct DhcpContext {
     pub valid:        u32,
     #[cfg(feature = "dhcp6")]
     pub preferred:    u32,
+    /// `context->ra_time` (dnsmasq.h) — unix-epoch seconds of the next RA due
+    /// on this context, or `0` when no RA is currently scheduled.
+    #[cfg(feature = "dhcp6")]
+    pub ra_time:      u64,
+    /// `context->ra_short_period_start` — start of the "resend frequently"
+    /// window used by `new_timeout()` (radv.c:973-984).
+    #[cfg(feature = "dhcp6")]
+    pub ra_short_period_start: u64,
+    /// `context->saved_valid` — valid lifetime captured by `add_prefixes()`
+    /// for use once the context becomes `CONTEXT_OLD` (radv.c:625).
+    #[cfg(feature = "dhcp6")]
+    pub saved_valid:  u32,
+    /// `context->address_lost_time` — when a `CONTEXT_OLD` context's address
+    /// disappeared, used to compute the shrinking valid lifetime it's still
+    /// advertised with (radv.c:334-346).
+    #[cfg(feature = "dhcp6")]
+    pub address_lost_time: u64,
 }
 
 /// Static DHCP host configuration entry.
