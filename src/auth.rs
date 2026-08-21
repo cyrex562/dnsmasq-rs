@@ -518,7 +518,6 @@ pub fn answer_auth(
                     if rc == 0 { continue; }
                     nxdomain = false;
                     if rc == 2 && qtype == Some(RrType::MX) {
-                        found = true;
                         answers.push(make_mx_rr(&name, rec, config.auth_ttl));
                     }
                 }
@@ -532,7 +531,6 @@ pub fn answer_auth(
                     if rc == 0 { continue; }
                     nxdomain = false;
                     if rc == 2 && qtype == Some(RrType::SRV) {
-                        found = true;
                         answers.push(make_srv_rr(&name, rec, config.auth_ttl));
                     }
                     if first_srv_idx.is_none() {
@@ -550,7 +548,6 @@ pub fn answer_auth(
                     if rc == 0 { continue; }
                     nxdomain = false;
                     if rc == 2 && txt.class == qtype_num {
-                        found = true;
                         answers.push(make_txt_like_rr(&name, txt.class, &txt.txt, config.auth_ttl));
                     }
                 }
@@ -562,7 +559,6 @@ pub fn answer_auth(
                     if rc == 0 { continue; }
                     nxdomain = false;
                     if rc == 2 && qtype == Some(RrType::TXT) {
-                        found = true;
                         answers.push(make_txt_like_rr(&name, RrType::TXT as u16, &txt.txt, config.auth_ttl));
                     }
                 }
@@ -573,7 +569,6 @@ pub fn answer_auth(
                     if rc == 0 { continue; }
                     nxdomain = false;
                     if rc == 2 && qtype == Some(RrType::NAPTR) {
-                        found = true;
                         answers.push(make_naptr_rr(&name, na, config.auth_ttl));
                     }
                 }
@@ -592,7 +587,6 @@ pub fn answer_auth(
                             if want as u16 != qtype_num { continue; }
                             if al.flags & ADDRLIST_REVONLY != 0 { continue; }
                             if !(local_query || filter_zone(zone.as_ref().unwrap(), &al.addr)) { continue; }
-                            found = true;
                             if let Some(rr) = make_addr_rr(&name, qtype_num, &al.addr, config.auth_ttl) {
                                 answers.push(rr);
                             }
@@ -645,7 +639,6 @@ pub fn answer_auth(
                                 if cr.flags & flag != 0 {
                                     let Some(addr) = &cr.addr else { continue };
                                     if local_query || filter_zone(zone.as_ref().unwrap(), addr) {
-                                        found = true;
                                         if let Some(rr) = make_addr_rr(&stripped, qtype_num, addr, config.auth_ttl) {
                                             answers.push(rr);
                                         }
@@ -665,7 +658,6 @@ pub fn answer_auth(
                     if cr.flags & flag != 0 {
                         let Some(addr) = &cr.addr else { continue };
                         if local_query || filter_zone(zone.as_ref().unwrap(), addr) {
-                            found = true;
                             if let Some(rr) = make_addr_rr(&name, qtype_num, addr, config.auth_ttl) {
                                 answers.push(rr);
                             }
@@ -730,15 +722,17 @@ pub fn answer_auth(
     }
 
     // ── Header / flags / rcode (auth.c:851-912) ─────────────────────────────
-    let mut hdr = DnsHeader::default();
-    hdr.id = query.header.id;
-    hdr.hb3 = (query.header.hb3 & !(HB3_AA | HB3_TC)) | HB3_QR;
-    hdr.hb4 = if local_query { query.header.hb4 | HB4_RA } else { query.header.hb4 & !HB4_RA };
+    let mut hdr = DnsHeader {
+        id: query.header.id,
+        hb3: (query.header.hb3 & !(HB3_AA | HB3_TC)) | HB3_QR,
+        hb4: if local_query { query.header.hb4 | HB4_RA } else { query.header.hb4 & !HB4_RA },
+        qdcount: 1,
+        ..Default::default()
+    };
     hdr.hb4 &= !HB4_AD;
     if auth {
         hdr.hb3 |= HB3_AA;
     }
-    hdr.qdcount = 1;
 
     // Coarse (all-or-nothing) UDP truncation: build the candidate reply and
     // check its wire size against the packet-size budget. Multi-message TCP
@@ -884,20 +878,20 @@ fn build_auth_section(
             let Some(addr) = &cr.addr else { continue };
             let rtype = if cr.flags & F_IPV6 != 0 { RrType::AAAA as u16 } else { RrType::A as u16 };
 
-            if cr.flags & F_DHCP != 0 && !config.dhcp_fqdn {
-                if !cr.name.contains('.') && (local_query || filter_zone(zone, addr)) {
-                    let owner = append_domain_if_bare(cr.name.clone(), &zone.domain);
-                    if let Some(rr) = make_addr_rr(&owner, rtype, addr, config.auth_ttl) {
-                        answers.push(rr);
-                    }
+            if cr.flags & F_DHCP != 0 && !config.dhcp_fqdn
+                && !cr.name.contains('.') && (local_query || filter_zone(zone, addr))
+            {
+                let owner = append_domain_if_bare(cr.name.clone(), &zone.domain);
+                if let Some(rr) = make_addr_rr(&owner, rtype, addr, config.auth_ttl) {
+                    answers.push(rr);
                 }
             }
 
-            if cr.flags & F_HOSTS != 0 || (cr.flags & F_DHCP != 0 && config.dhcp_fqdn) {
-                if in_zone(&cr.name, &zone.domain).is_some() && (local_query || filter_zone(zone, addr)) {
-                    if let Some(rr) = make_addr_rr(&cr.name, rtype, addr, config.auth_ttl) {
-                        answers.push(rr);
-                    }
+            if (cr.flags & F_HOSTS != 0 || (cr.flags & F_DHCP != 0 && config.dhcp_fqdn))
+                && in_zone(&cr.name, &zone.domain).is_some() && (local_query || filter_zone(zone, addr))
+            {
+                if let Some(rr) = make_addr_rr(&cr.name, rtype, addr, config.auth_ttl) {
+                    answers.push(rr);
                 }
             }
         }
@@ -982,9 +976,7 @@ mod tests {
     }
 
     fn make_query(name: &str, qtype: RrType) -> DnsPacket {
-        let mut hdr = DnsHeader::default();
-        hdr.id = 0x1234;
-        hdr.qdcount = 1;
+        let hdr = DnsHeader { id: 0x1234, qdcount: 1, ..Default::default() };
         DnsPacket {
             header: hdr,
             questions: vec![DnsQuestion { name: name.into(), qtype: qtype as u16, qclass: 1 }],
