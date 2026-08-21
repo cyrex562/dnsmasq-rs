@@ -983,6 +983,13 @@ async fn process_transfer_packet(transfer: &mut TftpTransfer, data: &[u8], confi
     let now = Instant::now();
     match handle_tftp_packet(transfer, data, now) {
         TftpHandleResult::AckAdvance { .. } => {
+            // Mirrors the `transfer->block = transfer->lastack;` reset that
+            // upstream's retransmit branch does (tftp.c:691) immediately
+            // before sending the window: without it `transfer.block` is
+            // still the pre-ACK block number (0 on the very first ACK, since
+            // any negotiated option resets it there), so `send_window` would
+            // resend the OACK/prior block instead of the next window.
+            transfer.block = transfer.lastack;
             let (endcon, _error) = send_window(transfer).await;
             if endcon {
                 return true;
@@ -1036,17 +1043,25 @@ async fn bind_transfer_socket(source: IpAddr, config: &TftpConfig) -> io::Result
     }
 }
 
+/// Send a reply through a request's own socket (the per-transfer socket, or
+/// the shared listener socket in single-port mode) rather than the
+/// listener's socket directly. Upstream binds `transfer->sockfd` before
+/// parsing the opcode (tftp.c:305-359) and every reply — including the
+/// terminal error packets for WRQ/empty-filename/bad-mode/file-not-found —
+/// goes out through it (tftp.c:518), never through the bare listener socket.
 #[cfg(unix)]
-async fn reply_to_new_peer(
-    listener: &TftpListenerHandle,
+async fn send_transfer_reply(
+    sock: &tokio::net::UdpSocket,
+    single_port: bool,
+    source_addr: IpAddr,
+    if_index: u32,
     peer: SocketAddr,
-    meta: &crate::network::RecvMeta,
     pkt: &[u8],
 ) {
     use std::os::unix::io::AsRawFd;
-    let fd = listener.sock.as_raw_fd();
-    let nowild = meta.dest.is_none();
-    if let Err(e) = crate::forward::send_from(fd, nowild, pkt, peer, meta.dest, meta.if_index) {
+    let fd = sock.as_raw_fd();
+    let nowild = !single_port;
+    if let Err(e) = crate::forward::send_from(fd, nowild, pkt, peer, Some(source_addr), if_index) {
         warn!("failed to send TFTP error to {peer}: {e}");
     }
 }
@@ -1075,18 +1090,44 @@ async fn handle_new_request(
         return;
     }
     let opcode = u16::from_be_bytes([data[0], data[1]]);
+    if opcode != TftpOpcode::Wrq as u16 && opcode != TftpOpcode::Rrq as u16 {
+        // Upstream binds a transfer socket even for an unrecognized opcode,
+        // but since no reply is ever sent for it (tftp.c:518 `if (len)`
+        // guards the only send), skipping the bind here has no observable
+        // wire effect — it just avoids a pointless bind+close.
+        return;
+    }
     let peer = meta.src;
     let client_addr_str = peer.ip().to_string();
+
+    // Upstream binds `transfer->sockfd` here, before parsing the opcode
+    // body, and every reply below — including terminal errors — goes out
+    // through it rather than the listener socket (tftp.c:305-359, 518).
+    let source_addr = meta.dest.unwrap_or_else(|| listener.addr.ip());
+    let (sock, single_port) = if config.single_port {
+        (listener.sock.clone(), true)
+    } else {
+        match bind_transfer_socket(source_addr, config).await {
+            Ok(s) => (Arc::new(s), false),
+            Err(e) => {
+                warn!("unable to get a free port for TFTP: {e}");
+                return;
+            }
+        }
+    };
+    let if_index = meta.if_index;
+    macro_rules! reply {
+        ($pkt:expr) => {
+            send_transfer_reply(&sock, single_port, source_addr, if_index, peer, $pkt).await
+        };
+    }
 
     if opcode == TftpOpcode::Wrq as u16 {
         let err = tftp_err_packet(
             TftpError::IllegalOp,
             &format!("unsupported write request from {client_addr_str}"),
         );
-        reply_to_new_peer(listener, peer, meta, &err).await;
-        return;
-    }
-    if opcode != TftpOpcode::Rrq as u16 {
+        reply!(&err);
         return;
     }
 
@@ -1099,13 +1140,13 @@ async fn handle_new_request(
             TftpError::IllegalOp,
             &format!("empty filename in request from {client_addr_str}"),
         );
-        reply_to_new_peer(listener, peer, meta, &err).await;
+        reply!(&err);
         return;
     }
     let netascii = mode.eq_ignore_ascii_case("netascii");
     if !netascii && !mode.eq_ignore_ascii_case("octet") {
         let err = tftp_err_packet(TftpError::IllegalOp, &format!("unsupported request from {client_addr_str}"));
-        reply_to_new_peer(listener, peer, meta, &err).await;
+        reply!(&err);
         return;
     }
 
@@ -1146,17 +1187,17 @@ async fn handle_new_request(
                 TftpError::FileNotFound,
                 &format!("file {namebuff} not found for {client_addr_str}"),
             );
-            reply_to_new_peer(listener, peer, meta, &err).await;
+            reply!(&err);
             return;
         }
         Err(TftpOpenError::Perm) => {
             let err = tftp_err_packet(TftpError::AccessViolation, &format!("cannot access {namebuff}: Permission denied"));
-            reply_to_new_peer(listener, peer, meta, &err).await;
+            reply!(&err);
             return;
         }
         Err(TftpOpenError::Oops(e)) => {
             let err = tftp_err_oops(&namebuff, &e);
-            reply_to_new_peer(listener, peer, meta, &err).await;
+            reply!(&err);
             return;
         }
     };
@@ -1165,20 +1206,7 @@ async fn handle_new_request(
         return;
     }
 
-    let source_addr = meta.dest.unwrap_or_else(|| listener.addr.ip());
-    let (sock, single_port) = if config.single_port {
-        (listener.sock.clone(), true)
-    } else {
-        match bind_transfer_socket(source_addr, config).await {
-            Ok(s) => (Arc::new(s), false),
-            Err(e) => {
-                warn!("unable to get a free port for TFTP: {e}");
-                return;
-            }
-        }
-    };
-
-    let mut transfer = TftpTransfer::new(peer, source_addr, meta.if_index, sock.clone(), single_port, file);
+    let mut transfer = TftpTransfer::new(peer, source_addr, if_index, sock.clone(), single_port, file);
     transfer.netascii = netascii;
     transfer.blocksize = opts.blocksize;
     transfer.opt_blocksize = opts.opt_blocksize;
@@ -2160,15 +2188,17 @@ mod tests {
         };
         let server = tokio::spawn(run_tftp_loop(vec![listener], config));
 
+        // Deliberately *not* `connect()`-ed: like the other end-to-end test
+        // above, the reply (here an error) now comes from a fresh
+        // per-transfer ephemeral socket, not the listener's own port.
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        client.connect(listener_addr).await.unwrap();
 
         let traversal = format!("../{}/secret", secret_dir.path().file_name().unwrap().to_str().unwrap());
         let rrq = make_rrq(&traversal, "octet", &[]);
-        client.send(&rrq).await.unwrap();
+        client.send_to(&rrq, listener_addr).await.unwrap();
 
         let mut buf = vec![0u8; 2048];
-        let n = tokio::time::timeout(Duration::from_secs(5), client.recv(&mut buf))
+        let (n, _from) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
             .await
             .expect("timed out waiting for a TFTP reply")
             .unwrap();
