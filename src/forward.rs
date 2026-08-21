@@ -2628,7 +2628,9 @@ pub async fn run_forward_loop_on(
             "no DNS listening sockets were bound",
         ));
     }
+    let mut listeners = listeners;
     let mut filter = filter;
+    let port = config.port;
 
     // Local data is owned by the loop; `LocalConfig` borrows from `local` and
     // is rebuilt per query.  The cache is shared with SIGHUP reload handling
@@ -2912,6 +2914,25 @@ pub async fn run_forward_loop_on(
                 // readiness on the log fd; see `src/log.rs` for why a
                 // periodic drain is the substitute here).
                 crate::log::check_log_writer(true);
+
+                // `--bind-dynamic`: bind a listener for every interface address
+                // that appeared since the last pass, and release the listener
+                // for every one that disappeared (network.c:854-880's
+                // OPT_CLEVERBIND branch of `enumerate_interfaces()`). A no-op
+                // under plain `--bind-interfaces` or the default wildcard mode.
+                if let Some(f) = filter.as_mut() {
+                    let (added, removed) = f.refresh_dynamic(port);
+                    if !added.is_empty() || !removed.is_empty() {
+                        apply_dynamic_listener_diff(&mut listeners, added, removed);
+                        if listeners.is_empty() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "no DNS listening sockets remain after --bind-dynamic reconciliation",
+                            ));
+                        }
+                        scan_from = scan_from % listeners.len();
+                    }
+                }
             }
         }
     }
@@ -2940,6 +2961,53 @@ fn dump_reply(
             crate::dump::DumpFallback::None,
         );
     }
+}
+
+/// Bind a listener for every newly-appeared address and drop the listener for
+/// every address that disappeared, mutating `listeners` in place.
+///
+/// Only ever called under `--bind-dynamic`, where `--bind-interfaces`
+/// (`nowild`) is rejected at startup (`dnsmasq.rs`'s `bind_dns_listeners`), so
+/// a freshly bound listener always has `check_dst = true`
+/// (`forward.c:1612`). Refuses to release every listener in one pass — an
+/// enumeration glitch that (incorrectly) reports every address gone must not
+/// take the daemon off the air; the next tick gets another chance.
+fn apply_dynamic_listener_diff(
+    listeners: &mut Vec<DnsListener>,
+    added:     Vec<SocketAddr>,
+    removed:   Vec<SocketAddr>,
+) {
+    for addr in added {
+        match crate::network::create_listeners_checked(
+            addr, crate::network::ListenerKinds::UDP_ONLY, /*nowild=*/false, /*cleverbind=*/true,
+        ) {
+            Ok(Some(l)) => match crate::network::listener_take_udp(l) {
+                Ok((std_sock, bound)) => match tokio::net::UdpSocket::from_std(std_sock) {
+                    Ok(sock) => {
+                        tracing::info!("bind-dynamic: new DNS listener on {bound}");
+                        listeners.push(DnsListener { sock: Arc::new(sock), check_dst: true });
+                    }
+                    Err(e) => tracing::warn!("bind-dynamic: failed to adopt listener for {addr}: {e}"),
+                },
+                Err(e) => tracing::warn!("bind-dynamic: failed to take listener for {addr}: {e}"),
+            },
+            Ok(None) => {}
+            Err(e) => tracing::warn!("bind-dynamic: failed to bind {addr}: {e}"),
+        }
+    }
+
+    if removed.is_empty() {
+        return;
+    }
+    let still_present = |l: &DnsListener| {
+        l.sock.local_addr().map(|a| !removed.contains(&a)).unwrap_or(true)
+    };
+    let remaining = listeners.iter().filter(|l| still_present(l)).count();
+    if remaining == 0 {
+        tracing::warn!("bind-dynamic: refusing to release every DNS listener at once");
+        return;
+    }
+    listeners.retain(still_present);
 }
 
 /// Wait until one of `socks` has a datagram ready, returning its **position in
@@ -5506,5 +5574,56 @@ mod tests {
         let mut addr = [0u8; 16];
         addr[0] = 0x20;
         assert!(!is_private_reply(&addr));
+    }
+
+    // ── dynamic listener lifecycle (--bind-dynamic) ───────────────────────────
+
+    async fn loopback_listener() -> DnsListener {
+        let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        std_sock.set_nonblocking(true).unwrap();
+        let sock = tokio::net::UdpSocket::from_std(std_sock).unwrap();
+        DnsListener { sock: Arc::new(sock), check_dst: true }
+    }
+
+    /// A newly-appeared interface address must gain a bound listener —
+    /// the acceptance criterion "interfaces appearing... create... listeners".
+    #[tokio::test]
+    async fn apply_dynamic_listener_diff_binds_added_addresses() {
+        let mut listeners = vec![loopback_listener().await];
+        let added: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        apply_dynamic_listener_diff(&mut listeners, vec![added], Vec::new());
+
+        assert_eq!(listeners.len(), 2, "a listener must be bound for the new address");
+    }
+
+    /// An interface address that disappeared must have its listener released —
+    /// the acceptance criterion "interfaces... disappearing... release listeners".
+    #[tokio::test]
+    async fn apply_dynamic_listener_diff_releases_removed_addresses() {
+        let survivor = loopback_listener().await;
+        let survivor_addr = survivor.sock.local_addr().unwrap();
+        let doomed = loopback_listener().await;
+        let doomed_addr = doomed.sock.local_addr().unwrap();
+        let mut listeners = vec![survivor, doomed];
+
+        apply_dynamic_listener_diff(&mut listeners, Vec::new(), vec![doomed_addr]);
+
+        assert_eq!(listeners.len(), 1, "the removed address's listener must be dropped");
+        assert_eq!(listeners[0].sock.local_addr().unwrap(), survivor_addr);
+    }
+
+    /// A reconciliation pass must never release every listener at once — an
+    /// enumeration glitch that (incorrectly) reports every address gone must
+    /// not take the daemon off the air.
+    #[tokio::test]
+    async fn apply_dynamic_listener_diff_never_empties_the_listener_set() {
+        let only = loopback_listener().await;
+        let only_addr = only.sock.local_addr().unwrap();
+        let mut listeners = vec![only];
+
+        apply_dynamic_listener_diff(&mut listeners, Vec::new(), vec![only_addr]);
+
+        assert_eq!(listeners.len(), 1, "must refuse to drop the last listener");
     }
 }

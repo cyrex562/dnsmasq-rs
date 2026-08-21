@@ -934,6 +934,36 @@ pub struct Listener {
     pub iface:    Option<String>,
 }
 
+/// Take ownership of a `Listener`'s UDP socket as a `std::net::UdpSocket`,
+/// closing any TCP/TFTP descriptors it also carries.
+///
+/// Nothing downstream of this call serves TCP or TFTP on a dynamically
+/// created listener today, so those descriptors would otherwise leak; the
+/// `Listener` is consumed and never `release()`d, so this is the one place
+/// that takes responsibility for them.  Reports the address the kernel
+/// actually bound (falls back to the requested address if that lookup
+/// fails), matching what a bind of port 0 needs.
+#[cfg(unix)]
+pub fn listener_take_udp(mut l: Listener) -> std::io::Result<(std::net::UdpSocket, std::net::SocketAddr)> {
+    use std::os::unix::io::FromRawFd;
+
+    for fd in [std::mem::replace(&mut l.tcp_fd, -1), std::mem::replace(&mut l.tftp_fd, -1)] {
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+        }
+    }
+    if l.udp_fd < 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "listener has no UDP socket"));
+    }
+    // Safety: `create_listeners`/`create_listeners_checked` just returned this
+    // fd and we take sole ownership of it here; `l` is consumed and never
+    // reaches `release()`.
+    let sock = unsafe { std::net::UdpSocket::from_raw_fd(l.udp_fd) };
+    sock.set_nonblocking(true)?;
+    let addr = sock.local_addr().unwrap_or(l.addr);
+    Ok((sock, addr))
+}
+
 impl Listener {
     /// Decrement the use-counter.  When it reaches zero, close all open file
     /// descriptors and return `true`; otherwise return `false`.
@@ -1886,6 +1916,29 @@ impl ArrivalFilter {
         }
     }
 
+    /// Re-run interface enumeration and report which listen addresses newly
+    /// appeared or disappeared, for `--bind-dynamic` listener lifecycle.
+    ///
+    /// Mirrors the `OPT_CLEVERBIND` branch of `enumerate_interfaces()`
+    /// (`network.c:854-880`), which binds a listener for each newly-seen
+    /// address and releases the listener for each one no longer found.
+    /// A no-op (empty diff) outside `--bind-dynamic`: upstream only performs
+    /// this dance under `OPT_CLEVERBIND`, and `network.c:1240-1250` documents
+    /// that `--bind-interfaces` cannot track interface changes at all.
+    /// Failures leave the previous list in place, same as [`Self::refresh`].
+    pub fn refresh_dynamic(&mut self, port: u16) -> (Vec<std::net::SocketAddr>, Vec<std::net::SocketAddr>) {
+        if !self.cleverbind {
+            return (Vec::new(), Vec::new());
+        }
+        let fresh = match enumerate_allowed_interfaces(&mut self.check, &self.allowed) {
+            Ok(fresh) => fresh,
+            Err(_) => return (Vec::new(), Vec::new()),
+        };
+        let diff = diff_dynamic_interfaces(&self.interfaces, &fresh.interfaces, port);
+        self.interfaces = fresh.interfaces;
+        diff
+    }
+
     /// Decide whether a datagram that arrived on interface index `if_index`,
     /// addressed to `dest`, may be answered.
     ///
@@ -1938,6 +1991,27 @@ impl ArrivalFilter {
 ///
 /// Returns the number of records removed.
 ///
+/// Compute which listen addresses newly appeared or disappeared between two
+/// interface enumeration passes, keyed by [`IfaceRecord::listen_addr`].
+///
+/// Mirrors the `OPT_CLEVERBIND` branch of `enumerate_interfaces()`
+/// (`network.c:854-880`): an address in `after` but not `before` needs a new
+/// listener bound (`create_bound_listeners`); one in `before` but not `after`
+/// needs its listener released (`release_listener`).
+pub fn diff_dynamic_interfaces(
+    before: &[IfaceRecord],
+    after:  &[IfaceRecord],
+    port:   u16,
+) -> (Vec<std::net::SocketAddr>, Vec<std::net::SocketAddr>) {
+    let before_set: std::collections::HashSet<_> =
+        before.iter().map(|r| r.listen_addr(port)).collect();
+    let after_set: std::collections::HashSet<_> =
+        after.iter().map(|r| r.listen_addr(port)).collect();
+    let added   = after_set.difference(&before_set).cloned().collect();
+    let removed = before_set.difference(&after_set).cloned().collect();
+    (added, removed)
+}
+
 /// Mirrors `clean_interfaces()` in `network.c`.
 pub fn clean_interfaces(ifaces: &mut Vec<IfaceRecord>) -> usize {
     let before = ifaces.len();
@@ -1974,14 +2048,24 @@ pub fn parse_resolv_conf(text: &str, dns_port: u16) -> Vec<std::net::SocketAddr>
             Some(a) => a,
             None => continue,
         };
-        // Strip scope ID for IPv6 (e.g. "fe80::1%eth0" → "fe80::1")
-        let clean = if let Some(idx) = addr_str.find('%') {
-            &addr_str[..idx]
-        } else {
-            addr_str
+        // Split off the scope ID for IPv6 (e.g. "fe80::1%eth0" → "fe80::1", "eth0").
+        // network.c:1738-1745 resolves it via `if_nametoindex()` and stores it in
+        // `sin6_scope_id` rather than discarding it — without a scope a
+        // link-local resolver address is unroutable.
+        let (clean, scope) = match addr_str.find('%') {
+            Some(idx) => (&addr_str[..idx], Some(&addr_str[idx + 1..])),
+            None => (addr_str, None),
         };
         if let Ok(ip) = clean.parse::<std::net::IpAddr>() {
-            servers.push(std::net::SocketAddr::new(ip, dns_port));
+            match (ip, scope) {
+                (std::net::IpAddr::V6(v6), Some(scope)) => {
+                    let scope_id = nametoindex(scope);
+                    servers.push(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                        v6, dns_port, 0, scope_id,
+                    )));
+                }
+                _ => servers.push(std::net::SocketAddr::new(ip, dns_port)),
+            }
         }
     }
     servers
@@ -2447,6 +2531,81 @@ mod tests {
         );
         assert!(!filter.accepts(0, None));
         assert!(!filter.accepts(0, Some(IpAddr::V4(Ipv4Addr::LOCALHOST))));
+    }
+
+    // ── dynamic interface listener lifecycle (--bind-dynamic) ────────────────
+
+    /// Mirrors the `OPT_CLEVERBIND` branch of `enumerate_interfaces()`
+    /// (`network.c:854-880`): an address seen in `after` but not `before` must
+    /// be reported so a new listener can be bound for it, and one seen only in
+    /// `before` reported so its listener can be released.
+    #[test]
+    fn diff_dynamic_interfaces_detects_added_and_removed() {
+        let eth0 = IfaceRecord {
+            name: "eth0".into(),
+            addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            ..Default::default()
+        };
+        let eth1 = IfaceRecord {
+            name: "eth1".into(),
+            addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)),
+            ..Default::default()
+        };
+        let (added, removed) = diff_dynamic_interfaces(
+            std::slice::from_ref(&eth0),
+            std::slice::from_ref(&eth1),
+            53,
+        );
+        assert_eq!(added, vec![eth1.listen_addr(53)]);
+        assert_eq!(removed, vec![eth0.listen_addr(53)]);
+    }
+
+    #[test]
+    fn diff_dynamic_interfaces_empty_when_unchanged() {
+        let eth0 = IfaceRecord {
+            name: "eth0".into(),
+            addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            ..Default::default()
+        };
+        let (added, removed) = diff_dynamic_interfaces(
+            std::slice::from_ref(&eth0),
+            std::slice::from_ref(&eth0),
+            53,
+        );
+        assert!(added.is_empty());
+        assert!(removed.is_empty());
+    }
+
+    /// `--bind-interfaces` (not `--bind-dynamic`) must never report dynamic
+    /// listener changes — upstream only creates/releases listeners on the fly
+    /// for `OPT_CLEVERBIND` (network.c:854).
+    #[test]
+    fn arrival_filter_refresh_dynamic_noop_when_not_cleverbind() {
+        let mut filter = ArrivalFilter::new(
+            IfaceCheckConfig::default(),
+            IfaceAllowedConfig::default(),
+            Vec::new(),
+            /*cleverbind=*/false,
+        );
+        let (added, removed) = filter.refresh_dynamic(53);
+        assert!(added.is_empty());
+        assert!(removed.is_empty());
+    }
+
+    /// A live host's interfaces do not change between two calls a moment
+    /// apart, so a `--bind-dynamic` filter built from a fresh enumeration must
+    /// report no changes against itself.
+    #[test]
+    fn arrival_filter_refresh_dynamic_stable_when_nothing_changed() {
+        let mut check = IfaceCheckConfig::default();
+        let allowed = IfaceAllowedConfig::default();
+        let enumerated = enumerate_allowed_interfaces(&mut check, &allowed)
+            .expect("enumeration must succeed");
+        let mut filter =
+            ArrivalFilter::new(check, allowed, enumerated.interfaces, /*cleverbind=*/true);
+        let (added, removed) = filter.refresh_dynamic(53);
+        assert!(added.is_empty(), "unexpected additions: {added:?}");
+        assert!(removed.is_empty(), "unexpected removals: {removed:?}");
     }
 
     // ── listener socket creation ──────────────────────────────────────────────
@@ -3022,6 +3181,38 @@ mod tests {
         let text = "nameserver fe80::1%eth0\n";
         let servers = parse_resolv_conf(text, 53);
         assert_eq!(servers.len(), 1);
+    }
+
+    /// `network.c:1738-1745`: `reload_servers()` resolves the `%<iface>` scope
+    /// via `if_nametoindex()` and stores it in `sin6_scope_id`, not just
+    /// strips it — a link-local resolver is unroutable without it.
+    #[test]
+    fn parse_resolv_conf_ipv6_scope_resolves_interface_index() {
+        let lo_index = nametoindex("lo");
+        let text = "nameserver fe80::1%lo\n";
+        let servers = parse_resolv_conf(text, 53);
+        assert_eq!(servers.len(), 1);
+        match servers[0] {
+            std::net::SocketAddr::V6(v6) => {
+                assert_eq!(v6.scope_id(), lo_index);
+                assert_ne!(v6.scope_id(), 0, "loopback must resolve to a nonzero index");
+            }
+            other => panic!("expected an IPv6 address, got {other:?}"),
+        }
+    }
+
+    /// An unresolvable scope name must not make the whole line unparsable —
+    /// upstream's `if_nametoindex()` returns `0` for an unknown name and
+    /// still stores that as `sin6_scope_id`.
+    #[test]
+    fn parse_resolv_conf_ipv6_unknown_scope_resolves_to_zero() {
+        let text = "nameserver fe80::1%this-interface-does-not-exist\n";
+        let servers = parse_resolv_conf(text, 53);
+        assert_eq!(servers.len(), 1);
+        match servers[0] {
+            std::net::SocketAddr::V6(v6) => assert_eq!(v6.scope_id(), 0),
+            other => panic!("expected an IPv6 address, got {other:?}"),
+        }
     }
 
     #[test]

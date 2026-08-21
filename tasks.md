@@ -801,12 +801,22 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     (`forward.c` `send_from`); here the kernel picks the source by route lookup, which can
     differ on a multi-homed host. `forward::send_from` exists and is tested but has no
     caller.
-  - **`--bind-dynamic` does not actually re-bind.** Its arrival check is wired up (see
-    above), but the dynamic half is not: there is no netlink listener re-running
-    `create_bound_listeners` when an interface appears, and no
-    `RTM_NEWADDR`/`RTM_DELADDR` handling. `is_dad_listeners`/DAD-tentative deferral
-    (`network.c:1300`) is absent too, so an IPv6 address still in DAD is bound or skipped
-    by whatever `getifaddrs` reports rather than retried.
+  - **`--bind-dynamic` re-binds on a 1s poll, not on netlink events.** (Issue #39
+    follow-up) `run_forward_loop_on`'s existing per-second ticker now calls
+    `ArrivalFilter::refresh_dynamic`, which re-enumerates and diffs
+    (`network::diff_dynamic_interfaces`) against the previous pass; `forward.rs`'s
+    `apply_dynamic_listener_diff` binds a new listener for every newly-seen address
+    (`network::create_listeners_checked` → `network::listener_take_udp` →
+    `tokio::net::UdpSocket::from_std`) and drops the `DnsListener` for every address
+    that disappeared, refusing to empty the listener set in one pass. This is upstream's
+    `OPT_CLEVERBIND` branch of `enumerate_interfaces()` (`network.c:854-880`) by polling
+    rather than by `RTM_NEWADDR`/`RTM_DELADDR` — up to ~1s of lag versus upstream's
+    immediate netlink-driven rebind, and it still can't see an address change that
+    happens and reverts inside one tick. `is_dad_listeners`/DAD-tentative deferral
+    (`network.c:1300`) is still absent, so an IPv6 address still in DAD is bound or
+    skipped by whatever `getifaddrs` reports rather than retried. Covered by
+    `network::tests::diff_dynamic_interfaces_*`, `arrival_filter_refresh_dynamic_*`, and
+    `forward::tests::apply_dynamic_listener_diff_*`.
   - **IPv6 link-local addresses are never enumerated, so no link-local listener is bound.**
     `enumerate_interfaces()` goes through `if_addrs::get_if_addrs()`, which drops
     `fe80::/10` addresses; upstream's `iface_enumerate` reports them and
@@ -816,10 +826,12 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     `EINVAL` — so only the enumeration source has to change. Pinned by
     `enumeration_omits_ipv6_link_local_addresses` in
     `tests/listener_binding_integration.rs`, which fails once enumeration reports them.
-  - **The interface set is never garbage-collected.** `clean_interfaces` has no caller;
-    `ArrivalFilter::refresh` re-enumerates on a failed check (matching upstream's
-    `enumerate_interfaces(0)` retry) but nothing releases listeners for addresses that went
-    away (`release_listener`).
+  - **`clean_interfaces`/`Listener::release` (the bind-time types) still have no caller.**
+    The bind-dynamic reconciliation above operates on `forward::DnsListener` (the runtime,
+    tokio-socket representation used by `run_forward_loop_on`), not on the
+    `network::Listener`/`IfaceRecord` pair `clean_interfaces` and `Listener::release` were
+    written for — those stay dead code, reserved for whichever startup/reload path grows a
+    caller for the bind-time `Vec<Listener>` this runtime doesn't retain.
   - **`--local-service` (net) is not enforced.** `--local-service=host` works, because
     `option.rs` lowers it to a NULL-named `--interface` plus `OPT_NOWILD` as upstream does,
     and that path now reaches real listeners. Plain `--local-service` needs the
@@ -1050,9 +1062,21 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   each `--addn-hosts` file. `--resolv-file` entries are re-read and merged into
   `daemon.servers` as `SERV_FROM_RESOLV`-flagged entries, replacing only the
   previously-resolv-derived ones so explicit `--server=` entries survive.
+  (Issue #39 follow-up) That merge now goes through the same
+  `mark_servers`/`add_update_server`/`cleanup_servers` mark-and-sweep upstream's
+  `reload_servers()` uses (`network.c:1711,1766,1774`) instead of a blind
+  retain-then-rebuild, so a `Server` entry whose address survives a reload is
+  *reused* rather than replaced — its query statistics (`queries`,
+  `failed_queries`, ...) carry over across SIGHUP instead of resetting every time.
+  `parse_resolv_conf` also now resolves a `%<iface>` IPv6 scope via
+  `if_nametoindex()` into `sin6_scope_id` (`network.c:1738-1745`) instead of just
+  stripping it, and `source_addr` is built in the matching address family at
+  `--query-port` (previously always an IPv4 `0.0.0.0:0` dummy, even for an IPv6
+  server).
   Covered by `dnsmasq::tests::clear_cache_and_reload_*` / `on_sighup_*` (cache flush,
-  hosts reload, resolv reload, repeated-SIGHUP idempotency, explicit-server survival)
-  and `tests/forward_cache_integration.rs::sighup_reload_flushes_the_live_forward_cache`
+  hosts reload, resolv reload, repeated-SIGHUP idempotency, explicit-server survival,
+  query-stat survival across reload, IPv6 source-family correctness) and
+  `tests/forward_cache_integration.rs::sighup_reload_flushes_the_live_forward_cache`
   (drives the real `run_forward_loop_on` loop and confirms a cached answer is evicted).
 
   Deliberate simplifications, still open:
