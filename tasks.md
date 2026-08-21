@@ -1428,7 +1428,14 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   - `zone_status` (dnssec.c:1881-1956): walks a name toward a cached/configured
     trust anchor, then back down, exactly as upstream.
   - `dnssec_validate_by_ds` (dnssec.c:716-972): validates a DNSKEY RRset's
-    self-signature against a cached DS, caches the resulting zone-key DNSKEYs.
+    self-signature against a cached DS, then caches every protocol-3 DNSKEY in
+    the now-validated RRset — matching upstream's cache-insert loop
+    (dnssec.c:895-925) exactly, which does not re-check the zone-key flag at
+    that point (that flag only gates which key is *tried* against the DS, not
+    which keys get cached once the RRset as a whole validates). An earlier
+    version of this port over-restricted the cache-insert to zone-key-flagged
+    DNSKEYs only; fixed, with a regression test
+    (`dnssec_validate_by_ds_caches_non_zone_key_dnskeys_too`).
   - `dnssec_validate_ds` (dnssec.c:990-1179): validates/accepts a DS-query
     answer via `dnssec_validate_reply`, caches positive DS or a negative
     zone-cut/non-zone-cut proof. Not ported: the RFC-1918/`--bogus-priv` and
@@ -1451,6 +1458,14 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     RRset must share a single signer name — enforced here as part of the
     per-RRset validation loop (a mismatch is `Bogus`), rather than by changing
     `explore_rrset`'s own signature and risking existing callers/tests.
+    The CNAME-chain chase (a simplified single-target-by-name walk, not
+    upstream's index-bounded multi-target array — see "Still open" below) is
+    guarded by a `visited` set: a repeated name breaks the loop instead of
+    spinning forever on an attacker-supplied CNAME cycle
+    (`a -> b -> a`), falling through to the ordinary missing-answer
+    non-existence-proof path so a cyclic/unresolvable chain reports
+    `NeedDs`/`NeedKey`/`Bogus`, never `Secure`. Regression test:
+    `dnssec_validate_reply_cname_cycle_terminates`.
   - `setup_timestamp`/`timestamp_clock_now_sane` (dnssec.c:68-141): the pure
     decision logic (mtime vs now) is ported; the actual file stat/create/touch
     IO is deliberately left to the caller (see "Still open").
@@ -1473,6 +1488,20 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     ported; a DNAME reply without a literal matching CNAME RRset falls
     through to the ordinary CNAME-chase/non-existence-proof path instead of
     being pre-accepted.
+  - The CNAME-target-discovery step is a single-target-by-name chase (follow
+    `qname`'s CNAME chain one hop at a time, cycle-guarded by a `visited`
+    set) rather than upstream's index-bounded multi-target array
+    (dnssec.c:2038-2060, 2298-2325), which records *every* CNAME found in the
+    answer section and proves non-existence for each one still unresolved
+    after the RRset-validation loop. For a normal linear chain (A -> B -> C,
+    no branching) the two are equivalent — both end up proving non-existence
+    for the final unresolved name. They diverge for an answer with multiple,
+    independent unresolved CNAME targets (not just one chain): upstream
+    would check non-existence for each; this port only follows the one chain
+    rooted at `qname`. Not exploitable into a false `Secure` (a real branch
+    left unchecked would still need its own valid answer/proof to matter),
+    but it is a real behavioral simplification worth closing if the
+    multi-target case turns out to matter in practice.
   - The wildcard-replay re-check (dnssec.c:2271-2273: after a wildcard-expanded
     RRset validates, re-run `prove_non_existence` to rule out a replayed
     wildcard answer overlaying a genuine record) is not implemented —

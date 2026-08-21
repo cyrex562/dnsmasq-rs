@@ -1207,9 +1207,15 @@ pub fn dnssec_validate_by_ds(
 
             match result {
                 RrsetValidation::Secure { .. } => {
+                    // Cache every protocol-3 DNSKEY in the now-validated
+                    // RRset, matching upstream's cache loop (dnssec.c:895-925)
+                    // exactly — it does not re-check the zone-key flag here
+                    // (that check gates which key is *tried* against the DS
+                    // above, not which keys get cached once the RRset as a
+                    // whole validates).
                     for k in &rrset {
                         if let Ok(kd) = parse_dnskey_rdata(&k.rdata) {
-                            if kd.protocol == 3 && kd.flags & 0x0100 != 0 {
+                            if kd.protocol == 3 {
                                 cache.insert_dnskey(name, k.rdata.clone(), class);
                             }
                         }
@@ -1667,7 +1673,20 @@ pub fn dnssec_validate_reply(
     let mut target = norm_name(qname);
     let mut answered = false;
     if qtype != T_CNAME_Q && qtype != T_ANY {
+        // Bound the chase by the number of answer records: upstream builds
+        // its CNAME target list in a single index-bounded pass over ancount
+        // (dnssec.c:2038-2060), so it can never loop more times than there
+        // are records. A `visited` guard gives the same bound here and also
+        // rejects a same-name self-CNAME on the first hop.
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
         loop {
+            if !visited.insert(target.clone()) {
+                // Cycle: this name was already chased. Leave `target` as
+                // the (still unanswered) name where the cycle closed and
+                // fall through to the non-existence proof, which will fail
+                // and report Bogus rather than hang.
+                break;
+            }
             if answer.iter().any(|r| norm_name(&r.name) == target && r.rtype == qtype && r.class == qclass) {
                 answered = true;
                 break;
@@ -2887,6 +2906,92 @@ mod tests {
     }
 
     #[test]
+    fn dnssec_validate_by_ds_caches_non_zone_key_dnskeys_too() {
+        // Upstream's cache-insert loop (dnssec.c:895-925) caches every
+        // protocol-3 DNSKEY in a now-validated RRset, not just the ones with
+        // the zone-key flag set — that flag only gates which key is *tried*
+        // against the DS above, not which keys get cached once the RRset as
+        // a whole validates. A second (e.g. KSK-like) DNSKEY sharing the
+        // RRset with the DS-validated zone key must be cached too.
+        use p256::ecdsa::signature::Signer;
+        use p256::ecdsa::SigningKey;
+        use rand::rngs::OsRng;
+
+        let name = "example.com";
+        let class = 1u16;
+        const ALGO: u8 = 13;
+
+        let signing_key = SigningKey::random(&mut OsRng);
+        let zone_key_rdata = dnskey_rdata_for_ecdsa_p256(signing_key.verifying_key());
+        let key_tag = compute_key_tag(&zone_key_rdata);
+
+        let other_key = SigningKey::random(&mut OsRng);
+        let mut non_zone_key_rdata = dnskey_rdata_for_ecdsa_p256(other_key.verifying_key());
+        non_zone_key_rdata[0] = 0;
+        non_zone_key_rdata[1] = 0; // clear the zone-key flag; protocol stays 3
+
+        let mut sorted_rrset = vec![
+            make_typed_rr(name, 48, &zone_key_rdata),
+            make_typed_rr(name, 48, &non_zone_key_rdata),
+        ];
+        sort_rrset(&mut sorted_rrset);
+
+        let orig_ttl: u32 = 300;
+        let labels = count_labels(name) as u8;
+        let mut header = Vec::new();
+        header.extend_from_slice(&48u16.to_be_bytes()); // type_covered = DNSKEY
+        header.push(ALGO);
+        header.push(labels);
+        header.extend_from_slice(&orig_ttl.to_be_bytes());
+        header.extend_from_slice(&u32::MAX.to_be_bytes()); // expiry
+        header.extend_from_slice(&0u32.to_be_bytes());     // inception
+        header.extend_from_slice(&key_tag.to_be_bytes());
+
+        let wire_name = name_to_wire(name).unwrap();
+        let mut signed_data = Vec::new();
+        signed_data.extend_from_slice(&header);
+        signed_data.extend_from_slice(&wire_name); // signer
+        for rr in &sorted_rrset {
+            signed_data.extend_from_slice(&wire_name); // owner
+            signed_data.extend_from_slice(&48u16.to_be_bytes());
+            signed_data.extend_from_slice(&class.to_be_bytes());
+            signed_data.extend_from_slice(&orig_ttl.to_be_bytes());
+            signed_data.extend_from_slice(&(rr.rdata.len() as u16).to_be_bytes());
+            signed_data.extend_from_slice(&rr.rdata);
+        }
+
+        let signature: p256::ecdsa::Signature = signing_key.sign(&signed_data);
+        let mut rrsig_rdata = header;
+        rrsig_rdata.extend_from_slice(&wire_name);
+        rrsig_rdata.extend_from_slice(&signature.to_bytes());
+        let rrsig_rr = make_typed_rr(name, 46, &rrsig_rdata);
+
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&wire_name);
+        hasher.update(&zone_key_rdata);
+        let digest = hasher.finalize().to_vec();
+        let ds = DsData { key_tag, algorithm: ALGO, digest_type: 2, digest };
+
+        let mut cache = DnssecCache::new();
+        cache.insert_ds_positive(name, vec![(ds, class)]);
+
+        let records = vec![
+            make_typed_rr(name, 48, &zone_key_rdata),
+            make_typed_rr(name, 48, &non_zone_key_rdata),
+            rrsig_rr,
+        ];
+        let mut counter = 100i32;
+        let status = dnssec_validate_by_ds(&records, name, class, 500_000, &mut cache, &mut counter);
+
+        assert_eq!(status.code, StatCode::Secure, "expected Secure, got {status:?}");
+        let keys = cache.find_dnskeys(name, class);
+        assert_eq!(keys.len(), 2, "both the zone key and the non-zone-key DNSKEY must be cached, got {keys:?}");
+        assert!(keys.iter().any(|k| *k == zone_key_rdata.as_slice()));
+        assert!(keys.iter().any(|k| *k == non_zone_key_rdata.as_slice()));
+    }
+
+    #[test]
     fn dnssec_validate_by_ds_no_ds_cached_needs_ds() {
         let name = "example.com";
         let class = 1u16;
@@ -3280,6 +3385,46 @@ mod tests {
             500_000, &mut cache, &mut counter, false, None, DEFAULT_NSEC3_ITERS_LIMIT,
         );
         assert_eq!(status.code, StatCode::Bogus, "corrupted signature must not validate, got {status:?}");
+    }
+
+    #[test]
+    fn dnssec_validate_reply_cname_cycle_terminates() {
+        // A crafted answer with a two-hop CNAME cycle (a -> b -> a) and no
+        // record of the queried type anywhere must not hang the CNAME-chase
+        // loop; it must terminate and report Bogus (no proof of non-existence
+        // for the still-unanswered target).
+        let zone = "example.com";
+        let class = 1u16;
+        let (signing_key, key_tag, mut cache) = setup_trusted_zone(zone, class);
+
+        let a_name = "a.example.com";
+        let b_name = "b.example.com";
+        let a_target = name_to_wire(b_name).unwrap();
+        let b_target = name_to_wire(a_name).unwrap();
+        let (a_cname_rr, a_cname_sig_rr) =
+            sign_single_rr(&signing_key, a_name, 5 /* CNAME */, class, &a_target, zone, key_tag, 300);
+        let (b_cname_rr, b_cname_sig_rr) =
+            sign_single_rr(&signing_key, b_name, 5, class, &b_target, zone, key_tag, 300);
+
+        let answer = vec![a_cname_rr, a_cname_sig_rr, b_cname_rr, b_cname_sig_rr];
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut counter = 1000i32;
+            let status = dnssec_validate_reply(
+                &answer, &[], a_name, 1 /* A */, class, 0 /* NOERROR */,
+                500_000, &mut cache, &mut counter, false, None, DEFAULT_NSEC3_ITERS_LIMIT,
+            );
+            let _ = tx.send(status);
+        });
+        let status = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("dnssec_validate_reply hung chasing a cyclic CNAME chain");
+        // The cycle breaks the chase with the query unanswered; since there's
+        // no cached DS info for a.example.com specifically, zone_status can't
+        // yet tell whether it's secure, so this comes back NeedDs (asking the
+        // caller to fetch one) rather than Bogus — but it must never come
+        // back Secure, and (checked above) it must terminate at all.
+        assert_ne!(status.code, StatCode::Secure, "cyclic CNAME chain with no answer must never validate as Secure, got {status:?}");
     }
 
     #[test]
