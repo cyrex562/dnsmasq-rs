@@ -603,6 +603,8 @@ fn normalize_config(daemon: &mut Daemon) -> Result<(), ConfigError> {
     apply_dhcp_leasefile_default(daemon);
     #[cfg(feature = "dhcp6")]
     apply_doing_ra_default(daemon);
+    #[cfg(feature = "tftp")]
+    apply_tftp_defaults(daemon);
     validate_auth_config(daemon)?;
     Ok(())
 }
@@ -622,6 +624,17 @@ fn apply_doing_ra_default(daemon: &mut Daemon) {
         if context.flags & CONTEXT_RA != 0 {
             daemon.doing_ra = true;
         }
+    }
+}
+
+/// Fill in `tftp_max` when unset, mirroring `dnsmasq.c`'s
+/// `daemon->tftp_max = TFTP_MAX_CONNECTIONS;` default-assignment at startup
+/// (option.c:5979) — without this, `--tftp-max` left unset would read as `0`
+/// simultaneous transfers allowed, rather than "no explicit limit given".
+#[cfg(feature = "tftp")]
+fn apply_tftp_defaults(daemon: &mut Daemon) {
+    if daemon.tftp_max == 0 {
+        daemon.tftp_max = crate::tftp::TFTP_MAX_CONNECTIONS_DEFAULT;
     }
 }
 

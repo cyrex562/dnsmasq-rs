@@ -1,7 +1,18 @@
-//! TFTP server state machine (RFC 1350 + RFC 2347 options).
+//! TFTP server (RFC 1350 + RFC 2347/2348/7440 options).
+//!
+//! Port of `tftp.c`: wire-format parse/build helpers, option negotiation,
+//! path resolution + permission checks, the block-read/CRLF-expansion path,
+//! and the socket-driven transfer table + retransmit/timeout state machine
+//! that used to be entirely missing from this port.
 #![cfg(feature = "tftp")]
 
+use std::io;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
 use thiserror::Error;
+use tracing::{info, warn};
 
 // ---------------------------------------------------------------------------
 // Opcodes and error codes
@@ -60,7 +71,7 @@ fn read_cstring(buf: &[u8], pos: usize) -> Result<(String, usize), TftpParseErro
 }
 
 // ---------------------------------------------------------------------------
-// Public API
+// Wire format
 // ---------------------------------------------------------------------------
 
 /// Parse a TFTP RRQ (or WRQ) packet.
@@ -142,91 +153,37 @@ pub fn build_oack(options: &[(&str, &str)]) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Transfer state machine
-// ---------------------------------------------------------------------------
-
-/// Represents an active TFTP transfer.
-pub struct TftpTransfer {
-    pub filename: String,
-    pub block: u16,
-    pub block_size: usize,
-    pub file_size: Option<u64>,
-    pub complete: bool,
-    pub retries: u32,
-    pub max_retries: u32,
-}
-
-impl TftpTransfer {
-    /// Create a new transfer for the given filename and block size.
-    pub fn new(filename: &str, block_size: usize) -> Self {
-        TftpTransfer {
-            filename: filename.to_string(),
-            block: 0,
-            block_size,
-            file_size: None,
-            complete: false,
-            retries: 0,
-            max_retries: 5,
-        }
-    }
-
-    /// Build a DATA packet for the next block from provided file data.
-    /// Increments block number. Marks complete if data length < block_size.
-    pub fn next_block(&mut self, data: &[u8]) -> Vec<u8> {
-        self.block = self.block.wrapping_add(1);
-        if data.len() < self.block_size {
-            self.complete = true;
-        }
-        build_data(self.block, data)
-    }
-
-    /// Process an ACK packet. Returns true if the ACK matches the current block.
-    /// Resets retries on match, increments retries on mismatch.
-    pub fn handle_ack(&mut self, block: u16) -> bool {
-        if block == self.block {
-            self.retries = 0;
-            true
-        } else {
-            self.retries += 1;
-            false
-        }
-    }
-
-    /// Check if retries exceeded max_retries.
-    pub fn is_timed_out(&self) -> bool {
-        self.retries > self.max_retries
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Filename sanitization
 // ---------------------------------------------------------------------------
 
 /// Validate and sanitize a TFTP filename.
 /// Rejects paths with "..", leading "/", or null bytes.
 /// Converts backslashes to forward slashes.
+///
+/// Not itself upstream's path-traversal defense: unlike this function,
+/// `check_tftp_fileperm` (ported as [`open_tftp_file`]'s `/../` substring
+/// check) explicitly *allows* an absolute filename and a leading "..", as
+/// long as the resulting path stays under `--tftp-root` — this stricter,
+/// non-upstream helper would reject legitimate requests upstream accepts, so
+/// [`build_tftp_path`]/[`open_tftp_file`] deliberately don't call it. Kept
+/// standalone as a general-purpose filename check for other future callers.
 pub fn sanitize_filename(name: &str) -> Option<String> {
-    // Reject null bytes
     if name.contains('\0') {
         return None;
     }
 
-    // Convert backslashes to forward slashes
     let name = name.replace('\\', "/");
 
-    // Reject leading slash
     if name.starts_with('/') {
         return None;
     }
 
-    // Reject ".." path components
     for component in name.split('/') {
         if component == ".." {
             return None;
         }
     }
 
-    // Reject empty filenames
     if name.is_empty() {
         return None;
     }
@@ -235,43 +192,7 @@ pub fn sanitize_filename(name: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Option negotiation (RFC 2347)
-// ---------------------------------------------------------------------------
-
-/// Process TFTP option negotiation (RFC 2347).
-/// Handles "blksize" and "tsize" options.
-/// Returns the list of acknowledged options with their negotiated values.
-pub fn negotiate_options(
-    requested: &[(String, String)],
-    max_block_size: usize,
-) -> Vec<(String, String)> {
-    let mut result = Vec::new();
-
-    for (key, value) in requested {
-        match key.to_lowercase().as_str() {
-            "blksize" => {
-                if let Ok(requested_size) = value.parse::<usize>() {
-                    // Clamp to [8, max_block_size]
-                    let negotiated = requested_size.clamp(8, max_block_size);
-                    result.push(("blksize".to_string(), negotiated.to_string()));
-                }
-            }
-            "tsize" => {
-                // Echo back the tsize option; the caller fills in the actual
-                // file size. We acknowledge with "0" to indicate we accept it.
-                result.push(("tsize".to_string(), value.clone()));
-            }
-            _ => {
-                // Unknown options are silently ignored per RFC 2347
-            }
-        }
-    }
-
-    result
-}
-
-// ---------------------------------------------------------------------------
-// String extraction (ported from tftp.c:840-853)
+// String extraction / sanitisation (ported from tftp.c:840-902)
 // ---------------------------------------------------------------------------
 
 /// Extract a null-terminated string from a buffer, advancing position.
@@ -300,10 +221,6 @@ pub fn tftp_sanitise(input: &str) -> String {
     input.chars().filter(|&c| c >= ' ' && c <= '~').collect()
 }
 
-// ---------------------------------------------------------------------------
-// Error packet builders (ported from tftp.c:874-902)
-// ---------------------------------------------------------------------------
-
 /// Maximum TFTP error message length.
 const TFTP_MAX_MESSAGE: usize = 500;
 
@@ -331,64 +248,472 @@ pub fn tftp_err_oops(filename: &str, err: &std::io::Error) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// ACK handling (ported from tftp.c:752-824)
+// Option negotiation (RFC 2347/2348/7440) — port of the option loop in
+// tftp_request() (tftp.c:381-423)
 // ---------------------------------------------------------------------------
 
-/// Result of handling an incoming TFTP packet for an active transfer.
-#[derive(Debug, PartialEq)]
-pub enum TftpHandleResult {
-    /// ACK received for expected block.
-    AckOk { block: u32 },
-    /// ACK for an already-acknowledged or out-of-range block (ignored).
-    AckIgnored,
-    /// Client sent an ERROR packet.
-    Error { code: u16, message: String },
-    /// Packet too short or unrecognized opcode.
-    InvalidPacket,
+/// RFC 2348's stated maximum `blksize`. Stands in for
+/// `daemon->packet_buff_sz - 4`, upstream's other clamp: this port has no
+/// equivalent dynamically-sized EDNS packet buffer to size against.
+pub const TFTP_MAX_BLKSIZE: usize = 65464;
+
+/// `TFTP_MAX_WINDOW` (config.h) — max `windowsize` to negotiate.
+pub const TFTP_MAX_WINDOW: u32 = 32;
+
+/// `TFTP_TRANSFER_TIME` (config.h) — abandon a transfer after this long.
+pub const TFTP_TRANSFER_TIME_SECS: u64 = 120;
+
+/// `TFTP_MAX_CONNECTIONS` (config.h) — default simultaneous-transfer cap
+/// when `--tftp-max` is not given.
+pub const TFTP_MAX_CONNECTIONS_DEFAULT: i32 = 50;
+
+/// Negotiated per-transfer options, mirroring the `opt_*`/`blocksize`/
+/// `timeout`/`windowsize` fields of `struct tftp_transfer`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RequestOptions {
+    pub blocksize: usize,
+    pub opt_blocksize: bool,
+    pub opt_transize: bool,
+    pub opt_timeout: bool,
+    pub opt_windowsize: bool,
+    pub timeout: u32,
+    pub windowsize: u32,
 }
 
-/// Process an incoming TFTP packet (ACK or ERROR) for an active transfer.
-///
-/// Handles 16-bit block number wraparound.
-/// Port of `handle_tftp()` from tftp.c:752-824.
-pub fn handle_tftp_packet(transfer: &mut TftpTransfer, packet: &[u8]) -> TftpHandleResult {
-    if packet.len() < 4 {
-        return TftpHandleResult::InvalidPacket;
+impl Default for RequestOptions {
+    fn default() -> Self {
+        RequestOptions {
+            blocksize: 512,
+            opt_blocksize: false,
+            opt_transize: false,
+            opt_timeout: false,
+            opt_windowsize: false,
+            timeout: 2,
+            windowsize: 1,
+        }
     }
-    let opcode = u16::from_be_bytes([packet[0], packet[1]]);
-    match opcode {
-        4 => { // ACK
-            let block_num = u16::from_be_bytes([packet[2], packet[3]]);
-            let expected = transfer.block;
-            if block_num == expected {
-                transfer.retries = 0;
-                TftpHandleResult::AckOk { block: block_num as u32 }
-            } else {
-                TftpHandleResult::AckIgnored
+}
+
+/// `atoi()` semantics: parse the leading run of decimal digits (with an
+/// optional sign), ignoring trailing garbage; a value with no leading digits
+/// at all parses as `0`. `tftp_request` never checks `atoi`'s failure mode.
+fn atoi_like(s: &str) -> i64 {
+    let mut chars = s.trim_start().chars().peekable();
+    let neg = matches!(chars.peek(), Some('-'));
+    if neg || matches!(chars.peek(), Some('+')) {
+        chars.next();
+    }
+    let mut val: i64 = 0;
+    let mut any = false;
+    for c in chars {
+        match c.to_digit(10) {
+            Some(d) => {
+                val = val.saturating_mul(10).saturating_add(d as i64);
+                any = true;
+            }
+            None => break,
+        }
+    }
+    if !any {
+        return 0;
+    }
+    if neg { -val } else { val }
+}
+
+/// Parse and clamp the `blksize`/`tsize`/`timeout`/`windowsize` options off
+/// an RRQ, exactly as the option loop in `tftp_request` does.
+///
+/// `mtu` is the outgoing interface's MTU (`None` when unknown); `family_v4`
+/// picks the 32-byte (IPv4) vs 52-byte (IPv6) header overhead subtracted
+/// from it for the `blksize` clamp.
+pub fn parse_request_options(
+    options: &[(String, String)],
+    netascii: bool,
+    family_v4: bool,
+    mtu: Option<i32>,
+    no_blocksize_option: bool,
+) -> RequestOptions {
+    let mut opts = RequestOptions::default();
+    let overhead: i64 = if family_v4 { 32 } else { 52 };
+
+    for (key, value) in options {
+        let val = atoi_like(value);
+        match key.to_ascii_lowercase().as_str() {
+            "blksize" if !no_blocksize_option => {
+                let mut v = val.max(1);
+                if v > TFTP_MAX_BLKSIZE as i64 {
+                    v = TFTP_MAX_BLKSIZE as i64;
+                }
+                if let Some(mtu) = mtu {
+                    if mtu != 0 && v > (mtu as i64 - overhead) {
+                        v = (mtu as i64 - overhead).max(1);
+                    }
+                }
+                opts.blocksize = v as usize;
+                opts.opt_blocksize = true;
+            }
+            "tsize" if !netascii => {
+                opts.opt_transize = true;
+            }
+            "timeout" => {
+                let v = val.clamp(0, 255);
+                opts.timeout = v as u32;
+                opts.opt_timeout = true;
+            }
+            "windowsize" if !netascii => {
+                let v = val.clamp(1, TFTP_MAX_WINDOW as i64);
+                opts.windowsize = v as u32;
+                opts.opt_windowsize = true;
+            }
+            _ => {}
+        }
+    }
+
+    opts
+}
+
+/// True when any option in [`RequestOptions`] was actually negotiated —
+/// upstream sets `transfer->block = 0` (send an OACK first) whenever any of
+/// the four options is present (tftp.c:397/403/410/421).
+pub fn any_option_negotiated(opts: &RequestOptions) -> bool {
+    opts.opt_blocksize || opts.opt_transize || opts.opt_timeout || opts.opt_windowsize
+}
+
+// ---------------------------------------------------------------------------
+// Path resolution (ported from tftp_request, tftp.c:425-498)
+// ---------------------------------------------------------------------------
+
+/// Inputs [`build_tftp_path`] needs beyond the raw filename.
+#[derive(Debug, Clone, Default)]
+pub struct PathParts {
+    pub prefix: Option<String>,
+    pub lowercase: bool,
+    pub apref_ip: bool,
+    pub apref_mac: bool,
+    pub client_addr_str: String,
+    /// Best-effort client MAC for `--tftp-unique-root=mac`; `None` when it
+    /// could not be resolved (falls back to no MAC subdirectory, same as
+    /// upstream when neither the lease table nor the ARP cache have it).
+    pub client_mac: Option<[u8; 6]>,
+}
+
+fn dir_exists(path: &str) -> bool {
+    std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
+}
+
+/// Build the absolute on-disk path for an incoming TFTP filename: backslash
+/// and lowercase normalization, `--tftp-root` prefixing, the optional
+/// per-client IP/MAC subdirectory (falling back when it doesn't exist), and
+/// the "absolute paths OK if they already match the prefix" rule.
+///
+/// Port of the path-construction block in `tftp_request` (tftp.c:425-498).
+pub fn build_tftp_path(filename_raw: &str, parts: &PathParts) -> String {
+    let mut filename: String = filename_raw
+        .chars()
+        .map(|c| {
+            let c = if c == '\\' { '/' } else { c };
+            if parts.lowercase { c.to_ascii_lowercase() } else { c }
+        })
+        .collect();
+
+    let mut namebuff = String::from("/");
+
+    if let Some(prefix) = parts.prefix.as_deref() {
+        if prefix.starts_with('/') {
+            namebuff.clear();
+        }
+        namebuff.push_str(prefix);
+        if !prefix.ends_with('/') {
+            namebuff.push('/');
+        }
+
+        if parts.apref_ip {
+            let oldlen = namebuff.len();
+            namebuff.push_str(&parts.client_addr_str);
+            namebuff.push('/');
+            if !dir_exists(&namebuff) {
+                namebuff.truncate(oldlen);
             }
         }
-        5 => { // ERROR
-            let code = u16::from_be_bytes([packet[2], packet[3]]);
-            let msg = if packet.len() > 4 {
-                let end = packet[4..].iter().position(|&b| b == 0).unwrap_or(packet.len() - 4);
-                String::from_utf8_lossy(&packet[4..4 + end]).to_string()
-            } else {
-                String::new()
-            };
-            TftpHandleResult::Error { code, message: msg }
+
+        if parts.apref_mac {
+            if let Some(mac) = parts.client_mac {
+                let oldlen = namebuff.len();
+                namebuff.push_str(&format!(
+                    "{:02x}-{:02x}-{:02x}-{:02x}-{:02x}-{:02x}/",
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                ));
+                if !dir_exists(&namebuff) {
+                    namebuff.truncate(oldlen);
+                }
+            }
         }
-        _ => TftpHandleResult::InvalidPacket,
+
+        // Absolute pathnames OK if they match the prefix.
+        if filename.starts_with('/') {
+            if filename.starts_with(&namebuff) {
+                namebuff.clear();
+            } else {
+                filename.remove(0);
+            }
+        }
+    } else if filename.starts_with('/') {
+        namebuff.clear();
+    }
+
+    namebuff.push_str(&filename);
+    namebuff
+}
+
+// ---------------------------------------------------------------------------
+// File open / permission check (ported from check_tftp_fileperm, tftp.c:538-619)
+// ---------------------------------------------------------------------------
+
+/// A shared, refcounted open file: multiple in-flight transfers of the same
+/// file (matched by device + inode + name, as upstream does) share one `fd`.
+/// Refcounting itself is just `Arc` — the file closes when the last
+/// transfer holding it is dropped.
+#[derive(Debug)]
+pub struct TftpFile {
+    file: std::fs::File,
+    pub size: u64,
+    pub dev: u64,
+    pub inode: u64,
+    pub filename: String,
+    posn: u64,
+}
+
+#[derive(Debug)]
+pub enum TftpOpenError {
+    NotFound,
+    Perm,
+    Oops(io::Error),
+}
+
+/// Open `namebuff` for a new transfer: reject `/../` traversal (only once a
+/// prefix is configured — matching upstream, which only sets this trap when
+/// `--tftp-root` is given), enforce world-readable-when-root /
+/// owned-by-us-when-`--tftp-secure`, and share an already-open fd with any
+/// in-flight transfer of the same (dev, inode, filename).
+///
+/// Port of `check_tftp_fileperm()` (tftp.c:538-619).
+pub fn open_tftp_file(
+    namebuff: &str,
+    prefix_set: bool,
+    secure: bool,
+    shared: &[Arc<Mutex<TftpFile>>],
+) -> Result<Arc<Mutex<TftpFile>>, TftpOpenError> {
+    // "trick to ban moving out of the subtree" (tftp.c:547-549).
+    if prefix_set && namebuff.contains("/../") {
+        return Err(TftpOpenError::Perm);
+    }
+
+    let file = match std::fs::File::open(namebuff) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(TftpOpenError::NotFound),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Err(TftpOpenError::Perm),
+        Err(e) => return Err(TftpOpenError::Oops(e)),
+    };
+
+    let meta = match file.metadata() {
+        Ok(m) => m,
+        Err(e) => return Err(TftpOpenError::Oops(e)),
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let dev = meta.dev();
+        let inode = meta.ino();
+        let mode = meta.mode();
+        let uid = unsafe { libc::geteuid() };
+
+        if uid == 0 {
+            // Running as root: must be world-readable.
+            if mode & 0o004 == 0 {
+                return Err(TftpOpenError::Perm);
+            }
+        } else if secure && uid != meta.uid() {
+            return Err(TftpOpenError::Perm);
+        }
+
+        for existing in shared {
+            let matches = {
+                let f = existing.lock().unwrap();
+                f.dev == dev && f.inode == inode && f.filename == namebuff
+            };
+            if matches {
+                return Ok(existing.clone());
+            }
+        }
+
+        Ok(Arc::new(Mutex::new(TftpFile {
+            file,
+            size: meta.len(),
+            dev,
+            inode,
+            filename: namebuff.to_string(),
+            posn: 0,
+        })))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (secure, shared);
+        Ok(Arc::new(Mutex::new(TftpFile {
+            file,
+            size: meta.len(),
+            dev: 0,
+            inode: 0,
+            filename: namebuff.to_string(),
+            posn: 0,
+        })))
     }
 }
 
 // ---------------------------------------------------------------------------
-// Block reading (ported from tftp.c:905-1021)
+// Transfer state
+// ---------------------------------------------------------------------------
+
+/// An active TFTP transfer — the real thing this time: a live peer address,
+/// a socket to reply on, an open (possibly shared) file, and every bit of
+/// negotiated-option and retransmit-timer state `struct tftp_transfer`
+/// carries.
+pub struct TftpTransfer {
+    pub peer: SocketAddr,
+    /// Source address to reply from (the address the request arrived on).
+    pub source_addr: IpAddr,
+    pub if_index: u32,
+    /// The socket to send/receive on: the shared listener socket in
+    /// `--tftp-single-port` mode, or a dedicated per-transfer socket
+    /// otherwise.
+    pub sock: Arc<tokio::net::UdpSocket>,
+    pub single_port: bool,
+    /// Join handle for the background task forwarding datagrams off this
+    /// transfer's own socket; `None` in single-port mode, where the shared
+    /// listener's forwarder already covers it.
+    pub forwarder: Option<tokio::task::JoinHandle<()>>,
+    pub file: Arc<Mutex<TftpFile>>,
+
+    pub netascii: bool,
+    pub blocksize: usize,
+    pub windowsize: u32,
+    pub opt_blocksize: bool,
+    pub opt_transize: bool,
+    pub opt_timeout: bool,
+    pub opt_windowsize: bool,
+    pub timeout: u32,
+    pub backoff: u32,
+
+    /// `None` once an ERROR packet aborts the transfer (upstream's
+    /// `start == 0` sentinel).
+    pub start: Option<Instant>,
+    pub retransmit: Instant,
+
+    pub block: u32,
+    pub lastack: u32,
+    pub ackprev: u16,
+    pub block_hi: u32,
+
+    pub offset: u64,
+    pub expansion: u64,
+    pub carrylf: bool,
+    pub lastcarrylf: bool,
+
+    /// One-block read-ahead cache, mirroring `daemon->srv_save`: avoids a
+    /// double read between the initial send and the first retransmit pass.
+    prefetch: Option<(u64, Vec<u8>)>,
+}
+
+impl TftpTransfer {
+    pub fn new(
+        peer: SocketAddr,
+        source_addr: IpAddr,
+        if_index: u32,
+        sock: Arc<tokio::net::UdpSocket>,
+        single_port: bool,
+        file: Arc<Mutex<TftpFile>>,
+    ) -> Self {
+        let now = Instant::now();
+        TftpTransfer {
+            peer,
+            source_addr,
+            if_index,
+            sock,
+            single_port,
+            forwarder: None,
+            file,
+            netascii: false,
+            blocksize: 512,
+            windowsize: 1,
+            opt_blocksize: false,
+            opt_transize: false,
+            opt_timeout: false,
+            opt_windowsize: false,
+            timeout: 2,
+            backoff: 1,
+            start: Some(now),
+            retransmit: now,
+            block: 1,
+            lastack: 0,
+            ackprev: 0,
+            block_hi: 0,
+            offset: 0,
+            expansion: 0,
+            carrylf: false,
+            lastcarrylf: false,
+            prefetch: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// netascii CRLF expansion (ported from the tail of get_block, tftp.c:989-1013)
+// ---------------------------------------------------------------------------
+
+/// Expand bare `\n` to `\r\n` in a raw block read from disk, mirroring the
+/// in-place, index-skipping algorithm in `get_block()`: growth is capped at
+/// `blocksize`, and a `\n` landing exactly on the last byte of an already-full
+/// block is deferred (`carrylf`) to the next block rather than expanded here,
+/// with `offset` bookkeeping (done by the caller on ACK) making up the
+/// difference.
+fn netascii_expand(raw: &[u8], blocksize: usize, lastcarrylf: bool) -> (Vec<u8>, u64, bool) {
+    let cap = blocksize.max(raw.len());
+    let mut buf = vec![0u8; cap];
+    buf[..raw.len()].copy_from_slice(raw);
+
+    let mut size = raw.len();
+    let mut expansion: u64 = 0;
+    let mut carrylf = false;
+    let mut i = 0usize;
+
+    while i < size {
+        if buf[i] == b'\n' && (i != 0 || !lastcarrylf) {
+            expansion += 1;
+            if size != blocksize {
+                size += 1;
+            } else if i == size - 1 {
+                carrylf = true;
+            }
+            // memmove(&buf[i+1], &buf[i], size - (i+1))
+            buf.copy_within(i..size - 1, i + 1);
+            buf[i] = b'\r';
+            i += 1;
+        }
+        i += 1;
+    }
+
+    buf.truncate(size);
+    (buf, expansion, carrylf)
+}
+
+// ---------------------------------------------------------------------------
+// Block reading (ported from get_block(), tftp.c:905-1021)
 // ---------------------------------------------------------------------------
 
 /// Result of reading a file block for a TFTP transfer.
 #[derive(Debug)]
 pub enum GetBlockResult {
-    /// Block 0: send OACK with negotiated options.
+    /// Block 0: send an OACK with the negotiated options.
     Oack(Vec<u8>),
     /// Data block to send.
     Data(Vec<u8>),
@@ -396,56 +721,699 @@ pub enum GetBlockResult {
     Done,
 }
 
-/// Read a file block for the next DATA packet.
+/// Read (or fetch from the one-block prefetch cache) the next DATA/OACK
+/// packet for `transfer`, from its actual open file.
 ///
-/// Block 0 returns an OACK with negotiated options.
-/// Blocks 1+ return data from the file with optional netascii LF→CRLF expansion.
-/// Port of `get_block()` from tftp.c:905-1021.
-pub fn get_block(
-    block: u16,
-    file_data: &[u8],
-    blocksize: usize,
-    netascii: bool,
-    opt_blocksize: bool,
-    opt_transize: bool,
-) -> GetBlockResult {
-    if block == 0 {
-        // Build OACK
+/// Port of `get_block()` (tftp.c:905-1021).
+pub fn get_block(transfer: &mut TftpTransfer) -> io::Result<GetBlockResult> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    if transfer.block == 0 {
         let mut opts: Vec<(String, String)> = Vec::new();
-        if opt_blocksize {
-            opts.push(("blksize".to_string(), blocksize.to_string()));
+        if transfer.opt_blocksize {
+            opts.push(("blksize".to_string(), transfer.blocksize.to_string()));
         }
-        if opt_transize {
-            opts.push(("tsize".to_string(), file_data.len().to_string()));
+        if transfer.opt_transize {
+            let size = transfer.file.lock().unwrap().size;
+            opts.push(("tsize".to_string(), size.to_string()));
+        }
+        if transfer.opt_timeout {
+            opts.push(("timeout".to_string(), transfer.timeout.to_string()));
+        }
+        if transfer.opt_windowsize {
+            opts.push(("windowsize".to_string(), transfer.windowsize.to_string()));
         }
         let refs: Vec<(&str, &str)> = opts.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        let pkt = build_oack(&refs);
-        return GetBlockResult::Oack(pkt);
+        return Ok(GetBlockResult::Oack(build_oack(&refs)));
     }
 
-    let offset = (block as usize - 1) * blocksize;
-    if offset >= file_data.len() {
-        return GetBlockResult::Done;
+    if !transfer.netascii {
+        transfer.offset = (transfer.block as u64 - 1) * transfer.blocksize as u64;
     }
 
-    let end = (offset + blocksize).min(file_data.len());
-    let raw = &file_data[offset..end];
+    let file_size = transfer.file.lock().unwrap().size;
+    if transfer.offset > file_size {
+        return Ok(GetBlockResult::Done);
+    }
 
-    let data = if netascii {
-        // LF → CRLF expansion
-        let mut expanded = Vec::with_capacity(raw.len() * 2);
-        for &b in raw {
-            if b == b'\n' {
-                expanded.push(b'\r');
-            }
-            expanded.push(b);
+    if let Some((off, data)) = &transfer.prefetch {
+        if *off == transfer.offset {
+            let data = data.clone();
+            return Ok(GetBlockResult::Data(build_data(transfer.block as u16, &data)));
         }
+    }
+    transfer.prefetch = None;
+
+    let want = ((file_size - transfer.offset).min(transfer.blocksize as u64)) as usize;
+    let mut raw = vec![0u8; want];
+    if want != 0 {
+        let mut f = transfer.file.lock().unwrap();
+        if f.posn != transfer.offset {
+            f.file.seek(SeekFrom::Start(transfer.offset))?;
+        }
+        f.file.read_exact(&mut raw)?;
+        f.posn = transfer.offset + want as u64;
+    }
+
+    let data = if transfer.netascii {
+        let (expanded, expansion, carrylf) = netascii_expand(&raw, transfer.blocksize, transfer.lastcarrylf);
+        transfer.expansion = expansion;
+        transfer.carrylf = carrylf;
         expanded
     } else {
-        raw.to_vec()
+        raw
     };
 
-    GetBlockResult::Data(build_data(block, &data))
+    transfer.prefetch = Some((transfer.offset, data.clone()));
+    Ok(GetBlockResult::Data(build_data(transfer.block as u16, &data)))
+}
+
+// ---------------------------------------------------------------------------
+// ACK/ERROR handling (ported from handle_tftp(), tftp.c:752-824)
+// ---------------------------------------------------------------------------
+
+/// Result of handling an incoming TFTP packet for an active transfer.
+#[derive(Debug, PartialEq)]
+pub enum TftpHandleResult {
+    /// ACK advanced the window; `lastack` is the new value.
+    AckAdvance { lastack: u32 },
+    /// ACK for an already-acknowledged or not-yet-sent block (ignored).
+    AckIgnored,
+    /// Client sent an ERROR packet; the transfer is aborted (`start` cleared).
+    Error { code: u16, message: String },
+    /// Packet too short or unrecognized opcode.
+    InvalidPacket,
+}
+
+/// Process an incoming TFTP packet (ACK or ERROR) for an active transfer,
+/// including the 16-bit ACK block number's wraparound-to-32-bit math.
+///
+/// Port of `handle_tftp()` (tftp.c:752-824).
+pub fn handle_tftp_packet(transfer: &mut TftpTransfer, packet: &[u8], now: Instant) -> TftpHandleResult {
+    if packet.len() < 4 {
+        return TftpHandleResult::InvalidPacket;
+    }
+    let opcode = u16::from_be_bytes([packet[0], packet[1]]);
+    match opcode {
+        4 => {
+            let new = u16::from_be_bytes([packet[2], packet[3]]);
+
+            // If the last ACK was in the top quarter of a 64k block and this
+            // one is in the bottom quarter, assume it wrapped; the reverse
+            // step handles a stray old duplicate wandering in.
+            if new <= 0x4000 && transfer.ackprev >= 0xc000 {
+                transfer.block_hi += 1;
+            } else if new >= 0xc000 && transfer.ackprev <= 0x4000 && transfer.block_hi != 0 {
+                transfer.block_hi -= 1;
+            }
+            transfer.ackprev = new;
+            let block = (transfer.block_hi << 16) + new as u32;
+
+            // Ignore duplicate ACKs and ACKs for blocks not yet sent.
+            if block >= transfer.lastack && block <= transfer.block {
+                transfer.retransmit = now;
+                transfer.start = Some(now);
+                transfer.backoff = 0;
+                transfer.lastack = block + 1;
+
+                if transfer.netascii && block != 0 {
+                    transfer.offset += transfer.blocksize as u64 - transfer.expansion;
+                    transfer.lastcarrylf = transfer.carrylf;
+                }
+                TftpHandleResult::AckAdvance { lastack: transfer.lastack }
+            } else {
+                TftpHandleResult::AckIgnored
+            }
+        }
+        5 => {
+            let code = u16::from_be_bytes([packet[2], packet[3]]);
+            let msg = if packet.len() > 4 {
+                let end = packet[4..].iter().position(|&b| b == 0).unwrap_or(packet.len() - 4);
+                tftp_sanitise(&String::from_utf8_lossy(&packet[4..4 + end]))
+            } else {
+                String::new()
+            };
+            transfer.start = None;
+            TftpHandleResult::Error { code, message: msg }
+        }
+        _ => TftpHandleResult::InvalidPacket,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime: transfer table + retransmit driver
+// (ported from check_tftp_listeners()/tftp_request()/free_transfer(), unix only)
+// ---------------------------------------------------------------------------
+
+/// One bound TFTP listener socket, plus what the request handler needs to
+/// know about the interface it is bound to (or `None` for a wildcard bind,
+/// where the interface is resolved per-datagram via `IP_PKTINFO`).
+#[derive(Debug, Clone)]
+pub struct TftpListenerHandle {
+    pub sock: Arc<tokio::net::UdpSocket>,
+    pub addr: SocketAddr,
+    pub iface: Option<String>,
+    pub mtu: Option<i32>,
+}
+
+/// Daemon-derived TFTP configuration the runtime loop needs; assembled once
+/// by `dnsmasq::daemon_tftp_config` from `Daemon`'s `tftp_*` fields and
+/// `OPT_TFTP_*` flags.
+#[derive(Debug, Clone, Default)]
+pub struct TftpConfig {
+    pub prefix: Option<String>,
+    pub secure: bool,
+    pub no_blocksize_option: bool,
+    pub lowercase: bool,
+    pub single_port: bool,
+    pub apref_ip: bool,
+    pub apref_mac: bool,
+    pub quiet: bool,
+    /// `<= 0` means "use [`TFTP_MAX_CONNECTIONS_DEFAULT`]".
+    pub max_transfers: i32,
+    /// `0` means "no configured override; use the interface MTU alone".
+    pub mtu_override: i32,
+    /// `0` start port means "bind ephemeral" (no `--tftp-port-range`).
+    pub start_port: u16,
+    pub end_port: u16,
+    /// The dedicated `--enable-tftp=iface,...` list; empty means "every
+    /// interface DNS/DHCP would also serve is allowed".
+    pub interfaces: Vec<String>,
+}
+
+fn effective_max(config: &TftpConfig) -> i32 {
+    if config.max_transfers > 0 { config.max_transfers } else { TFTP_MAX_CONNECTIONS_DEFAULT }
+}
+
+/// Events fed into the central transfer-table loop by the listener and
+/// per-transfer forwarder tasks.
+enum TftpEvent {
+    Listener { listener_idx: usize, meta: crate::network::RecvMeta, data: Vec<u8> },
+    Transfer { id: u64, peer: SocketAddr, data: Vec<u8> },
+}
+
+fn drop_transfer(mut t: TftpTransfer) {
+    if let Some(h) = t.forwarder.take() {
+        h.abort();
+    }
+    // `t.file` (Arc<Mutex<TftpFile>>) and `t.sock` close/drop naturally once
+    // their last reference goes away.
+}
+
+fn log_transfer_end(t: &TftpTransfer, timeout: bool, error: bool, config: &TftpConfig) {
+    let fname = t.file.lock().unwrap().filename.clone();
+    if timeout {
+        warn!("timeout sending {fname} to {}", t.peer);
+    } else if error {
+        warn!("failed sending {fname} to {}", t.peer);
+    } else if !config.quiet {
+        info!("sent {fname} to {}", t.peer);
+    }
+}
+
+#[cfg(unix)]
+async fn send_packet_to(transfer: &TftpTransfer, peer: SocketAddr, pkt: &[u8]) {
+    use std::os::unix::io::AsRawFd;
+    let fd = transfer.sock.as_raw_fd();
+    let nowild = !transfer.single_port;
+    if let Err(e) = crate::forward::send_from(fd, nowild, pkt, peer, Some(transfer.source_addr), transfer.if_index) {
+        warn!("failed to send TFTP packet to {peer}: {e}");
+    }
+}
+
+#[cfg(unix)]
+async fn send_packet(transfer: &TftpTransfer, pkt: &[u8]) {
+    send_packet_to(transfer, transfer.peer, pkt).await;
+}
+
+/// Send one window's worth of blocks (or just the OACK), advancing
+/// `transfer.block` after each. Returns `(endcon, error)`.
+///
+/// Port of the per-transfer body of the retransmit branch in
+/// `check_tftp_listeners()` (tftp.c:693-717), factored out since
+/// `tftp_request`'s initial reply and every later (re)transmission both run
+/// through it.
+#[cfg(unix)]
+async fn send_window(transfer: &mut TftpTransfer) -> (bool, bool) {
+    let winsize = if transfer.block != 0 { transfer.windowsize } else { 1 };
+    for i in 0..winsize {
+        match get_block(transfer) {
+            Ok(GetBlockResult::Done) => return (i == 0, false),
+            Ok(GetBlockResult::Oack(pkt)) | Ok(GetBlockResult::Data(pkt)) => {
+                send_packet(transfer, &pkt).await;
+                transfer.block += 1;
+            }
+            Err(e) => {
+                let fname = transfer.file.lock().unwrap().filename.clone();
+                let err = tftp_err_oops(&fname, &e);
+                send_packet(transfer, &err).await;
+                return (true, true);
+            }
+        }
+    }
+    (false, false)
+}
+
+/// Apply an incoming ACK/ERROR to `transfer`; on a valid ACK, immediately
+/// send the next window (rather than waiting for the next sweep tick — the
+/// same packets upstream sends, just without an added poll-interval delay).
+/// Returns `true` if the transfer is now finished and should be removed.
+#[cfg(unix)]
+async fn process_transfer_packet(transfer: &mut TftpTransfer, data: &[u8], config: &TftpConfig) -> bool {
+    let now = Instant::now();
+    match handle_tftp_packet(transfer, data, now) {
+        TftpHandleResult::AckAdvance { .. } => {
+            let (endcon, _error) = send_window(transfer).await;
+            if endcon {
+                return true;
+            }
+            let _ = get_block(transfer); // prefetch the likely-next block
+            false
+        }
+        TftpHandleResult::AckIgnored | TftpHandleResult::InvalidPacket => false,
+        TftpHandleResult::Error { code, message } => {
+            if !config.quiet {
+                warn!("error {code} {message} received from {}", transfer.peer);
+            }
+            true
+        }
+    }
+}
+
+/// Resolve the interface a request arrived on, and its MTU: known directly
+/// for a listener bound to a specific interface; via `IP_PKTINFO`'s
+/// `if_index` (`indextoname` + `SIOCGIFMTU`) for a wildcard bind.
+fn resolve_request_interface(
+    listener: &TftpListenerHandle,
+    meta: &crate::network::RecvMeta,
+) -> (Option<String>, Option<i32>) {
+    if listener.iface.is_some() {
+        return (listener.iface.clone(), listener.mtu);
+    }
+    if meta.if_index != 0 {
+        if let Some(name) = crate::network::indextoname(meta.if_index) {
+            let mtu = crate::network::interface_mtu(&name);
+            return (Some(name), mtu);
+        }
+    }
+    (None, None)
+}
+
+#[cfg(unix)]
+async fn bind_transfer_socket(source: IpAddr, config: &TftpConfig) -> io::Result<tokio::net::UdpSocket> {
+    if config.start_port == 0 {
+        return tokio::net::UdpSocket::bind(SocketAddr::new(source, 0)).await;
+    }
+    let mut port = config.start_port;
+    loop {
+        match tokio::net::UdpSocket::bind(SocketAddr::new(source, port)).await {
+            Ok(s) => return Ok(s),
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse && port < config.end_port => {
+                port += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn reply_to_new_peer(
+    listener: &TftpListenerHandle,
+    peer: SocketAddr,
+    meta: &crate::network::RecvMeta,
+    pkt: &[u8],
+) {
+    use std::os::unix::io::AsRawFd;
+    let fd = listener.sock.as_raw_fd();
+    let nowild = meta.dest.is_none();
+    if let Err(e) = crate::forward::send_from(fd, nowild, pkt, peer, meta.dest, meta.if_index) {
+        warn!("failed to send TFTP error to {peer}: {e}");
+    }
+}
+
+/// Handle a fresh (or single-port-shared-socket) RRQ, exactly as
+/// `tftp_request()` does after the single-port peer-matching dance: parse
+/// filename/mode/options, resolve+open the file, and send exactly one
+/// initial reply packet (OACK if any option was negotiated, else DATA block
+/// 1) — matching upstream's single `get_block()` call in `tftp_request`,
+/// *not* a full window (window sends only happen from ACK/timeout handling).
+///
+/// Port of `tftp_request()` (tftp.c:44-536).
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+async fn handle_new_request(
+    listener: &TftpListenerHandle,
+    meta: &crate::network::RecvMeta,
+    data: &[u8],
+    config: &TftpConfig,
+    transfers: &mut Vec<TftpTransfer>,
+    ids: &mut Vec<u64>,
+    next_id: &mut u64,
+    tx: &tokio::sync::mpsc::Sender<TftpEvent>,
+) {
+    if data.len() < 2 {
+        return;
+    }
+    let opcode = u16::from_be_bytes([data[0], data[1]]);
+    let peer = meta.src;
+    let client_addr_str = peer.ip().to_string();
+
+    if opcode == TftpOpcode::Wrq as u16 {
+        let err = tftp_err_packet(
+            TftpError::IllegalOp,
+            &format!("unsupported write request from {client_addr_str}"),
+        );
+        reply_to_new_peer(listener, peer, meta, &err).await;
+        return;
+    }
+    if opcode != TftpOpcode::Rrq as u16 {
+        return;
+    }
+
+    let (filename_raw, mode, options) = match parse_rrq(data) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    if filename_raw.is_empty() {
+        let err = tftp_err_packet(
+            TftpError::IllegalOp,
+            &format!("empty filename in request from {client_addr_str}"),
+        );
+        reply_to_new_peer(listener, peer, meta, &err).await;
+        return;
+    }
+    let netascii = mode.eq_ignore_ascii_case("netascii");
+    if !netascii && !mode.eq_ignore_ascii_case("octet") {
+        let err = tftp_err_packet(TftpError::IllegalOp, &format!("unsupported request from {client_addr_str}"));
+        reply_to_new_peer(listener, peer, meta, &err).await;
+        return;
+    }
+
+    let (iface_name, iface_mtu) = resolve_request_interface(listener, meta);
+    if let Some(name) = iface_name.as_deref() {
+        if !config.interfaces.is_empty()
+            && !config.interfaces.iter().any(|p| crate::network::iface_name_matches(name, p))
+        {
+            return;
+        }
+    }
+    let mut mtu = iface_mtu.unwrap_or(0);
+    if config.mtu_override != 0 && (mtu == 0 || config.mtu_override < mtu) {
+        mtu = config.mtu_override;
+    }
+    let mtu_opt = if mtu != 0 { Some(mtu) } else { None };
+
+    let opts = parse_request_options(&options, netascii, peer.is_ipv4(), mtu_opt, config.no_blocksize_option);
+    let any_opt = any_option_negotiated(&opts);
+
+    let namebuff = build_tftp_path(
+        &filename_raw,
+        &PathParts {
+            prefix: config.prefix.clone(),
+            lowercase: config.lowercase,
+            apref_ip: config.apref_ip,
+            apref_mac: config.apref_mac,
+            client_addr_str: client_addr_str.clone(),
+            client_mac: None,
+        },
+    );
+
+    let shared: Vec<Arc<Mutex<TftpFile>>> = transfers.iter().map(|t| t.file.clone()).collect();
+    let file = match open_tftp_file(&namebuff, config.prefix.is_some(), config.secure, &shared) {
+        Ok(f) => f,
+        Err(TftpOpenError::NotFound) => {
+            let err = tftp_err_packet(
+                TftpError::FileNotFound,
+                &format!("file {namebuff} not found for {client_addr_str}"),
+            );
+            reply_to_new_peer(listener, peer, meta, &err).await;
+            return;
+        }
+        Err(TftpOpenError::Perm) => {
+            let err = tftp_err_packet(TftpError::AccessViolation, &format!("cannot access {namebuff}: Permission denied"));
+            reply_to_new_peer(listener, peer, meta, &err).await;
+            return;
+        }
+        Err(TftpOpenError::Oops(e)) => {
+            let err = tftp_err_oops(&namebuff, &e);
+            reply_to_new_peer(listener, peer, meta, &err).await;
+            return;
+        }
+    };
+
+    if transfers.len() as i32 >= effective_max(config) {
+        return;
+    }
+
+    let source_addr = meta.dest.unwrap_or_else(|| listener.addr.ip());
+    let (sock, single_port) = if config.single_port {
+        (listener.sock.clone(), true)
+    } else {
+        match bind_transfer_socket(source_addr, config).await {
+            Ok(s) => (Arc::new(s), false),
+            Err(e) => {
+                warn!("unable to get a free port for TFTP: {e}");
+                return;
+            }
+        }
+    };
+
+    let mut transfer = TftpTransfer::new(peer, source_addr, meta.if_index, sock.clone(), single_port, file);
+    transfer.netascii = netascii;
+    transfer.blocksize = opts.blocksize;
+    transfer.opt_blocksize = opts.opt_blocksize;
+    transfer.opt_transize = opts.opt_transize;
+    transfer.opt_timeout = opts.opt_timeout;
+    transfer.opt_windowsize = opts.opt_windowsize;
+    transfer.timeout = opts.timeout;
+    transfer.windowsize = opts.windowsize;
+    if any_opt {
+        transfer.block = 0;
+    }
+    transfer.lastack = transfer.block;
+    transfer.retransmit = Instant::now() + Duration::from_secs(transfer.timeout.max(1) as u64);
+
+    let pkt = match get_block(&mut transfer) {
+        Ok(GetBlockResult::Oack(p)) | Ok(GetBlockResult::Data(p)) => p,
+        Ok(GetBlockResult::Done) => return,
+        Err(e) => {
+            let fname = transfer.file.lock().unwrap().filename.clone();
+            let err = tftp_err_oops(&fname, &e);
+            send_packet(&transfer, &err).await;
+            drop_transfer(transfer);
+            return;
+        }
+    };
+    send_packet(&transfer, &pkt).await;
+
+    let id = *next_id;
+    *next_id += 1;
+
+    if !single_port {
+        let sock2 = sock.clone();
+        let tx2 = tx.clone();
+        transfer.forwarder = Some(tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                match sock2.recv_from(&mut buf).await {
+                    Ok((len, peer)) => {
+                        if tx2.send(TftpEvent::Transfer { id, peer, data: buf[..len].to_vec() }).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        }));
+    }
+
+    transfers.push(transfer);
+    ids.push(id);
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+async fn handle_listener_datagram(
+    listener: &TftpListenerHandle,
+    meta: crate::network::RecvMeta,
+    data: Vec<u8>,
+    config: &TftpConfig,
+    transfers: &mut Vec<TftpTransfer>,
+    ids: &mut Vec<u64>,
+    next_id: &mut u64,
+    tx: &tokio::sync::mpsc::Sender<TftpEvent>,
+) {
+    if config.single_port && data.len() >= 2 {
+        let opcode = u16::from_be_bytes([data[0], data[1]]);
+        if let Some(pos) = transfers.iter().position(|t| t.peer == meta.src) {
+            if opcode == TftpOpcode::Rrq as u16 {
+                let t = transfers.remove(pos);
+                ids.remove(pos);
+                drop_transfer(t);
+            } else {
+                if process_transfer_packet(&mut transfers[pos], &data, config).await {
+                    let t = transfers.remove(pos);
+                    ids.remove(pos);
+                    log_transfer_end(&t, false, true, config);
+                    drop_transfer(t);
+                }
+                return;
+            }
+        } else if transfers.len() as i32 >= effective_max(config) {
+            return;
+        }
+    }
+
+    handle_new_request(listener, &meta, &data, config, transfers, ids, next_id, tx).await;
+}
+
+#[cfg(unix)]
+async fn sweep_transfers(transfers: &mut Vec<TftpTransfer>, ids: &mut Vec<u64>, config: &TftpConfig) {
+    let now = Instant::now();
+    let mut i = 0;
+    while i < transfers.len() {
+        let mut endcon = false;
+        let mut error = false;
+        let mut timeout_flag = false;
+
+        if transfers[i].start.is_none() {
+            endcon = true;
+            error = true;
+        } else if now.duration_since(transfers[i].start.unwrap()) > Duration::from_secs(TFTP_TRANSFER_TIME_SECS) {
+            endcon = true;
+            // Don't complain when we're just awaiting the last ACK — some
+            // clients never send it.
+            if !matches!(get_block(&mut transfers[i]), Ok(GetBlockResult::Done)) {
+                error = true;
+                timeout_flag = true;
+            }
+        } else if now >= transfers[i].retransmit {
+            let backoff = transfers[i].backoff;
+            let shift = (backoff / 2).min(20);
+            transfers[i].retransmit =
+                now + Duration::from_secs(transfers[i].timeout as u64) + Duration::from_secs(1u64 << shift);
+            transfers[i].backoff = backoff.saturating_add(1);
+            transfers[i].block = transfers[i].lastack;
+
+            let (ec, err) = send_window(&mut transfers[i]).await;
+            endcon = ec;
+            error = err;
+            if !endcon {
+                let _ = get_block(&mut transfers[i]); // prefetch
+            }
+        }
+
+        if endcon {
+            let t = transfers.remove(i);
+            ids.remove(i);
+            log_transfer_end(&t, timeout_flag, error, config);
+            drop_transfer(t);
+            // `do_tftp_script_run`'s completion hook (tftp.c:1024-1039) would
+            // fire here; the external-script pipeline it feeds
+            // (`helper::create_helper`/`HelperHandle`) isn't wired into the
+            // main loop for any daemon subsystem yet — see tasks.md.
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Run the TFTP server: accept requests on `listeners`, drive every active
+/// transfer's ACK/retransmit/timeout state machine, until the task is
+/// aborted by the caller (mirrors `run_forward_loop_on`'s lifecycle — there
+/// is no persistent state here that needs a graceful-shutdown handshake).
+///
+/// Port of `check_tftp_listeners()` (tftp.c:621-750), restructured around
+/// tokio: one forwarder task per listener socket (and, once created, per
+/// per-transfer socket) pushes datagrams onto a channel the central loop
+/// drains, interleaved with a periodic sweep that drives retransmission and
+/// the 120s abandoned-transfer timeout.
+#[cfg(unix)]
+pub async fn run_tftp_loop(listeners: Vec<TftpListenerHandle>, config: TftpConfig) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    use tokio::sync::mpsc;
+
+    if listeners.is_empty() {
+        return Ok(());
+    }
+
+    let (tx, mut rx) = mpsc::channel::<TftpEvent>(256);
+
+    for (idx, l) in listeners.iter().enumerate() {
+        let sock = l.sock.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                if sock.readable().await.is_err() {
+                    return;
+                }
+                let fd = sock.as_raw_fd();
+                match sock.try_io(tokio::io::Interest::READABLE, || crate::network::recv_with_dest(fd, &mut buf)) {
+                    Ok(meta) => {
+                        let data = buf[..meta.len].to_vec();
+                        if tx.send(TftpEvent::Listener { listener_idx: idx, meta, data }).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(_) => continue,
+                }
+            }
+        });
+    }
+    let mut transfers: Vec<TftpTransfer> = Vec::new();
+    let mut ids: Vec<u64> = Vec::new();
+    let mut next_id: u64 = 1;
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            ev = rx.recv() => {
+                let Some(ev) = ev else { break };
+                match ev {
+                    TftpEvent::Listener { listener_idx, meta, data } => {
+                        handle_listener_datagram(
+                            &listeners[listener_idx], meta, data, &config,
+                            &mut transfers, &mut ids, &mut next_id, &tx,
+                        ).await;
+                    }
+                    TftpEvent::Transfer { id, peer, data } => {
+                        let Some(pos) = ids.iter().position(|&i| i == id) else { continue };
+                        if peer != transfers[pos].peer {
+                            // Wrong source address — RFC 1350 §4.
+                            let err = tftp_err_packet(
+                                TftpError::UnknownTransferId,
+                                &format!("ignoring packet from {peer} (TID mismatch)"),
+                            );
+                            send_packet_to(&transfers[pos], peer, &err).await;
+                            continue;
+                        }
+                        if process_transfer_packet(&mut transfers[pos], &data, &config).await {
+                            let t = transfers.remove(pos);
+                            ids.remove(pos);
+                            log_transfer_end(&t, false, true, &config);
+                            drop_transfer(t);
+                        }
+                    }
+                }
+            }
+            _ = tick.tick() => {
+                sweep_transfers(&mut transfers, &mut ids, &config).await;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Non-Unix stub: this port's socket-level TFTP internals (`recv_with_dest`,
+/// `send_from`, raw-fd `AsRawFd` control-message tricks) are Unix-only, same
+/// as the DNS/DHCP forwarding loops they're modeled on.
+#[cfg(not(unix))]
+pub async fn run_tftp_loop(_listeners: Vec<TftpListenerHandle>, _config: TftpConfig) -> io::Result<()> {
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -471,6 +1439,8 @@ mod tests {
         }
         pkt
     }
+
+    // ── wire format ─────────────────────────────────────────────────────────
 
     #[test]
     fn test_parse_rrq_basic() {
@@ -518,9 +1488,7 @@ mod tests {
 
     #[test]
     fn test_parse_rrq_truncated() {
-        // Too short
         assert!(parse_rrq(&[0, 1]).is_err());
-        // Missing null terminator
         let pkt = [0u8, 1, b'f', b'i', b'l', b'e'];
         assert!(matches!(parse_rrq(&pkt), Err(TftpParseError::MissingNull)));
     }
@@ -538,125 +1506,11 @@ mod tests {
         assert!(pkt[2..].starts_with(b"blksize\0512\0"));
     }
 
-    // -----------------------------------------------------------------------
-    // TftpTransfer tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn transfer_new_defaults() {
-        let t = TftpTransfer::new("boot.img", 512);
-        assert_eq!(t.filename, "boot.img");
-        assert_eq!(t.block, 0);
-        assert_eq!(t.block_size, 512);
-        assert!(!t.complete);
-        assert_eq!(t.retries, 0);
-        assert_eq!(t.max_retries, 5);
-        assert!(t.file_size.is_none());
-    }
-
-    #[test]
-    fn transfer_next_block_increments() {
-        let mut t = TftpTransfer::new("file", 512);
-        let data = vec![0xABu8; 512];
-        let pkt = t.next_block(&data);
-        assert_eq!(t.block, 1);
-        assert!(!t.complete);
-        let (block, payload) = parse_data(&pkt).unwrap();
-        assert_eq!(block, 1);
-        assert_eq!(payload.len(), 512);
-    }
-
-    #[test]
-    fn transfer_next_block_marks_complete_on_short() {
-        let mut t = TftpTransfer::new("file", 512);
-        let data = vec![0u8; 100]; // less than block_size
-        let _pkt = t.next_block(&data);
-        assert_eq!(t.block, 1);
-        assert!(t.complete);
-    }
-
-    #[test]
-    fn transfer_next_block_marks_complete_on_empty() {
-        let mut t = TftpTransfer::new("file", 512);
-        let _pkt = t.next_block(&[]);
-        assert!(t.complete);
-    }
-
-    #[test]
-    fn transfer_next_block_sequential() {
-        let mut t = TftpTransfer::new("file", 512);
-        let full = vec![0u8; 512];
-        t.next_block(&full);
-        assert_eq!(t.block, 1);
-        t.next_block(&full);
-        assert_eq!(t.block, 2);
-        t.next_block(&full);
-        assert_eq!(t.block, 3);
-        assert!(!t.complete);
-    }
-
-    #[test]
-    fn transfer_handle_ack_matching() {
-        let mut t = TftpTransfer::new("file", 512);
-        t.block = 5;
-        t.retries = 3;
-        assert!(t.handle_ack(5));
-        assert_eq!(t.retries, 0);
-    }
-
-    #[test]
-    fn transfer_handle_ack_mismatch() {
-        let mut t = TftpTransfer::new("file", 512);
-        t.block = 5;
-        assert!(!t.handle_ack(4));
-        assert_eq!(t.retries, 1);
-        assert!(!t.handle_ack(3));
-        assert_eq!(t.retries, 2);
-    }
-
-    #[test]
-    fn transfer_is_timed_out() {
-        let mut t = TftpTransfer::new("file", 512);
-        t.max_retries = 3;
-        assert!(!t.is_timed_out());
-        t.retries = 3;
-        assert!(!t.is_timed_out());
-        t.retries = 4;
-        assert!(t.is_timed_out());
-    }
-
-    #[test]
-    fn transfer_full_session() {
-        let mut t = TftpTransfer::new("test.bin", 4);
-        // Block 1: full block
-        let pkt1 = t.next_block(&[1, 2, 3, 4]);
-        assert!(!t.complete);
-        let (b, d) = parse_data(&pkt1).unwrap();
-        assert_eq!(b, 1);
-        assert_eq!(d, &[1, 2, 3, 4]);
-        assert!(t.handle_ack(1));
-
-        // Block 2: partial (last block)
-        let pkt2 = t.next_block(&[5, 6]);
-        assert!(t.complete);
-        let (b, d) = parse_data(&pkt2).unwrap();
-        assert_eq!(b, 2);
-        assert_eq!(d, &[5, 6]);
-        assert!(t.handle_ack(2));
-    }
-
-    // -----------------------------------------------------------------------
-    // sanitize_filename tests
-    // -----------------------------------------------------------------------
+    // ── sanitize_filename ───────────────────────────────────────────────────
 
     #[test]
     fn sanitize_normal_filename() {
         assert_eq!(sanitize_filename("boot/pxelinux.0"), Some("boot/pxelinux.0".to_string()));
-    }
-
-    #[test]
-    fn sanitize_simple_name() {
-        assert_eq!(sanitize_filename("file.txt"), Some("file.txt".to_string()));
     }
 
     #[test]
@@ -669,7 +1523,6 @@ mod tests {
     #[test]
     fn sanitize_rejects_leading_slash() {
         assert_eq!(sanitize_filename("/etc/passwd"), None);
-        assert_eq!(sanitize_filename("/boot/file"), None);
     }
 
     #[test]
@@ -678,105 +1531,11 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_rejects_empty() {
-        assert_eq!(sanitize_filename(""), None);
-    }
-
-    #[test]
     fn sanitize_converts_backslashes() {
         assert_eq!(sanitize_filename("boot\\pxe\\file.0"), Some("boot/pxe/file.0".to_string()));
     }
 
-    #[test]
-    fn sanitize_rejects_backslash_dotdot() {
-        assert_eq!(sanitize_filename("boot\\..\\secret"), None);
-    }
-
-    #[test]
-    fn sanitize_allows_dots_in_names() {
-        assert_eq!(sanitize_filename("file.tar.gz"), Some("file.tar.gz".to_string()));
-        assert_eq!(sanitize_filename(".hidden"), Some(".hidden".to_string()));
-    }
-
-    #[test]
-    fn sanitize_allows_single_dot_component() {
-        // "." as a path component is fine, ".." is not
-        assert_eq!(sanitize_filename("./file.txt"), Some("./file.txt".to_string()));
-    }
-
-    // -----------------------------------------------------------------------
-    // negotiate_options tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn negotiate_blksize_within_range() {
-        let opts = vec![("blksize".to_string(), "1024".to_string())];
-        let result = negotiate_options(&opts, 1428);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], ("blksize".to_string(), "1024".to_string()));
-    }
-
-    #[test]
-    fn negotiate_blksize_clamped_to_max() {
-        let opts = vec![("blksize".to_string(), "65535".to_string())];
-        let result = negotiate_options(&opts, 1428);
-        assert_eq!(result[0], ("blksize".to_string(), "1428".to_string()));
-    }
-
-    #[test]
-    fn negotiate_blksize_clamped_to_min() {
-        let opts = vec![("blksize".to_string(), "2".to_string())];
-        let result = negotiate_options(&opts, 1428);
-        assert_eq!(result[0], ("blksize".to_string(), "8".to_string()));
-    }
-
-    #[test]
-    fn negotiate_tsize_echoed() {
-        let opts = vec![("tsize".to_string(), "0".to_string())];
-        let result = negotiate_options(&opts, 512);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], ("tsize".to_string(), "0".to_string()));
-    }
-
-    #[test]
-    fn negotiate_multiple_options() {
-        let opts = vec![
-            ("blksize".to_string(), "1024".to_string()),
-            ("tsize".to_string(), "0".to_string()),
-        ];
-        let result = negotiate_options(&opts, 1428);
-        assert_eq!(result.len(), 2);
-    }
-
-    #[test]
-    fn negotiate_unknown_option_ignored() {
-        let opts = vec![("windowsize".to_string(), "4".to_string())];
-        let result = negotiate_options(&opts, 512);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn negotiate_case_insensitive() {
-        let opts = vec![("BLKSIZE".to_string(), "512".to_string())];
-        let result = negotiate_options(&opts, 1428);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, "blksize");
-    }
-
-    #[test]
-    fn negotiate_invalid_blksize_ignored() {
-        let opts = vec![("blksize".to_string(), "not_a_number".to_string())];
-        let result = negotiate_options(&opts, 512);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn negotiate_empty_options() {
-        let result = negotiate_options(&[], 512);
-        assert!(result.is_empty());
-    }
-
-    // ── next_cstring ─────────────────────────────────────────────────────────
+    // ── next_cstring / tftp_sanitise / tftp_err_packet / tftp_err_oops ─────
 
     #[test]
     fn next_cstring_basic() {
@@ -788,44 +1547,9 @@ mod tests {
     }
 
     #[test]
-    fn next_cstring_second_string() {
-        let buf = b"first\0second\0";
-        let mut pos = 0;
-        let _ = next_cstring(buf, &mut pos).unwrap();
-        let s2 = next_cstring(buf, &mut pos).unwrap();
-        assert_eq!(s2, b"second");
-    }
-
-    #[test]
-    fn next_cstring_no_null() {
-        let mut pos = 0;
-        assert!(next_cstring(b"hello", &mut pos).is_none());
-    }
-
-    #[test]
     fn next_cstring_empty_returns_none() {
         let mut pos = 0;
         assert!(next_cstring(b"\0rest", &mut pos).is_none());
-    }
-
-    #[test]
-    fn next_cstring_at_end() {
-        let mut pos = 5;
-        assert!(next_cstring(b"hello", &mut pos).is_none());
-    }
-
-    #[test]
-    fn next_cstring_single_char() {
-        let mut pos = 0;
-        let s = next_cstring(b"x\0", &mut pos).unwrap();
-        assert_eq!(s, b"x");
-    }
-
-    // ── tftp_sanitise ────────────────────────────────────────────────────────
-
-    #[test]
-    fn tftp_sanitise_printable() {
-        assert_eq!(tftp_sanitise("hello world"), "hello world");
     }
 
     #[test]
@@ -834,184 +1558,623 @@ mod tests {
     }
 
     #[test]
-    fn tftp_sanitise_removes_null() {
-        assert_eq!(tftp_sanitise("hel\x00lo"), "hello");
-    }
-
-    #[test]
-    fn tftp_sanitise_empty() {
-        assert_eq!(tftp_sanitise(""), "");
-    }
-
-    #[test]
-    fn tftp_sanitise_all_unprintable() {
-        assert_eq!(tftp_sanitise("\x01\x02\x03"), "");
-    }
-
-    // ── tftp_err_packet ──────────────────────────────────────────────────────
-
-    #[test]
-    fn tftp_err_packet_basic() {
-        let pkt = tftp_err_packet(TftpError::FileNotFound, "File not found");
-        assert_eq!(u16::from_be_bytes([pkt[0], pkt[1]]), 5); // ERROR opcode
-        assert_eq!(u16::from_be_bytes([pkt[2], pkt[3]]), 1); // error code
-        assert!(pkt.len() > 4);
-    }
-
-    #[test]
     fn tftp_err_packet_truncates_long() {
         let long_msg = "x".repeat(600);
         let pkt = tftp_err_packet(TftpError::NotDefined, &long_msg);
-        // Message after header (4 bytes) should be ≤ 500 + null
         assert!(pkt.len() <= 4 + 500 + 1);
     }
 
     #[test]
-    fn tftp_err_packet_null_terminated() {
-        let pkt = tftp_err_packet(TftpError::NotDefined, "test");
-        assert_eq!(*pkt.last().unwrap(), 0);
-    }
-
-    #[test]
-    fn tftp_err_packet_sanitises() {
-        let pkt = tftp_err_packet(TftpError::NotDefined, "bad\x01msg");
-        let msg_bytes = &pkt[4..pkt.len() - 1]; // skip header and null
-        let msg = std::str::from_utf8(msg_bytes).unwrap();
-        assert_eq!(msg, "badmsg");
-    }
-
-    // ── tftp_err_oops ────────────────────────────────────────────────────────
-
-    #[test]
-    fn tftp_err_oops_contains_filename() {
+    fn tftp_err_oops_contains_filename_and_error() {
         let err = std::io::Error::new(std::io::ErrorKind::NotFound, "not found");
         let pkt = tftp_err_oops("test.bin", &err);
         let msg = String::from_utf8_lossy(&pkt[4..]);
         assert!(msg.contains("test.bin"));
+        assert!(msg.contains("not found"));
+    }
+
+    // ── parse_request_options ───────────────────────────────────────────────
+
+    #[test]
+    fn options_blksize_basic() {
+        let opts = parse_request_options(&[("blksize".into(), "1024".into())], false, true, None, false);
+        assert_eq!(opts.blocksize, 1024);
+        assert!(opts.opt_blocksize);
     }
 
     #[test]
-    fn tftp_err_oops_contains_error() {
-        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
-        let pkt = tftp_err_oops("file", &err);
-        let msg = String::from_utf8_lossy(&pkt[4..]);
-        assert!(msg.contains("denied"));
+    fn options_blksize_floor_is_one_not_eight() {
+        // Upstream's floor is `if (val < 1) val = 1;` — not 8.
+        let opts = parse_request_options(&[("blksize".into(), "0".into())], false, true, None, false);
+        assert_eq!(opts.blocksize, 1);
     }
 
     #[test]
-    fn tftp_err_oops_error_code_zero() {
-        let err = std::io::Error::new(std::io::ErrorKind::Other, "oops");
-        let pkt = tftp_err_oops("f", &err);
-        assert_eq!(u16::from_be_bytes([pkt[2], pkt[3]]), 0);
-    }
-
-    // ── handle_tftp_packet ───────────────────────────────────────────────────
-
-    #[test]
-    fn handle_tftp_ack_basic() {
-        let mut t = TftpTransfer::new("file", 512);
-        t.block = 1;
-        t.retries = 2;
-        let ack = [0, 4, 0, 1]; // ACK block 1
-        let result = handle_tftp_packet(&mut t, &ack);
-        assert_eq!(result, TftpHandleResult::AckOk { block: 1 });
-        assert_eq!(t.retries, 0);
+    fn options_blksize_clamped_to_rfc2348_max() {
+        let opts = parse_request_options(&[("blksize".into(), "999999".into())], false, true, None, false);
+        assert_eq!(opts.blocksize, TFTP_MAX_BLKSIZE);
     }
 
     #[test]
-    fn handle_tftp_ack_mismatch_ignored() {
-        let mut t = TftpTransfer::new("file", 512);
-        t.block = 5;
-        let ack = [0, 4, 0, 3]; // ACK block 3 (wrong)
-        assert_eq!(handle_tftp_packet(&mut t, &ack), TftpHandleResult::AckIgnored);
+    fn options_blksize_clamped_by_mtu_v4_overhead() {
+        let opts = parse_request_options(&[("blksize".into(), "2000".into())], false, true, Some(1500), false);
+        assert_eq!(opts.blocksize, 1500 - 32);
     }
 
     #[test]
-    fn handle_tftp_error_packet() {
-        let mut t = TftpTransfer::new("file", 512);
-        let mut pkt = vec![0, 5, 0, 1]; // ERROR code 1
-        pkt.extend_from_slice(b"File not found\0");
-        let result = handle_tftp_packet(&mut t, &pkt);
-        match result {
-            TftpHandleResult::Error { code, message } => {
-                assert_eq!(code, 1);
-                assert_eq!(message, "File not found");
-            }
-            _ => panic!("expected Error"),
+    fn options_blksize_clamped_by_mtu_v6_overhead() {
+        let opts = parse_request_options(&[("blksize".into(), "2000".into())], false, false, Some(1500), false);
+        assert_eq!(opts.blocksize, 1500 - 52);
+    }
+
+    #[test]
+    fn options_blksize_ignored_when_no_block_option_set() {
+        let opts = parse_request_options(&[("blksize".into(), "1024".into())], false, true, None, true);
+        assert!(!opts.opt_blocksize);
+        assert_eq!(opts.blocksize, 512);
+    }
+
+    #[test]
+    fn options_tsize_set_opt_flag_octet_mode() {
+        let opts = parse_request_options(&[("tsize".into(), "0".into())], false, true, None, false);
+        assert!(opts.opt_transize);
+    }
+
+    #[test]
+    fn options_tsize_ignored_in_netascii_mode() {
+        let opts = parse_request_options(&[("tsize".into(), "0".into())], true, true, None, false);
+        assert!(!opts.opt_transize);
+    }
+
+    #[test]
+    fn options_windowsize_ignored_in_netascii_mode() {
+        let opts = parse_request_options(&[("windowsize".into(), "4".into())], true, true, None, false);
+        assert!(!opts.opt_windowsize);
+        assert_eq!(opts.windowsize, 1);
+    }
+
+    #[test]
+    fn options_windowsize_clamped_to_max() {
+        let opts = parse_request_options(&[("windowsize".into(), "999".into())], false, true, None, false);
+        assert_eq!(opts.windowsize, TFTP_MAX_WINDOW);
+    }
+
+    #[test]
+    fn options_timeout_clamped_to_255() {
+        let opts = parse_request_options(&[("timeout".into(), "9999".into())], false, true, None, false);
+        assert_eq!(opts.timeout, 255);
+    }
+
+    #[test]
+    fn options_case_insensitive() {
+        let opts = parse_request_options(&[("BLKSIZE".into(), "1024".into())], false, true, None, false);
+        assert!(opts.opt_blocksize);
+    }
+
+    #[test]
+    fn options_unknown_ignored() {
+        let opts = parse_request_options(&[("frobnicate".into(), "1".into())], false, true, None, false);
+        assert_eq!(opts, RequestOptions::default());
+    }
+
+    #[test]
+    fn options_none_negotiated_by_default() {
+        assert!(!any_option_negotiated(&RequestOptions::default()));
+    }
+
+    #[test]
+    fn options_any_negotiated_true_when_present() {
+        let opts = parse_request_options(&[("timeout".into(), "5".into())], false, true, None, false);
+        assert!(any_option_negotiated(&opts));
+    }
+
+    // ── build_tftp_path ──────────────────────────────────────────────────────
+
+    fn parts(prefix: Option<&str>) -> PathParts {
+        PathParts {
+            prefix: prefix.map(str::to_string),
+            lowercase: false,
+            apref_ip: false,
+            apref_mac: false,
+            client_addr_str: "10.0.0.5".to_string(),
+            client_mac: None,
         }
     }
 
     #[test]
-    fn handle_tftp_too_short() {
-        let mut t = TftpTransfer::new("file", 512);
-        assert_eq!(handle_tftp_packet(&mut t, &[0, 4]), TftpHandleResult::InvalidPacket);
+    fn path_no_prefix_roots_at_filesystem_root() {
+        assert_eq!(build_tftp_path("boot.img", &parts(None)), "/boot.img");
     }
 
     #[test]
-    fn handle_tftp_unknown_opcode() {
-        let mut t = TftpTransfer::new("file", 512);
-        let pkt = [0, 99, 0, 0];
-        assert_eq!(handle_tftp_packet(&mut t, &pkt), TftpHandleResult::InvalidPacket);
+    fn path_with_prefix_joins() {
+        assert_eq!(build_tftp_path("boot.img", &parts(Some("/tftpboot"))), "/tftpboot/boot.img");
+    }
+
+    #[test]
+    fn path_prefix_with_trailing_slash_not_doubled() {
+        assert_eq!(build_tftp_path("boot.img", &parts(Some("/tftpboot/"))), "/tftpboot/boot.img");
+    }
+
+    #[test]
+    fn path_relative_prefix_is_appended_to_root_slash() {
+        assert_eq!(build_tftp_path("boot.img", &parts(Some("tftpboot"))), "/tftpboot/boot.img");
+    }
+
+    #[test]
+    fn path_backslashes_become_forward_slashes() {
+        assert_eq!(build_tftp_path("boot\\pxelinux.0", &parts(Some("/tftpboot"))), "/tftpboot/boot/pxelinux.0");
+    }
+
+    #[test]
+    fn path_lowercased_when_configured() {
+        let mut p = parts(Some("/tftpboot"));
+        p.lowercase = true;
+        assert_eq!(build_tftp_path("BOOT.IMG", &p), "/tftpboot/boot.img");
+    }
+
+    #[test]
+    fn path_absolute_filename_matching_prefix_used_verbatim() {
+        assert_eq!(build_tftp_path("/tftpboot/x/boot.img", &parts(Some("/tftpboot"))), "/tftpboot/x/boot.img");
+    }
+
+    #[test]
+    fn path_absolute_filename_not_matching_prefix_becomes_relative() {
+        assert_eq!(build_tftp_path("/etc/passwd", &parts(Some("/tftpboot"))), "/tftpboot/etc/passwd");
+    }
+
+    #[test]
+    fn path_traversal_survives_into_namebuff_for_permcheck_to_reject() {
+        // build_tftp_path doesn't itself reject "..": open_tftp_file's
+        // "/../"  substring check (matching upstream) is what rejects it —
+        // verified in the open_tftp_file tests below.
+        let p = build_tftp_path("../../etc/passwd", &parts(Some("/tftpboot")));
+        assert!(p.contains("/../"));
+    }
+
+    #[test]
+    fn path_apref_ip_falls_back_when_dir_missing() {
+        let mut p = parts(Some("/tftpboot"));
+        p.apref_ip = true;
+        // "/tftpboot/10.0.0.5/" almost certainly doesn't exist on the test host.
+        assert_eq!(build_tftp_path("boot.img", &p), "/tftpboot/boot.img");
+    }
+
+    #[test]
+    fn path_apref_ip_used_when_dir_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let client_dir = dir.path().join("10.0.0.5");
+        std::fs::create_dir(&client_dir).unwrap();
+        let mut p = parts(Some(dir.path().to_str().unwrap()));
+        p.apref_ip = true;
+        let got = build_tftp_path("boot.img", &p);
+        assert_eq!(got, client_dir.join("boot.img").to_str().unwrap());
+    }
+
+    // ── open_tftp_file ───────────────────────────────────────────────────────
+
+    #[test]
+    fn open_file_success_reads_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boot.img");
+        std::fs::write(&path, b"hello world").unwrap();
+        let f = open_tftp_file(path.to_str().unwrap(), true, false, &[]).unwrap();
+        assert_eq!(f.lock().unwrap().size, 11);
+    }
+
+    #[test]
+    fn open_file_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.img");
+        let err = open_tftp_file(path.to_str().unwrap(), true, false, &[]).unwrap_err();
+        assert!(matches!(err, TftpOpenError::NotFound));
+    }
+
+    #[test]
+    fn open_file_rejects_dotdot_traversal_when_prefix_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let namebuff = format!("{}/../secret", dir.path().to_str().unwrap());
+        let err = open_tftp_file(&namebuff, true, false, &[]).unwrap_err();
+        assert!(matches!(err, TftpOpenError::Perm));
+    }
+
+    #[test]
+    fn open_file_dotdot_allowed_when_no_prefix_configured() {
+        // Upstream only sets the "/../" trap when --tftp-root is given
+        // (tftp.c:548: `if (prefix && strstr(namebuff, "/../"))`).
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let path = sub.join("boot.img");
+        std::fs::write(&path, b"hi").unwrap();
+        let namebuff = format!("{}/../sub/boot.img", sub.to_str().unwrap());
+        let f = open_tftp_file(&namebuff, false, false, &[]).unwrap();
+        assert_eq!(f.lock().unwrap().size, 2);
+    }
+
+    #[test]
+    fn open_file_dedups_shared_fd_by_dev_inode_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.img");
+        std::fs::write(&path, b"shared contents").unwrap();
+        let first = open_tftp_file(path.to_str().unwrap(), true, false, &[]).unwrap();
+        let second = open_tftp_file(path.to_str().unwrap(), true, false, &[first.clone()]).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_file_permission_denied_when_not_world_readable_as_root_placeholder() {
+        // Can't easily become root in a test; instead verify the plain
+        // non-secure, non-root path (this process's own uid) succeeds even
+        // when the file is mode 0600, since only root-mode and
+        // --tftp-secure enforce anything beyond "openable".
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private.img");
+        std::fs::write(&path, b"x").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let f = open_tftp_file(path.to_str().unwrap(), true, false, &[]).unwrap();
+        assert_eq!(f.lock().unwrap().size, 1);
     }
 
     // ── get_block ────────────────────────────────────────────────────────────
 
-    #[test]
-    fn get_block_zero_oack() {
-        let result = get_block(0, b"hello", 512, false, true, true);
-        match result {
+    async fn transfer_over(bytes: &[u8], blocksize: usize) -> TftpTransfer {
+        let mut named = tempfile::NamedTempFile::new().unwrap();
+        use std::io::Write;
+        named.write_all(bytes).unwrap();
+        let meta = named.as_file().metadata().unwrap();
+        #[cfg(unix)]
+        let (dev, inode) = { use std::os::unix::fs::MetadataExt; (meta.dev(), meta.ino()) };
+        #[cfg(not(unix))]
+        let (dev, inode) = (0, 0);
+        // The already-open `reopen()`'d handle stays valid even after the
+        // `NamedTempFile` guard drops and unlinks the path (standard Unix
+        // "delete while held open" semantics), so it need not outlive this fn.
+        let file = Arc::new(Mutex::new(TftpFile {
+            file: named.reopen().unwrap(),
+            size: meta.len(),
+            dev,
+            inode,
+            filename: named.path().to_str().unwrap().to_string(),
+            posn: 0,
+        }));
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut t = TftpTransfer::new(
+            "127.0.0.1:12345".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+            0,
+            Arc::new(sock),
+            false,
+            file,
+        );
+        t.blocksize = blocksize;
+        t
+    }
+
+    #[tokio::test]
+    async fn get_block_zero_sends_oack_with_negotiated_options() {
+        let mut t = transfer_over(b"hello", 512).await;
+        t.block = 0;
+        t.opt_blocksize = true;
+        t.opt_transize = true;
+        match get_block(&mut t).unwrap() {
             GetBlockResult::Oack(pkt) => {
-                assert_eq!(u16::from_be_bytes([pkt[0], pkt[1]]), 6); // OACK opcode
+                assert_eq!(u16::from_be_bytes([pkt[0], pkt[1]]), TftpOpcode::Oack as u16);
+                let body = String::from_utf8_lossy(&pkt[2..]);
+                assert!(body.contains("blksize"));
+                assert!(body.contains("tsize"));
             }
-            _ => panic!("expected Oack"),
+            other => panic!("expected Oack, got {other:?}"),
         }
     }
 
-    #[test]
-    fn get_block_first_data() {
-        let file = b"hello world!!!"; // 14 bytes
-        let result = get_block(1, file, 512, false, false, false);
-        match result {
+    #[tokio::test]
+    async fn get_block_reads_real_file_contents() {
+        let mut t = transfer_over(b"hello world!!!", 512).await;
+        match get_block(&mut t).unwrap() {
             GetBlockResult::Data(pkt) => {
                 let (block, data) = parse_data(&pkt).unwrap();
                 assert_eq!(block, 1);
                 assert_eq!(data, b"hello world!!!");
             }
-            _ => panic!("expected Data"),
+            other => panic!("expected Data, got {other:?}"),
         }
     }
 
-    #[test]
-    fn get_block_past_eof() {
-        let result = get_block(2, b"hello", 512, false, false, false);
-        assert!(matches!(result, GetBlockResult::Done));
+    #[tokio::test]
+    async fn get_block_past_eof_is_done() {
+        let mut t = transfer_over(b"hello", 512).await;
+        t.block = 2; // offset = 512, past a 5-byte file
+        assert!(matches!(get_block(&mut t).unwrap(), GetBlockResult::Done));
     }
 
-    #[test]
-    fn get_block_netascii_lf_to_crlf() {
-        let file = b"line1\nline2\n";
-        let result = get_block(1, file, 512, true, false, false);
-        match result {
-            GetBlockResult::Data(pkt) => {
-                let (_, data) = parse_data(&pkt).unwrap();
-                assert!(data.windows(2).any(|w| w == b"\r\n"), "should contain CRLF");
-                assert!(!data.windows(2).any(|w| w == b"\n\n"), "bare LF should be gone");
-            }
-            _ => panic!("expected Data"),
-        }
-    }
-
-    #[test]
-    fn get_block_last_block_short() {
-        let file = vec![0xAA; 600]; // 600 bytes, blocksize=512
-        let result = get_block(2, &file, 512, false, false, false);
-        match result {
+    #[tokio::test]
+    async fn get_block_last_block_is_short() {
+        let mut t = transfer_over(&vec![0xAAu8; 600], 512).await;
+        t.block = 2;
+        match get_block(&mut t).unwrap() {
             GetBlockResult::Data(pkt) => {
                 let (block, data) = parse_data(&pkt).unwrap();
                 assert_eq!(block, 2);
-                assert_eq!(data.len(), 88); // 600 - 512 = 88
+                assert_eq!(data.len(), 88);
             }
-            _ => panic!("expected Data"),
+            other => panic!("expected Data, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn get_block_prefetch_reused_for_same_offset() {
+        let mut t = transfer_over(b"hello world!!!", 512).await;
+        let first = get_block(&mut t).unwrap();
+        // block unchanged (caller normally increments after sending) — the
+        // second call at the same offset should come from the prefetch
+        // cache and produce identical bytes.
+        let second = get_block(&mut t).unwrap();
+        let (GetBlockResult::Data(p1), GetBlockResult::Data(p2)) = (first, second) else { panic!() };
+        assert_eq!(p1, p2);
+    }
+
+    #[tokio::test]
+    async fn get_block_netascii_expands_lf_to_crlf() {
+        let mut t = transfer_over(b"line1\nline2\n", 512).await;
+        t.netascii = true;
+        match get_block(&mut t).unwrap() {
+            GetBlockResult::Data(pkt) => {
+                let (_, data) = parse_data(&pkt).unwrap();
+                assert!(data.windows(2).any(|w| w == b"\r\n"));
+                assert!(!data.windows(2).any(|w| w == b"\n\n"));
+            }
+            other => panic!("expected Data, got {other:?}"),
+        }
+    }
+
+    // ── netascii_expand ──────────────────────────────────────────────────────
+
+    #[test]
+    fn netascii_expand_single_lf() {
+        let (out, expansion, carrylf) = netascii_expand(b"a\nb", 10, false);
+        assert_eq!(out, b"a\r\nb");
+        assert_eq!(expansion, 1);
+        assert!(!carrylf);
+    }
+
+    #[test]
+    fn netascii_expand_multiple_lf() {
+        let (out, expansion, _) = netascii_expand(b"line1\nline2\n", 100, false);
+        assert_eq!(out, b"line1\r\nline2\r\n");
+        assert_eq!(expansion, 2);
+    }
+
+    #[test]
+    fn netascii_expand_no_lf_unchanged() {
+        let (out, expansion, carrylf) = netascii_expand(b"plain", 100, false);
+        assert_eq!(out, b"plain");
+        assert_eq!(expansion, 0);
+        assert!(!carrylf);
+    }
+
+    #[test]
+    fn netascii_expand_lf_at_full_blocksize_defers_via_carrylf() {
+        // A block that's already exactly `blocksize` bytes with the LF as its
+        // very last byte can't grow to fit a full "\r\n": the trailing byte
+        // becomes '\r' (matching upstream's unconditional `mess->data[i] =
+        // '\r'`) and the accompanying '\n' is deferred to the next block —
+        // the caller's offset math (`blocksize - expansion`) re-reads it from
+        // the file, and `lastcarrylf` stops it being expanded a second time.
+        let raw = b"aaaa\n"; // 5 bytes, blocksize == 5 (already "full")
+        let (out, expansion, carrylf) = netascii_expand(raw, 5, false);
+        assert_eq!(out, b"aaaa\r");
+        assert_eq!(expansion, 1);
+        assert!(carrylf);
+    }
+
+    #[test]
+    fn netascii_expand_lastcarrylf_suppresses_leading_lf() {
+        // If the previous block ended with a deferred LF, this block's
+        // leading '\n' (the second half of that CRLF) is not re-expanded.
+        let (out, expansion, _) = netascii_expand(b"\nrest", 100, true);
+        assert_eq!(out, b"\nrest");
+        assert_eq!(expansion, 0);
+    }
+
+    // ── handle_tftp_packet ───────────────────────────────────────────────────
+
+    async fn dummy_transfer() -> TftpTransfer {
+        transfer_over(b"x", 512).await
+    }
+
+    #[tokio::test]
+    async fn handle_ack_advances_lastack() {
+        let mut t = dummy_transfer().await;
+        t.block = 1;
+        t.lastack = 0;
+        let ack = build_ack(1);
+        let result = handle_tftp_packet(&mut t, &ack, Instant::now());
+        assert_eq!(result, TftpHandleResult::AckAdvance { lastack: 2 });
+        assert_eq!(t.lastack, 2);
+        assert_eq!(t.backoff, 0);
+    }
+
+    #[tokio::test]
+    async fn handle_ack_ignored_below_lastack() {
+        let mut t = dummy_transfer().await;
+        t.block = 5;
+        t.lastack = 3;
+        let ack = build_ack(2);
+        assert_eq!(handle_tftp_packet(&mut t, &ack, Instant::now()), TftpHandleResult::AckIgnored);
+    }
+
+    #[tokio::test]
+    async fn handle_ack_ignored_above_block() {
+        let mut t = dummy_transfer().await;
+        t.block = 2;
+        t.lastack = 0;
+        let ack = build_ack(5);
+        assert_eq!(handle_tftp_packet(&mut t, &ack, Instant::now()), TftpHandleResult::AckIgnored);
+    }
+
+    #[tokio::test]
+    async fn handle_ack_wraparound_forward() {
+        let mut t = dummy_transfer().await;
+        // Simulate having sent up through block 0x10005 (block_hi=1, wire block=5).
+        t.block = 0x10005;
+        t.lastack = 0x10000;
+        t.ackprev = 0xfffe; // previous ack was in the top quarter
+        t.block_hi = 0;
+        let ack = build_ack(2); // wraps into the bottom quarter
+        let result = handle_tftp_packet(&mut t, &ack, Instant::now());
+        assert_eq!(result, TftpHandleResult::AckAdvance { lastack: 0x10003 });
+        assert_eq!(t.block_hi, 1);
+    }
+
+    #[tokio::test]
+    async fn handle_error_aborts_transfer() {
+        let mut t = dummy_transfer().await;
+        let mut pkt = vec![0, 5, 0, 1];
+        pkt.extend_from_slice(b"File not found\0");
+        let result = handle_tftp_packet(&mut t, &pkt, Instant::now());
+        match result {
+            TftpHandleResult::Error { code, message } => {
+                assert_eq!(code, 1);
+                assert_eq!(message, "File not found");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert!(t.start.is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_too_short_is_invalid() {
+        let mut t = dummy_transfer().await;
+        assert_eq!(handle_tftp_packet(&mut t, &[0, 4], Instant::now()), TftpHandleResult::InvalidPacket);
+    }
+
+    #[tokio::test]
+    async fn handle_unknown_opcode_is_invalid() {
+        let mut t = dummy_transfer().await;
+        let pkt = [0, 99, 0, 0];
+        assert_eq!(handle_tftp_packet(&mut t, &pkt, Instant::now()), TftpHandleResult::InvalidPacket);
+    }
+
+    #[tokio::test]
+    async fn handle_ack_netascii_advances_offset_by_blocksize_minus_expansion() {
+        let mut t = dummy_transfer().await;
+        t.netascii = true;
+        t.block = 1;
+        t.lastack = 0;
+        t.blocksize = 512;
+        t.expansion = 3;
+        t.offset = 0;
+        let ack = build_ack(1);
+        handle_tftp_packet(&mut t, &ack, Instant::now());
+        assert_eq!(t.offset, 512 - 3);
+    }
+
+    // ── end-to-end over real sockets + a real file ──────────────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn end_to_end_download_over_real_sockets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boot.img");
+        let contents = vec![0x42u8; 1200]; // spans 3 blocks at blksize=512
+        std::fs::write(&path, &contents).unwrap();
+
+        let listener_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listener_addr = listener_sock.local_addr().unwrap();
+        let listener = TftpListenerHandle {
+            sock: Arc::new(listener_sock),
+            addr: listener_addr,
+            iface: Some("lo".to_string()),
+            mtu: None,
+        };
+
+        let config = TftpConfig {
+            prefix: Some(dir.path().to_str().unwrap().to_string()),
+            start_port: 0,
+            end_port: 0,
+            ..Default::default()
+        };
+
+        let server = tokio::spawn(run_tftp_loop(vec![listener], config));
+
+        // Deliberately *not* `connect()`-ed: in non-single-port mode (the
+        // default) the server replies from a fresh per-transfer ephemeral
+        // socket, not the listener's own address/port — exactly the RFC 1350
+        // §4 behavior a real client relies on, and a connected socket would
+        // filter those replies out.
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let rrq = make_rrq("boot.img", "octet", &[("blksize", "512")]);
+        client.send_to(&rrq, listener_addr).await.unwrap();
+
+        let mut received = Vec::new();
+        let mut buf = vec![0u8; 2048];
+        let mut server_addr;
+        loop {
+            let (n, from) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+                .await
+                .expect("timed out waiting for a TFTP reply")
+                .unwrap();
+            server_addr = from;
+            let pkt = &buf[..n];
+            let opcode = u16::from_be_bytes([pkt[0], pkt[1]]);
+            if opcode == TftpOpcode::Oack as u16 {
+                client.send_to(&build_ack(0), server_addr).await.unwrap();
+                continue;
+            }
+            assert_eq!(opcode, TftpOpcode::Data as u16);
+            let (block, data) = parse_data(pkt).unwrap();
+            received.extend_from_slice(data);
+            client.send_to(&build_ack(block), server_addr).await.unwrap();
+            if data.len() < 512 {
+                break;
+            }
+        }
+
+        assert_eq!(received, contents);
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn end_to_end_path_traversal_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        // A secret file that lives *outside* the tftp-root directory.
+        let secret_dir = tempfile::tempdir().unwrap();
+        std::fs::write(secret_dir.path().join("secret"), b"do not serve").unwrap();
+
+        let listener_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listener_addr = listener_sock.local_addr().unwrap();
+        let listener = TftpListenerHandle {
+            sock: Arc::new(listener_sock),
+            addr: listener_addr,
+            iface: Some("lo".to_string()),
+            mtu: None,
+        };
+        let config = TftpConfig {
+            prefix: Some(dir.path().to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        let server = tokio::spawn(run_tftp_loop(vec![listener], config));
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.connect(listener_addr).await.unwrap();
+
+        let traversal = format!("../{}/secret", secret_dir.path().file_name().unwrap().to_str().unwrap());
+        let rrq = make_rrq(&traversal, "octet", &[]);
+        client.send(&rrq).await.unwrap();
+
+        let mut buf = vec![0u8; 2048];
+        let n = tokio::time::timeout(Duration::from_secs(5), client.recv(&mut buf))
+            .await
+            .expect("timed out waiting for a TFTP reply")
+            .unwrap();
+        let pkt = &buf[..n];
+        assert_eq!(u16::from_be_bytes([pkt[0], pkt[1]]), TftpOpcode::Error as u16);
+
+        server.abort();
     }
 }

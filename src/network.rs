@@ -922,6 +922,37 @@ pub fn indextoname(_index: u32) -> Option<String> {
     None
 }
 
+/// Look up an interface's MTU via `SIOCGIFMTU`.
+///
+/// Used by TFTP's `blksize` negotiation (`tftp.c:235-240`) to clamp the
+/// negotiated block size to what the outgoing interface can carry without
+/// fragmentation.
+#[cfg(unix)]
+pub fn interface_mtu(name: &str) -> Option<i32> {
+    use std::os::unix::io::AsRawFd;
+
+    // Any UDP socket works as the ioctl handle; it need not be bound.
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+    let name_bytes = name.as_bytes();
+    if name_bytes.len() >= ifr.ifr_name.len() {
+        return None;
+    }
+    for (dst, &src) in ifr.ifr_name.iter_mut().zip(name_bytes.iter()) {
+        *dst = src as libc::c_char;
+    }
+    let rc = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFMTU, &mut ifr) };
+    if rc == -1 {
+        return None;
+    }
+    Some(unsafe { ifr.ifr_ifru.ifru_mtu })
+}
+
+#[cfg(not(unix))]
+pub fn interface_mtu(_name: &str) -> Option<i32> {
+    None
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Receiving with destination metadata (forward.c:1700-1780)
 // ──────────────────────────────────────────────────────────────────────────────

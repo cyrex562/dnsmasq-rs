@@ -1016,6 +1016,23 @@ pub struct Listeners {
     dhcp: Option<std::net::UdpSocket>,
     #[cfg(feature = "dhcp6")]
     dhcp6: Option<std::net::UdpSocket>,
+    #[cfg(feature = "tftp")]
+    tftp: Vec<BoundTftpSocket>,
+}
+
+/// A TFTP listener socket bound before the fork, plus what
+/// [`crate::tftp::run_tftp_loop`] needs to know about it.
+#[cfg(feature = "tftp")]
+#[derive(Debug)]
+struct BoundTftpSocket {
+    sock: std::net::UdpSocket,
+    addr: SocketAddr,
+    /// Known when bound under `--bind-interfaces`/`--bind-dynamic`; `None`
+    /// for a wildcard bind, where the arrival interface is only known
+    /// per-datagram via `IP_PKTINFO`/`IPV6_PKTINFO` (`recv_with_dest`).
+    iface: Option<String>,
+    /// This interface's MTU, when [`iface`](Self::iface) is known.
+    mtu: Option<i32>,
 }
 
 /// A DNS socket bound before the fork, plus what the query loop needs to know
@@ -1099,6 +1116,34 @@ fn iface_allowed_config(daemon: &Daemon) -> crate::network::IfaceAllowedConfig {
         })
         .collect();
     config
+}
+
+/// Assemble [`crate::tftp::TftpConfig`] from `Daemon`'s `tftp_*` fields and
+/// `OPT_TFTP_*` flags, for [`run_main_loop_with`] to hand to
+/// [`crate::tftp::run_tftp_loop`].
+#[cfg(feature = "tftp")]
+fn daemon_tftp_config(daemon: &Daemon) -> crate::tftp::TftpConfig {
+    use crate::types::constants::{
+        OPT_QUIET_TFTP, OPT_SINGLE_PORT, OPT_TFTP_APREF_IP, OPT_TFTP_APREF_MAC, OPT_TFTP_LC,
+        OPT_TFTP_NOBLOCK, OPT_TFTP_SECURE,
+    };
+
+    let (start_port, end_port) = (daemon.start_tftp_port, daemon.end_tftp_port);
+    crate::tftp::TftpConfig {
+        prefix: daemon.tftp_prefix.clone(),
+        secure: daemon.option_bool(OPT_TFTP_SECURE),
+        no_blocksize_option: daemon.option_bool(OPT_TFTP_NOBLOCK),
+        lowercase: daemon.option_bool(OPT_TFTP_LC),
+        single_port: daemon.option_bool(OPT_SINGLE_PORT),
+        apref_ip: daemon.option_bool(OPT_TFTP_APREF_IP),
+        apref_mac: daemon.option_bool(OPT_TFTP_APREF_MAC),
+        quiet: daemon.option_bool(OPT_QUIET_TFTP),
+        max_transfers: daemon.tftp_max,
+        mtu_override: daemon.tftp_mtu,
+        start_port: start_port.clamp(0, u16::MAX as i32) as u16,
+        end_port: end_port.clamp(0, u16::MAX as i32) as u16,
+        interfaces: daemon.tftp_interfaces.iter().filter_map(|i| i.name.clone()).collect(),
+    }
 }
 
 /// Turn `network::Listener`s into owned std sockets.
@@ -1290,10 +1335,87 @@ fn bind_dns_listeners(
     Ok((adopt_dns_listeners(listeners, nowild)?, Some(filter)))
 }
 
+/// Bind the TFTP listening socket(s) (port 69), mirroring the same
+/// `--bind-interfaces`/`--bind-dynamic`-vs-wildcard dispatch
+/// [`bind_dns_listeners`] uses — upstream shares one `struct listener` per
+/// address for DNS, TCP and TFTP alike (`network.c`), so the set of
+/// addresses TFTP listens on tracks the DNS listener set exactly.
+///
+/// Only called when `--enable-tftp` (`OPT_TFTP`) is set; returns an empty
+/// `Vec` otherwise.
+#[cfg(feature = "tftp")]
+fn bind_tftp_listeners(daemon: &Daemon) -> Result<Vec<BoundTftpSocket>, DnsmasqError> {
+    use crate::network::{self, ListenerKinds};
+    use crate::types::constants::{OPT_CLEVERBIND, OPT_NOWILD, OPT_TFTP};
+
+    if !daemon.option_bool(OPT_TFTP) {
+        return Ok(Vec::new());
+    }
+
+    let nowild     = daemon.option_bool(OPT_NOWILD);
+    let cleverbind = daemon.option_bool(OPT_CLEVERBIND);
+    let kinds = ListenerKinds { udp: false, tcp: false, tftp: true };
+
+    let mut check   = iface_check_config(daemon);
+    let allowed_cfg = iface_allowed_config(daemon);
+    let enumerated  = network::enumerate_allowed_interfaces(&mut check, &allowed_cfg)
+        .map_err(|e| DnsmasqError::BadNet(format!("failed to find list of interfaces: {e}")))?;
+
+    let listeners = if !nowild && !cleverbind {
+        network::create_wildcard_listeners_checked(69, kinds)
+            .map_err(|e| DnsmasqError::Bind("0.0.0.0:69".to_string(), e.to_string()))?
+    } else {
+        let iface_addrs: Vec<(SocketAddr, String)> = enumerated
+            .interfaces
+            .iter()
+            .filter(|i| i.tftp_ok)
+            .map(|i| (i.listen_addr(69), i.name.clone()))
+            .collect();
+        let mut listeners = Vec::new();
+        network::create_bound_listeners_checked(&mut listeners, &iface_addrs, kinds, nowild, cleverbind)
+            .map_err(|e| DnsmasqError::Bind("port 69".to_string(), e.to_string()))?;
+        listeners
+    };
+
+    adopt_tftp_listeners(listeners)
+}
+
+/// [`adopt_dns_listeners`], but for TFTP's `tftp_fd` and carrying the known
+/// interface name/MTU forward for the request handler.
+#[cfg(feature = "tftp")]
+fn adopt_tftp_listeners(
+    listeners: Vec<crate::network::Listener>,
+) -> Result<Vec<BoundTftpSocket>, DnsmasqError> {
+    use std::os::unix::io::FromRawFd;
+
+    let mut out = Vec::with_capacity(listeners.len());
+    for mut l in listeners {
+        // Nothing serves the DNS/TCP descriptors on this path; close them
+        // rather than leak, same as `adopt_dns_listeners`.
+        for fd in [std::mem::replace(&mut l.udp_fd, -1), std::mem::replace(&mut l.tcp_fd, -1)] {
+            if fd >= 0 {
+                unsafe { libc::close(fd) };
+            }
+        }
+        if l.tftp_fd < 0 {
+            continue;
+        }
+        let sock = unsafe { std::net::UdpSocket::from_raw_fd(l.tftp_fd) };
+        sock.set_nonblocking(true)?;
+        let addr = sock.local_addr().unwrap_or(l.addr);
+        let mtu = l.iface.as_deref().and_then(crate::network::interface_mtu);
+        out.push(BoundTftpSocket { sock, addr, iface: l.iface.clone(), mtu });
+    }
+    Ok(out)
+}
+
 /// Bind every socket the daemon serves from, before forking and before the
 /// privilege drop.
 pub fn bind_listeners(daemon: &Daemon) -> Result<Listeners, DnsmasqError> {
     let (dns, arrival_filter) = bind_dns_listeners(daemon)?;
+
+    #[cfg(feature = "tftp")]
+    let tftp = bind_tftp_listeners(daemon)?;
 
     #[cfg(feature = "dhcp")]
     let dhcp = match daemon_dhcp_runtime(daemon) {
@@ -1349,6 +1471,8 @@ pub fn bind_listeners(daemon: &Daemon) -> Result<Listeners, DnsmasqError> {
         dhcp,
         #[cfg(feature = "dhcp6")]
         dhcp6,
+        #[cfg(feature = "tftp")]
+        tftp,
     })
 }
 
@@ -1537,7 +1661,7 @@ pub async fn run_main_loop_with(
     use crate::dhcp::{DhcpLoopOptions, run_dhcp_loop};
 
     // ── Resolve configuration ────────────────────────────────────────────────
-    let (mut fwd_config, dhcp_runtime, arp_state) = {
+    let (mut fwd_config, dhcp_runtime, arp_state, tftp_config) = {
         let d = daemon_handle.read().await;
         let fwd_config = daemon_forward_config(&d);
         // Shared (not copied) so a kernel refresh triggered by the forwarding
@@ -1548,7 +1672,11 @@ pub async fn run_main_loop_with(
         let dhcp_runtime = daemon_dhcp_runtime(&d);
         #[cfg(not(feature = "dhcp"))]
         let dhcp_runtime = ();
-        (fwd_config, dhcp_runtime, arp_state)
+        #[cfg(feature = "tftp")]
+        let tftp_config = daemon_tftp_config(&d);
+        #[cfg(not(feature = "tftp"))]
+        let tftp_config = ();
+        (fwd_config, dhcp_runtime, arp_state, tftp_config)
     };
 
     // `--dns-loop-detect`: send the first round of loop probes once at
@@ -1636,6 +1764,8 @@ pub async fn run_main_loop_with(
     let prebound_dhcp = listeners.dhcp.take();
     #[cfg(feature = "dhcp6")]
     let prebound_dhcp6 = listeners.dhcp6.take();
+    #[cfg(feature = "tftp")]
+    let bound_tftp = std::mem::take(&mut listeners.tftp);
     let bound_dns = std::mem::take(&mut listeners.dns);
     let arrival_filter = listeners.arrival_filter.take();
 
@@ -1724,6 +1854,38 @@ pub async fn run_main_loop_with(
         std::time::Duration::from_secs(1),
     );
 
+    // ── Spawn the TFTP server ─────────────────────────────────────────────────
+    #[cfg(feature = "tftp")]
+    let tftp_task = if bound_tftp.is_empty() {
+        None
+    } else {
+        let mut tftp_listeners = Vec::with_capacity(bound_tftp.len());
+        for bound in bound_tftp {
+            let addr = bound.addr;
+            let sock = match tokio::net::UdpSocket::from_std(bound.sock) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("failed to adopt the TFTP socket bound on {addr}: {e}");
+                    fwd_task.abort();
+                    arp_task.abort();
+                    return RunResult::IoError;
+                }
+            };
+            info!("listening for TFTP requests on {addr}");
+            tftp_listeners.push(crate::tftp::TftpListenerHandle {
+                sock: Arc::new(sock),
+                addr,
+                iface: bound.iface,
+                mtu: bound.mtu,
+            });
+        }
+        Some(tokio::spawn(async move {
+            if let Err(e) = crate::tftp::run_tftp_loop(tftp_listeners, tftp_config).await {
+                error!("tftp loop exited: {e}");
+            }
+        }))
+    };
+
     #[cfg(feature = "dhcp")]
     let (dhcp_task, dhcp_shutdown_tx) = if let Some(mut dhcp_runtime) = dhcp_runtime {
         // Feed the DHCPv6 "current" RA-name context chain to the DHCPv4 loop
@@ -1746,6 +1908,8 @@ pub async fn run_main_loop_with(
                 error!("failed to bind DHCP socket on {bind_addr}: {e}");
                 fwd_task.abort();
                 arp_task.abort();
+                #[cfg(feature = "tftp")]
+                if let Some(t) = tftp_task.as_ref() { t.abort(); }
                 return RunResult::IoError;
             }
         };
@@ -1759,6 +1923,8 @@ pub async fn run_main_loop_with(
                     error!("failed to bind DHCP socket to interface {device}: {e}");
                     fwd_task.abort();
                     arp_task.abort();
+                    #[cfg(feature = "tftp")]
+                    if let Some(t) = tftp_task.as_ref() { t.abort(); }
                     return RunResult::IoError;
                 }
             }
@@ -1793,6 +1959,9 @@ pub async fn run_main_loop_with(
             Err(e) => {
                 error!("failed to bind DHCPv6 socket on {}: {e}", rt.bind_addr);
                 fwd_task.abort();
+                arp_task.abort();
+                #[cfg(feature = "tftp")]
+                if let Some(t) = tftp_task.as_ref() { t.abort(); }
                 #[cfg(feature = "dhcp")]
                 {
                     if let Some(tx) = dhcp_shutdown_tx.as_ref() {
@@ -1921,6 +2090,8 @@ pub async fn run_main_loop_with(
             if let Some(task) = dbus_task.as_ref() {
                 task.abort();
             }
+            #[cfg(feature = "tftp")]
+            if let Some(t) = tftp_task.as_ref() { t.abort(); }
             fwd_task.abort();
             arp_task.abort();
             return RunResult::IoError;
@@ -1962,6 +2133,8 @@ pub async fn run_main_loop_with(
             if let Some(task) = dbus_task.as_ref() {
                 task.abort();
             }
+            #[cfg(feature = "tftp")]
+            if let Some(t) = tftp_task.as_ref() { t.abort(); }
             fwd_task.abort();
             arp_task.abort();
             return RunResult::IoError;
@@ -1988,6 +2161,10 @@ pub async fn run_main_loop_with(
     };
 
     fwd_task.abort();
+    #[cfg(feature = "tftp")]
+    if let Some(task) = tftp_task {
+        task.abort();
+    }
     if let Some(task) = netlink_task {
         task.abort();
     }
