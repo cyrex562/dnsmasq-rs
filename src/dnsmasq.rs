@@ -1242,6 +1242,64 @@ fn bind_dhcp_socket_to_device(
     Ok(())
 }
 
+/// Open a netlink socket and spawn a background task that re-enumerates
+/// network interfaces whenever the kernel announces an address change.
+///
+/// Mirrors upstream's `netlink_init()` call site in `dnsmasq.c` plus
+/// `nl_async()`'s `queue_event(EVENT_NEWADDR)` (`netlink.c:406-411`): there,
+/// the netlink fd is registered in the daemon's `poll()` set and an
+/// `EVENT_NEWADDR` eventually triggers `enumerate_interfaces()` again so
+/// newly-appeared addresses are picked up without a restart. This task is the
+/// same reaction, driven by [`crate::netlink::watch_address_changes`]'s
+/// `AsyncFd` readiness loop instead of a poll/event-queue pair.
+///
+/// Only wires up re-enumeration itself — it does not yet feed the refreshed
+/// interface list into the live `ArrivalFilter` or rebuild bound listeners
+/// (`--bind-dynamic` re-bind is tracked separately in `tasks.md`). A failure
+/// to open the netlink socket (e.g. no `CAP_NET_ADMIN`, or a non-Linux
+/// sandbox) is logged and treated as "no live address-change notifications",
+/// matching how [`crate::slaac::Icmp6Socket`] degrades gracefully rather than
+/// aborting startup.
+#[cfg(target_os = "linux")]
+fn spawn_netlink_watch_task() -> Option<tokio::task::JoinHandle<()>> {
+    use tracing::{info, warn};
+
+    match crate::netlink::netlink_open() {
+        Ok((fd, _pid)) => Some(tokio::spawn(async move {
+            let result = crate::netlink::watch_address_changes(fd, |state| {
+                if state & crate::netlink::STATE_NEWADDR != 0 {
+                    match crate::network::enumerate_interfaces() {
+                        Ok(ifaces) => info!(
+                            count = ifaces.len(),
+                            "netlink: address change detected, re-enumerated interfaces"
+                        ),
+                        Err(e) => warn!("netlink: address change detected but re-enumeration failed: {e}"),
+                    }
+                }
+                if state & crate::netlink::STATE_NEWROUTE != 0 {
+                    info!("netlink: route change detected");
+                }
+            })
+            .await;
+            if let Err(e) = result {
+                warn!("netlink watch loop exited: {e}");
+            }
+        })),
+        Err(e) => {
+            warn!("failed to open netlink socket for address-change notifications: {e}");
+            None
+        }
+    }
+}
+
+/// Non-Linux platforms have no netlink socket; address-change notification is
+/// a Linux-specific runtime feature (matching `netlink.rs`'s existing
+/// `#[cfg(target_os = "linux")]` gating on the socket-level functions).
+#[cfg(not(target_os = "linux"))]
+fn spawn_netlink_watch_task() -> Option<tokio::task::JoinHandle<()>> {
+    None
+}
+
 /// Run the main daemon event loop, binding its own sockets.
 ///
 /// This function:
@@ -1467,6 +1525,9 @@ pub async fn run_main_loop_with(
         (None, None)
     };
 
+    // ── Netlink address-change watcher ───────────────────────────────────────
+    let netlink_task = spawn_netlink_watch_task();
+
     // ── Signal handling ──────────────────────────────────────────────────────
     let mut sigterm = match signal(SignalKind::terminate()) {
         Ok(s) => s,
@@ -1488,6 +1549,9 @@ pub async fn run_main_loop_with(
                 if let Some(task) = dhcp6_task.as_ref() {
                     task.abort();
                 }
+            }
+            if let Some(task) = netlink_task.as_ref() {
+                task.abort();
             }
             fwd_task.abort();
             return RunResult::IoError;
@@ -1514,6 +1578,9 @@ pub async fn run_main_loop_with(
                     task.abort();
                 }
             }
+            if let Some(task) = netlink_task.as_ref() {
+                task.abort();
+            }
             fwd_task.abort();
             return RunResult::IoError;
         }
@@ -1539,6 +1606,9 @@ pub async fn run_main_loop_with(
     };
 
     fwd_task.abort();
+    if let Some(task) = netlink_task {
+        task.abort();
+    }
     #[cfg(feature = "dhcp")]
     {
         if let Some(tx) = dhcp_shutdown_tx {
