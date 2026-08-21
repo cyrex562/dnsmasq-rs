@@ -10,6 +10,7 @@
 //!
 //! Every helper returns `None` when the environment forbids binding loopback
 //! UDP sockets, so restricted sandboxes skip rather than fail.
+#![cfg(feature = "loop")]
 
 use std::net::SocketAddr;
 use std::time::Duration;
