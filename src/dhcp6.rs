@@ -1188,6 +1188,27 @@ pub async fn run_dhcp6_loop(
     reply_port_override: Option<u16>,
 ) -> std::io::Result<()> {
     let mut buf = vec![0u8; 1500];
+
+    // SLAAC DAD probing (slaac.c:119-213) needs a nonzero, process-lifetime
+    // `ping_id` (matching the `while (ping_id == 0) ping_id = rand16();` at
+    // slaac.c:134-135) and a raw ICMPv6 socket, which requires `CAP_NET_RAW`.
+    // Probing is disabled — not a hard failure — when the process lacks it;
+    // "DAD probing works where permissions allow" is the acceptance bar, not
+    // "DHCPv6 startup requires it".
+    let mut ping_id: u16 = crate::util::rand16();
+    while ping_id == 0 {
+        ping_id = crate::util::rand16();
+    }
+    let icmp6 = match crate::slaac::Icmp6Socket::create() {
+        Ok(s) => Some(s),
+        Err(e) => {
+            debug!("SLAAC DAD probing disabled (no ICMPv6 raw socket: {e})");
+            None
+        }
+    };
+    let mut slaac_probe_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut icmp6_buf = [0u8; 1500];
+
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -1209,6 +1230,19 @@ pub async fn run_dhcp6_loop(
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 let reply = dispatch_dhcp6(&pkt, &duid, &contexts, &configs, &mut lease_db, authoritative, now_secs);
+
+                // Port of the `lease_set_hwaddr()` -> `slaac_add_addrs()` call
+                // chain (lease.c:992-993), applied across the whole lease set
+                // rather than the single lease `lease_set_hwaddr` targets —
+                // this port's DHCPv4 commit path does not yet thread
+                // `daemon->dhcp6` contexts down to `LeaseDb::set_hwaddr`
+                // itself (see `tasks.md`), so this is the nearest production
+                // call site that actually has both a fresh lease commit and
+                // the live RA-name context chain in scope. The RA-trigger
+                // callback is a documented no-op: production RA scheduling
+                // has no main-loop caller yet either (`tasks.md`, `radv.rs`).
+                lease_db.refresh_slaac(std::time::SystemTime::now(), &contexts, false, |_ctx| {});
+
                 let Some(reply) = reply else { continue };
 
                 let dest = dhcp6_reply_dest(src, reply_port_override);
@@ -1216,8 +1250,32 @@ pub async fn run_dhcp6_loop(
                     warn!("failed to send DHCPv6 reply to {dest}: {e}");
                 }
             }
+            _ = slaac_probe_tick.tick(), if icmp6.is_some() => {
+                let sock = icmp6.as_ref().unwrap();
+                lease_db.tick_slaac(std::time::SystemTime::now(), &contexts, ping_id, |dest, packet| {
+                    sock.send_echo_sync(dest, packet)
+                });
+            }
+            recv6 = icmp6_recv(&icmp6, &mut icmp6_buf), if icmp6.is_some() => {
+                match recv6 {
+                    Ok((n, sender)) => {
+                        lease_db.confirm_slaac_ping(sender, &icmp6_buf[..n], ping_id, "", false);
+                    }
+                    Err(e) => debug!("SLAAC DAD probe ICMPv6 recv error: {e}"),
+                }
+            }
         }
     }
+}
+
+/// Await a receive on `icmp6` when present. Only ever polled from the
+/// `tokio::select!` arm guarded by `icmp6.is_some()`, so the `unwrap()` here
+/// never fires in practice.
+async fn icmp6_recv(
+    icmp6: &Option<crate::slaac::Icmp6Socket>,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, Ipv6Addr)> {
+    icmp6.as_ref().unwrap().recv(buf).await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

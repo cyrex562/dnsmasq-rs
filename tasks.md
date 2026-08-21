@@ -1643,6 +1643,72 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   (which is what actually sets `CONTEXT_CONSTRUCTED`/`CONTEXT_TEMPLATE` at runtime, called from
   `dhcp6.c:771/807/852`) is not ported either, so this gap is currently unreachable in practice.
 
+- [x] `slaac::slaac_add_addrs` / `periodic_slaac` / `slaac_ping_reply` — real lease-derived SLAAC
+  address tracking and ICMPv6 DAD probing (Issue #37 / T3-slaac).
+  Source of truth: `slaac.c` (all three functions, gated `HAVE_DHCP6`).
+  Implemented, tested, real (no longer stubs):
+  - `slaac_add_addrs` (slaac.c:25-116): a real port operating on `&mut DhcpLease` +
+    `&[DhcpContext]`, mutating `lease.slaac_address` in place — diffs the derived address set
+    against the existing list (reuse-and-reset on `force`, drop stale entries, `ra_start_unsolicited`
+    callback for genuinely new ones), replacing the old disconnected `synthesize_slaac_addrs`
+    (which only returned a `Vec<Ipv6Addr>` with no lease/state tie-in and had zero callers).
+    `derive_slaac_host_id` replicates all three upstream hwaddr branches (6-byte Ethernet MAC via
+    EUI-64 synthesis, raw 8-byte `ARPHRD_EUI64` hardware address, FireWire EUI-64 carried in the
+    client-id) with the single post-branch `^= 0x02` U/L-bit flip upstream applies uniformly.
+  - `periodic_slaac` (slaac.c:119-190): real exponential-backoff/jitter DAD probe scheduling
+    operating on `SlaacAddress` entries directly (not the old disconnected `SlaacProbeState`,
+    which had zero callers and wasn't attached to `DhcpLease` at all) — matches the
+    `EHOSTUNREACH`-at-backoff-12 give-up case, the `next_event` earliest-pending-probe
+    computation, and the "nothing configured" (`!CONTEXT_RA_NAME`) early return exactly.
+  - `slaac_ping_reply` (slaac.c:191-213): matches inbound ICMPv6 echo replies by `ping_id` and
+    sender address, confirms (`backoff = 0`), and logs `SLAAC-CONFIRM`.
+  - A real (`CAP_NET_RAW`-gated) `Icmp6Socket` (raw ICMPv6, `socket2` + `tokio::io::unix::AsyncFd`)
+    for send/receive; `Icmp6Socket::create()` returns `Err` rather than failing DHCPv6 startup
+    when the process lacks the capability — "DAD probing works where permissions allow", not
+    "is mandatory". Ping-packet wire format (`build_ping_packet`/`parse_ping_packet`) matches
+    `struct ping_packet` (type/code/checksum/identifier/sequence, checksum left zero for the
+    kernel to fill in on a raw ICMPv6 socket).
+  - **Production wiring:** `LeaseDb` gained `refresh_slaac`/`tick_slaac`/`confirm_slaac_ping`
+    (the lease-set-wide equivalents of `slaac_add_addrs`/`periodic_slaac`/`slaac_ping_reply`,
+    setting `dns_dirty` — this port's existing stand-in for upstream's `lease_update_dns`).
+    `LeaseDb::set_hwaddr` had a real, separate bug fixed as a prerequisite: it never set
+    `LEASE_HAVE_HWADDR` (lease.c:946 sets it unconditionally in `lease_set_hwaddr`), so
+    `slaac_add_addrs`'s guard could never pass for any lease created through the normal
+    DHCP commit path. `set_hwaddr` now takes upstream's `force` parameter and returns upstream's
+    `change` value (true on `force` or a client-id change — a hwaddr-only change does *not* set
+    it, matching lease.c:944-993 exactly, including the "a packet with no client-id must not clear
+    an existing one" guard at lease.c:963). `dhcp6::run_dhcp6_loop` calls `refresh_slaac` after
+    every dispatched packet (contexts are in scope there) and runs a 1s `tick_slaac` probe tick
+    plus an `Icmp6Socket::recv` receive arm, both no-ops when the raw socket couldn't be opened.
+  Covered by `slaac::tests::*` (36 tests: all three hwaddr-derivation branches, force-reset,
+  stale-entry removal, RA-trigger-only-on-new-address, "nothing configured", due/not-due/confirmed/
+  give-up/reschedule probe states, ping-reply match/mismatch/malformed/already-confirmed, and a
+  capability-gated `Icmp6Socket::create` test that accepts either outcome), plus
+  `lease::tests::{set_hwaddr_sets_lease_have_hwaddr_flag, set_hwaddr_returns_*,
+  set_hwaddr_missing_clid_does_not_clear_existing_one, refresh_slaac_*, tick_slaac_sends_due_probe_and_confirm_ping_clears_it}`.
+  Explicitly still unsupported / open:
+  - `LeaseDb::set_hwaddr`'s `force` parameter is always passed `false` from the one production
+    caller (`dhcp.rs`'s DHCPv4 commit path) — upstream's `rfc2131.c:679` passes `true` for the
+    init-reboot-without-prior-record case and a context-dependent flag at `rfc2131.c:1683`; this
+    port's DHCPv4 state machine doesn't yet track that distinction. Conservative (never forces a
+    probe reset it shouldn't), not incorrect, but not full parity either.
+  - The DHCPv4 lease commit path (`dhcp.rs::record_lease` → `LeaseDb::set_hwaddr`) does not call
+    `refresh_slaac` itself — `daemon->dhcp6`'s RA-name context chain isn't threaded through the
+    DHCPv4 dispatch call chain. `dhcp6::run_dhcp6_loop`'s wiring is real and does exercise the
+    logic on every DHCPv6 packet, but per the pre-existing, separately-tracked "two independent
+    in-memory `LeaseDb` instances" gap (`run_dhcp6_loop`'s own doc comment, P1), DHCPv4-sourced
+    leases (the ones SLAAC actually targets — `LEASE_NA`/`LEASE_TA` leases are excluded by
+    `slaac_add_addrs`'s own guard) live in a different `LeaseDb` than the one `run_dhcp6_loop`
+    refreshes, so in the current architecture this wiring is exercised but currently inert
+    end-to-end until that `LeaseDb` unification lands.
+  - The RA-trigger callback passed to `refresh_slaac` at the `run_dhcp6_loop` call site is a
+    documented no-op: production RA scheduling itself has no main-loop caller yet either (see the
+    `radv::calc_interval`/`calc_lifetime` entry above), so there is no live `RaSchedule` to invoke
+    `start_unsolicited` on. Once that lands, the callback should call it for the matching context.
+  - The ICMPv6 receive path passes an empty `interface` string to `confirm_slaac_ping` (no
+    `IPV6_RECVPKTINFO`/cmsg support on the raw socket yet), so `SLAAC-CONFIRM` log lines never
+    show a real interface name. Matching/confirm/dns_dirty behavior itself is unaffected.
+
 ## P4 Test Harness And Tooling
 
 - [ ] Build reusable parity fixtures.

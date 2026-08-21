@@ -625,7 +625,7 @@ fn record_lease(
     if lease_db.find_by_addr(addr).is_none() && lease_db.allocate_v4(addr).is_none() {
         return;
     }
-    lease_db.set_hwaddr(addr, &pkt.chaddr[..hw_len], i32::from(pkt.htype), clid);
+    lease_db.set_hwaddr(addr, &pkt.chaddr[..hw_len], i32::from(pkt.htype), clid, false);
     lease_db.set_hostname(addr, hostname, false);
     lease_db.set_expires(addr, lease_time);
 }
