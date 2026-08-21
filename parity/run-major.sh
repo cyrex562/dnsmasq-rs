@@ -28,7 +28,13 @@ cleanup() {
   if [[ "${KEEP_CONTAINERS:-0}" == "1" ]]; then
     return
   fi
-  docker compose -f "$COMPOSE_FILE" down --remove-orphans >/dev/null 2>&1 || true
+  # --rmi local removes the images this compose file built (not anything
+  # pulled/tagged elsewhere on the host). Left unbounded across many harness
+  # cycles, these plus their build-cache layers grew to ~2.5TB and filled the
+  # disk — this teardown, plus the age-bounded builder prune below, keeps that
+  # from recurring without nuking cache useful for back-to-back runs.
+  docker compose -f "$COMPOSE_FILE" down --remove-orphans --rmi local --volumes >/dev/null 2>&1 || true
+  docker builder prune -f --filter "until=24h" >/dev/null 2>&1 || true
 }
 
 trap cleanup EXIT
