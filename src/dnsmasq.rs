@@ -2460,7 +2460,6 @@ pub struct RadvSocket {
 #[cfg(feature = "dhcp6")]
 impl std::os::unix::io::AsRawFd for RadvSocket {
     fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
-        use std::os::unix::io::AsRawFd;
         self.socket.as_raw_fd()
     }
 }
@@ -2702,6 +2701,7 @@ fn build_ra_packet(
 /// alias lookup, handled separately in [`run_radv_loop`]'s RS branch since it
 /// picks the *source* interface's bridge, not the destination's).
 #[cfg(feature = "dhcp6")]
+#[allow(clippy::too_many_arguments)]
 fn send_ra_with_aliases(
     socket: &RadvSocket,
     if_index: u32,
@@ -2737,6 +2737,7 @@ fn send_ra_with_aliases(
 ///
 /// Port of `icmp6_packet()` (radv.c:141-255).
 #[cfg(feature = "dhcp6")]
+#[allow(clippy::too_many_arguments)]
 fn handle_icmp6_packet(
     socket: &RadvSocket,
     data: &[u8],
@@ -2807,6 +2808,7 @@ fn handle_icmp6_packet(
 /// (radv.c:141-255, 789-897), run here as one `tokio::select!` loop instead
 /// of upstream's shared `select()`-based main loop.
 #[cfg(feature = "dhcp6")]
+#[allow(clippy::too_many_arguments)]
 pub async fn run_radv_loop(
     socket: RadvSocket,
     mut contexts: Vec<crate::types::dhcp::DhcpContext>,

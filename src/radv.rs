@@ -840,10 +840,15 @@ pub fn build_ra_for_interface(
 /// payload starting at the RS's type byte; the fixed RS header is 8 bytes
 /// (type, code, checksum, 4 reserved), so options start at offset 8.
 ///
-/// Returns `Err(())` on a malformed option (`opt_sz == 0 || opt_sz > rem`),
-/// matching upstream's "bad packet" early return.
+/// Returns `Err(MalformedRsOption)` on a malformed option
+/// (`opt_sz == 0 || opt_sz > rem`), matching upstream's "bad packet" early
+/// return.
 #[cfg(feature = "dhcp6")]
-pub fn parse_rs_source_mac(data: &[u8]) -> Result<Option<Vec<u8>>, ()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MalformedRsOption;
+
+#[cfg(feature = "dhcp6")]
+pub fn parse_rs_source_mac(data: &[u8]) -> Result<Option<Vec<u8>>, MalformedRsOption> {
     if data.len() < 8 {
         return Ok(None);
     }
@@ -853,7 +858,7 @@ pub fn parse_rs_source_mac(data: &[u8]) -> Result<Option<Vec<u8>>, ()> {
     while rem >= 2 {
         let opt_sz = (data[pos + 1] as usize) * 8;
         if opt_sz == 0 || opt_sz > rem {
-            return Err(());
+            return Err(MalformedRsOption);
         }
         if data[pos] == crate::radv_protocol::ICMP6_OPT_SOURCE_MAC {
             mac = Some(data[pos + 2..pos + opt_sz].to_vec());
@@ -967,10 +972,15 @@ pub struct RaSendTarget {
 /// applied at the same two points, mirroring radv.c:938-941 and :836-839.
 ///
 /// Port of `periodic_ra()`/`iface_search()`/`new_timeout()` (radv.c:789-984).
+///
+/// Mirrors upstream's parameter list (per-context state, live interfaces,
+/// the `--ra-param`/`--no-dhcp-interface` config, and the RNG/name-resolver
+/// hooks tests substitute) rather than collapsing it into a config struct.
 #[cfg(feature = "dhcp6")]
+#[allow(clippy::too_many_arguments)]
 pub fn periodic_ra(
     now: u64,
-    contexts: &mut Vec<DhcpContext>,
+    contexts: &mut [DhcpContext],
     live_ifaces: &[LiveIface6],
     ra_interfaces: &[RaInterface],
     dhcp_except: &[Iname],
@@ -1036,15 +1046,15 @@ pub fn periodic_ra(
                 let adv_interval = calc_interval(find_iface_param(ra_interfaces, &iface.name));
                 new_timeout_context(&mut contexts[idx], adv_interval, now, rand16());
 
-                for j in 0..contexts.len() {
+                for (j, other) in contexts.iter_mut().enumerate() {
                     if j == idx {
                         continue;
                     }
-                    if iface.prefix <= contexts[j].prefix
-                        && is_same_net6(&iface.addr, &contexts[j].start6, contexts[j].prefix)
-                        && is_same_net6(&iface.addr, &contexts[j].end6, contexts[j].prefix)
+                    if iface.prefix <= other.prefix
+                        && is_same_net6(&iface.addr, &other.start6, other.prefix)
+                        && is_same_net6(&iface.addr, &other.end6, other.prefix)
                     {
-                        contexts[j].ra_time = 0;
+                        other.ra_time = 0;
                     }
                 }
 
