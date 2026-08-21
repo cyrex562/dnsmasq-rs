@@ -1580,6 +1580,51 @@ pub struct IfaceAllowedConfig {
     pub dhcp_except:   Vec<(String, u32)>,
     /// If non-empty, only these interfaces get TFTP service.
     pub tftp_ifaces:   Vec<String>,
+    /// `--auth-server=<domain>[,interface|ip-address...]` (`daemon->authinterface`).
+    /// A matching interface/address is served for auth DNS regardless of any
+    /// other allow/deny rule, and has DHCP/TFTP disabled on it.
+    pub auth_interfaces: Vec<AuthInterface>,
+}
+
+/// One entry from `--auth-server`'s interface/address list
+/// (`struct iname` as used for `daemon->authinterface`).
+#[derive(Debug, Clone)]
+pub struct AuthInterface {
+    /// Set for a name-based entry (`--auth-server=domain,eth0`).
+    pub name:  Option<String>,
+    /// Set for an address-based entry (`--auth-server=domain,192.0.2.1`), or
+    /// as a family restriction (unspecified address) alongside `name`.
+    pub addr:  Option<IpAddr>,
+    /// `INAME_4`/`INAME_6`: restricts a name-based entry to one family.
+    /// `0` (upstream's `sa_family == 0`) means "either family".
+    pub flags: u32,
+}
+
+/// Decide whether `(name, addr)` is served as an auth-DNS interface.
+///
+/// Direct port of the `daemon->authinterface` loop in `iface_check()`
+/// (`network.c:153-179`): a name-based entry matches by exact name (no
+/// wildcards) plus an optional family restriction; an address-based entry
+/// matches by exact address. The first match wins, matching upstream's `break`.
+pub fn auth_interface_match(name: &str, addr: IpAddr, entries: &[AuthInterface]) -> bool {
+    for entry in entries {
+        if let Some(ename) = &entry.name {
+            let family_ok = if entry.flags & (INAME_4 | INAME_6) == 0 {
+                true
+            } else {
+                match addr {
+                    IpAddr::V4(_) => entry.flags & INAME_4 != 0,
+                    IpAddr::V6(_) => entry.flags & INAME_6 != 0,
+                }
+            };
+            if ename == name && family_ok {
+                return true;
+            }
+        } else if entry.addr == Some(addr) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Determine whether a label (secondary IPv4 address alias) should be treated
@@ -1633,7 +1678,11 @@ pub fn iface_allowed_v4(
         netmask: Some(IpAddr::V4(netmask)),
         flags:   if loopback { IFACE_LOOPBACK } else { 0 },
     };
-    if !iface_check_used(&dummy, iface_check_cfg, used) {
+    // `--auth-server`: a match forces inclusion regardless of the check above
+    // (network.c:153-179's `*auth = 1; ret = 1;`, applied inside `iface_check`
+    // before `iface_allowed` ever sees the combined result).
+    let auth_dns = auth_interface_match(effective_name, IpAddr::V4(addr), &config.auth_interfaces);
+    if !iface_check_used(&dummy, iface_check_cfg, used) && !auth_dns {
         return None;
     }
 
@@ -1641,26 +1690,32 @@ pub fn iface_allowed_v4(
     let mut dhcp4_ok = !loopback;
     let tftp_ok_base = !loopback;
 
-    // Apply dhcp_except deny list. Matches upstream network.c:538-546: any
-    // name match disables TFTP; the family bit gates whether DHCP for this
-    // family is also disabled.
-    let mut tftp_denied = false;
-    for (pat, flags) in &config.dhcp_except {
-        if iface_name_matches(name, pat) {
-            tftp_denied = true;
-            if flags & INAME_4 != 0 {
-                dhcp4_ok = false;
+    let tftp_ok = if auth_dns {
+        // "No DHCP where we're doing auth DNS" (network.c:531-537).
+        dhcp4_ok = false;
+        false
+    } else {
+        // Apply dhcp_except deny list. Matches upstream network.c:538-546: any
+        // name match disables TFTP; the family bit gates whether DHCP for this
+        // family is also disabled.
+        let mut tftp_denied = false;
+        for (pat, flags) in &config.dhcp_except {
+            if iface_name_matches(name, pat) {
+                tftp_denied = true;
+                if flags & INAME_4 != 0 {
+                    dhcp4_ok = false;
+                }
             }
         }
-    }
 
-    // TFTP: if a dedicated list is given, only those interfaces get TFTP.
-    let tftp_ok = if tftp_denied {
-        false
-    } else if config.tftp_ifaces.is_empty() {
-        tftp_ok_base
-    } else {
-        config.tftp_ifaces.iter().any(|p| iface_name_matches(name, p))
+        // TFTP: if a dedicated list is given, only those interfaces get TFTP.
+        if tftp_denied {
+            false
+        } else if config.tftp_ifaces.is_empty() {
+            tftp_ok_base
+        } else {
+            config.tftp_ifaces.iter().any(|p| iface_name_matches(name, p))
+        }
     };
 
     // Compute prefix length from netmask.
@@ -1677,7 +1732,7 @@ pub fn iface_allowed_v4(
         dhcp4_ok,
         dhcp6_ok:   false, // IPv4 interface → no DHCPv6
         tftp_ok,
-        auth_dns:   false,
+        auth_dns,
         found:      true,
         is_label,
     })
@@ -1707,28 +1762,34 @@ pub fn iface_allowed_v6(
         netmask: None,
         flags:   if loopback { IFACE_LOOPBACK } else { 0 },
     };
-    if !iface_check_used(&dummy, iface_check_cfg, used) {
+    let auth_dns = auth_interface_match(name, IpAddr::V6(addr), &config.auth_interfaces);
+    if !iface_check_used(&dummy, iface_check_cfg, used) && !auth_dns {
         return None;
     }
 
     let mut dhcp6_ok = !loopback;
 
-    let mut tftp_denied = false;
-    for (pat, flags) in &config.dhcp_except {
-        if iface_name_matches(name, pat) {
-            tftp_denied = true;
-            if flags & INAME_6 != 0 {
-                dhcp6_ok = false;
+    let tftp_ok = if auth_dns {
+        dhcp6_ok = false;
+        false
+    } else {
+        let mut tftp_denied = false;
+        for (pat, flags) in &config.dhcp_except {
+            if iface_name_matches(name, pat) {
+                tftp_denied = true;
+                if flags & INAME_6 != 0 {
+                    dhcp6_ok = false;
+                }
             }
         }
-    }
 
-    let tftp_ok = if tftp_denied {
-        false
-    } else if config.tftp_ifaces.is_empty() {
-        !loopback
-    } else {
-        config.tftp_ifaces.iter().any(|p| iface_name_matches(name, p))
+        if tftp_denied {
+            false
+        } else if config.tftp_ifaces.is_empty() {
+            !loopback
+        } else {
+            config.tftp_ifaces.iter().any(|p| iface_name_matches(name, p))
+        }
     };
 
     Some(IfaceRecord {
@@ -1741,7 +1802,7 @@ pub fn iface_allowed_v6(
         dhcp4_ok:   false, // IPv6 interface → no DHCPv4
         dhcp6_ok,
         tftp_ok,
-        auth_dns:   false,
+        auth_dns,
         found:      true,
         is_label:   false,
     })
@@ -2094,6 +2155,49 @@ pub fn is_globally_routable(addr: IpAddr) -> bool {
                 || v6 == Ipv6Addr::UNSPECIFIED)
         }
     }
+}
+
+/// Build the "LOUD WARNING" messages upstream logs when `--bind-interfaces`
+/// binds a globally-routable IPv4 address without `--bind-dynamic`.
+///
+/// Direct port of `warn_bound_listeners()` (`network.c:1251-1272`): under plain
+/// `--bind-interfaces` the kernel does not reliably report the arrival
+/// interface for IPv4, so a non-private address risks answering queries that
+/// arrived via an interface it wasn't meant to serve — the DNS-amplification
+/// concern the message calls out. Only `AF_INET` addresses are checked
+/// (upstream never checks IPv6 here), and an auth-DNS interface is exempt
+/// (`iface->dns_auth`, `network.c:1257`) since it isn't a resolver. Uses
+/// [`crate::rfc1035::private_net`] rather than [`is_globally_routable`] to
+/// match upstream's `private_net()` call exactly (CGNAT, test-nets, and the
+/// broadcast address included).
+///
+/// Returns one message per flagged interface, plus a trailing advisory to use
+/// `--bind-dynamic` when any were flagged — matching the two-`my_syslog` shape
+/// of the C function. The caller should log each line and is responsible for
+/// only calling this under `--bind-interfaces` (`OPT_NOWILD`), matching
+/// `dnsmasq.c:963-964`.
+pub fn warn_bound_listeners(interfaces: &[IfaceRecord]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for iface in interfaces {
+        if iface.auth_dns {
+            continue;
+        }
+        if let IpAddr::V4(v4) = iface.addr {
+            if !crate::rfc1035::private_net(v4, true) {
+                warnings.push(format!(
+                    "LOUD WARNING: listening on {v4} may accept requests via interfaces other than {}",
+                    iface.name
+                ));
+            }
+        }
+    }
+    if !warnings.is_empty() {
+        warnings.push(
+            "LOUD WARNING: use --bind-dynamic rather than --bind-interfaces to avoid DNS amplification attacks via these interface(s)"
+                .to_string(),
+        );
+    }
+    warnings
 }
 
 /// Validate an upstream server address.
@@ -3132,6 +3236,151 @@ mod tests {
         ).unwrap();
         assert!(!rec.dhcp6_ok);
         assert!(!rec.tftp_ok);
+    }
+
+    // ── auth_interface_match / --auth-server precedence ─────────────────────────
+
+    #[test]
+    fn auth_interface_match_by_name_any_family() {
+        let entries = vec![AuthInterface { name: Some("eth0".to_string()), addr: None, flags: 0 }];
+        assert!(auth_interface_match("eth0", IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), &entries));
+        assert!(auth_interface_match("eth0", "2001:db8::1".parse().unwrap(), &entries));
+        assert!(!auth_interface_match("eth1", IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), &entries));
+    }
+
+    #[test]
+    fn auth_interface_match_by_name_family_restricted() {
+        let entries = vec![AuthInterface { name: Some("eth0".to_string()), addr: None, flags: INAME_4 }];
+        assert!(auth_interface_match("eth0", IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), &entries));
+        assert!(!auth_interface_match("eth0", "2001:db8::1".parse().unwrap(), &entries));
+    }
+
+    #[test]
+    fn auth_interface_match_by_address() {
+        let addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let entries = vec![AuthInterface { name: None, addr: Some(addr), flags: 0 }];
+        assert!(auth_interface_match("eth0", addr, &entries));
+        assert!(!auth_interface_match("eth0", IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), &entries));
+    }
+
+    #[test]
+    fn auth_interface_match_empty_list_never_matches() {
+        assert!(!auth_interface_match("eth0", IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), &[]));
+    }
+
+    #[test]
+    fn iface_allowed_v4_auth_server_forces_inclusion_past_deny_list() {
+        // Denied by --except-interface, but an --auth-server match must still
+        // force inclusion (network.c:153-179's `*auth = 1; ret = 1;`).
+        let check_cfg = IfaceCheckConfig {
+            deny: vec!["eth0".to_string()],
+            ..Default::default()
+        };
+        let allowed_cfg = IfaceAllowedConfig {
+            auth_interfaces: vec![AuthInterface { name: Some("eth0".to_string()), addr: None, flags: 0 }],
+            ..Default::default()
+        };
+        let rec = iface_allowed_v4(
+            "eth0", None, 2,
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(255, 255, 255, 0),
+            false,
+            &allowed_cfg, &check_cfg, &mut IfaceCheckUsed::default(),
+        ).expect("auth-server match must force inclusion despite except-interface");
+        assert!(rec.auth_dns, "matched interface must be marked dns_auth");
+        assert!(!rec.dhcp4_ok, "auth-DNS interfaces must not offer DHCP (network.c:531-537)");
+        assert!(!rec.tftp_ok, "auth-DNS interfaces must not offer TFTP (network.c:531-537)");
+    }
+
+    #[test]
+    fn iface_allowed_v4_auth_server_by_address() {
+        let addr = Ipv4Addr::new(192, 168, 1, 1);
+        let allowed_cfg = IfaceAllowedConfig {
+            auth_interfaces: vec![AuthInterface { name: None, addr: Some(IpAddr::V4(addr)), flags: 0 }],
+            ..Default::default()
+        };
+        let rec = iface_allowed_v4(
+            "eth0", None, 2, addr, Ipv4Addr::new(255, 255, 255, 0), false,
+            &allowed_cfg, &default_check_cfg(), &mut IfaceCheckUsed::default(),
+        ).unwrap();
+        assert!(rec.auth_dns);
+        assert!(!rec.dhcp4_ok);
+    }
+
+    #[test]
+    fn iface_allowed_v4_no_auth_server_leaves_dns_auth_false() {
+        let rec = iface_allowed_v4(
+            "eth0", None, 2,
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(255, 255, 255, 0),
+            false,
+            &default_allowed_cfg(), &default_check_cfg(), &mut IfaceCheckUsed::default(),
+        ).unwrap();
+        assert!(!rec.auth_dns);
+        assert!(rec.dhcp4_ok);
+    }
+
+    #[test]
+    fn iface_allowed_v6_auth_server_disables_dhcp6_and_tftp() {
+        let addr: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let allowed_cfg = IfaceAllowedConfig {
+            auth_interfaces: vec![AuthInterface { name: Some("eth0".to_string()), addr: None, flags: 0 }],
+            ..Default::default()
+        };
+        let rec = iface_allowed_v6(
+            "eth0", 2, addr, 64, false,
+            &allowed_cfg, &default_check_cfg(), &mut IfaceCheckUsed::default(),
+        ).unwrap();
+        assert!(rec.auth_dns);
+        assert!(!rec.dhcp6_ok);
+        assert!(!rec.tftp_ok);
+    }
+
+    // ── warn_bound_listeners ─────────────────────────────────────────────────────
+
+    #[test]
+    fn warn_bound_listeners_warns_on_globally_routable_v4() {
+        let ifaces = vec![IfaceRecord {
+            name: "eth0".to_string(),
+            addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)),
+            ..Default::default()
+        }];
+        let warnings = warn_bound_listeners(&ifaces);
+        assert_eq!(warnings.len(), 2, "one per-interface warning plus the advisory");
+        assert!(warnings[0].contains("203.0.113.5"));
+        assert!(warnings[0].contains("eth0"));
+        assert!(warnings[1].contains("--bind-dynamic"));
+    }
+
+    #[test]
+    fn warn_bound_listeners_silent_for_private_address() {
+        let ifaces = vec![IfaceRecord {
+            name: "eth0".to_string(),
+            addr: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            ..Default::default()
+        }];
+        assert!(warn_bound_listeners(&ifaces).is_empty());
+    }
+
+    #[test]
+    fn warn_bound_listeners_silent_for_auth_dns_interface() {
+        let ifaces = vec![IfaceRecord {
+            name: "eth0".to_string(),
+            addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)),
+            auth_dns: true,
+            ..Default::default()
+        }];
+        assert!(warn_bound_listeners(&ifaces).is_empty(), "auth-DNS interfaces are exempt (network.c:1257)");
+    }
+
+    #[test]
+    fn warn_bound_listeners_ignores_ipv6() {
+        let ifaces = vec![IfaceRecord {
+            name: "eth0".to_string(),
+            addr: "2001:db8::1".parse().unwrap(),
+            ..Default::default()
+        }];
+        assert!(warn_bound_listeners(&ifaces).is_empty(), "upstream only checks AF_INET (network.c:1258)");
     }
 
     // ── clean_interfaces ──────────────────────────────────────────────────────

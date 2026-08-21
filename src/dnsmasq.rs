@@ -1072,6 +1072,8 @@ fn iface_check_config(daemon: &Daemon) -> crate::network::IfaceCheckConfig {
 
 /// Per-interface DHCP/TFTP permissions, for `iface_allowed_v4`/`_v6`.
 fn iface_allowed_config(daemon: &Daemon) -> crate::network::IfaceAllowedConfig {
+    use crate::types::addr::MySockAddr as Msa;
+
     let _ = daemon;
     #[allow(unused_mut)] // both fields below are feature-gated
     let mut config = crate::network::IfaceAllowedConfig::default();
@@ -1086,6 +1088,16 @@ fn iface_allowed_config(daemon: &Daemon) -> crate::network::IfaceAllowedConfig {
         config.tftp_ifaces =
             daemon.tftp_interfaces.iter().filter_map(|i| i.name.clone()).collect();
     }
+    config.auth_interfaces = daemon.auth_interfaces.iter()
+        .map(|i| crate::network::AuthInterface {
+            name:  i.name.clone(),
+            addr:  i.addr.as_ref().map(|a| match a {
+                Msa::V4(s) => std::net::IpAddr::V4(*s.ip()),
+                Msa::V6(s) => std::net::IpAddr::V6(*s.ip()),
+            }),
+            flags: i.flags,
+        })
+        .collect();
     config
 }
 
@@ -1169,6 +1181,15 @@ fn bind_dns_listeners(
     }
 
     // ── --bind-interfaces / --bind-dynamic ───────────────────────────────────
+    // `dnsmasq.c:963-964`: `warn_bound_listeners` fires only under plain
+    // `--bind-interfaces` (`OPT_NOWILD`), not `--bind-dynamic`, which actually
+    // rechecks the arrival interface and so isn't at risk.
+    if nowild {
+        for msg in network::warn_bound_listeners(&enumerated.interfaces) {
+            tracing::warn!("{msg}");
+        }
+    }
+
     // `listen_addr` carries the interface index into `sin6_scope_id` for
     // link-local addresses; without it the bind fails with EINVAL
     // (`network.c:617-620`).

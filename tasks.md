@@ -838,15 +838,39 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     `daemon->interface_addrs` subnet-membership check on the *source* address
     (`network.c:272`, `forward.c:1672`), which is not implemented — the option is parsed
     and normalised but has no runtime effect.
-  - **`--auth-server` interfaces are ignored.** `iface_check`'s `auth` output parameter
-    (`network.c:153-179`) is not ported, so `iface->dns_auth` is always false and
-    `--auth-zone` interface names do not affect which queries are served.
+  - [x] **`--auth-server` interfaces** (issue #39 follow-up). `iface_check`'s `auth` output
+    parameter (`network.c:153-179`) is now ported as `network::auth_interface_match` —
+    exact name match (with an optional `INAME_4`/`INAME_6` family restriction) or exact
+    address match against `daemon->authinterface` — and wired into `iface_allowed_v4`/`_v6`
+    via a new `IfaceAllowedConfig::auth_interfaces` field (populated in
+    `dnsmasq::iface_allowed_config` from `daemon.auth_interfaces`, which `option.rs`'s
+    `auth-server` parsing already fed but nothing consumed). A match now forces the
+    interface into the served set even past an `--except-interface` deny (matching
+    upstream's `*auth = 1; ret = 1;` override) and disables DHCP/TFTP on it
+    (`network.c:531-537`), setting `IfaceRecord::auth_dns` — previously hardcoded `false`
+    everywhere it was constructed. `--auth-zone` interface-name subnet resolution
+    (`network.c:307-355`, populating `auth_zone.subnet`) is a separate gap, still open —
+    see the `auth_zones`/`interface_names` note elsewhere in this file.
+  - [x] **`warn_bound_listeners`** (issue #39 follow-up): ported as `network::warn_bound_listeners`,
+    using the already-correct `rfc1035::private_net` (not the cruder `is_globally_routable`)
+    to match `network.c:1251-1272` exactly, including the auth-DNS exemption. Wired into
+    `bind_dns_listeners` under plain `--bind-interfaces` (not `--bind-dynamic`), matching
+    `dnsmasq.c:963-964`.
   - **Interface labels/aliases (`eth0:0`) are not enumerated.** `if-addrs` reports no label,
     so `iface_allowed_v4` is always called with `label: None` and `is_label` is always
     false. `label_exception` is wired into the arrival check but can only match on index +
-    address, never on a genuine alias name. `warn_wild_labels`/`warn_int_names`/
-    `warn_bound_listeners` (the "LOUD WARNING" for globally-routable `--bind-interfaces`
-    addresses, `network.c:1240-1275`) have no Rust equivalent.
+    address, never on a genuine alias name. `warn_wild_labels`/`warn_int_names` (log-only,
+    `network.c:1276-1292`) still have no Rust equivalent — low risk once labels exist, but
+    blocked on the same enumeration-backend gap.
+  - **`iface_allowed`'s remaining ports are still open**: bridge-interface alias resolution
+    (`--bridge-interface`, not the `iface_allowed` address-list refresh at `network.c:358-487`
+    for `--interface-name`/`domain=<domain>,<iface>`, tracked separately above), IPv6
+    `IFACE_TENTATIVE`/`IFACE_DEPRECATED` skip-and-reverse-only handling (`network.c:443-446,
+    494,577`, needs a netlink-based enumeration source — `if-addrs` doesn't expose DAD or
+    deprecated state), and `--local-service`'s address-list population (`network.c:272-301`,
+    tracked above). `local_bind`/`allocate_sfd`/`pre_allocate_sfds`/`check_servers`/
+    `newaddress` (outbound-socket and dynamic-reconfiguration lifecycle) remain unported —
+    see the `reload_servers`/`RandFdPool` notes elsewhere in this file.
   - **DHCP socket binding is unchanged.** `bind_dhcp_socket_to_device` still picks the
     first non-wildcard `--interface` name itself rather than going through the enumerated
     set; `whichdevice`/`bind_dhcp_devices` (`dnsmasq.c:400-405`) are not ported.
