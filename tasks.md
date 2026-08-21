@@ -1523,6 +1523,68 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     iterator is likewise not ported 1:1; `canonicalize_rdata` (already in this
     file before this issue) is the parsed-`DnsRr` equivalent used instead.
 
+- [ ] `src/auth.rs`: `answer_auth` now answers from real `Daemon`/`DnsCache` state instead of
+  the synthetic `AuthZoneConfig`/`LocalRecords` structs (Issue #41 / T3-auth).
+  Source of truth: `auth.c:21-916`.
+  Implemented, tested:
+  - Signature changed to `answer_auth(query, config: &mut AuthConfig, cache: &mut DnsCache,
+    peer_addr, local_query, now)`. `AuthConfig<'a>` borrows straight out of `Daemon`
+    (`auth_zones`, `mxnames` (`&mut`, for SRV rotation), `naptr`, `rr`, `txt`, `int_names`,
+    `cnames`, `auth_peers`, SOA/`auth_ttl`/`authserver`/`hostmaster` fields), matching the
+    existing `rfc1035::LocalConfig` convention rather than taking the whole `Daemon`.
+    `AuthZoneConfig`/`LocalRecords` are gone.
+  - `in_zone` now returns `Option<Option<usize>>` (member? → cut point), restoring the `cut`
+    output C's version has (`auth.c:72-96`) and dropped in the previous port.
+  - `find_subnet`/`find_exclude`/`filter_zone` (already correctly ported, auth.rs pre-#41) are
+    now actually called from `answer_auth`'s zone-selection, PTR, A/AAAA, and AXFR-dump paths —
+    previously dead code with no caller.
+  - OPCODE != QUERY → NOTIMP, `qclass != IN` → REFUSED (`auth.c:130-153`), both previously
+    entirely absent.
+  - PTR reverse lookups walk `int_names` address lists and `DnsCache::lookup_all_by_addr`
+    (real DHCP/hosts-sourced records, identified by `F_DHCP`/`F_HOSTS`), with the
+    `OPT_DHCP_FQDN` bare-name/FQDN split and zone-suffix reattachment (`auth.c:173-274`).
+  - CNAME-chain and wildcard-CNAME (`*.zone`) resolution with a `cname_restart`-equivalent
+    loop, appending the zone domain to a bare target (`auth.c:527-586`).
+  - SRV and NAPTR are served (`daemon.mxnames` where `is_srv`, `daemon.naptr`); the first
+    matching SRV record is rotated to the end of `mxnames` on each query, matching upstream's
+    round-robin side effect (`auth.c:312-345`).
+  - AXFR is authorized against `--auth-peer` (`daemon.auth_peers`, port ignored like upstream)
+    or `--auth-sec-servers` (`daemon.secondary_forward_servers`); an unauthorized request
+    returns `None` (dropped, no wire reply) instead of always succeeding.
+  - Coarse (all-or-nothing) UDP truncation: the built reply's wire size is checked against
+    `PACKETSZ`/`edns_pktsz` and `HB3_TC` set with counts zeroed on overflow, matching
+    `auth.c:874-881`'s effect if not its incremental per-RR mechanism.
+  - `Addrlist`-derived reverse-zone apex name (`X.X.X.in-addr.arpa` / `...ip6.arpa`) for the
+    auth section's SOA/NS owner when a PTR/SOA/NS-on-`.arpa` query resolved via a zone subnet
+    match, matching the `authname` computation at `auth.c:596-631`.
+  Still open (tracked, not silently dropped):
+  - **No live caller.** `grep -rn "auth::answer_auth" src/forward.rs src/dnsmasq.rs` finds
+    nothing; nothing in the runtime query path routes a query into this function yet. Wiring
+    it into `run_forward_loop_on`/`answer_locally` needs its own design pass — naively calling
+    it for every query whenever any `--auth-zone` is configured would incorrectly REFUSE
+    ordinary out-of-zone queries on interfaces that should still recurse/forward, because
+    per-interface `dns_auth` gating (`--auth-server`, already tracked as missing in the
+    `src/network.rs` entry above) isn't ported. A safe integration has to pre-filter on
+    `in_zone`/`find_subnet` before dispatching to `answer_auth`, or port `dns_auth` first.
+  - `is_name_synthetic`/`is_rev_synth` (`--synth-domain` forward/reverse synthesis fallback,
+    `auth.c:260,420`) are not called. `daemon.synth_domains` exists and is consulted elsewhere
+    (`rfc1035::check_for_local_domain`), but `daemon->cond_domain` (the plain `--domain` subnet
+    form) is not yet populated anywhere in this port — see the existing note on
+    `Daemon::synth_domains` in `src/types/daemon.rs`.
+  - Multi-message TCP AXFR framing is not implemented; truncation only sets `HB3_TC` on a
+    single UDP-sized reply, matching the *signal* upstream's `add_resource_record` truncation
+    gives but not the TCP-retry zone-transfer path itself.
+  - The AXFR dump and forward-answer paths always write full (non-cut) owner names on the
+    wire; upstream's `cut`-truncate-then-restore dance around `add_resource_record` is a
+    wire-compression optimization with no effect on the decoded name, and this port (like the
+    rest of `src/rfc1035.rs`) writes uncompressed names throughout, so it's intentionally not
+    replicated.
+  Required tests: `src/auth.rs`'s `#[cfg(test)]` module — OPCODE/QCLASS gating, zone-subnet
+  filtering actually applied to A/AAAA and PTR, a PTR answer sourced from a real `DnsCache`
+  DHCP-style record with FQDN stripped, CNAME-chain and wildcard-CNAME resolution, SRV
+  serving + rotation, NAPTR serving, AXFR authorized/refused via peer list and via
+  `--auth-sec-servers`, NXDOMAIN/NODATA/SOA-at-apex, out-of-zone REFUSED.
+
 - [x] `dhcp6::dispatch_dhcp6` real allocation/DUID/context pipeline, wired into the main loop
   (Issue #34 / T3-dhcp6).
   Source of truth: `dhcp6.c:35-689` (`dhcp6_init`, `complete_context6`, `address6_allocate`,
