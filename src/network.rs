@@ -441,6 +441,30 @@ pub fn iface_check(iface: &IfaceInfo, config: &IfaceCheckConfig) -> bool {
     iface_check_used(iface, config, &mut used)
 }
 
+/// [`iface_check`] restricted to name matching, with no address to check
+/// against `--listen-address`.
+///
+/// Port of `iface_check(AF_LOCAL, NULL, name, NULL)` — the form radv.c's
+/// `icmp6_packet()` (:178) and `iface_search()` (:934-935) call, since a
+/// Router Solicitation's arrival interface is known by name/index only.
+/// Passing `addr == NULL` upstream skips the whole `if_addrs` match loop
+/// (`network.c:131`), so an interface can only be pulled in by `--interface`
+/// here, never by `--listen-address`; `--except-interface` still applies
+/// unconditionally since `match_addr` can never be set.
+pub fn iface_check_name(name: &str, config: &IfaceCheckConfig) -> bool {
+    let mut ret = true;
+
+    if config.restricted() {
+        ret = config.allow.iter().any(|p| iface_name_matches(name, p));
+    }
+
+    if config.deny.iter().any(|p| iface_name_matches(name, p)) {
+        ret = false;
+    }
+
+    ret
+}
+
 /// Accept a datagram that arrived via a loopback interface addressed to an
 /// address we do serve.
 ///
@@ -2191,6 +2215,43 @@ mod tests {
         let cfg = IfaceCheckConfig { unnamed_iface: true, ..Default::default() };
         assert!(cfg.restricted());
         assert!(!iface_check(&make_iface("eth0"), &cfg));
+    }
+
+    // ── iface_check_name: AF_LOCAL / addr == NULL form (radv.c's icmp6_packet
+    //    / iface_search callers) ────────────────────────────────────────────
+
+    #[test]
+    fn iface_check_name_allow_empty_accepts_all() {
+        let cfg = IfaceCheckConfig::default();
+        assert!(iface_check_name("eth0", &cfg));
+    }
+
+    #[test]
+    fn iface_check_name_allow_list() {
+        let cfg = IfaceCheckConfig { allow: vec!["eth*".to_string()], ..Default::default() };
+        assert!(iface_check_name("eth0", &cfg));
+        assert!(!iface_check_name("lo", &cfg));
+    }
+
+    #[test]
+    fn iface_check_name_except_interface_rejects() {
+        let cfg = IfaceCheckConfig { deny: vec!["eth0".to_string()], ..Default::default() };
+        assert!(iface_check_name("eth1", &cfg));
+        assert!(!iface_check_name("eth0", &cfg));
+    }
+
+    /// `--listen-address` never accepts by name here — upstream passes
+    /// `addr == NULL` for this call form, so the whole `if_addrs` match loop
+    /// is skipped (`network.c:131`) and only `--interface` can pull an
+    /// interface in.
+    #[test]
+    fn iface_check_name_listen_address_does_not_restrict_by_name() {
+        let cfg = IfaceCheckConfig {
+            addrs: vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))],
+            ..Default::default()
+        };
+        assert!(cfg.restricted());
+        assert!(!iface_check_name("eth0", &cfg), "no --interface entry, so nothing is allowed by name");
     }
 
     #[test]

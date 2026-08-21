@@ -1555,6 +1555,7 @@ pub async fn run_main_loop_with(
                 bridges: d.bridges.clone(),
                 opt_ra: d.option_bool(crate::types::constants::OPT_RA),
                 is_dns_server: d.port == crate::dns_protocol::NAMESERVER_PORT,
+                iface_check: iface_check_config(&d),
             })
         } else {
             None
@@ -1822,7 +1823,7 @@ pub async fn run_main_loop_with(
         let task = tokio::spawn(async move {
             if let Err(e) = run_radv_loop(
                 socket, cfg.contexts, cfg.ra_interfaces, cfg.dhcp_except, cfg.bridges,
-                cfg.opt_ra, cfg.is_dns_server, shutdown_rx,
+                cfg.opt_ra, cfg.is_dns_server, cfg.iface_check, shutdown_rx,
             ).await {
                 error!("radv loop exited: {e}");
             }
@@ -2443,6 +2444,11 @@ pub struct RadvConfig {
     pub bridges: Vec<crate::types::daemon::DhcpBridge>,
     pub opt_ra: bool,
     pub is_dns_server: bool,
+    /// The `--interface`/`--except-interface`/`--listen-address` filter,
+    /// applied via [`crate::network::iface_check_name`] to both the RA send
+    /// path ([`crate::radv::periodic_ra`]) and the receive path
+    /// ([`handle_icmp6_packet`]) — radv.c:178, :934-935.
+    pub iface_check: crate::network::IfaceCheckConfig,
 }
 
 #[cfg(feature = "dhcp6")]
@@ -2740,6 +2746,7 @@ fn handle_icmp6_packet(
     ra_interfaces: &[crate::types::dhcp::RaInterface],
     bridges: &[crate::types::daemon::DhcpBridge],
     dhcp_except: &[crate::types::network::Iname],
+    iface_check: &crate::network::IfaceCheckConfig,
     opt_ra: bool,
     is_dns_server: bool,
 ) {
@@ -2751,6 +2758,10 @@ fn handle_icmp6_packet(
     }
 
     let Some(name) = crate::network::indextoname(if_index) else { return };
+    // radv.c:178 — `--interface`/`--except-interface`/`--listen-address`.
+    if !crate::network::iface_check_name(&name, iface_check) {
+        return;
+    }
     if crate::radv::blocked_by_dhcp_except(&name, dhcp_except) {
         return;
     }
@@ -2760,13 +2771,23 @@ fn handle_icmp6_packet(
         _ => None,
     };
 
-    if let Some(bridge) = crate::radv::find_bridge_for_alias(bridges, &name) {
+    // radv.c:228-247: a bridge only "claims" the RS when its own interface
+    // resolves AND one of its aliases matches the arrival interface: an
+    // unresolvable bridge (`if_nametoindex` fails, e.g. configured but not
+    // currently present) is skipped in favour of the next bridge, not treated
+    // as a match that silently drops the RS — falling through to the direct
+    // reply below if no bridge ends up claiming it.
+    for bridge in bridges {
         let bridge_idx = crate::network::nametoindex(&bridge.iface);
-        if bridge_idx != 0 {
-            if let Some(packet) = build_ra_packet(socket, bridge_idx, &bridge.iface, contexts, ra_interfaces, opt_ra, is_dns_server) {
-                if let Err(e) = socket.send(if_index, dest, &packet) {
-                    tracing::warn!("failed to send bridged RA reply on {name}: {e}");
-                }
+        if bridge_idx == 0 {
+            continue;
+        }
+        if !bridge.aliases.iter().any(|a| crate::util::wildcard_matchn(a, &name, libc::IF_NAMESIZE)) {
+            continue;
+        }
+        if let Some(packet) = build_ra_packet(socket, bridge_idx, &bridge.iface, contexts, ra_interfaces, opt_ra, is_dns_server) {
+            if let Err(e) = socket.send(if_index, dest, &packet) {
+                tracing::warn!("failed to send bridged RA reply on {name}: {e}");
             }
         }
         return;
@@ -2794,6 +2815,7 @@ pub async fn run_radv_loop(
     bridges: Vec<crate::types::daemon::DhcpBridge>,
     opt_ra: bool,
     is_dns_server: bool,
+    iface_check: crate::network::IfaceCheckConfig,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     use tokio::io::unix::AsyncFd;
@@ -2819,6 +2841,7 @@ pub async fn run_radv_loop(
                 let (targets, next) = crate::radv::periodic_ra(
                     now, &mut contexts, &live_ifaces, &ra_interfaces, &dhcp_except,
                     crate::util::rand16, crate::network::indextoname,
+                    |name| crate::network::iface_check_name(name, &iface_check),
                 );
                 for target in &targets {
                     send_ra_with_aliases(
@@ -2841,7 +2864,8 @@ pub async fn run_radv_loop(
                 if let Ok(meta) = result {
                     handle_icmp6_packet(
                         async_fd.get_ref(), &recv_buf[..meta.len], meta.if_index, meta.src,
-                        &mut contexts, &ra_interfaces, &bridges, &dhcp_except, opt_ra, is_dns_server,
+                        &mut contexts, &ra_interfaces, &bridges, &dhcp_except, &iface_check,
+                        opt_ra, is_dns_server,
                     );
                 }
             }
@@ -4832,7 +4856,8 @@ mod tests {
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(run_radv_loop(
-            socket, vec![ctx], vec![], vec![], vec![], false, false, shutdown_rx,
+            socket, vec![ctx], vec![], vec![], vec![], false, false,
+            crate::network::IfaceCheckConfig::default(), shutdown_rx,
         ));
 
         // `ra_start_unsolicited_all` schedules within 0-5s; give it a moment

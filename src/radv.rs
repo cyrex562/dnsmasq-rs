@@ -956,10 +956,15 @@ pub struct RaSendTarget {
 /// live kernel lookup rather than the `live_ifaces` snapshot, since a
 /// `CONTEXT_OLD` context's address has already vanished from that snapshot.
 ///
-/// `live_ifaces` and `dhcp_except` are assumed already `iface_check`-filtered
-/// by the caller (radv.c:934-935's `iface_check` call happens once, at
-/// enumeration time, in the transport layer); this function only applies the
-/// `--no-dhcp-interface` (`INAME_6`) filter itself, since that's RA-specific.
+/// `iface_allowed` is the `--interface`/`--except-interface`/`--listen-address`
+/// gate, ported as `crate::network::iface_check_name` and applied here exactly
+/// where upstream applies it: once inside the `iface_search` candidate scan
+/// (radv.c:934-935, so a disallowed interface is skipped in favour of another
+/// live candidate on the same subnet) and again, uniformly, on whichever
+/// interface name was found — including the `CONTEXT_OLD` branch, which has
+/// no candidate scan of its own — right before upstream's `send_ra`
+/// (radv.c:833-834). `dhcp_except` (`--no-dhcp-interface`, `INAME_6`) is
+/// applied at the same two points, mirroring radv.c:938-941 and :836-839.
 ///
 /// Port of `periodic_ra()`/`iface_search()`/`new_timeout()` (radv.c:789-984).
 #[cfg(feature = "dhcp6")]
@@ -971,6 +976,7 @@ pub fn periodic_ra(
     dhcp_except: &[Iname],
     mut rand16: impl FnMut() -> u16,
     resolve_stale_name: impl Fn(u32) -> Option<String>,
+    iface_allowed: impl Fn(&str) -> bool,
 ) -> (Vec<RaSendTarget>, Option<u64>) {
     let mut targets = Vec::new();
 
@@ -1013,7 +1019,7 @@ pub fn periodic_ra(
             let mut found = false;
 
             for iface in live_ifaces {
-                if blocked_by_dhcp_except(&iface.name, dhcp_except) {
+                if !iface_allowed(&iface.name) || blocked_by_dhcp_except(&iface.name, dhcp_except) {
                     continue;
                 }
                 if iface.prefix > prefix
@@ -1051,8 +1057,13 @@ pub fn periodic_ra(
             }
         }
 
+        // radv.c:833-834's `iface_check`/`dhcp_except` re-check, applied
+        // uniformly to whichever branch found `target` — the only gate the
+        // `CONTEXT_OLD` branch gets, since it has no candidate scan of its own.
         if let Some(t) = target {
-            targets.push(t);
+            if iface_allowed(&t.name) && !blocked_by_dhcp_except(&t.name, dhcp_except) {
+                targets.push(t);
+            }
         }
     }
 }
@@ -1757,7 +1768,7 @@ mod tests {
         let mut ctx = base_ctx();
         ctx.ra_time = 2000;
         let mut ctxs = vec![ctx];
-        let (targets, next) = periodic_ra(1000, &mut ctxs, &[], &[], &[], || 0, |_| None);
+        let (targets, next) = periodic_ra(1000, &mut ctxs, &[], &[], &[], || 0, |_| None, |_| true);
         assert!(targets.is_empty());
         assert_eq!(next, Some(2000));
     }
@@ -1768,7 +1779,7 @@ mod tests {
         ctx.ra_time = 900; // overdue at now=1000
         let mut ctxs = vec![ctx];
         let ifaces = vec![live_iface(5, "eth0", "2001:db8::1", 64)];
-        let (targets, _next) = periodic_ra(1000, &mut ctxs, &ifaces, &[], &[], || 0, |_| None);
+        let (targets, _next) = periodic_ra(1000, &mut ctxs, &ifaces, &[], &[], || 0, |_| None, |_| true);
         assert_eq!(targets, vec![RaSendTarget { if_index: 5, name: "eth0".to_string() }]);
         assert!(ctxs[0].ra_time > 1000, "should be rescheduled, not left overdue");
     }
@@ -1779,7 +1790,7 @@ mod tests {
         ctx.ra_time = 900;
         let mut ctxs = vec![ctx];
         // No live interfaces on this subnet at all.
-        let (targets, next) = periodic_ra(1000, &mut ctxs, &[], &[], &[], || 0, |_| None);
+        let (targets, next) = periodic_ra(1000, &mut ctxs, &[], &[], &[], || 0, |_| None, |_| true);
         assert!(targets.is_empty());
         assert_eq!(next, None);
         assert_eq!(ctxs[0].ra_time, 0, "gives up rather than spinning forever");
@@ -1792,9 +1803,40 @@ mod tests {
         let mut ctxs = vec![ctx];
         let ifaces = vec![live_iface(5, "eth0", "2001:db8::1", 64)];
         let except = vec![Iname { name: Some("eth0".to_string()), addr: None, flags: INAME_6 }];
-        let (targets, _next) = periodic_ra(1000, &mut ctxs, &ifaces, &[], &except, || 0, |_| None);
+        let (targets, _next) = periodic_ra(1000, &mut ctxs, &ifaces, &[], &except, || 0, |_| None, |_| true);
         assert!(targets.is_empty());
         assert_eq!(ctxs[0].ra_time, 0);
+    }
+
+    #[test]
+    fn periodic_ra_iface_check_blocks_interface() {
+        let mut ctx = base_ctx();
+        ctx.ra_time = 900;
+        let mut ctxs = vec![ctx];
+        let ifaces = vec![live_iface(5, "eth0", "2001:db8::1", 64)];
+        let (targets, _next) =
+            periodic_ra(1000, &mut ctxs, &ifaces, &[], &[], || 0, |_| None, |name| name != "eth0");
+        assert!(targets.is_empty(), "--except-interface=eth0 should suppress the RA");
+        assert_eq!(ctxs[0].ra_time, 0);
+    }
+
+    #[test]
+    fn periodic_ra_iface_check_blocks_old_context() {
+        let mut ctx = base_ctx();
+        ctx.flags |= CONTEXT_OLD;
+        ctx.if_index = 7;
+        ctx.ra_time = 900;
+        let mut ctxs = vec![ctx];
+        let (targets, _next) = periodic_ra(
+            1000, &mut ctxs, &[], &[], &[], || 0,
+            |idx| if idx == 7 { Some("eth7".to_string()) } else { None },
+            |name| name != "eth7",
+        );
+        assert!(
+            targets.is_empty(),
+            "a CONTEXT_OLD context has no candidate scan of its own, so it must still be \
+             gated by --except-interface at the final check"
+        );
     }
 
     #[test]
@@ -1804,7 +1846,7 @@ mod tests {
         let mut ctxs = vec![ctx];
         let mut iface = live_iface(5, "eth0", "2001:db8::1", 64);
         iface.tentative = true;
-        let (targets, _next) = periodic_ra(1000, &mut ctxs, &[iface], &[], &[], || 0, |_| None);
+        let (targets, _next) = periodic_ra(1000, &mut ctxs, &[iface], &[], &[], || 0, |_| None, |_| true);
         assert!(targets.is_empty());
         assert!(ctxs[0].ra_time > 1000, "still rescheduled even though nothing sent");
     }
@@ -1818,7 +1860,7 @@ mod tests {
         let mut ctxs = vec![ctx];
         let (targets, _next) = periodic_ra(1000, &mut ctxs, &[], &[], &[], || 0, |idx| {
             if idx == 7 { Some("eth7".to_string()) } else { None }
-        });
+        }, |_| true);
         assert_eq!(targets, vec![RaSendTarget { if_index: 7, name: "eth7".to_string() }]);
     }
 
@@ -1829,7 +1871,7 @@ mod tests {
         ctx.if_index = 7;
         ctx.ra_time = 900;
         let mut ctxs = vec![ctx];
-        let (targets, next) = periodic_ra(1000, &mut ctxs, &[], &[], &[], || 0, |_| None);
+        let (targets, next) = periodic_ra(1000, &mut ctxs, &[], &[], &[], || 0, |_| None, |_| true);
         assert!(targets.is_empty());
         assert_eq!(next, None);
         assert_eq!(ctxs[0].ra_time, 0);
@@ -1843,7 +1885,7 @@ mod tests {
         ctx2.ra_time = 950;
         let mut ctxs = vec![ctx1, ctx2];
         let ifaces = vec![live_iface(5, "eth0", "2001:db8::1", 64)];
-        let (targets, _next) = periodic_ra(1000, &mut ctxs, &ifaces, &[], &[], || 0, |_| None);
+        let (targets, _next) = periodic_ra(1000, &mut ctxs, &ifaces, &[], &[], || 0, |_| None, |_| true);
         assert_eq!(targets.len(), 1, "only one RA sent even though two contexts were overdue");
         assert_eq!(ctxs[1].ra_time, 0, "sibling on the same subnet is zeroed, not independently rescheduled");
     }

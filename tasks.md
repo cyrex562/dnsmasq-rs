@@ -1972,6 +1972,26 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     `run_main_loop_with` alongside the DHCPv6 socket, gated on `daemon.doing_ra`; a failed
     `RadvSocket::new()` is a hard startup failure (matching upstream's `die()`), same convention
     already used for a failed DHCPv6 bind in that function.
+  Follow-up fix: the first pass left `--interface`/`--except-interface`/`--listen-address`
+  filtering out of both the RA send and receive paths — `RadvConfig` carried `dhcp_except`/
+  `bridges` but never `daemon.if_names`/`if_except`/`if_addrs`, and `periodic_ra`'s doc comment
+  incorrectly claimed the caller had already applied `iface_check`. Fixed:
+  - `network::iface_check_name` added — the `iface_check(AF_LOCAL, NULL, name, NULL)` form
+    (name-only, no `--listen-address` match, since the RS/RA call sites have no specific address
+    to check against it).
+  - `radv::periodic_ra` gained an `iface_allowed` closure param, applied both inside the live-
+    interface candidate scan (radv.c:934-935) and uniformly on whichever interface name was
+    found — including the `CONTEXT_OLD` branch, which has no candidate scan of its own and was
+    previously ungated by either `iface_check` or `--no-dhcp-interface` (radv.c:833-834, 836-839).
+  - `dnsmasq::handle_icmp6_packet` now calls `iface_check_name` on the arrival interface before
+    dispatching a Router Solicitation reply (radv.c:178), and `RadvConfig`/`run_radv_loop` thread
+    an `IfaceCheckConfig` through from `iface_check_config(daemon)` (already used for DNS listener
+    binding) end to end.
+  - Also fixed: the bridge-alias branch in `handle_icmp6_packet` now matches upstream's loop
+    exactly (radv.c:228-247) — a `--bridge-interface` whose own interface doesn't currently
+    resolve (`if_nametoindex` fails) is skipped in favour of the next bridge, rather than
+    unconditionally dropping the RS. Only when no bridge claims the RS does it fall through to a
+    direct reply on the arrival interface.
   Known gaps, left for a follow-up:
   - `--dhcp-option6=option6:dns-server/domain-search`-driven RDNSS/DNSSL tag-filtered substitution
     (radv.c:454-525) is not implemented; only the default "advertise ourselves" RDNSS fallback is.
