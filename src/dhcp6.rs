@@ -7,6 +7,7 @@
 #![cfg(feature = "dhcp6")]
 
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::sync::Arc;
 
 use tracing::{debug, warn};
 
@@ -14,9 +15,10 @@ use crate::dhcp6_protocol::{
     Dhcp6MsgType, DHCPV6_CLIENT_PORT, DHCPV6_SERVER_PORT,
     OPTION6_CLIENT_ID, OPTION6_IA_NA, OPTION6_IAADDR, OPTION6_SERVER_ID, OPTION6_STATUS_CODE,
 };
+use crate::lease::LeaseDb;
 use crate::metrics::{inc_metric, Metric};
 use crate::types::daemon::Daemon;
-use crate::types::dhcp::DhcpNetid;
+use crate::types::dhcp::{DhcpConfig, DhcpContext, DhcpNetid, LEASE_NA};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DHCPv6 packet representation
@@ -261,15 +263,20 @@ pub fn dispatch_dhcp6(
 ///
 /// DHCPv6 replies go to the client's link-local address on port 546.
 /// If the source address is unspecified, use all-nodes multicast.
-pub fn dhcp6_reply_dest(src: SocketAddr) -> SocketAddr {
+///
+/// `port_override` substitutes a different reply port, for unprivileged test
+/// and harness setups that can't bind the real client port — mirrors
+/// [`crate::dhcp::DhcpLoopOptions::reply_port_override`].
+pub fn dhcp6_reply_dest(src: SocketAddr, port_override: Option<u16>) -> SocketAddr {
+    let port = port_override.unwrap_or(DHCPV6_CLIENT_PORT);
     match src {
         SocketAddr::V6(v6) => {
-            SocketAddr::V6(SocketAddrV6::new(*v6.ip(), DHCPV6_CLIENT_PORT, 0, v6.scope_id()))
+            SocketAddr::V6(SocketAddrV6::new(*v6.ip(), port, 0, v6.scope_id()))
         }
         _ => {
             // Fallback: all-nodes link-local multicast
             let all_nodes: Ipv6Addr = "ff02::1".parse().unwrap();
-            SocketAddr::V6(SocketAddrV6::new(all_nodes, DHCPV6_CLIENT_PORT, 0, 0))
+            SocketAddr::V6(SocketAddrV6::new(all_nodes, port, 0, 0))
         }
     }
 }
@@ -758,6 +765,106 @@ pub fn dhcp6_init(nowild: bool) -> std::io::Result<std::os::unix::io::RawFd> {
 
     let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, DHCPV6_SERVER_PORT, 0, 0));
     make_sock(addr, SockType::Udp, nowild)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Receive/dispatch loop (ported from dhcp6.c:89-306, receive-loop portion)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Extract the allocated IPv6 address from a reply's IA_NA/IAADDR sub-option,
+/// if the allocation succeeded (as opposed to a Status-Code NoAddrsAvail).
+fn extract_allocated_addr(reply: &Dhcp6Reply) -> Option<Ipv6Addr> {
+    let ia_data = find_option6(&reply.options, OPTION6_IA_NA)?;
+    if ia_data.len() <= 12 {
+        return None;
+    }
+    let iaaddr = find_option6(&ia_data[12..], OPTION6_IAADDR)?;
+    let bytes: [u8; 16] = iaaddr.get(0..16)?.try_into().ok()?;
+    Some(Ipv6Addr::from(bytes))
+}
+
+/// Run the DHCPv6 receive/dispatch loop over an already-bound `[::]:547` socket.
+///
+/// `contexts` is the "current" chain [`complete_context6`] builds from live
+/// interface prefixes — production callers build this once at startup via
+/// [`dhcp_construct_contexts`]/[`complete_context6`]. This loop does not
+/// re-derive that chain per packet against the packet's arrival interface the
+/// way upstream's `dhcp6_packet()` does (dhcp6.c:89-306); see `tasks.md`.
+///
+/// An allocated address is committed into `lease_db` only when the client
+/// sent Request/Renew/Rebind — Solicit/Advertise never commits, matching
+/// upstream (`address6_allocate()` is a pure candidate search; only
+/// `lease6_allocate()` on the Reply path persists it). `lease_db` is kept
+/// in-memory only by this loop: it does not load or write a shared
+/// `--dhcp-leasefile` — doing that safely needs one writer for the file the
+/// IPv4 loop already owns, not two independent in-memory copies of it (see
+/// `tasks.md`).
+///
+/// Port of the receive-loop portion of `dhcp6_packet()` (dhcp6.c:89-306),
+/// wired to the real [`dispatch_dhcp6`] pipeline.
+pub async fn run_dhcp6_loop(
+    socket: Arc<tokio::net::UdpSocket>,
+    duid: Vec<u8>,
+    contexts: Vec<DhcpContext>,
+    configs: Vec<DhcpConfig>,
+    mut lease_db: LeaseDb,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    reply_port_override: Option<u16>,
+) -> std::io::Result<()> {
+    let mut buf = vec![0u8; 1500];
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                match changed {
+                    Ok(()) if *shutdown.borrow() => return Ok(()),
+                    Ok(()) => continue,
+                    Err(_) => return Ok(()),
+                }
+            }
+            recv = socket.recv_from(&mut buf) => {
+                let (len, src) = recv?;
+                let Ok(pkt) = parse_dhcp6_packet(&buf[..len]) else {
+                    debug!("ignoring malformed or relay DHCPv6 packet from {src}");
+                    continue;
+                };
+
+                let reply = {
+                    let mut in_use = |addr: &Ipv6Addr| {
+                        lease_db.find_v6_by_addr(addr).is_some()
+                            || config_find_by_address6(&configs, addr)
+                    };
+                    dispatch_dhcp6(&pkt, &duid, &contexts, &mut in_use)
+                };
+                let Some(reply) = reply else { continue };
+
+                if matches!(
+                    pkt.msg_type,
+                    Dhcp6MsgType::Request | Dhcp6MsgType::Renew | Dhcp6MsgType::Rebind
+                ) {
+                    if let Some(addr) = extract_allocated_addr(&reply) {
+                        if lease_db.find_v6_by_addr(&addr).is_none() {
+                            let client_id = find_option6(&pkt.options, OPTION6_CLIENT_ID)
+                                .unwrap_or(&[])
+                                .to_vec();
+                            let iaid = find_option6(&pkt.options, OPTION6_IA_NA)
+                                .filter(|d| d.len() >= 4)
+                                .map(|d| u32::from_be_bytes([d[0], d[1], d[2], d[3]]))
+                                .unwrap_or(0);
+                            if let Some(lease) = lease_db.allocate_v6(addr, LEASE_NA) {
+                                lease.clid = Some(client_id);
+                                lease.iaid = iaid;
+                            }
+                        }
+                    }
+                }
+
+                let dest = dhcp6_reply_dest(src, reply_port_override);
+                if let Err(e) = socket.send_to(&reply.to_wire(), dest).await {
+                    warn!("failed to send DHCPv6 reply to {dest}: {e}");
+                }
+            }
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1424,5 +1531,114 @@ mod tests {
             Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {}
             Err(err) => panic!("dhcp6_init failed unexpectedly: {err}"),
         }
+    }
+
+    // ── run_dhcp6_loop ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_dhcp6_loop_solicit_gets_advertise_with_allocated_address() {
+        let server = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+        let client = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+        client.connect(server.local_addr().unwrap()).await.unwrap();
+
+        let ctx = make_v6_ctx(
+            "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(),
+            64, crate::types::dhcp::CONTEXT_DHCP,
+        );
+        let duid = vec![0x00, 0x03, 0x00, 0x01, 1, 2, 3, 4, 5, 6];
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server = std::sync::Arc::new(server);
+        let loop_task = tokio::spawn(run_dhcp6_loop(
+            server.clone(), duid, vec![ctx], vec![],
+            crate::lease::LeaseDb::new(), shutdown_rx,
+            Some(client.local_addr().unwrap().port()),
+        ));
+
+        client.send(&solicit_with_ia(0xABCD, [0, 0, 0, 7])).await.unwrap();
+
+        let mut buf = [0u8; 512];
+        let len = tokio::time::timeout(std::time::Duration::from_millis(500), client.recv(&mut buf))
+            .await
+            .expect("timed out waiting for DHCPv6 loop reply")
+            .unwrap();
+        let reply = parse_dhcp6_packet(&buf[..len]).unwrap();
+        assert_eq!(reply.msg_type, Dhcp6MsgType::Advertise);
+        let ia_data = find_option6(&reply.options, OPTION6_IA_NA).unwrap();
+        assert!(find_option6(&ia_data[12..], OPTION6_IAADDR).is_some());
+
+        shutdown_tx.send(true).unwrap();
+        loop_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_dhcp6_loop_request_commits_lease_so_second_client_is_refused() {
+        let server = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+        let client = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+        client.connect(server.local_addr().unwrap()).await.unwrap();
+
+        // Single-address pool: only one address to ever hand out.
+        let ctx = make_v6_ctx(
+            "2001:db8::1".parse().unwrap(), "2001:db8::1".parse().unwrap(),
+            128, crate::types::dhcp::CONTEXT_DHCP,
+        );
+        let duid = vec![0x00, 0x03, 0x00, 0x01, 1, 2, 3, 4, 5, 6];
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server = std::sync::Arc::new(server);
+        let loop_task = tokio::spawn(run_dhcp6_loop(
+            server.clone(), duid, vec![ctx], vec![],
+            crate::lease::LeaseDb::new(), shutdown_rx,
+            Some(client.local_addr().unwrap().port()),
+        ));
+
+        let mut req1 = solicit_with_ia(1, [0, 0, 0, 1]);
+        req1[0] = Dhcp6MsgType::Request as u8;
+        client.send(&req1).await.unwrap();
+        let mut buf = [0u8; 512];
+        let len1 = tokio::time::timeout(std::time::Duration::from_millis(500), client.recv(&mut buf))
+            .await
+            .expect("timed out on first reply")
+            .unwrap();
+        let reply1 = parse_dhcp6_packet(&buf[..len1]).unwrap();
+        let ia1 = find_option6(&reply1.options, OPTION6_IA_NA).unwrap();
+        assert!(
+            find_option6(&ia1[12..], OPTION6_IAADDR).is_some(),
+            "first client should get the only address in the pool"
+        );
+
+        let mut req2 = solicit_with_ia(2, [0, 0, 0, 2]);
+        req2[0] = Dhcp6MsgType::Request as u8;
+        client.send(&req2).await.unwrap();
+        let len2 = tokio::time::timeout(std::time::Duration::from_millis(500), client.recv(&mut buf))
+            .await
+            .expect("timed out on second reply")
+            .unwrap();
+        let reply2 = parse_dhcp6_packet(&buf[..len2]).unwrap();
+        let ia2 = find_option6(&reply2.options, OPTION6_IA_NA).unwrap();
+        assert!(
+            find_option6(&ia2[12..], OPTION6_IAADDR).is_none(),
+            "second client must be refused: the loop should have committed the first lease"
+        );
+        assert!(find_option6(&ia2[12..], OPTION6_STATUS_CODE).is_some());
+
+        shutdown_tx.send(true).unwrap();
+        loop_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_dhcp6_loop_stops_on_shutdown_signal() {
+        let server = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server = std::sync::Arc::new(server);
+        let loop_task = tokio::spawn(run_dhcp6_loop(
+            server, vec![], vec![], vec![],
+            crate::lease::LeaseDb::new(), shutdown_rx, None,
+        ));
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(500), loop_task)
+            .await
+            .expect("loop did not stop after shutdown signal")
+            .unwrap()
+            .unwrap();
     }
 }

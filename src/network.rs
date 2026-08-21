@@ -109,6 +109,109 @@ pub fn enumerate_interfaces() -> std::io::Result<Vec<IfaceInfo>> {
     Ok(result)
 }
 
+/// Count the leading one-bits of an IPv6 netmask, giving a prefix length.
+///
+/// `if_addrs` reports IPv6 netmasks the same shape as IPv4's (a mask, not a
+/// prefix length); DHCPv6 context matching (`complete_context6`,
+/// `dhcp_construct_contexts`) wants a plain prefix length instead.
+pub fn netmask_to_prefix6(mask: Ipv6Addr) -> i32 {
+    mask.segments().iter().map(|s| s.count_ones()).sum::<u32>() as i32
+}
+
+/// Enumerate live IPv6 addresses across all interfaces as
+/// [`crate::dhcp6::LiveAddr6`] values, for DHCPv6 context construction
+/// (`dhcp_construct_contexts`/`complete_context6`, dhcp6.c's
+/// `iface_enumerate(AF_INET6, ...)`).
+///
+/// `if-addrs` doesn't surface kernel preferred/valid lifetimes or the
+/// `IFACE_DEPRECATED` flag the way `getifaddrs`'s `ifa_flags` or a netlink
+/// `RTM_NEWADDR` does, so every address is reported as non-deprecated with
+/// maximal lifetimes — `complete_context6` only actually reads those fields
+/// for `CONTEXT_CONSTRUCTED` contexts, so this only affects lease lifetimes
+/// offered from a *constructed* context, not plain configured ranges.
+#[cfg(feature = "dhcp6")]
+pub fn enumerate_live_addrs6() -> std::io::Result<Vec<crate::dhcp6::LiveAddr6>> {
+    let ifaces = enumerate_interfaces()?;
+    Ok(ifaces
+        .into_iter()
+        .filter_map(|i| {
+            let IpAddr::V6(addr) = i.addr else { return None };
+            let prefix = match i.netmask {
+                Some(IpAddr::V6(mask)) => netmask_to_prefix6(mask),
+                _ => 128,
+            };
+            Some(crate::dhcp6::LiveAddr6 {
+                addr,
+                prefix,
+                if_index: i.index,
+                preferred: 0xffff_ffff,
+                valid: 0xffff_ffff,
+                deprecated: false,
+            })
+        })
+        .collect())
+}
+
+/// Parse a colon-separated hex MAC address string (`/sys/class/net/*/address`
+/// format) into raw bytes.
+fn parse_mac_addr_str(s: &str) -> Option<Vec<u8>> {
+    let bytes: Vec<u8> = s
+        .trim()
+        .split(':')
+        .map(|b| u8::from_str_radix(b, 16))
+        .collect::<Result<_, _>>()
+        .ok()?;
+    if bytes.is_empty() || bytes.iter().all(|&b| b == 0) {
+        return None;
+    }
+    Some(bytes)
+}
+
+/// Find the first non-loopback interface with a usable Ethernet-class MAC,
+/// for DHCPv6 DUID-LL/DUID-LLT generation (`make_duid1`, dhcp6.c:643-683).
+///
+/// Reads `/sys/class/net/<iface>/{type,address}`. Skips `lo` and any
+/// interface reporting an ARPHRD type `>= 256` (tunnels and other MAC-less
+/// link types), matching `make_duid1()`'s own cutoff (dhcp6.c:653).
+#[cfg(all(feature = "dhcp6", target_os = "linux"))]
+pub fn first_dhcp6_mac_source() -> Option<crate::dhcp6::DuidMacSource> {
+    let mut names: Vec<String> = std::fs::read_dir("/sys/class/net")
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    names.sort();
+
+    for name in names {
+        if name == "lo" {
+            continue;
+        }
+        let Some(hw_type): Option<u16> = std::fs::read_to_string(format!("/sys/class/net/{name}/type"))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+        else {
+            continue;
+        };
+        if hw_type >= 256 {
+            continue;
+        }
+        let Some(mac) = std::fs::read_to_string(format!("/sys/class/net/{name}/address"))
+            .ok()
+            .and_then(|s| parse_mac_addr_str(&s))
+        else {
+            continue;
+        };
+        return Some(crate::dhcp6::DuidMacSource { hw_type, mac });
+    }
+    None
+}
+
+/// Non-Linux stub: no `/sys/class/net` to read.
+#[cfg(all(feature = "dhcp6", not(target_os = "linux")))]
+pub fn first_dhcp6_mac_source() -> Option<crate::dhcp6::DuidMacSource> {
+    None
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Listener socket creation
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2779,5 +2882,52 @@ mod tests {
     fn validate_server_addr_unspecified() {
         let addr: std::net::SocketAddr = "0.0.0.0:53".parse().unwrap();
         assert!(validate_server_addr(&addr).is_some());
+    }
+
+    // ── netmask_to_prefix6 ────────────────────────────────────────────────────
+
+    #[test]
+    fn netmask_to_prefix6_64() {
+        let mask: Ipv6Addr = "ffff:ffff:ffff:ffff::".parse().unwrap();
+        assert_eq!(netmask_to_prefix6(mask), 64);
+    }
+
+    #[test]
+    fn netmask_to_prefix6_128() {
+        assert_eq!(netmask_to_prefix6(Ipv6Addr::from([0xff; 16])), 128);
+    }
+
+    #[test]
+    fn netmask_to_prefix6_zero() {
+        assert_eq!(netmask_to_prefix6(Ipv6Addr::UNSPECIFIED), 0);
+    }
+
+    // ── parse_mac_addr_str ────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_mac_addr_str_valid() {
+        assert_eq!(
+            parse_mac_addr_str("aa:bb:cc:dd:ee:ff\n"),
+            Some(vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+        );
+    }
+
+    #[test]
+    fn parse_mac_addr_str_all_zero_rejected() {
+        assert_eq!(parse_mac_addr_str("00:00:00:00:00:00"), None);
+    }
+
+    #[test]
+    fn parse_mac_addr_str_malformed_rejected() {
+        assert_eq!(parse_mac_addr_str("not-a-mac"), None);
+    }
+
+    // ── enumerate_live_addrs6 smoke test ─────────────────────────────────────
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn enumerate_live_addrs6_does_not_error() {
+        let result = enumerate_live_addrs6();
+        assert!(result.is_ok(), "enumerate_live_addrs6 failed: {:?}", result.err());
     }
 }
