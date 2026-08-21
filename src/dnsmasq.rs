@@ -1349,7 +1349,7 @@ pub async fn run_main_loop_with(
     use crate::dhcp::{DhcpLoopOptions, run_dhcp_loop};
 
     // ── Resolve configuration ────────────────────────────────────────────────
-    let (fwd_config, dhcp_runtime) = {
+    let (mut fwd_config, dhcp_runtime) = {
         let d = daemon_handle.read().await;
         let fwd_config = daemon_forward_config(&d);
         #[cfg(feature = "dhcp")]
@@ -1358,6 +1358,26 @@ pub async fn run_main_loop_with(
         let dhcp_runtime = ();
         (fwd_config, dhcp_runtime)
     };
+
+    // `--dump-file`: open (or create/reopen) the pcap dump once at startup,
+    // mirroring `dump_init()` being called once from `main()` (`dnsmasq.c:450`).
+    // A failure here is fatal, matching upstream's `die()` on the same paths.
+    #[cfg(feature = "dump")]
+    {
+        let (dump_file, edns_pktsz, dump_mask) = {
+            let d = daemon_handle.read().await;
+            (d.dump_file.clone(), d.edns_pktsz, d.dump_mask)
+        };
+        if let Some(path) = dump_file {
+            match crate::dump::DumpHandle::init(&path, edns_pktsz, dump_mask) {
+                Ok(handle) => fwd_config.dump = Some(handle),
+                Err(e) => {
+                    error!("cannot open dump file {path}: {e}");
+                    return RunResult::IoError;
+                }
+            }
+        }
+    }
 
     // DUID generation mutates `daemon.duid`, so this needs a write lock —
     // taken and released here, separate from the read lock above.
@@ -2377,6 +2397,71 @@ mod tests {
             "port {port} should still be held by the adopted socket"
         );
         task.abort();
+    }
+
+    /// End-to-end: `--dump-file` must produce a real pcap file, and a live
+    /// query/reply exchange through `run_main_loop_with` must land in it —
+    /// this is Issue #43's acceptance criterion, not just a `dump.rs` unit
+    /// test, because before this change `dump-file`/`dump-mask` parsed into
+    /// `Daemon` but nothing ever opened the file or wrote to it.
+    #[tokio::test]
+    #[cfg(feature = "dump")]
+    async fn run_main_loop_writes_query_and_reply_to_the_dump_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let dump_path = dir.path().join("dump.pcap");
+
+        let listeners = bind_listeners(&Daemon { port: 0, ..Default::default() }).unwrap();
+        let port = listeners.dns_addrs().first().map(|a| a.port()).unwrap();
+
+        let lines = crate::option::parse_config_text(
+            &format!(
+                "dumpfile={}\naddress=/example.test/10.1.2.3\n",
+                dump_path.display()
+            ),
+            "test",
+        )
+        .unwrap();
+        let mut daemon = Daemon { port, ..Default::default() };
+        crate::option::apply_config(&mut daemon, &lines).unwrap();
+
+        let daemon_handle = init_daemon_with(daemon);
+        let cache = build_shared_cache(&daemon_handle).await;
+        let task = tokio::spawn(run_main_loop_with(daemon_handle, None, Some(listeners), cache));
+
+        // A freshly opened dump file has only the 24-byte global header.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let bytes = std::fs::read(&dump_path).expect("dump-file must be created at startup");
+        assert_eq!(bytes.len(), 24, "only the global header before any traffic");
+
+        // Minimal DNS query: ID=0x1234, RD, one question for example.test A/IN.
+        let mut query = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        for label in "example.test".split('.') {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.push(0);
+        query.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // QTYPE=A, QCLASS=IN
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(&query, ("127.0.0.1", port)).await.unwrap();
+        let mut buf = [0u8; 512];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .expect("reply must arrive")
+            .unwrap();
+        assert!(len >= 12, "reply must at least contain a DNS header");
+
+        task.abort();
+
+        let bytes = std::fs::read(&dump_path).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            crate::dump::PCAP_MAGIC
+        );
+        assert!(
+            bytes.len() > 24,
+            "the query and its reply must have been written after the global header"
+        );
     }
 
     /// End-to-end: a `Daemon` with a configured DHCPv6 context makes

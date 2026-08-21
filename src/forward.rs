@@ -1156,6 +1156,11 @@ pub struct ForwardConfig {
     pub add_subnet4: Option<crate::edns0::AddSubnetOpt>,
     /// `--add-subnet` (IPv6 half). See [`ForwardConfig::add_subnet4`].
     pub add_subnet6: Option<crate::edns0::AddSubnetOpt>,
+    /// `--dump-file`/`--dump-mask`: the open pcap dump file, if configured.
+    /// The Rust equivalent of `daemon->dumpfd`/`daemon->dump_mask`, opened
+    /// once at startup by [`crate::dump::DumpHandle::init`].
+    #[cfg(feature = "dump")]
+    pub dump: Option<crate::dump::DumpHandle>,
 }
 
 impl Default for ForwardConfig {
@@ -1192,6 +1197,8 @@ impl Default for ForwardConfig {
             client_subnet: false,
             add_subnet4:   None,
             add_subnet6:   None,
+            #[cfg(feature = "dump")]
+            dump:          None,
         }
     }
 }
@@ -2394,6 +2401,20 @@ pub async fn run_forward_loop_on(
                 let dest = meta.dest.or_else(|| listener.sock.local_addr().ok().map(|a| a.ip()));
                 // Only forward DNS queries (QR bit == 0).
                 if pkt.len() >= 12 && pkt[2] & 0x80 == 0 {
+                    // `--dump-file`/`--dump-mask`: record the client query,
+                    // mirroring `dump_packet_udp(DUMP_QUERY, ...)` at
+                    // `forward.c:1818`.
+                    #[cfg(feature = "dump")]
+                    if let Some(dump) = &engine.config.dump {
+                        let local = dest.map(|ip| SocketAddr::new(ip, engine.config.port));
+                        dump.dump_packet_udp(
+                            crate::types::constants::DUMP_QUERY,
+                            pkt,
+                            Some(src),
+                            local,
+                            crate::dump::DumpFallback::None,
+                        );
+                    }
                     // `--connmark-allowlist-enable`: a query whose connection
                     // mark is not allow-listed gets REFUSED here, before it
                     // ever reaches local-data lookup or forwarding — this
@@ -2422,6 +2443,8 @@ pub async fn run_forward_loop_on(
 
                     if !admitted {
                         if let Some(wire) = make_refused_answer(pkt, engine.config.local.edns_pktsz) {
+                            #[cfg(feature = "dump")]
+                            dump_reply(&engine.config.dump, &wire, dest, engine.config.port, src);
                             let _ = listener.sock.send_to(&wire, src).await;
                         }
                     } else {
@@ -2434,6 +2457,8 @@ pub async fn run_forward_loop_on(
                             answer_locally(pkt, &mut cache, &local)
                         };
                         if let Some(wire) = local_wire {
+                            #[cfg(feature = "dump")]
+                            dump_reply(&engine.config.dump, &wire, dest, engine.config.port, src);
                             let _ = listener.sock.send_to(&wire, src).await;
                             inc_metric(Metric::DnsLocalAnswered);
                         } else {
@@ -2451,6 +2476,8 @@ pub async fn run_forward_loop_on(
                                     if let Some(wire) =
                                         make_refused_answer(pkt, engine.config.local.edns_pktsz)
                                     {
+                                        #[cfg(feature = "dump")]
+                                        dump_reply(&engine.config.dump, &wire, dest, engine.config.port, src);
                                         let _ = listener.sock.send_to(&wire, src).await;
                                     }
                                 }
@@ -2562,6 +2589,17 @@ pub async fn run_forward_loop_on(
                         }
                     }
 
+                    #[cfg(feature = "dump")]
+                    if let Some(dump) = &engine.config.dump {
+                        let local = listeners[listener_idx].sock.local_addr().ok();
+                        dump.dump_packet_udp(
+                            crate::types::constants::DUMP_REPLY,
+                            &pkt,
+                            local,
+                            Some(target.client),
+                            crate::dump::DumpFallback::None,
+                        );
+                    }
                     let _ = listeners[listener_idx].sock.send_to(&pkt, target.client).await;
                 }
             }
@@ -2570,6 +2608,31 @@ pub async fn run_forward_loop_on(
                 let _expired = engine.expire_queries();
             }
         }
+    }
+}
+
+/// Record a reply sent to a client, mirroring `dump_packet_udp(DUMP_REPLY,
+/// ...)` at the various `forward.c` reply call sites (e.g. `forward.c:616`).
+///
+/// `local_ip`/`local_port` are the server's own address — the reply's
+/// source; `client` is its destination.
+#[cfg(feature = "dump")]
+fn dump_reply(
+    dump: &Option<crate::dump::DumpHandle>,
+    wire: &[u8],
+    local_ip: Option<IpAddr>,
+    local_port: u16,
+    client: SocketAddr,
+) {
+    if let Some(dump) = dump {
+        let local = local_ip.map(|ip| SocketAddr::new(ip, local_port));
+        dump.dump_packet_udp(
+            crate::types::constants::DUMP_REPLY,
+            wire,
+            local,
+            Some(client),
+            crate::dump::DumpFallback::None,
+        );
     }
 }
 
