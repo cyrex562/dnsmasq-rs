@@ -144,21 +144,21 @@ pub fn ds_matches_dnskey(ds: &DsData, dnskey_rdata: &[u8], owner_name: &str) -> 
             let mut hasher = Sha1::new();
             hasher.update(&wire);
             hasher.update(dnskey_rdata);
-            hasher.finalize().as_slice() == ds.digest.as_slice()
+            hasher.finalize()[..] == ds.digest[..]
         }
         2 => {
             // SHA-256: hash( owner_name_wire || dnskey_rdata )
             let mut hasher = Sha256::new();
             hasher.update(&wire);
             hasher.update(dnskey_rdata);
-            hasher.finalize().as_slice() == ds.digest.as_slice()
+            hasher.finalize()[..] == ds.digest[..]
         }
         4 => {
             use sha2::Sha384;
             let mut hasher = Sha384::new();
             hasher.update(&wire);
             hasher.update(dnskey_rdata);
-            hasher.finalize().as_slice() == ds.digest.as_slice()
+            hasher.finalize()[..] == ds.digest[..]
         }
         _ => false,
     }
@@ -473,6 +473,7 @@ pub enum RrsetValidation {
 /// RRSIG has been tried does the call return `Bogus`.
 ///
 /// Mirrors `validate_rrset()` in `dnssec.c`.
+#[allow(clippy::too_many_arguments)]
 pub fn validate_rrset(
     rrset_in: &[crate::rfc1035::DnsRr],
     rrsigs:   &[&crate::rfc1035::DnsRr],
@@ -1355,7 +1356,16 @@ pub struct ParsedNsec3Raw {
 /// Parse NSEC3 RDATA (RFC 5155 §3.2): algo, flags, iterations, salt,
 /// next-hashed-owner, type bitmap. `owner_hash` must be supplied separately
 /// (decoded from the owner name's first label, base32).
-fn parse_nsec3_rdata(rdata: &[u8]) -> Option<(u8, u8, u32, Vec<u8>, Vec<u8>, Vec<u8>)> {
+struct Nsec3RdataFields {
+    algo: u8,
+    flags: u8,
+    iterations: u32,
+    salt: Vec<u8>,
+    next_hashed: Vec<u8>,
+    bitmap: Vec<u8>,
+}
+
+fn parse_nsec3_rdata(rdata: &[u8]) -> Option<Nsec3RdataFields> {
     if rdata.len() < 5 { return None; }
     let algo = rdata[0];
     let flags = rdata[1];
@@ -1371,7 +1381,7 @@ fn parse_nsec3_rdata(rdata: &[u8]) -> Option<(u8, u8, u32, Vec<u8>, Vec<u8>, Vec
     let next_hashed = rdata[pos..pos + hash_len].to_vec();
     pos += hash_len;
     let bitmap = rdata[pos..].to_vec();
-    Some((algo, flags, iterations, salt, next_hashed, bitmap))
+    Some(Nsec3RdataFields { algo, flags, iterations, salt, next_hashed, bitmap })
 }
 
 /// Find whether `digest` (the hashed query name) is covered by, or exactly
@@ -1538,6 +1548,7 @@ pub fn prove_non_existence_nsec3(
 /// reply) proving that `name`/`qtype` doesn't exist, and dispatch to the
 /// matching proof routine. Port of `prove_non_existence()`
 /// (dnssec.c:1719-1871).
+#[allow(clippy::too_many_arguments)]
 pub fn prove_non_existence(
     authority: &[crate::rfc1035::DnsRr],
     name: &str,
@@ -1589,10 +1600,18 @@ pub fn prove_non_existence(
         let mut raw = Vec::with_capacity(nsec3_rrs.len());
         for rr in &nsec3_rrs {
             let Some(owner_hash) = base32_decode(&rr.name) else { return Err(DNSSEC_FAIL_BADPACKET) };
-            let Some((algo, flags, iterations, salt, next_hashed, bitmap)) = parse_nsec3_rdata(&rr.rdata) else {
+            let Some(fields) = parse_nsec3_rdata(&rr.rdata) else {
                 return Err(DNSSEC_FAIL_BADPACKET);
             };
-            raw.push(ParsedNsec3Raw { algo, flags, iterations, salt, owner_hash, next_hashed, bitmap });
+            raw.push(ParsedNsec3Raw {
+                algo: fields.algo,
+                flags: fields.flags,
+                iterations: fields.iterations,
+                salt: fields.salt,
+                owner_hash,
+                next_hashed: fields.next_hashed,
+                bitmap: fields.bitmap,
+            });
         }
         return prove_non_existence_nsec3(&raw, name, qtype, wild_offset, nons, counter, iters_limit);
     }
@@ -1630,7 +1649,7 @@ pub fn dnssec_validate_reply(
     cache: &mut DnssecCache,
     counter: &mut i32,
     check_unsigned: bool,
-    mut nons: Option<&mut bool>,
+    nons: Option<&mut bool>,
     iters_limit: u32,
 ) -> ValidateStatus {
     if rcode == RCODE_SERVFAIL {
@@ -1750,7 +1769,7 @@ pub fn dnssec_validate_reply(
     }
 
     // Missing answer (NXDOMAIN or NODATA): require an NSEC/NSEC3 proof.
-    let rc_nsec = prove_non_existence(authority, &target, qtype, qclass, 0, nons.as_deref_mut().unwrap_or(&mut true), counter, iters_limit);
+    let rc_nsec = prove_non_existence(authority, &target, qtype, qclass, 0, nons.unwrap_or(&mut true), counter, iters_limit);
     match rc_nsec {
         Ok(()) => secure_flag,
         Err(fail) => {
