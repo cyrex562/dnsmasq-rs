@@ -437,14 +437,28 @@ pub fn nl_async(msg: &[u8], mut state: u32) -> u32 {
 
 // ── Linux socket-level operations ────────────────────────────────────────────
 
+/// Whether a failed multicast-group `bind()` should be retried with
+/// `nl_groups = 0` (no multicast).
+///
+/// Mirrors `netlink.c:79`: `errno != EPERM || bind(...) == -1`. Upstream
+/// retries the no-multicast bind *only* when the first bind failed with
+/// `EPERM` (insufficient privilege to join the multicast groups); any other
+/// errno (`EADDRINUSE`, `EINVAL`, ...) is a hard failure that should propagate
+/// immediately rather than being silently masked by a fallback bind.
+#[cfg(target_os = "linux")]
+fn should_retry_without_multicast(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(libc::EPERM)
+}
+
 /// Open a `NETLINK_ROUTE` socket and subscribe to address/route multicast groups.
 ///
 /// On success returns the raw file descriptor.  The caller must close it with
 /// `libc::close()` (or wrap it in a type that implements `Drop`).
 ///
 /// The function mirrors `netlink_init()` from the C source.  If the multicast
-/// groups cannot be subscribed (e.g. insufficient permissions) it falls back to
-/// a plain socket with no multicast.
+/// groups cannot be subscribed because of `EPERM` it falls back to a plain
+/// socket with no multicast, matching upstream exactly; any other bind error
+/// is returned as-is.
 #[cfg(target_os = "linux")]
 pub fn netlink_open() -> std::io::Result<(i32, u32)> {
     use libc::{
@@ -467,6 +481,12 @@ pub fn netlink_open() -> std::io::Result<(i32, u32)> {
         libc::bind(fd, addr.as_ptr() as *const libc::sockaddr, addr.len() as libc::socklen_t)
     };
     if bind_ret == -1 {
+        let first_err = std::io::Error::last_os_error();
+        if !should_retry_without_multicast(&first_err) {
+            unsafe { libc::close(fd) };
+            return Err(first_err);
+        }
+
         // Fall back to no multicast
         let mut addr2 = [0u8; 12];
         addr2[0..2].copy_from_slice(&(AF_NETLINK as u16).to_ne_bytes());
@@ -592,6 +612,36 @@ pub fn netlink_multicast(fd: i32) -> u32 {
         });
     }
     state
+}
+
+/// Await readability on a netlink socket and drain address/route-change
+/// notifications as they arrive, calling `on_change` with the resulting
+/// [`STATE_NEWADDR`]/[`STATE_NEWROUTE`] bits whenever a wakeup yields a
+/// non-zero state.
+///
+/// This is the runtime consumer of [`netlink_open`] / [`netlink_multicast`]:
+/// upstream registers `daemon->netlinkfd` in its main `poll()` loop and reacts
+/// to `EVENT_NEWADDR`/`EVENT_NEWROUTE` from `nl_async()` (`dnsmasq.c`); this
+/// mirrors that with a `tokio::io::unix::AsyncFd` readiness loop instead of a
+/// poll-based event queue. Takes ownership of `fd` (closed on return/drop via
+/// `OwnedFd`). Runs until the socket errors.
+#[cfg(target_os = "linux")]
+pub async fn watch_address_changes<F>(fd: i32, mut on_change: F) -> std::io::Result<()>
+where
+    F: FnMut(u32) + Send,
+{
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let async_fd = tokio::io::unix::AsyncFd::new(owned)?;
+    loop {
+        let mut guard = async_fd.readable().await?;
+        let state = netlink_multicast(async_fd.get_ref().as_raw_fd());
+        guard.clear_ready();
+        if state != 0 {
+            on_change(state);
+        }
+    }
 }
 
 /// Query the kernel for all network addresses / neighbours / links of `family`
@@ -1140,5 +1190,70 @@ mod tests {
         let s0 = nl_async(&msg, 0);
         let s1 = nl_async(&msg, s0);
         assert_eq!(s0, s1); // flag already set, no change
+    }
+
+    // ── EPERM-only multicast-bind fallback (netlink.c:76-81) ─────────────────
+
+    #[test]
+    fn retries_without_multicast_only_on_eperm() {
+        let eperm = std::io::Error::from_raw_os_error(libc::EPERM);
+        assert!(should_retry_without_multicast(&eperm));
+    }
+
+    #[test]
+    fn does_not_retry_on_other_bind_errors() {
+        let eaddrinuse = std::io::Error::from_raw_os_error(libc::EADDRINUSE);
+        let einval = std::io::Error::from_raw_os_error(libc::EINVAL);
+        let eacces = std::io::Error::from_raw_os_error(libc::EACCES);
+        assert!(!should_retry_without_multicast(&eaddrinuse));
+        assert!(!should_retry_without_multicast(&einval));
+        assert!(!should_retry_without_multicast(&eacces));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn netlink_open_succeeds_or_fails_gracefully() {
+        // Creating a NETLINK_ROUTE socket never requires elevated privilege;
+        // only the multicast-group bind might (netlink.c:73-81), and
+        // `netlink_open` already falls back to a no-multicast bind on EPERM.
+        // Either outcome here is acceptable — we only assert it doesn't panic
+        // and that any error carries a real errno.
+        match netlink_open() {
+            Ok((fd, _pid)) => unsafe { libc::close(fd); },
+            Err(e) => assert!(e.raw_os_error().is_some()),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn netlink_multicast_drains_and_detects_newaddr() {
+        // netlink_multicast() only ever calls libc::recv() on the fd it's
+        // given, so a plain AF_UNIX SOCK_DGRAM socketpair can stand in for a
+        // real netlink socket to prove the drain/dispatch wiring works,
+        // without needing CAP_NET_ADMIN to bind real multicast groups.
+        let mut fds = [0i32; 2];
+        let rc = unsafe {
+            libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr())
+        };
+        assert_eq!(rc, 0);
+        let [a, b] = fds;
+
+        let mut msg = build_nlmsghdr(0, nlmsg_type::RTM_NEWADDR);
+        msg.extend(build_ifaddrmsg(AF_INET, 24, 1));
+        let total = msg.len() as u32;
+        msg[0..4].copy_from_slice(&total.to_ne_bytes());
+
+        let sent = unsafe {
+            libc::send(a, msg.as_ptr() as *const libc::c_void, msg.len(), 0)
+        };
+        assert_eq!(sent as usize, msg.len());
+
+        let state = netlink_multicast(b);
+        assert_ne!(state & STATE_NEWADDR, 0);
+
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
     }
 }

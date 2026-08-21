@@ -694,6 +694,41 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     than fail when the sandbox has no spare loopback aliasing or refuses the bind, so a
     restricted environment reports a pass it did not actually verify.
 
+- [x] `src/netlink.rs`: fix the EPERM-only multicast-bind fallback and give `netlink_open` a
+  runtime caller (issue #38).
+
+  `netlink_open` used to retry the no-multicast bind on *any* first-bind failure
+  (`EADDRINUSE`, `EINVAL`, `EACCES`, ...), silently masking errors upstream treats as fatal.
+  `netlink.c:76-81` only retries when `errno == EPERM`; anything else is a hard failure. Fixed
+  by capturing the first bind's `io::Error` and gating the fallback on a new pure
+  `should_retry_without_multicast` (`err.raw_os_error() == Some(libc::EPERM)`), covered by
+  `retries_without_multicast_only_on_eperm` / `does_not_retry_on_other_bind_errors`.
+
+  `netlink_open`/`iface_enumerate`/`netlink_multicast` previously had zero production callers
+  — `network::enumerate_interfaces()` uses the `if-addrs` crate and never touches this module.
+  `dnsmasq::spawn_netlink_watch_task` (Linux-only; a no-op stub elsewhere) now opens a netlink
+  socket at `run_main_loop_with` startup and drives `netlink::watch_address_changes` — an
+  `AsyncFd`-based readiness loop around `netlink_multicast`/`nl_async` — as a background task,
+  aborted alongside the forward/DHCP tasks on shutdown. On `STATE_NEWADDR` it re-runs
+  `network::enumerate_interfaces()` and logs the refreshed count, mirroring upstream's
+  `nl_async()` → `queue_event(EVENT_NEWADDR)` reaction (`netlink.c:406-411`). A netlink-open
+  failure (no `CAP_NET_ADMIN`, non-Linux) is logged and treated as "no live notifications"
+  rather than aborting startup, same as `slaac::Icmp6Socket::create`.
+  `netlink_multicast_drains_and_detects_newaddr` proves the drain/dispatch wiring against a
+  real socket (an `AF_UNIX` socketpair standing in for the netlink fd, since `netlink_multicast`
+  only ever calls `recv()`).
+
+  Explicitly **not** covered — the re-enumeration is observational only:
+  - It does not feed the refreshed interface list into the live `network::ArrivalFilter` or
+    rebuild bound listeners. That's the pre-existing `--bind-dynamic` re-bind gap noted above
+    ("there is no netlink listener re-running `create_bound_listeners` when an interface
+    appears") — this change opens the socket and detects the event, but does not yet close
+    that gap.
+  - `STATE_NEWROUTE`'s upstream purpose (re-send a queued DNS packet once a dial-on-demand
+    route appears, `netlink.c:391-395`) has no consumer here; the watch task only logs it.
+  - `iface_enumerate`/`parse_newneigh_record`/`parse_newlink_record` (ARP/DUID-MAC lookup via
+    netlink) still have no caller; `arp.rs`/DHCPv6 DUID generation don't use them.
+
 - [x] Randomise the outbound source port and unify the two pending-query implementations.
   `run_forward_loop_on` used to bind one `0.0.0.0:0` socket at startup and send every
   upstream query from it, so the whole daemon had a single, stable source port for its
