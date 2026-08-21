@@ -1421,6 +1421,17 @@ pub async fn run_main_loop_with(
             }
         };
         info!("listening for DHCPv6 packets on {}", rt.bind_addr);
+        // A wildcard bind alone never receives multicast SOLICITs — real
+        // clients always multicast their first message, since they have no
+        // unicast address to send to yet. Best-effort: a sandboxed
+        // environment without the right capability, or an interface that
+        // can't do multicast, logs and keeps the rest of the daemon running
+        // rather than aborting startup (see `join_dhcp6_multicast_all_interfaces`).
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            crate::network::join_dhcp6_multicast_all_interfaces(dhcp6_sock.as_raw_fd());
+        }
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         // Kept in-memory only — see `run_dhcp6_loop`'s doc comment on why this
         // doesn't share the v4 loop's lease file.

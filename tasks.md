@@ -1399,9 +1399,22 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     `IPV6_V6ONLY`/`IPV6_RECVPKTINFO`/`SO_REUSEADDR`).
   - `dispatch_dhcp6`: takes real `duid`/`contexts`/`in_use` state and returns a genuine
     IA_NA/IAADDR-bearing Advertise/Reply (or a Status-Code NoAddrsAvail IA_NA when allocation
-    fails), instead of the old canned empty-options stub. Uses this module's own flat option
-    encoding rather than `rfc3315::Dhcp6Packet` — the crate's two DHCPv6 packet representations
-    were **not** unified in this change (still a follow-up item).
+    fails), instead of the old canned empty-options stub. On a successful allocation, it now
+    delegates reply construction to `rfc3315::handle_solicit`/`handle_request6` — the exact pair
+    the issue named as taking `server_duid`/an address as opaque, generator-less parameters —
+    feeding them the real DUID (`make_duid`) and the real `address6_allocate` result instead of
+    leaving them unreachable dead code (confirmed by grep: previously `rfc3315::` had zero callers
+    anywhere outside its own doc comments and unit tests). `parse_dhcp6_packet`/`write_dhcp6_packet`
+    handle the conversion between this module's flat-bytes `Dhcp6Packet`/`Dhcp6Reply` and
+    `rfc3315::Dhcp6Packet`'s structured `Vec<Dhcp6Option>` (`flatten_dhcp6_options`); the two
+    representations are still not fully unified into one type (still a follow-up item), but the
+    success path is no longer a second, parallel, unwired implementation of the same logic — it's
+    a bytes-level adapter in front of the real handler. The no-address branch (Status Code
+    NoAddrsAvail) is still built locally in `dhcp6.rs`, since `handle_solicit`/`handle_request6`
+    always assume success (they take `Ipv6Addr`, not `Option<Ipv6Addr>`).
+    Covered by `dhcp6::tests::dispatch_dhcp6_solicit_success_delegates_to_rfc3315_handle_solicit`
+    (asserts the top-level Status-Code option only `rfc3315::handle_solicit`'s construction adds —
+    proof the reply came from that function, not `dhcp6.rs`'s old parallel encoder).
   - `src/main.rs` was missing `pub mod dhcp6;` entirely (present in `lib.rs` only, so the release
     binary never even compiled this file) — added, matching `rfc3315`/`radv`/`slaac`.
   - **Production wiring (this pass):** `dhcp6::run_dhcp6_loop` is a real receive/dispatch loop —
@@ -1422,7 +1435,31 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     persist a DUID) and `dhcp6::tests::run_dhcp6_loop_*` (Solicit → Advertise with an allocated
     address over a real socket pair; a Request commits the lease so a second client requesting
     the same single-address pool is refused; the loop stops on the shutdown signal).
+  - `network::join_dhcp6_multicast`/`join_dhcp6_multicast_all_interfaces` (port of the DHCPv6
+    portion of `join_multicast()`, network.c:1306-1360): a wildcard `[::]:547` bind does **not**
+    by itself receive multicast SOLICITs — IPv6 requires explicit `IPV6_JOIN_GROUP` membership per
+    interface even for a wildcard bind, and the kernel silently drops unjoined multicast, so a real
+    (non-relay, non-unicast-only) client could never have reached this server without it. Joins
+    `ALL_DHCP_RELAY_AGENTS_AND_SERVERS` (ff02::1:2) and `ALL_DHCP_SERVERS` (ff05::1:3) on every
+    live, non-loopback interface index from `enumerate_live_addrs6()`, deduplicated by index.
+    Called from `run_main_loop_with` right after the DHCPv6 socket is adopted/bound. Unlike
+    upstream, this doesn't track `iface->dhcp6_ok`/`relay6`-only join separately — it joins
+    unconditionally whenever `daemon.dhcp6` is non-empty (i.e. whenever the DHCPv6 loop is
+    started at all) — and a per-interface join failure is logged and skipped rather than
+    `die()`-ing the whole daemon (a sandboxed environment without `CAP_NET_ADMIN`, or an interface
+    that can't do multicast, must not prevent the rest of the daemon from starting). Upstream also
+    joins `ALL_ROUTERS` on the ICMPv6 socket for RA; this crate's RA support does not call the new
+    join helper. Covered by `network::tests::join_dhcp6_multicast_on_loopback_succeeds` (a real
+    `IPV6_JOIN_GROUP` setsockopt against the loopback interface).
   Still open / explicitly unsupported:
+  - `complete_context6` classifies a live address as ULA (`classify_addr6` /
+    `Addr6Class::Ula`, matching upstream's `IN6_IS_ADDR_ULA(local)` at dhcp6.c:370) but does not
+    record it anywhere a DNS-server-option fallback could read: upstream's `iface_param.ula_addr`
+    (and `.ll_addr`/`.fallback`) exist specifically so `dhcp6_reply()` can offer a sensible
+    default `--dhcp-option=6,<addr>` when none is configured. This crate's `dispatch_dhcp6` does
+    not build a DNS-server option at all yet (DHCPv6 `--dhcp-option` support doesn't exist), so
+    plumbing the ULA/link-local/fallback addresses through today would have no consumer; the
+    classification is real but currently a dead end pending that larger feature.
   - The "current" context chain is built **once at startup**, not re-derived per packet against
     the packet's actual arrival interface the way upstream's `dhcp6_packet()` does (dhcp6.c:250).
     A context only ever offers addresses if some live interface matched it at startup; an

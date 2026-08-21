@@ -144,6 +144,18 @@ fn build_option6(code: u16, data: &[u8]) -> Vec<u8> {
     buf
 }
 
+/// Flatten `rfc3315::Dhcp6Option`'s structured option list back into this
+/// module's raw TLV-bytes representation — both are the same wire format,
+/// just different in-memory shapes (see the module-level gap analysis for
+/// why the crate has two DHCPv6 packet representations).
+fn flatten_dhcp6_options(opts: &[crate::rfc3315::Dhcp6Option]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for opt in opts {
+        buf.extend(build_option6(opt.code, &opt.data));
+    }
+    buf
+}
+
 /// Build an IA_NA reply option: `IAID | T1 | T2 | sub-options`.
 ///
 /// On a successful allocation the sub-option is an IAADDR carrying `addr`;
@@ -216,21 +228,43 @@ pub fn dispatch_dhcp6(
             let iaid = u32::from_be_bytes(iaid_bytes);
 
             let addr = address6_allocate(contexts, client_id, iaid, &[], in_use);
-            let (preferred, valid, t1, t2) = match addr {
-                Some(_) => (3600, 7200, 1800, 2880),
-                None => (0, 0, 0, 0),
-            };
-
-            let mut options = Vec::new();
-            options.extend(build_option6(OPTION6_CLIENT_ID, client_id));
-            options.extend(build_option6(OPTION6_SERVER_ID, duid));
-            options.extend(build_ia_na_reply(iaid_bytes, addr, preferred, valid, t1, t2));
 
             let reply_type = if pkt.msg_type == Dhcp6MsgType::Solicit {
                 Dhcp6MsgType::Advertise
             } else {
                 Dhcp6MsgType::Reply
             };
+
+            let options = match addr {
+                // Delegate the success path to `rfc3315::handle_solicit`/
+                // `handle_request6` — the exact pairing named in the gap
+                // analysis — now fed the real DUID and a real allocated
+                // address instead of being unreachable dead code. Those
+                // functions always assume success (they take `Ipv6Addr`, not
+                // `Option<Ipv6Addr>`), so the no-address branch below still
+                // has to be built locally.
+                Some(allocated) => {
+                    let mut raw = Vec::with_capacity(4 + pkt.options.len());
+                    raw.push(pkt.msg_type as u8);
+                    raw.extend_from_slice(&pkt.xid.to_be_bytes()[1..]);
+                    raw.extend_from_slice(&pkt.options);
+                    let pkt3315 = crate::rfc3315::parse_dhcp6_packet(&raw).ok()?;
+                    let reply3315 = if pkt.msg_type == Dhcp6MsgType::Solicit {
+                        crate::rfc3315::handle_solicit(&pkt3315, duid, allocated)
+                    } else {
+                        crate::rfc3315::handle_request6(&pkt3315, duid, allocated)
+                    };
+                    flatten_dhcp6_options(&reply3315.options)
+                }
+                None => {
+                    let mut options = Vec::new();
+                    options.extend(build_option6(OPTION6_CLIENT_ID, client_id));
+                    options.extend(build_option6(OPTION6_SERVER_ID, duid));
+                    options.extend(build_ia_na_reply(iaid_bytes, None, 0, 0, 0, 0));
+                    options
+                }
+            };
+
             Some(Dhcp6Reply { msg_type: reply_type, xid: pkt.xid, options })
         }
         Dhcp6MsgType::Release | Dhcp6MsgType::Decline => {
@@ -1485,6 +1519,30 @@ mod tests {
         assert_eq!(iaaddr.len(), 24);
         let addr = Ipv6Addr::from(<[u8; 16]>::try_from(&iaaddr[0..16]).unwrap());
         assert!(is_same_net6(&addr, &"2001:db8::1".parse().unwrap(), 64));
+    }
+
+    #[test]
+    fn dispatch_dhcp6_solicit_success_delegates_to_rfc3315_handle_solicit() {
+        use crate::types::dhcp::CONTEXT_DHCP;
+        let ctx = make_v6_ctx(
+            "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(),
+            64, CONTEXT_DHCP,
+        );
+        let data = solicit_with_ia(0x1234, [0, 0, 0, 1]);
+        let pkt = parse_dhcp6_packet(&data).unwrap();
+        let duid = vec![0x00, 0x03, 0x00, 0x01, 1, 2, 3, 4, 5, 6];
+        let mut in_use = |_: &Ipv6Addr| false;
+
+        let reply = dispatch_dhcp6(&pkt, &duid, &[ctx], &mut in_use).unwrap();
+        // `rfc3315::handle_solicit`'s construction includes a top-level
+        // Status Code (Success) option alongside CLIENT_ID/SERVER_ID/IA_NA --
+        // proof the reply was actually built by calling into rfc3315.rs's
+        // real handler on the success path, not dhcp6.rs's own parallel flat
+        // option encoder (see the module-level gap analysis / tasks.md).
+        assert!(
+            find_option6(&reply.options, OPTION6_STATUS_CODE).is_some(),
+            "expected a top-level Status Code option from rfc3315::handle_solicit"
+        );
     }
 
     #[test]
