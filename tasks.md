@@ -1414,6 +1414,114 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   Ed448 (algorithm 16, `crypto.c:320-362`) remain unimplemented — both are
   explicitly rejected (`DnssecAlgorithm::try_from` fails closed for 12;
   `parse_dnskey`/`verify_sig` fail closed for 16), not silently ignored.
+  Update (Issue #40 / T3-dnssec-depth): the trust-chain orchestration layer
+  on top of the T1-1 crypto/parsing primitives is now real, in `src/dnssec.rs`.
+  Source of truth: `dnssec.c:68-2331`.
+  Implemented, tested:
+  - `ValidateStatus`/`StatCode`: unified `Secure|Insecure|Bogus|NeedKey|NeedDs|Abandoned`
+    result carrying a `DNSSEC_FAIL_*` bitmask, replacing the never-populated `ValidationResult`.
+  - `DnssecCache`: an in-memory DS/DNSKEY trust store (positive entries, `NegInsecure`
+    "proved no DS at a real zone cut", `NegNotZoneCut` "proved no DS but not a
+    delegation point either" — the same three outcomes as upstream's `crec`
+    `F_NEG`/`F_DNSSECOK` combinations). **This is a stand-in for live `cache.rs`
+    wiring, not a port of `struct crec` itself** — see "Still open" below.
+  - `zone_status` (dnssec.c:1881-1956): walks a name toward a cached/configured
+    trust anchor, then back down, exactly as upstream.
+  - `dnssec_validate_by_ds` (dnssec.c:716-972): validates a DNSKEY RRset's
+    self-signature against a cached DS, then caches every protocol-3 DNSKEY in
+    the now-validated RRset — matching upstream's cache-insert loop
+    (dnssec.c:895-925) exactly, which does not re-check the zone-key flag at
+    that point (that flag only gates which key is *tried* against the DS, not
+    which keys get cached once the RRset as a whole validates). An earlier
+    version of this port over-restricted the cache-insert to zone-key-flagged
+    DNSKEYs only; fixed, with a regression test
+    (`dnssec_validate_by_ds_caches_non_zone_key_dnskeys_too`).
+  - `dnssec_validate_ds` (dnssec.c:990-1179): validates/accepts a DS-query
+    answer via `dnssec_validate_reply`, caches positive DS or a negative
+    zone-cut/non-zone-cut proof. Not ported: the RFC-1918/`--bogus-priv` and
+    domain-specific-server insecure-DS fallback carve-outs (dnssec.c:1026-1047)
+    and the CNAME-proves-DS-absence `prim_ok` path — both need config/cache
+    surfaces (`option_bool(OPT_BOGUSPRIV)`, `lookup_domain`) not wired here.
+  - `ds_matches_dnskey` extended from SHA-256-only to also support digest
+    types 1 (SHA-1) and 4 (SHA-384), matching `crypto::ds_digest_name`.
+  - NSEC/NSEC3 negative proofs (dnssec.c:1247-1871): `prove_non_existence_nsec`,
+    `check_nsec3_coverage`, `prove_non_existence_nsec3` (closest-encloser walk,
+    opt-out, wildcard-non-existence check, `LIMIT_NSEC3_ITERS` bound —
+    `DEFAULT_NSEC3_ITERS_LIMIT = 150` matching `config.h`), and the
+    `prove_non_existence` NSEC-vs-NSEC3 dispatcher.
+  - `dnssec_validate_reply` (dnssec.c:1974-2331): the top-level orchestrator —
+    CNAME-chain following, per-RRset dedup, `zone_status` + multi-key
+    `validate_rrset` per RRset, missing-answer NSEC/NSEC3 proof with the
+    NEED_DS/NEED_KEY-vs-BOGUS fallback upstream uses when the proof itself
+    fails but the zone's signedness is still unknown. Also fixes the gap the
+    issue's audit flagged in the existing `explore_rrset`: RRSIGs covering one
+    RRset must share a single signer name — enforced here as part of the
+    per-RRset validation loop (a mismatch is `Bogus`), rather than by changing
+    `explore_rrset`'s own signature and risking existing callers/tests.
+    The CNAME-chain chase (a simplified single-target-by-name walk, not
+    upstream's index-bounded multi-target array — see "Still open" below) is
+    guarded by a `visited` set: a repeated name breaks the loop instead of
+    spinning forever on an attacker-supplied CNAME cycle
+    (`a -> b -> a`), falling through to the ordinary missing-answer
+    non-existence-proof path so a cyclic/unresolvable chain reports
+    `NeedDs`/`NeedKey`/`Bogus`, never `Secure`. Regression test:
+    `dnssec_validate_reply_cname_cycle_terminates`.
+  - `setup_timestamp`/`timestamp_clock_now_sane` (dnssec.c:68-141): the pure
+    decision logic (mtime vs now) is ported; the actual file stat/create/touch
+    IO is deliberately left to the caller (see "Still open").
+  Required tests: end-to-end signed-zone validation from a trust anchor
+  (`dnssec_validate_reply_secure_a_record`), corrupted-signature and
+  missing-DS Bogus/NeedDs paths, NSEC and NSEC3 negative-answer proofs
+  (direct-hit and closest-encloser), zone-cut vs non-zone-cut negative DS
+  caching, SERVFAIL handling. All in `src/dnssec.rs`'s `#[cfg(test)]` module.
+  Still open (tracked, not silently dropped):
+  - **No live caller anywhere in `src/`.** Exactly as before this issue,
+    `grep -rn "dnssec::" src/forward.rs` finds nothing. `DnssecCache` is a
+    self-contained trust store, not the real `cache.rs` — wiring
+    `dnssec_validate_by_ds`/`dnssec_validate_ds`/`dnssec_validate_reply` into
+    `forward.rs`'s dead `FREC_DNSKEY_QUERY`/`FREC_DS_QUERY`/`blocking_query`/
+    `dependent` scaffolding (forward.rs:246-249, 337-387), issuing real
+    sub-queries on `NeedKey`/`NeedDs`, and setting `secure`/`F_DNSSECOK` from
+    a real result instead of the hardcoded `secure: false`
+    (`ForwardConfig::extract_config`) is separate, still-untouched work.
+  - DNAME-synthesizes-CNAME pre-qualification (dnssec.c:2063-2149) is not
+    ported; a DNAME reply without a literal matching CNAME RRset falls
+    through to the ordinary CNAME-chase/non-existence-proof path instead of
+    being pre-accepted.
+  - The CNAME-target-discovery step is a single-target-by-name chase (follow
+    `qname`'s CNAME chain one hop at a time, cycle-guarded by a `visited`
+    set) rather than upstream's index-bounded multi-target array
+    (dnssec.c:2038-2060, 2298-2325), which records *every* CNAME found in the
+    answer section and proves non-existence for each one still unresolved
+    after the RRset-validation loop. For a normal linear chain (A -> B -> C,
+    no branching) the two are equivalent — both end up proving non-existence
+    for the final unresolved name. They diverge for an answer with multiple,
+    independent unresolved CNAME targets (not just one chain): upstream
+    would check non-existence for each; this port only follows the one chain
+    rooted at `qname`. Not exploitable into a false `Secure` (a real branch
+    left unchecked would still need its own valid answer/proof to matter),
+    but it is a real behavioral simplification worth closing if the
+    multi-target case turns out to matter in practice.
+  - The wildcard-replay re-check (dnssec.c:2271-2273: after a wildcard-expanded
+    RRset validates, re-run `prove_non_existence` to rule out a replayed
+    wildcard answer overlaying a genuine record) is not implemented —
+    `RrsetValidation::Secure` doesn't currently carry the `wild_offset`
+    upstream's `validate_rrset` returns, so `dnssec_validate_reply` has
+    nothing to trigger the recheck with. This is defense-in-depth on top of
+    the core validate/prove-negative state machine, not required for a
+    signed zone to validate or a broken chain to come back `Bogus`.
+  - `setup_timestamp`'s actual `stat`/`open`/`utimes` calls on
+    `daemon.timestamp_file`, and the `back_to_the_future` flag it should set
+    on `Daemon`, aren't wired into `dnsmasq.rs`'s init path — there's no
+    `--dnssec-timestamp` config directive yet either (check before assuming
+    one exists). The pure mtime-vs-now decision (`setup_timestamp`,
+    `timestamp_clock_now_sane`) is ready for that wiring.
+  - `dnssec_validate_by_ds`/`dnssec_validate_ds`/`dnssec_validate_reply` take
+    already-parsed `&[DnsRr]` slices (matching this file's existing
+    `explore_rrset`/`validate_rrset` convention), not a raw `dns_header*`
+    packet buffer like upstream — `get_rdata`'s byte-at-a-time canonicalization
+    iterator is likewise not ported 1:1; `canonicalize_rdata` (already in this
+    file before this issue) is the parsed-`DnsRr` equivalent used instead.
 
 - [x] `dhcp6::dispatch_dhcp6` real allocation/DUID/context pipeline, wired into the main loop
   (Issue #34 / T3-dhcp6).
