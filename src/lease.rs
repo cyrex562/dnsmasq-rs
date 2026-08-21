@@ -518,6 +518,21 @@ impl LeaseDb {
         })
     }
 
+    /// Find a DHCPv6 lease by CLID and IAID alone, regardless of address.
+    ///
+    /// Used to recall a client's existing address across a fresh Solicit
+    /// (upstream's `lease6_find_by_client()`, lease.c:730-750) without
+    /// requiring the client to have echoed it back in the request.
+    #[cfg(feature = "dhcp6")]
+    pub fn find_v6_by_client_iaid(&self, clid: &[u8], iaid: u32) -> Option<&DhcpLease> {
+        use crate::types::dhcp::{LEASE_TA, LEASE_NA};
+        self.leases.values().find(|l| {
+            (l.flags & (LEASE_TA | LEASE_NA) != 0)
+                && l.iaid == iaid
+                && l.clid.as_deref() == Some(clid)
+        })
+    }
+
     /// Find a DHCPv6 lease by exact IPv6 address.
     ///
     /// Port of `lease6_find_by_plain_addr()` from lease.c:776-790.
@@ -585,6 +600,106 @@ impl LeaseDb {
             if lease.flags & (LEASE_TA | LEASE_NA) != 0 {
                 lease.flags &= !LEASE_USED;
             }
+        }
+    }
+
+    /// Allocate-or-renew a DHCPv6 lease bound to a specific client/IAID.
+    ///
+    /// Unlike [`allocate_v6`], which inserts under a placeholder all-zero key
+    /// until the caller separately sets `clid`/`iaid` on the returned
+    /// reference (never re-keying the map entry, so a second such call before
+    /// the first lease's `clid` is set collides on the same key and silently
+    /// evicts it), this looks the lease up by `addr` first, removes it if
+    /// present, stamps `clid`/`iaid`/`expires`, and re-inserts under the
+    /// correct client key in one step — always leaving exactly one map entry
+    /// per bound address. Returns `None` only when this would be a genuinely
+    /// new lease and `max_leases` is already reached.
+    ///
+    /// Roughly combines `lease6_allocate()` (lease.c:873-887) with the
+    /// `lease_set_iaid()`/binding step callers otherwise do separately.
+    #[cfg(feature = "dhcp6")]
+    pub fn bind_v6(
+        &mut self,
+        addr: std::net::Ipv6Addr,
+        clid: &[u8],
+        iaid: u32,
+        lease_type: u32,
+        expires: Option<SystemTime>,
+    ) -> Option<&mut DhcpLease> {
+        use crate::types::dhcp::{LEASE_NEW, LEASE_TA, LEASE_NA};
+
+        let existing_key = self.leases.iter().find_map(|(k, l)| {
+            ((l.flags & (LEASE_TA | LEASE_NA)) != 0 && l.addr6 == addr).then_some(*k)
+        });
+
+        let mut lease = if let Some(k) = existing_key {
+            self.leases.remove(&k).unwrap()
+        } else {
+            if self.leases.len() >= self.max_leases {
+                return None;
+            }
+            DhcpLease {
+                clid: None,
+                hostname: None,
+                fqdn: None,
+                old_hostname: None,
+                flags: LEASE_NEW | lease_type,
+                expires: None,
+                hwaddr: [0u8; DHCP_CHADDR_MAX],
+                hwaddr_len: 0,
+                hwaddr_type: 0,
+                addr: Ipv4Addr::UNSPECIFIED,
+                giaddr: Ipv4Addr::UNSPECIFIED,
+                extradata: Vec::new(),
+                last_interface: 0,
+                new_interface: 0,
+                new_prefixlen: 0,
+                agent_id: None,
+                vendorclass: None,
+                addr6: addr,
+                iaid: 0,
+                slaac_address: Vec::new(),
+                vendorclass_count: 0,
+            }
+        };
+
+        lease.clid = Some(clid.to_vec());
+        lease.iaid = iaid;
+        lease.expires = expires;
+
+        let key = lease_key(&lease);
+        self.leases.insert(key, lease);
+        self.file_dirty = true;
+        self.dns_dirty = true;
+        self.leases.get_mut(&key)
+    }
+
+    /// Remove a DHCPv6 lease matching `clid`/`iaid`/`addr` exactly.
+    ///
+    /// Returns `true` if a matching lease was found and removed. Port of the
+    /// `lease6_find()` + `lease_prune()` pairing used by
+    /// `DHCP6RELEASE`/`DHCP6DECLINE` (rfc3315.c:1160-1162, 1241-1243).
+    #[cfg(feature = "dhcp6")]
+    pub fn remove_v6_by_clid_iaid_addr(
+        &mut self,
+        clid: &[u8],
+        iaid: u32,
+        addr: &std::net::Ipv6Addr,
+    ) -> bool {
+        use crate::types::dhcp::{LEASE_TA, LEASE_NA};
+        let key = self.leases.iter().find_map(|(k, l)| {
+            ((l.flags & (LEASE_TA | LEASE_NA)) != 0
+                && l.iaid == iaid
+                && l.addr6 == *addr
+                && l.clid.as_deref() == Some(clid))
+            .then_some(*k)
+        });
+        if let Some(k) = key {
+            self.leases.remove(&k);
+            self.file_dirty = true;
+            true
+        } else {
+            false
         }
     }
 }
@@ -1497,5 +1612,116 @@ mod tests {
         let a2: std::net::Ipv6Addr = "2001:db8::2".parse().unwrap();
         assert!(db.allocate_v6(a1, LEASE_NA).is_some());
         assert!(db.allocate_v6(a2, LEASE_NA).is_none());
+    }
+
+    // ── bind_v6 ──────────────────────────────────────────────────────────────
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn bind_v6_creates_new_lease_with_clid_and_iaid() {
+        use crate::types::dhcp::LEASE_NA;
+        let mut db = LeaseDb::new();
+        let addr: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let clid = vec![0xAA, 0xBB];
+        let lease = db.bind_v6(addr, &clid, 7, LEASE_NA, None).unwrap();
+        assert_eq!(lease.addr6, addr);
+        assert_eq!(lease.clid, Some(clid.clone()));
+        assert_eq!(lease.iaid, 7);
+        // Findable by clid/iaid afterwards.
+        assert!(db.find_v6_by_clid_iaid(&clid, 7, &addr).is_some());
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn bind_v6_does_not_clobber_other_clients() {
+        // Regression: binding a second client's address used to collide on the
+        // same all-zero lookup key as the first (both keyed off an empty
+        // clid/hwaddr at insert time), silently evicting the first lease.
+        use crate::types::dhcp::LEASE_NA;
+        let mut db = LeaseDb::new();
+        let a1: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let a2: std::net::Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let c1 = vec![0x01];
+        let c2 = vec![0x02];
+        db.bind_v6(a1, &c1, 1, LEASE_NA, None);
+        db.bind_v6(a2, &c2, 2, LEASE_NA, None);
+        assert!(db.find_v6_by_clid_iaid(&c1, 1, &a1).is_some());
+        assert!(db.find_v6_by_clid_iaid(&c2, 2, &a2).is_some());
+        assert_eq!(db.count(), 2);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn bind_v6_updates_existing_lease_in_place() {
+        use crate::types::dhcp::LEASE_NA;
+        use std::time::{Duration, SystemTime};
+        let mut db = LeaseDb::new();
+        let addr: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let clid = vec![0xAA];
+        db.bind_v6(addr, &clid, 1, LEASE_NA, None);
+        let later = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        db.bind_v6(addr, &clid, 1, LEASE_NA, Some(later));
+        assert_eq!(db.count(), 1);
+        let lease = db.find_v6_by_addr(&addr).unwrap();
+        assert_eq!(lease.expires, Some(later));
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn bind_v6_respects_max_leases_for_new_addr() {
+        use crate::types::dhcp::LEASE_NA;
+        let mut db = LeaseDb::new();
+        db.max_leases = 1;
+        let a1: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let a2: std::net::Ipv6Addr = "2001:db8::2".parse().unwrap();
+        assert!(db.bind_v6(a1, &[0x01], 1, LEASE_NA, None).is_some());
+        assert!(db.bind_v6(a2, &[0x02], 2, LEASE_NA, None).is_none());
+    }
+
+    // ── remove_v6_by_clid_iaid_addr ─────────────────────────────────────────
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn remove_v6_by_clid_iaid_addr_removes_match() {
+        use crate::types::dhcp::LEASE_NA;
+        let mut db = LeaseDb::new();
+        let addr: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let clid = vec![0xAA];
+        db.bind_v6(addr, &clid, 1, LEASE_NA, None);
+        assert!(db.remove_v6_by_clid_iaid_addr(&clid, 1, &addr));
+        assert!(db.find_v6_by_addr(&addr).is_none());
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn remove_v6_by_clid_iaid_addr_no_match_returns_false() {
+        let mut db = LeaseDb::new();
+        let addr: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        assert!(!db.remove_v6_by_clid_iaid_addr(&[0xAA], 1, &addr));
+    }
+
+    // ── find_v6_by_client_iaid ───────────────────────────────────────────────
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn find_v6_by_client_iaid_finds_regardless_of_address() {
+        use crate::types::dhcp::LEASE_NA;
+        let mut db = LeaseDb::new();
+        let addr: std::net::Ipv6Addr = "2001:db8::99".parse().unwrap();
+        let clid = vec![0xAA];
+        db.bind_v6(addr, &clid, 5, LEASE_NA, None);
+        let found = db.find_v6_by_client_iaid(&clid, 5).unwrap();
+        assert_eq!(found.addr6, addr);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn find_v6_by_client_iaid_wrong_iaid_not_found() {
+        use crate::types::dhcp::LEASE_NA;
+        let mut db = LeaseDb::new();
+        let addr: std::net::Ipv6Addr = "2001:db8::99".parse().unwrap();
+        let clid = vec![0xAA];
+        db.bind_v6(addr, &clid, 5, LEASE_NA, None);
+        assert!(db.find_v6_by_client_iaid(&clid, 6).is_none());
     }
 }

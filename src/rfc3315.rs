@@ -107,15 +107,16 @@ fn status_success() -> Dhcp6Option {
 
 /// Build an IA_NA option containing one IAADDR sub-option for `addr`.
 ///
+/// Lifetimes are derived from `lease_time` via [`calculate_times`] rather
+/// than fixed constants, so the offered IA_NA reflects the context/config
+/// lease time that actually applies to `addr`.
+///
 /// Layout (per RFC 3315):
 ///   IA_NA: 4-byte IAID | 4-byte T1 | 4-byte T2 | sub-options …
 ///   IAADDR sub-option: 16-byte addr | 4-byte preferred-lt | 4-byte valid-lt | sub-options …
 #[cfg(feature = "dhcp6")]
-fn build_ia_na(iaid: [u8; 4], addr: Ipv6Addr) -> Dhcp6Option {
-    let preferred_lt: u32 = 3600;
-    let valid_lt:     u32 = 7200;
-    let t1:           u32 = 1800;
-    let t2:           u32 = 2880;
+fn build_ia_na(iaid: [u8; 4], addr: Ipv6Addr, lease_time: u32) -> Dhcp6Option {
+    let (preferred_lt, valid_lt, t1, t2) = calculate_times(lease_time);
 
     // Build IAADDR sub-option data
     let mut iaaddr_data = Vec::with_capacity(24);
@@ -141,6 +142,7 @@ pub fn handle_solicit(
     solicit: &Dhcp6Packet,
     server_duid: &[u8],
     offered_addr: Ipv6Addr,
+    lease_time: u32,
 ) -> Dhcp6Packet {
     // Extract IAID from the client's IA_NA option (bytes 0..4), default to zeros
     let iaid = if let Some(ia) = find_option6(&solicit.options, OPTION6_IA_NA) {
@@ -160,7 +162,7 @@ pub fn handle_solicit(
     let mut options = Vec::new();
     options.push(client_id_opt);
     options.push(Dhcp6Option { code: OPTION6_SERVER_ID, data: server_duid.to_vec() });
-    options.push(build_ia_na(iaid, offered_addr));
+    options.push(build_ia_na(iaid, offered_addr, lease_time));
     options.push(status_success());
 
     Dhcp6Packet {
@@ -176,6 +178,7 @@ pub fn handle_request6(
     req: &Dhcp6Packet,
     server_duid: &[u8],
     assigned_addr: Ipv6Addr,
+    lease_time: u32,
 ) -> Dhcp6Packet {
     let iaid = if let Some(ia) = find_option6(&req.options, OPTION6_IA_NA) {
         if ia.data.len() >= 4 {
@@ -194,7 +197,7 @@ pub fn handle_request6(
     let mut options = Vec::new();
     options.push(client_id_opt);
     options.push(Dhcp6Option { code: OPTION6_SERVER_ID, data: server_duid.to_vec() });
-    options.push(build_ia_na(iaid, assigned_addr));
+    options.push(build_ia_na(iaid, assigned_addr, lease_time));
     options.push(status_success());
 
     Dhcp6Packet {
@@ -735,11 +738,25 @@ mod tests {
         let solicit = make_solicit();
         let server_duid = vec![0x00, 0x02, 0xDE, 0xAD];
         let offered = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
-        let adv = handle_solicit(&solicit, &server_duid, offered);
+        let adv = handle_solicit(&solicit, &server_duid, offered, 3600);
         assert_eq!(adv.msg_type, Dhcp6MsgType::Advertise);
         assert_eq!(adv.txn_id, solicit.txn_id);
         assert!(find_option6(&adv.options, OPTION6_IA_NA).is_some());
         assert!(find_option6(&adv.options, OPTION6_SERVER_ID).is_some());
+    }
+
+    #[test]
+    fn handle_solicit_lifetimes_come_from_lease_time_argument() {
+        let solicit = make_solicit();
+        let server_duid = vec![0x00, 0x02, 0xDE, 0xAD];
+        let offered = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let adv = handle_solicit(&solicit, &server_duid, offered, 100);
+        let ia = find_option6(&adv.options, OPTION6_IA_NA).unwrap();
+        let iaaddr_opt = opt6_find(&ia.data[12..], OPTION6_IAADDR, 24).unwrap();
+        let iaaddr = opt6_data(iaaddr_opt);
+        let preferred = u32::from_be_bytes(iaaddr[16..20].try_into().unwrap());
+        let valid = u32::from_be_bytes(iaaddr[20..24].try_into().unwrap());
+        assert_eq!((preferred, valid), (100, 100));
     }
 
     #[test]
@@ -753,7 +770,7 @@ mod tests {
         req.msg_type = Dhcp6MsgType::Request;
         req.options.push(Dhcp6Option { code: OPTION6_SERVER_ID, data: server_duid.clone() });
 
-        let reply = handle_request6(&req, &server_duid, addr);
+        let reply = handle_request6(&req, &server_duid, addr, 3600);
         assert_eq!(reply.msg_type, Dhcp6MsgType::Reply);
         assert_eq!(reply.txn_id, req.txn_id);
         assert!(find_option6(&reply.options, OPTION6_IA_NA).is_some());

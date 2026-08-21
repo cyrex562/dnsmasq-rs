@@ -795,6 +795,7 @@ pub struct Dhcp6DaemonRuntime {
     pub duid: Vec<u8>,
     pub contexts: Vec<crate::types::dhcp::DhcpContext>,
     pub configs: Vec<crate::types::dhcp::DhcpConfig>,
+    pub authoritative: bool,
 }
 
 /// Build the DHCPv6 runtime: generate/persist the server DUID if it isn't
@@ -846,6 +847,7 @@ fn daemon_dhcp6_runtime_with(
         current.extend(crate::dhcp6::complete_context6(addr, &contexts));
     }
 
+    use crate::types::constants::OPT_AUTHORITATIVE;
     Some(Dhcp6DaemonRuntime {
         bind_addr: SocketAddr::V6(SocketAddrV6::new(
             Ipv6Addr::UNSPECIFIED,
@@ -856,6 +858,7 @@ fn daemon_dhcp6_runtime_with(
         duid,
         contexts: current,
         configs: daemon.dhcp_conf.clone(),
+        authoritative: daemon.option_bool(OPT_AUTHORITATIVE),
     })
 }
 
@@ -1438,7 +1441,7 @@ pub async fn run_main_loop_with(
         let task = tokio::spawn(async move {
             if let Err(e) = crate::dhcp6::run_dhcp6_loop(
                 dhcp6_sock, rt.duid, rt.contexts, rt.configs,
-                crate::lease::LeaseDb::new(), shutdown_rx, None,
+                crate::lease::LeaseDb::new(), rt.authoritative, shutdown_rx, None,
             ).await {
                 error!("dhcp6 loop exited: {e}");
             }
