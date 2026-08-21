@@ -284,22 +284,50 @@ impl LeaseDb {
     }
 
     /// Update hardware address and optional client-id on a lease.
-    pub fn set_hwaddr(&mut self, addr: Ipv4Addr, hwaddr: &[u8], hw_type: i32, clid: Option<&[u8]>) {
+    ///
+    /// `force` mirrors upstream `lease_set_hwaddr()`'s own `force` parameter
+    /// (lease.c:940) — the init-reboot-without-prior-record case passes
+    /// `true` (rfc2131.c:679); this port's DHCPv4 path does not yet track
+    /// that distinction and always passes `false` (see `tasks.md`).
+    ///
+    /// Returns whether a SLAAC-relevant change occurred (upstream's local
+    /// `change` — lease.c:944,975,984 — true when `force` is set or the
+    /// client-id changed; a hwaddr-only change does *not* set it, matching
+    /// upstream exactly). Callers that also track `daemon->dhcp6` contexts
+    /// should feed this into [`crate::slaac::slaac_add_addrs`] the way
+    /// `lease_set_hwaddr()` calls `slaac_add_addrs()` inline (lease.c:992-993).
+    pub fn set_hwaddr(
+        &mut self,
+        addr: Ipv4Addr,
+        hwaddr: &[u8],
+        hw_type: i32,
+        clid: Option<&[u8]>,
+        force: bool,
+    ) -> bool {
         use crate::types::dhcp::{LEASE_CHANGED, LEASE_AUX_CHANGED};
+        #[cfg(feature = "dhcp6")]
+        use crate::types::dhcp::LEASE_HAVE_HWADDR;
 
         // We need to find the lease, potentially remove/re-key it if clid changes.
         let key = {
             let lease = match self.leases.values().find(|l| l.addr == addr) {
                 Some(l) => l,
-                None => return,
+                None => return false,
             };
             lease_key(lease)
         };
 
         let lease = match self.leases.get_mut(&key) {
             Some(l) if l.addr == addr => l,
-            _ => return,
+            _ => return false,
         };
+
+        #[cfg(feature = "dhcp6")]
+        {
+            lease.flags |= LEASE_HAVE_HWADDR;
+        }
+
+        let mut change = force;
 
         // Check if hwaddr changed
         let hw_len = hwaddr.len().min(DHCP_CHADDR_MAX);
@@ -316,19 +344,24 @@ impl LeaseDb {
             self.file_dirty = true;
         }
 
-        // Check if clid changed
-        let new_clid = clid.map(|c| c.to_vec());
-        let clid_changed = lease.clid != new_clid;
-
-        if clid_changed {
-            // Need to re-key: remove with old key, update clid, insert with new key
-            let mut lease = self.leases.remove(&key).unwrap();
-            lease.clid = new_clid;
-            lease.flags |= LEASE_AUX_CHANGED;
-            self.file_dirty = true;
-            let new_key = lease_key(&lease);
-            self.leases.insert(new_key, lease);
+        // Check if clid changed. Only ever considered when a clid is
+        // actually supplied — a packet with no clid must not clear or
+        // "un-set" an existing one (lease.c:963-965).
+        if let Some(clid) = clid {
+            let clid_changed = lease.clid.as_deref() != Some(clid);
+            if clid_changed {
+                change = true;
+                // Need to re-key: remove with old key, update clid, insert with new key
+                let mut lease = self.leases.remove(&key).unwrap();
+                lease.clid = Some(clid.to_vec());
+                lease.flags |= LEASE_AUX_CHANGED;
+                self.file_dirty = true;
+                let new_key = lease_key(&lease);
+                self.leases.insert(new_key, lease);
+            }
         }
+
+        change
     }
 
     /// Set the hostname on a lease. If `auth` is true, the `LEASE_AUTH_NAME` flag
@@ -481,6 +514,70 @@ impl LeaseDb {
     /// Iterate over all leases.
     pub fn iter(&self) -> impl Iterator<Item = &DhcpLease> {
         self.leases.values()
+    }
+
+    /// Mutably iterate over all leases.
+    #[cfg(feature = "dhcp6")]
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut DhcpLease> {
+        self.leases.values_mut()
+    }
+
+    /// Recompute SLAAC addresses for every lease against `contexts` (the
+    /// current `daemon->dhcp6` RA-name chain), matching upstream's per-lease
+    /// call to `slaac_add_addrs()` at lease commit/load time (lease.c:514,
+    /// 998, 1159), applied here across the whole database at once. Sets
+    /// `dns_dirty` when any lease's SLAAC address set changed.
+    #[cfg(feature = "dhcp6")]
+    pub fn refresh_slaac(
+        &mut self,
+        now: SystemTime,
+        contexts: &[crate::types::dhcp::DhcpContext],
+        force: bool,
+        mut ra_start_unsolicited: impl FnMut(&crate::types::dhcp::DhcpContext),
+    ) {
+        let mut dirty = false;
+        for lease in self.leases.values_mut() {
+            if crate::slaac::slaac_add_addrs(lease, now, force, contexts, &mut ra_start_unsolicited) {
+                dirty = true;
+            }
+        }
+        if dirty {
+            self.dns_dirty = true;
+        }
+    }
+
+    /// Run one tick of SLAAC DAD probing across every lease
+    /// (`periodic_slaac`, slaac.c:119-190). Returns the next wake time, or
+    /// `None` if nothing is configured or outstanding.
+    #[cfg(feature = "dhcp6")]
+    pub fn tick_slaac(
+        &mut self,
+        now: SystemTime,
+        contexts: &[crate::types::dhcp::DhcpContext],
+        ping_id: u16,
+        send: impl FnMut(std::net::Ipv6Addr, &[u8]) -> std::io::Result<()>,
+    ) -> Option<SystemTime> {
+        crate::slaac::periodic_slaac(now, contexts, self.leases.values_mut(), ping_id, send)
+    }
+
+    /// Handle an inbound ICMPv6 echo reply for SLAAC DAD confirmation
+    /// (`slaac_ping_reply`, slaac.c:191-213). Sets `dns_dirty` if any lease's
+    /// SLAAC address was confirmed.
+    #[cfg(feature = "dhcp6")]
+    pub fn confirm_slaac_ping(
+        &mut self,
+        sender: std::net::Ipv6Addr,
+        packet: &[u8],
+        ping_id: u16,
+        interface: &str,
+        quiet: bool,
+    ) {
+        let gotone = crate::slaac::slaac_ping_reply(
+            sender, packet, ping_id, interface, quiet, self.leases.values_mut(),
+        );
+        if gotone {
+            self.dns_dirty = true;
+        }
     }
 
     /// Compute FQDNs for all leases with hostnames.
@@ -987,7 +1084,7 @@ mod tests {
         db.insert(make_lease(addr, [0x01, 0x02, 0x03, 0x04, 0x05, 0x06], None));
 
         let new_hw = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
-        db.set_hwaddr(addr, &new_hw, 1, None);
+        db.set_hwaddr(addr, &new_hw, 1, None, false);
 
         let lease = db.find_by_addr(addr).unwrap();
         assert_eq!(&lease.hwaddr[..6], &new_hw);
@@ -1003,7 +1100,7 @@ mod tests {
         db.insert(make_lease(addr, hw, None));
         db.file_dirty = false;
 
-        db.set_hwaddr(addr, &hw, 1, None);
+        db.set_hwaddr(addr, &hw, 1, None, false);
         // hwaddr didn't change, clid didn't change
         assert!(!db.file_dirty);
     }
@@ -1016,17 +1113,81 @@ mod tests {
         db.insert(make_lease(addr, [0x01, 0, 0, 0, 0, 0], None));
 
         let clid = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        db.set_hwaddr(addr, &[0x01, 0, 0, 0, 0, 0], 1, Some(&clid));
+        db.set_hwaddr(addr, &[0x01, 0, 0, 0, 0, 0], 1, Some(&clid), false);
 
         let lease = db.find_by_addr(addr).unwrap();
         assert_eq!(lease.clid, Some(clid));
         assert_ne!(lease.flags & LEASE_AUX_CHANGED, 0);
     }
 
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn set_hwaddr_sets_lease_have_hwaddr_flag() {
+        use crate::types::dhcp::LEASE_HAVE_HWADDR;
+        let mut db = LeaseDb::new();
+        let addr = Ipv4Addr::new(10, 0, 0, 1);
+        db.insert(make_lease(addr, [0x01, 0x02, 0x03, 0x04, 0x05, 0x06], None));
+        assert_eq!(db.find_by_addr(addr).unwrap().flags & LEASE_HAVE_HWADDR, 0);
+
+        db.set_hwaddr(addr, &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], 1, None, false);
+        assert_ne!(db.find_by_addr(addr).unwrap().flags & LEASE_HAVE_HWADDR, 0);
+    }
+
+    #[test]
+    fn set_hwaddr_returns_false_when_no_slaac_relevant_change() {
+        let mut db = LeaseDb::new();
+        let addr = Ipv4Addr::new(10, 0, 0, 1);
+        let hw = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+        db.insert(make_lease(addr, hw, None));
+
+        // hwaddr-only change does not report a SLAAC-relevant change,
+        // matching upstream's `change` variable (lease.c:944-975).
+        let changed = db.set_hwaddr(addr, &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], 1, None, false);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn set_hwaddr_returns_true_when_clid_changes() {
+        let mut db = LeaseDb::new();
+        let addr = Ipv4Addr::new(10, 0, 0, 1);
+        let hw = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+        db.insert(make_lease(addr, hw, None));
+
+        let clid = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let changed = db.set_hwaddr(addr, &hw, 1, Some(&clid), false);
+        assert!(changed);
+    }
+
+    #[test]
+    fn set_hwaddr_returns_true_when_forced() {
+        let mut db = LeaseDb::new();
+        let addr = Ipv4Addr::new(10, 0, 0, 1);
+        let hw = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+        db.insert(make_lease(addr, hw, None));
+
+        let changed = db.set_hwaddr(addr, &hw, 1, None, true);
+        assert!(changed);
+    }
+
+    #[test]
+    fn set_hwaddr_missing_clid_does_not_clear_existing_one() {
+        let mut db = LeaseDb::new();
+        let addr = Ipv4Addr::new(10, 0, 0, 1);
+        let hw = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+        db.insert(make_lease(addr, hw, None));
+        let clid = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        db.set_hwaddr(addr, &hw, 1, Some(&clid), false);
+
+        // A subsequent packet with no client-id must not wipe the recorded one.
+        let changed = db.set_hwaddr(addr, &hw, 1, None, false);
+        assert!(!changed);
+        assert_eq!(db.find_by_addr(addr).unwrap().clid, Some(clid));
+    }
+
     #[test]
     fn set_hwaddr_nonexistent_no_panic() {
         let mut db = LeaseDb::new();
-        db.set_hwaddr(Ipv4Addr::new(10, 0, 0, 99), &[0x01, 0, 0, 0, 0, 0], 1, None);
+        db.set_hwaddr(Ipv4Addr::new(10, 0, 0, 99), &[0x01, 0, 0, 0, 0, 0], 1, None, false);
     }
 
     #[test]
@@ -1038,7 +1199,7 @@ mod tests {
         db.insert(make_lease(addr, hw, None));
 
         // Same hw bytes, different type
-        db.set_hwaddr(addr, &hw, 6, None);
+        db.set_hwaddr(addr, &hw, 6, None, false);
         let lease = db.find_by_addr(addr).unwrap();
         assert_eq!(lease.hwaddr_type, 6);
         assert_ne!(lease.flags & LEASE_CHANGED, 0);
@@ -1469,7 +1630,7 @@ mod tests {
         let addr = Ipv4Addr::new(192, 168, 1, 100);
 
         db.allocate_v4(addr);
-        db.set_hwaddr(addr, &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], 1, None);
+        db.set_hwaddr(addr, &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], 1, None, false);
         db.set_hostname(addr, Some("workstation"), true);
         db.set_expires(addr, 86400);
         db.set_interface(addr, 3);
@@ -1495,7 +1656,7 @@ mod tests {
         let mut db = LeaseDb::new();
         let addr = Ipv4Addr::new(192, 168, 1, 50);
         db.allocate_v4(addr);
-        db.set_hwaddr(addr, &[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01], 1, None);
+        db.set_hwaddr(addr, &[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01], 1, None, false);
         db.set_hostname(addr, Some("testbox"), false);
 
         db.write_to_file(path_str).unwrap();
@@ -1723,5 +1884,112 @@ mod tests {
         let clid = vec![0xAA];
         db.bind_v6(addr, &clid, 5, LEASE_NA, None);
         assert!(db.find_v6_by_client_iaid(&clid, 6).is_none());
+    }
+
+    // ── SLAAC integration (refresh_slaac / tick_slaac / confirm_slaac_ping) ──
+
+    #[cfg(feature = "dhcp6")]
+    fn make_ra_ctx(start6: std::net::Ipv6Addr, if_index: i32) -> crate::types::dhcp::DhcpContext {
+        use crate::types::dhcp::{CONTEXT_RA_NAME, DhcpNetid};
+        crate::types::dhcp::DhcpContext {
+            start: Ipv4Addr::UNSPECIFIED,
+            end: Ipv4Addr::UNSPECIFIED,
+            router: Ipv4Addr::UNSPECIFIED,
+            flags: CONTEXT_RA_NAME,
+            netmask: Ipv4Addr::UNSPECIFIED,
+            broadcast: Ipv4Addr::UNSPECIFIED,
+            local: Ipv4Addr::UNSPECIFIED,
+            lease_time: 0,
+            addr_epoch: 0,
+            netid: DhcpNetid { net: String::new() },
+            filter: vec![],
+            start6,
+            end6: std::net::Ipv6Addr::UNSPECIFIED,
+            local6: std::net::Ipv6Addr::UNSPECIFIED,
+            prefix: 64,
+            if_index,
+            valid: 0,
+            preferred: 0,
+        }
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn refresh_slaac_populates_matching_lease_and_marks_no_dirty_on_first_add() {
+        use crate::types::dhcp::LEASE_HAVE_HWADDR;
+        let mut db = LeaseDb::new();
+        let addr = Ipv4Addr::new(10, 0, 0, 1);
+        db.insert(make_lease(addr, [0x00, 0x60, 0x97, 0x00, 0x28, 0x4C], None));
+        {
+            let lease = db.leases.values_mut().next().unwrap();
+            lease.flags |= LEASE_HAVE_HWADDR;
+            lease.hostname = Some("host".to_string());
+            lease.last_interface = 1;
+        }
+
+        let ctx = make_ra_ctx("2001:db8::".parse().unwrap(), 1);
+        db.dns_dirty = false;
+        db.refresh_slaac(SystemTime::now(), &[ctx], false, |_| {});
+
+        let lease = db.find_by_addr(addr).unwrap();
+        assert_eq!(lease.slaac_address.len(), 1);
+        // Matches slaac_add_addrs's own semantics: no dirty flag on first population.
+        assert!(!db.dns_dirty);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn refresh_slaac_force_marks_dns_dirty() {
+        use crate::types::dhcp::LEASE_HAVE_HWADDR;
+        let mut db = LeaseDb::new();
+        let addr = Ipv4Addr::new(10, 0, 0, 1);
+        db.insert(make_lease(addr, [0x00, 0x60, 0x97, 0x00, 0x28, 0x4C], None));
+        {
+            let lease = db.leases.values_mut().next().unwrap();
+            lease.flags |= LEASE_HAVE_HWADDR;
+            lease.hostname = Some("host".to_string());
+            lease.last_interface = 1;
+        }
+
+        let ctx = make_ra_ctx("2001:db8::".parse().unwrap(), 1);
+        db.refresh_slaac(SystemTime::now(), &[ctx.clone()], false, |_| {});
+        db.dns_dirty = false;
+        db.refresh_slaac(SystemTime::now(), &[ctx], true, |_| {});
+        assert!(db.dns_dirty);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn tick_slaac_sends_due_probe_and_confirm_ping_clears_it() {
+        use crate::types::dhcp::LEASE_HAVE_HWADDR;
+        let mut db = LeaseDb::new();
+        let addr = Ipv4Addr::new(10, 0, 0, 1);
+        db.insert(make_lease(addr, [0x00, 0x60, 0x97, 0x00, 0x28, 0x4C], None));
+        let now = SystemTime::now();
+        {
+            let lease = db.leases.values_mut().next().unwrap();
+            lease.flags |= LEASE_HAVE_HWADDR;
+            lease.hostname = Some("host".to_string());
+            lease.last_interface = 1;
+        }
+
+        let ctx = make_ra_ctx("2001:db8::".parse().unwrap(), 1);
+        db.refresh_slaac(now, &[ctx.clone()], false, |_| {});
+        let slaac_addr = db.find_by_addr(addr).unwrap().slaac_address[0].addr;
+
+        let mut sent = Vec::new();
+        let next = db.tick_slaac(now, &[ctx], 42, |a, pkt| {
+            sent.push((a, pkt.to_vec()));
+            Ok(())
+        });
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, slaac_addr);
+        assert!(next.is_some());
+
+        let packet = crate::slaac::build_ping_packet(42, 1);
+        db.dns_dirty = false;
+        db.confirm_slaac_ping(slaac_addr, &packet, 42, "eth0", true);
+        assert!(db.dns_dirty);
+        assert_eq!(db.find_by_addr(addr).unwrap().slaac_address[0].backoff, 0);
     }
 }

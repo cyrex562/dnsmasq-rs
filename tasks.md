@@ -1643,6 +1643,109 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   (which is what actually sets `CONTEXT_CONSTRUCTED`/`CONTEXT_TEMPLATE` at runtime, called from
   `dhcp6.c:771/807/852`) is not ported either, so this gap is currently unreachable in practice.
 
+- [x] `slaac::slaac_add_addrs` / `periodic_slaac` / `slaac_ping_reply` — real lease-derived SLAAC
+  address tracking and ICMPv6 DAD probing (Issue #37 / T3-slaac).
+  Source of truth: `slaac.c` (all three functions, gated `HAVE_DHCP6`).
+  Implemented, tested, real (no longer stubs):
+  - `slaac_add_addrs` (slaac.c:25-116): a real port operating on `&mut DhcpLease` +
+    `&[DhcpContext]`, mutating `lease.slaac_address` in place — diffs the derived address set
+    against the existing list (reuse-and-reset on `force`, drop stale entries, `ra_start_unsolicited`
+    callback for genuinely new ones), replacing the old disconnected `synthesize_slaac_addrs`
+    (which only returned a `Vec<Ipv6Addr>` with no lease/state tie-in and had zero callers).
+    `derive_slaac_host_id` replicates all three upstream hwaddr branches (6-byte Ethernet MAC via
+    EUI-64 synthesis, raw 8-byte `ARPHRD_EUI64` hardware address, FireWire EUI-64 carried in the
+    client-id) with the single post-branch `^= 0x02` U/L-bit flip upstream applies uniformly.
+  - `periodic_slaac` (slaac.c:119-190): real exponential-backoff/jitter DAD probe scheduling
+    operating on `SlaacAddress` entries directly (not the old disconnected `SlaacProbeState`,
+    which had zero callers and wasn't attached to `DhcpLease` at all) — matches the
+    `EHOSTUNREACH`-at-backoff-12 give-up case, the `next_event` earliest-pending-probe
+    computation, and the "nothing configured" (`!CONTEXT_RA_NAME`) early return exactly.
+  - `slaac_ping_reply` (slaac.c:191-213): matches inbound ICMPv6 echo replies by `ping_id` and
+    sender address, confirms (`backoff = 0`), and logs `SLAAC-CONFIRM`.
+  - A real (`CAP_NET_RAW`-gated) `Icmp6Socket` (raw ICMPv6, `socket2` + `tokio::io::unix::AsyncFd`)
+    for send/receive; `Icmp6Socket::create()` returns `Err` rather than failing DHCPv6 startup
+    when the process lacks the capability — "DAD probing works where permissions allow", not
+    "is mandatory". Ping-packet wire format (`build_ping_packet`/`parse_ping_packet`) matches
+    `struct ping_packet` (type/code/checksum/identifier/sequence, checksum left zero for the
+    kernel to fill in on a raw ICMPv6 socket).
+  - **Production wiring — DHCPv4 loop (`dhcp.rs::run_dhcp_loop`), the real, live call site:**
+    `LeaseDb` gained `refresh_slaac`/`tick_slaac`/`confirm_slaac_ping` (the lease-set-wide
+    equivalents of `slaac_add_addrs`/`periodic_slaac`/`slaac_ping_reply`, setting `dns_dirty` —
+    this port's existing stand-in for upstream's `lease_update_dns`). Getting a real DHCPv4 lease
+    to actually satisfy `slaac_add_addrs`'s guards (slaac.c:31-35) took two separate fixes, not
+    one:
+    - `LeaseDb::set_hwaddr` never set `LEASE_HAVE_HWADDR` (lease.c:946 sets it unconditionally in
+      `lease_set_hwaddr`); fixed, and `set_hwaddr` now takes upstream's `force` parameter and
+      returns upstream's `change` value (true on `force` or a client-id change — a hwaddr-only
+      change does *not* set it, matching lease.c:944-993 exactly, including the "a packet with no
+      client-id must not clear an existing one" guard at lease.c:963).
+    - `lease.last_interface` was **never set anywhere in production** — `LeaseDb::set_interface`
+      existed but had zero non-test callers, so `slaac_add_addrs`'s `lease->last_interface == 0`
+      guard (slaac.c:33) always failed for every lease `record_lease` ever committed, independent
+      of the hwaddr/hostname fix above. Fixed by threading `if_index` through `ArrivalInterface`
+      (from the `IP_PKTINFO` arrival metadata `run_dhcp_loop` already resolves) and calling
+      `LeaseDb::set_interface` from `dispatch_dhcp_with_arrival` after a REQUEST is ACK'd — the
+      Rust equivalent of upstream's `lease_set_interface()` call from `rfc2131.c:1717`
+      (lease.c:1148-1159).
+    `run_dhcp_loop` calls `refresh_slaac` after every dispatched packet (using the DHCPv6
+    "current" RA-name context chain, threaded in via `DhcpLoopOptions::slaac_contexts` from
+    `run_main_loop_with` — cloned from the already-resolved `Dhcp6DaemonRuntime.contexts` before
+    it's moved into `run_dhcp6_loop`) and runs a 1s DAD probe tick plus an `Icmp6Socket::recv`
+    receive arm via a `SlaacDad` state machine (`tokio::select!` branches can't be individually
+    `#[cfg(...)]`-gated the way `match` arms can, so the dhcp6-on/off and
+    capability-present/absent split lives inside that type instead of around the branch), both
+    no-ops when the raw socket couldn't be opened or no RA-name context was configured.
+    **This — not `dhcp6::run_dhcp6_loop` — is the loop that makes SLAAC tracking real**: DHCPv6
+    stateful (`bind_v6`) leases are unconditionally `LEASE_NA`-flagged, so they can never pass
+    `slaac_add_addrs`'s own `LEASE_TA|LEASE_NA` exclusion guard (slaac.c:32) — `run_dhcp6_loop`'s
+    `refresh_slaac`/`tick_slaac`/`confirm_slaac_ping` calls are upstream-faithful (upstream's
+    single shared lease list relies on that same guard to skip its own DHCPv6 leases) but
+    structurally inert against its own `LeaseDb` today, and are left in place rather than removed.
+    DHCPv4-committed leases are never `LEASE_NA`/`LEASE_TA`-flagged, so `run_dhcp_loop`'s `LeaseDb`
+    is where real tracking and probing happens.
+  - `is_slaac_for` (the Rust-only "does this address match this prefix+MAC" helper flagged by the
+    original issue as having no 1:1 C counterpart and no caller) has been removed: no in-scope
+    production caller exists for it (the natural one — answering AAAA queries for DHCP lease
+    hostnames — doesn't exist anywhere in this port yet, IPv4 or IPv6, and building it is well
+    outside this issue), and the two internal tests that used it as an assertion helper now assert
+    directly against `slaac_address(...)` instead.
+  Covered by `slaac::tests::*` (33 tests: all three hwaddr-derivation branches, force-reset,
+  stale-entry removal, RA-trigger-only-on-new-address, "nothing configured", due/not-due/confirmed/
+  give-up/reschedule probe states, ping-reply match/mismatch/malformed/already-confirmed, and a
+  capability-gated `Icmp6Socket::create` test that accepts either outcome), plus
+  `lease::tests::{set_hwaddr_sets_lease_have_hwaddr_flag, set_hwaddr_returns_*,
+  set_hwaddr_missing_clid_does_not_clear_existing_one, refresh_slaac_*,
+  tick_slaac_sends_due_probe_and_confirm_ping_clears_it}`, plus new `dhcp::tests::{
+  dispatch_with_arrival_sets_last_interface_on_committed_lease,
+  dispatch_with_arrival_leaves_last_interface_unset_without_arrival,
+  dispatch_then_refresh_slaac_populates_address_for_real_v4_lease}` — the last one is the
+  regression test for the actual production gap: it drives a REQUEST through
+  `dispatch_dhcp_with_arrival` exactly as `run_dhcp_loop` does, then calls `refresh_slaac`, and
+  asserts the resulting (real, non-`LEASE_NA`/`TA`-flagged) lease has a populated
+  `slaac_address` — this failed before the `last_interface` fix and passes after it.
+  Explicitly still unsupported / open:
+  - `LeaseDb::set_hwaddr`'s `force` parameter is always passed `false` from the one production
+    caller (`dhcp.rs`'s DHCPv4 commit path) — upstream's `rfc2131.c:679` passes `true` for the
+    init-reboot-without-prior-record case and a context-dependent flag at `rfc2131.c:1683`; this
+    port's DHCPv4 state machine doesn't yet track that distinction. Conservative (never forces a
+    probe reset it shouldn't), not incorrect, but not full parity either.
+  - The RA-trigger callback passed to `refresh_slaac` at both loops' call sites is a documented
+    no-op: production RA scheduling itself has no main-loop caller yet either (see the
+    `radv::calc_interval`/`calc_lifetime` entry above), so there is no live `RaSchedule` to invoke
+    `start_unsolicited` on. Once that lands, the callback should call it for the matching context.
+  - The ICMPv6 receive path passes an empty `interface` string to `confirm_slaac_ping` (no
+    `IPV6_RECVPKTINFO`/cmsg support on the raw socket yet), so `SLAAC-CONFIRM` log lines never
+    show a real interface name. Matching/confirm/dns_dirty behavior itself is unaffected.
+  - The DHCPv6 "current" RA-name context chain is resolved once at startup (`daemon_dhcp6_runtime`)
+    and handed to the DHCPv4 loop as a snapshot; it does not follow a config reload/SIGHUP or live
+    interface changes without a restart. Same pre-existing scope simplification as
+    `run_dhcp6_loop`'s own context chain (see its doc comment).
+  - The two independent in-memory `LeaseDb` instances (DHCPv4 loop vs. DHCPv6 loop) remain
+    unmerged — a pre-existing, separately-tracked P1 gap. It no longer blocks SLAAC specifically
+    (SLAAC's real target, DHCPv4-committed leases, now gets tracked/probed from the loop that
+    actually owns them), but still means e.g. a DHCPv6-stateful lease and its dual-stack sibling's
+    DHCPv4 lease aren't visible to each other's loop.
+
 ## P4 Test Harness And Tooling
 
 - [ ] Build reusable parity fixtures.
