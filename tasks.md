@@ -1490,6 +1490,127 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     offered from a `CONTEXT_CONSTRUCTED` context (`complete_context6` only reads those fields for
     that case).
 
+- [x] `rfc3315.c`/`dhcp6::dispatch_dhcp6` per-message-type DHCPv6 state machine
+  (Issue #35 / T3-rfc3315).
+  Source of truth: `rfc3315.c:71-1301` (`dhcp6_reply()` and its per-`msg_type` case bodies),
+  `:1719-1732` (`check_address`), `:1823-1868` (`calculate_times`).
+  Previously `dhcp6::dispatch_dhcp6` folded Solicit/Request/Renew/Rebind/Confirm into one match
+  arm that always called a fresh `address6_allocate` and delegated success replies to
+  `rfc3315::handle_solicit`/`handle_request6`, which themselves hardcoded IA_NA lifetimes to
+  3600/7200/1800/2880 regardless of context config; Release/Decline were a no-op empty Reply that
+  never touched `lease_db`. Each message type is now its own function in `dhcp6.rs`
+  (`dispatch_solicit`/`dispatch_request`/`dispatch_renew_rebind`/`dispatch_confirm`/
+  `dispatch_release_or_decline`/`dispatch_inforeq`), and `dispatch_dhcp6` takes `lease_db: &mut
+  LeaseDb` / `configs: &[DhcpConfig]` / `authoritative: bool` / `now_secs: u64` directly instead of
+  an opaque `in_use` closure, since differentiating REQUEST's three failure statuses needs to know
+  *who* holds a conflicting lease, not just whether one exists (`check_address`, ported from
+  rfc3315.c:1719-1732).
+  - **Lifetimes**: `rfc3315::build_ia_na`/`handle_solicit`/`handle_request6` now take a
+    `lease_time: u32` argument and call `calculate_times()` instead of returning fixed constants
+    (covered by `rfc3315::tests::handle_solicit_lifetimes_come_from_lease_time_argument`); however
+    `dhcp6.rs`'s handlers no longer call into these — see below.
+  - **Solicit**: `select_address_for_ia` tries, in order, the client's requested address (if
+    `address6_valid`+`address6_available`+`check_address` all pass), an existing lease already
+    bound to this client/IAID, then a fresh `address6_allocate` — a 3-tier subset of upstream's
+    4-tier search (the omitted tier, preferring a statically-`--dhcp-host`-configured address ahead
+    of a dynamic one via `config_valid()`, needs the fuller static-host-address port below).
+    Rapid-commit (`OPTION6_RAPID_COMMIT`) is honored: reply type becomes `Reply` and the allocation
+    is persisted immediately via `persist_lease` (`LeaseDb::bind_v6`); a plain Solicit
+    (`Advertise`) computes lifetimes but persists nothing, matching upstream's `address6_allocate`
+    being a pure candidate search. `OPTION6_PREFERENCE` (255 if `authoritative`, else 0) is added on
+    success, matching `--dhcp-authoritative`.
+  - **Request**: three-way status differentiation — `NoAddrsAvail` ("address unavailable") for a
+    static-only range the client isn't configured for, `UnspecFail` ("address in use") when
+    `check_address` finds the address leased to a different client/IAID, `NotOnLink` when the
+    address matches no context at all — replacing the single `NoAddrsAvail`-only failure mode.
+    Success always persists (`persist_lease`). An IA with no IAADDR sub-option redirects into the
+    same `select_address_for_ia` Solicit-style search, forced to `Reply` and always persisting
+    (rfc3315.c:833-839's `goto request_no_address`); a *missing* IA_NA option entirely (distinct
+    from an empty one) instead falls through with no IA_NA in the reply and a top-level
+    `NoAddrsAvail`, mirroring upstream's per-IA loop simply never running.
+  - **Renew/Rebind**: split into their own function, no longer folded into the same allocate-fresh
+    path as Solicit/Request. Looks up the existing lease by `(clid, iaid, addr)`; if found and the
+    address is still `address6_valid`/`address6_available`, extends it (`persist_lease` recomputes
+    lifetimes from the owning context's `lease_time` and re-binds); if the address is no longer
+    valid for any context, deprecates it (preferred=valid=0) without touching the lease
+    (rfc3315.c:1026-1030). If no lease is found: Renew always reports per-IA `NoBinding` with *no*
+    top-level error status; Rebind additionally creates a lease when `authoritative` is set and the
+    address is still plausible for some context, else reports per-IA `NoBinding` *and* a top-level
+    `NoAddrsAvail` — the exact upstream asymmetry (rfc3315.c:925-1059).
+  - **Confirm**: rewritten to never allocate — only checks `address6_valid` for the client's
+    address and returns `NotOnLink`/`Success` accordingly. Returns `None` (no reply at all, not an
+    empty one) when the packet carries no address to confirm, per RFC 3315 §18.2.2
+    (rfc3315.c:1097-1098) — previously this case fell into the shared allocate-and-reply arm and
+    always returned `Some`.
+  - **Release/Decline**: now actually mutate `lease_db` — `LeaseDb::remove_v6_by_clid_iaid_addr`
+    (new) prunes the matching lease so a subsequent Solicit/Request can reallocate the address;
+    previously these were a no-op empty Reply that left `in_use` reporting the address taken
+    forever. Echoes per-IA `NoBinding` when no matching lease exists but *always* returns top-level
+    `Success` regardless (rfc3315.c:1139-1284) — release/decline of an unknown binding is not an
+    error at the top level.
+  - **Information-Request**: now rejects (drops, returns `None`) a request that carries an
+    `OPTION6_IA_NA`/`OPTION6_IA_TA`, per RFC 3315 §15.12 / rfc3315.c:1110-1112 — previously any
+    InfoReq got an empty-options Reply regardless of whether it illegally carried an IA.
+  - **`LeaseDb`** (`lease.rs`) gained `bind_v6` (allocate-or-renew a lease bound to a specific
+    `clid`/`iaid`, fixing a real bug: the old pattern of `allocate_v6()` then separately mutating
+    `lease.clid`/`.iaid` on the returned reference inserted under an all-zero placeholder key and
+    never re-keyed the map entry, so a second such call before the first lease's `clid` was set
+    collided on the same key and silently evicted it — regression-tested by
+    `bind_v6_does_not_clobber_other_clients`), `find_v6_by_client_iaid` (recall a client's address
+    across a fresh Solicit without it echoing the address back, upstream's
+    `lease6_find_by_client()`), and `remove_v6_by_clid_iaid_addr` (the `lease6_find()` +
+    `lease_prune()` pairing Release/Decline need). `run_dhcp6_loop`'s post-dispatch lease-commit
+    block is gone entirely — persistence now happens inside `dispatch_dhcp6`'s handlers themselves
+    (via `persist_lease`), matching upstream where `update_leases()` is called from inside the
+    per-message-type branches of `dhcp6_reply()`, not as a separate step after it returns.
+  - `rfc3315::handle_solicit`/`handle_request6` are no longer called from `dhcp6.rs` (previously
+    the sole non-test callers): their `Ipv6Addr`-only, always-success shape can't represent
+    Request's three-way failure status or Confirm/Release/Decline's no-allocation paths, so
+    `dhcp6.rs` now builds IA_NA/Status-Code options directly via small local helpers
+    (`iaaddr_suboption`/`status_option`/`build_ia_na_option`) reusing only
+    `rfc3315::calculate_times`/`build_status_code`/`STATUS_*`. They remain public API in
+    `rfc3315.rs` with their own tests but are effectively wire-format-helper-library functions now,
+    not the production reply path — the crate's two DHCPv6 packet representations
+    (`rfc3315::Dhcp6Packet` vs. `dhcp6::Dhcp6Packet`) are further apart than before this change,
+    not closer; unifying them is still open work.
+  Not ported (scope explicitly excluded from this pass):
+  - **IA_PD (prefix delegation)**: no `OPTION6_IAPREFIX` handling anywhere — this module and
+    `rfc3315.rs` only ever build/read `OPTION6_IA_NA`/`IAADDR`. A distinct, large feature axis from
+    IA_NA (separate context type, separate lease type, separate config directives) tracked here as
+    still entirely missing.
+  - **`add_options()`** (rfc3315.c:1301-1534): non-IA option delivery (DNS servers, domain search,
+    SNTP, the ULA/link-local auto-prefix logic at :1342/:1360-1365) is not implemented. A valid
+    Information-Request or a Solicit/Request/Renew/Rebind success reply carries no such options
+    today — `--dhcp-option` for DHCPv6 doesn't exist as a config surface yet.
+  - **`config_valid`/`config_implies`** (rfc3315.c:1765-1822, wildcard/prefix static-address
+    matching against `--dhcp-host ... ,[addr6]`) are not ported; `config_find_by_address6` (an
+    existing, narrower exact-`/128`-match helper) stands in for "is this address statically
+    reserved" in `addr_in_use`/Request's `config_ok` check, but Solicit never *prefers* a static
+    address the way upstream's `config_valid()` tier does, and DECLINE's static-host
+    `ADDRLIST_DECLINED`/`DECLINE_BACKOFF` blacklist (rfc3315.c:1227-1235) has no equivalent.
+  - **`mark_context_used`/`mark_config_used`/`CONTEXT_CONF_USED`/`CONTEXT_USED`** bookkeeping
+    (rfc3315.c:1701-1716, "one address per prefix per IAID" / "configured address used at most once
+    per prefix") is not ported — a consequence of not walking multiple IAs/addresses per packet
+    (below).
+  - **Multiple IAs / multiple addresses per IA**: this module reads only the first `OPTION6_IA_NA`
+    option and, within it, only the first `OPTION6_IAADDR` sub-option — a packet with two IA_NAs,
+    or one IA_NA requesting two addresses, only has its first entry processed. Upstream's
+    `check_ia`/`opt6_find(..., OPTION6_IAADDR, ...)` loops walk all of them independently.
+  - **DECLINE's `addr_epoch` bump** (rfc3315.c:1236-1239, nudging future hash-based allocation away
+    from a declined dynamic address for *this* client) is not ported; Decline here behaves
+    identically to Release (prune the matching lease) rather than the epoch-bump/static-blacklist
+    split upstream does.
+  - **`relay_upstream6`/`relay_reply6`** (rfc3315.c:2145-2327, forwarding a decapsulated
+    RELAY-FORW to an upstream DHCPv6 relay/server and re-encapsulating the reply) — unrelated to
+    this pass's per-message-type scope; still just wire encode/decode in `rfc3315.rs`
+    (`parse_relay_msg`/`build_relay_reply`), same gap already flagged above.
+  Covered by `dhcp6::tests::dispatch_dhcp6_*` (one or more tests per message type: Solicit
+  rapid-commit persistence, Request's three failure statuses plus the empty-IA redirect, Renew
+  extending an existing lease's lifetimes from context config, Rebind's authoritative-vs-not no-
+  lease behavior, Confirm's no-reply-on-empty-packet and valid/invalid-address cases,
+  Release/Decline actually freeing a lease vs. echoing NoBinding) and `lease::tests::bind_v6_*` /
+  `find_v6_by_client_iaid_*` / `remove_v6_by_clid_iaid_addr_*`.
+
 - [ ] Treat DBus, UBus, BPF, ipset, nftset, and similar integrations as feature-gated completion tracks.
   Required tests: feature-gated compile checks, targeted integration tests, parity scenarios only when implementation is real.
   Done when: each optional feature is either implemented with tests or explicitly marked incomplete.

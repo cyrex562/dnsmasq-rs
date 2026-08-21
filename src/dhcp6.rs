@@ -13,7 +13,8 @@ use tracing::{debug, warn};
 
 use crate::dhcp6_protocol::{
     Dhcp6MsgType, DHCPV6_CLIENT_PORT, DHCPV6_SERVER_PORT,
-    OPTION6_CLIENT_ID, OPTION6_IA_NA, OPTION6_IAADDR, OPTION6_SERVER_ID, OPTION6_STATUS_CODE,
+    OPTION6_CLIENT_ID, OPTION6_IA_NA, OPTION6_IAADDR, OPTION6_PREFERENCE,
+    OPTION6_RAPID_COMMIT, OPTION6_SERVER_ID, OPTION6_STATUS_CODE,
 };
 use crate::lease::LeaseDb;
 use crate::metrics::{inc_metric, Metric};
@@ -144,145 +145,495 @@ fn build_option6(code: u16, data: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// Flatten `rfc3315::Dhcp6Option`'s structured option list back into this
-/// module's raw TLV-bytes representation — both are the same wire format,
-/// just different in-memory shapes (see the module-level gap analysis for
-/// why the crate has two DHCPv6 packet representations).
-fn flatten_dhcp6_options(opts: &[crate::rfc3315::Dhcp6Option]) -> Vec<u8> {
-    let mut buf = Vec::new();
-    for opt in opts {
-        buf.extend(build_option6(opt.code, &opt.data));
-    }
-    buf
+/// Build a raw IAADDR sub-option (24 bytes: addr | preferred-lt | valid-lt).
+fn iaaddr_suboption(addr: Ipv6Addr, preferred: u32, valid: u32) -> Vec<u8> {
+    let mut iaaddr = Vec::with_capacity(24);
+    iaaddr.extend_from_slice(&addr.octets());
+    iaaddr.extend_from_slice(&preferred.to_be_bytes());
+    iaaddr.extend_from_slice(&valid.to_be_bytes());
+    build_option6(OPTION6_IAADDR, &iaaddr)
 }
 
-/// Build an IA_NA reply option: `IAID | T1 | T2 | sub-options`.
-///
-/// On a successful allocation the sub-option is an IAADDR carrying `addr`;
-/// otherwise it is a Status Code sub-option reporting `NoAddrsAvail` (2),
-/// mirroring upstream's IA_NA construction when `address6_allocate()`
-/// returns no context (rfc3315.c).
-fn build_ia_na_reply(
-    iaid: [u8; 4],
-    addr: Option<Ipv6Addr>,
-    preferred: u32,
-    valid: u32,
-    t1: u32,
-    t2: u32,
-) -> Vec<u8> {
-    let mut data = Vec::new();
+/// Build a raw Status Code sub/top-level option (both share the same wire shape).
+fn status_option(code: u16, message: &str) -> Vec<u8> {
+    build_option6(OPTION6_STATUS_CODE, &crate::rfc3315::build_status_code(code, message))
+}
+
+/// Build an IA_NA reply option: `IAID | T1 | T2 | suboption_bytes`.
+fn build_ia_na_option(iaid: [u8; 4], t1: u32, t2: u32, suboption: Vec<u8>) -> Vec<u8> {
+    let mut data = Vec::with_capacity(12 + suboption.len());
     data.extend_from_slice(&iaid);
     data.extend_from_slice(&t1.to_be_bytes());
     data.extend_from_slice(&t2.to_be_bytes());
+    data.extend(suboption);
+    build_option6(OPTION6_IA_NA, &data)
+}
 
-    match addr {
-        Some(addr) => {
-            let mut iaaddr = Vec::with_capacity(24);
-            iaaddr.extend_from_slice(&addr.octets());
-            iaaddr.extend_from_slice(&preferred.to_be_bytes());
-            iaaddr.extend_from_slice(&valid.to_be_bytes());
-            data.extend(build_option6(OPTION6_IAADDR, &iaaddr));
+/// Extract the client-id option's raw bytes (empty slice if absent).
+fn extract_client_id(pkt: &Dhcp6Packet) -> &[u8] {
+    find_option6(&pkt.options, OPTION6_CLIENT_ID).unwrap_or(&[])
+}
+
+/// Extract the packet's (single, first) IA_NA option value and IAID.
+///
+/// This module handles one IA_NA per packet — matching its existing
+/// simplification (see tasks.md); upstream walks every IA in the message.
+fn extract_ia(pkt: &Dhcp6Packet) -> Option<(&[u8], u32)> {
+    let ia_data = find_option6(&pkt.options, OPTION6_IA_NA)?;
+    if ia_data.len() < 4 {
+        return None;
+    }
+    let iaid = u32::from_be_bytes([ia_data[0], ia_data[1], ia_data[2], ia_data[3]]);
+    Some((ia_data, iaid))
+}
+
+/// Extract the first client-requested address from an IA_NA option's value
+/// (the bytes after the 4-byte option header: IAID(4) | T1(4) | T2(4) |
+/// sub-options…). Only the first IAADDR sub-option is read — this module
+/// handles a single address per IA (see tasks.md); upstream walks every
+/// IAADDR in the IA.
+fn ia_na_first_addr(ia_data: &[u8]) -> Option<Ipv6Addr> {
+    if ia_data.len() <= 12 {
+        return None;
+    }
+    let iaaddr = find_option6(&ia_data[12..], OPTION6_IAADDR)?;
+    let bytes: [u8; 16] = iaaddr.get(0..16)?.try_into().ok()?;
+    Some(Ipv6Addr::from(bytes))
+}
+
+/// `true` if `addr` is already committed to a lease or a static
+/// `--dhcp-host` reservation — the same test [`address6_allocate`]'s `in_use`
+/// callback performs, factored out so the per-message-type handlers below
+/// can build it from `lease_db`/`configs` directly.
+fn addr_in_use(lease_db: &LeaseDb, configs: &[DhcpConfig], addr: &Ipv6Addr) -> bool {
+    lease_db.find_v6_by_addr(addr).is_some() || config_find_by_address6(configs, addr)
+}
+
+/// Make sure `addr` isn't leased to a *different* client/IAID.
+///
+/// Port of `check_address()` (rfc3315.c:1719-1732).
+fn check_address(lease_db: &LeaseDb, clid: &[u8], iaid: u32, addr: &Ipv6Addr) -> bool {
+    match lease_db.find_v6_by_addr(addr) {
+        None => true,
+        Some(l) => l.clid.as_deref() == Some(clid) && l.iaid == iaid,
+    }
+}
+
+/// Find the context whose prefix `addr` belongs to, for reading its
+/// configured `lease_time`.
+fn context_for_addr<'a>(contexts: &'a [DhcpContext], addr: &Ipv6Addr) -> Option<&'a DhcpContext> {
+    contexts.iter().find(|c| is_same_net6(&c.start6, addr, c.prefix))
+}
+
+/// Compute `(preferred, valid, t1, t2)` for `addr` from its owning context's
+/// `lease_time` (falling back to 3600s if `addr` matches no context, e.g. a
+/// REBIND-created lease for an address a live context no longer covers).
+///
+/// Port of the `calculate_times()` call sites in rfc3315.c that read
+/// `context->lease_time` (or `config->lease_time` when `have_config(...,
+/// CONFIG_TIME)` — not ported, see tasks.md for the static-host-config gap).
+fn compute_times_for_addr(contexts: &[DhcpContext], addr: &Ipv6Addr) -> (u32, u32, u32, u32) {
+    let lease_time = context_for_addr(contexts, addr).map(|c| c.lease_time).unwrap_or(3600);
+    crate::rfc3315::calculate_times(lease_time)
+}
+
+/// Bind (allocate-or-renew) a lease for `addr` and return the lifetimes used
+/// to compute its expiry — the `update_leases()` equivalent every success
+/// path below calls (rfc3315.c:1870-1986).
+fn persist_lease(
+    lease_db: &mut LeaseDb,
+    clid: &[u8],
+    iaid: u32,
+    addr: Ipv6Addr,
+    contexts: &[DhcpContext],
+    now_secs: u64,
+) -> (u32, u32, u32, u32) {
+    let (preferred, valid, t1, t2) = compute_times_for_addr(contexts, &addr);
+    let expires = if valid == 0xFFFF_FFFF {
+        None
+    } else {
+        Some(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(now_secs.saturating_add(valid as u64)))
+    };
+    lease_db.bind_v6(addr, clid, iaid, LEASE_NA, expires);
+    (preferred, valid, t1, t2)
+}
+
+/// Select an address to offer/assign for a Solicit (or a Request whose IA
+/// carried no address, which upstream redirects into this same selection —
+/// rfc3315.c:833-839 `goto request_no_address`).
+///
+/// Tries, in order: (1) the client's requested address if it's valid,
+/// available, and not leased to someone else; (2) an existing lease already
+/// bound to this client/IAID; (3) a fresh [`address6_allocate`]. Does not
+/// persist anything — callers decide whether/when to call [`persist_lease`].
+///
+/// Scope note: unlike upstream's `DHCP6SOLICIT` case, this does not offer a
+/// statically-`--dhcp-host`-configured address ahead of a dynamic one
+/// (`config_valid()`, rfc3315.c:695-701) — that needs the fuller
+/// `config_valid`/`config_implies` static-host-address port tracked in
+/// tasks.md; a static reservation still blocks allocation via
+/// [`addr_in_use`], it's just never *preferred*.
+fn select_address_for_ia(
+    contexts: &[DhcpContext],
+    configs: &[DhcpConfig],
+    lease_db: &LeaseDb,
+    client_id: &[u8],
+    iaid: u32,
+    requested: Option<Ipv6Addr>,
+) -> Option<Ipv6Addr> {
+    if let Some(r) = requested {
+        if address6_valid(contexts, &r)
+            && address6_available(contexts, &r)
+            && check_address(lease_db, client_id, iaid, &r)
+        {
+            return Some(r);
         }
+    }
+    if let Some(existing) = lease_db.find_v6_by_client_iaid(client_id, iaid).map(|l| l.addr6) {
+        if address6_available(contexts, &existing) {
+            return Some(existing);
+        }
+    }
+    address6_allocate(contexts, client_id, iaid, &[], &mut |a| addr_in_use(lease_db, configs, a))
+}
+
+/// Build a Solicit-shaped (Advertise or, with rapid-commit, Reply) result.
+///
+/// Shared by [`dispatch_solicit`] and the Request-with-no-address redirect
+/// in [`dispatch_request`] (rfc3315.c:833-839).
+#[allow(clippy::too_many_arguments)]
+fn build_solicit_style_reply(
+    xid: u32,
+    duid: &[u8],
+    client_id: &[u8],
+    iaid_bytes: [u8; 4],
+    contexts: &[DhcpContext],
+    lease_db: &mut LeaseDb,
+    addr: Option<Ipv6Addr>,
+    persist: bool,
+    reply_type: Dhcp6MsgType,
+    include_rapid_commit_opt: bool,
+    authoritative: bool,
+    now_secs: u64,
+) -> Dhcp6Reply {
+    let iaid = u32::from_be_bytes(iaid_bytes);
+    let (preferred, valid, t1, t2) = match addr {
+        Some(a) if persist => persist_lease(lease_db, client_id, iaid, a, contexts, now_secs),
+        Some(a) => compute_times_for_addr(contexts, &a),
+        None => (0, 0, 0, 0),
+    };
+
+    let mut options = Vec::new();
+    options.extend(build_option6(OPTION6_CLIENT_ID, client_id));
+    options.extend(build_option6(OPTION6_SERVER_ID, duid));
+    if include_rapid_commit_opt {
+        options.extend(build_option6(OPTION6_RAPID_COMMIT, &[]));
+    }
+    let ia_sub = match addr {
+        Some(a) => iaaddr_suboption(a, preferred, valid),
+        None => status_option(crate::rfc3315::STATUS_NO_ADDRS_AVAIL, "address unavailable"),
+    };
+    options.extend(build_ia_na_option(iaid_bytes, t1, t2, ia_sub));
+    if addr.is_some() {
+        options.extend(status_option(crate::rfc3315::STATUS_SUCCESS, "success"));
+        options.extend(build_option6(OPTION6_PREFERENCE, &[if authoritative { 255 } else { 0 }]));
+    } else {
+        options.extend(status_option(crate::rfc3315::STATUS_NO_ADDRS_AVAIL, "no addresses available"));
+    }
+
+    Dhcp6Reply { msg_type: reply_type, xid, options }
+}
+
+/// `DHCP6SOLICIT` (rfc3315.c:627-808).
+fn dispatch_solicit(
+    pkt: &Dhcp6Packet,
+    duid: &[u8],
+    contexts: &[DhcpContext],
+    configs: &[DhcpConfig],
+    lease_db: &mut LeaseDb,
+    authoritative: bool,
+    now_secs: u64,
+) -> Option<Dhcp6Reply> {
+    let client_id = extract_client_id(pkt).to_vec();
+    let rapid_commit = find_option6(&pkt.options, OPTION6_RAPID_COMMIT).is_some();
+    let reply_type = if rapid_commit { Dhcp6MsgType::Reply } else { Dhcp6MsgType::Advertise };
+
+    // No IA in the packet at all: upstream's per-IA loop simply never runs,
+    // leaving `address_assigned == 0` -> a reply with no IA_NA option and a
+    // top-level NoAddrsAvail (rfc3315.c:660-807's loop body vs. :774-804).
+    let Some((ia_data, iaid)) = extract_ia(pkt) else {
+        let mut options = Vec::new();
+        options.extend(build_option6(OPTION6_CLIENT_ID, &client_id));
+        options.extend(build_option6(OPTION6_SERVER_ID, duid));
+        options.extend(status_option(crate::rfc3315::STATUS_NO_ADDRS_AVAIL, "no addresses available"));
+        return Some(Dhcp6Reply { msg_type: reply_type, xid: pkt.xid, options });
+    };
+    let iaid_bytes = iaid.to_be_bytes();
+    let requested = ia_na_first_addr(ia_data);
+
+    let addr = select_address_for_ia(contexts, configs, lease_db, &client_id, iaid, requested);
+
+    Some(build_solicit_style_reply(
+        pkt.xid, duid, &client_id, iaid_bytes, contexts, lease_db,
+        addr, rapid_commit, reply_type, rapid_commit, authoritative, now_secs,
+    ))
+}
+
+/// `DHCP6REQUEST` (rfc3315.c:810-922), including the "IA with no address"
+/// redirect into Solicit-with-rapid-commit-equivalent behavior
+/// (rfc3315.c:833-839).
+fn dispatch_request(
+    pkt: &Dhcp6Packet,
+    duid: &[u8],
+    contexts: &[DhcpContext],
+    configs: &[DhcpConfig],
+    lease_db: &mut LeaseDb,
+    authoritative: bool,
+    now_secs: u64,
+) -> Option<Dhcp6Reply> {
+    let client_id = extract_client_id(pkt).to_vec();
+    // No IA in the packet at all (distinct from an IA present but empty,
+    // handled by the redirect below): same "loop never runs" fall-through as
+    // Solicit (rfc3315.c:824-901 vs. :903-918).
+    let Some((ia_data, iaid)) = extract_ia(pkt) else {
+        let mut options = Vec::new();
+        options.extend(build_option6(OPTION6_CLIENT_ID, &client_id));
+        options.extend(build_option6(OPTION6_SERVER_ID, duid));
+        options.extend(status_option(crate::rfc3315::STATUS_NO_ADDRS_AVAIL, "no addresses available"));
+        return Some(Dhcp6Reply { msg_type: Dhcp6MsgType::Reply, xid: pkt.xid, options });
+    };
+    let iaid_bytes = iaid.to_be_bytes();
+    let requested = ia_na_first_addr(ia_data);
+
+    let Some(req_addr) = requested else {
+        let addr = select_address_for_ia(contexts, configs, lease_db, &client_id, iaid, None);
+        return Some(build_solicit_style_reply(
+            pkt.xid, duid, &client_id, iaid_bytes, contexts, lease_db,
+            addr, true, Dhcp6MsgType::Reply, false, authoritative, now_secs,
+        ));
+    };
+
+    let on_link = address6_valid(contexts, &req_addr);
+    let dynamic = address6_available(contexts, &req_addr);
+    let config_ok = config_find_by_address6(configs, &req_addr);
+
+    let (status, addr) = if dynamic || on_link {
+        if !dynamic && !config_ok {
+            (Some((crate::rfc3315::STATUS_NO_ADDRS_AVAIL, "address unavailable")), None)
+        } else if !check_address(lease_db, &client_id, iaid, &req_addr) {
+            (Some((crate::rfc3315::STATUS_UNSPEC_FAIL, "address in use")), None)
+        } else {
+            (None, Some(req_addr))
+        }
+    } else {
+        (Some((crate::rfc3315::STATUS_NOT_ON_LINK, "not on link")), None)
+    };
+
+    let (preferred, valid, t1, t2) = match addr {
+        Some(a) => persist_lease(lease_db, &client_id, iaid, a, contexts, now_secs),
+        None => (0, 0, 0, 0),
+    };
+
+    let mut options = Vec::new();
+    options.extend(build_option6(OPTION6_CLIENT_ID, &client_id));
+    options.extend(build_option6(OPTION6_SERVER_ID, duid));
+    let ia_sub = match addr {
+        Some(a) => iaaddr_suboption(a, preferred, valid),
         None => {
-            const STATUS_NO_ADDRS_AVAIL: u16 = 2;
-            let status = STATUS_NO_ADDRS_AVAIL.to_be_bytes();
-            data.extend(build_option6(OPTION6_STATUS_CODE, &status));
+            let (code, msg) = status.unwrap();
+            status_option(code, msg)
+        }
+    };
+    options.extend(build_ia_na_option(iaid_bytes, t1, t2, ia_sub));
+    if addr.is_some() {
+        options.extend(status_option(crate::rfc3315::STATUS_SUCCESS, "success"));
+    } else {
+        options.extend(status_option(crate::rfc3315::STATUS_NO_ADDRS_AVAIL, "no addresses available"));
+    }
+
+    Some(Dhcp6Reply { msg_type: Dhcp6MsgType::Reply, xid: pkt.xid, options })
+}
+
+/// `DHCP6RENEW`/`DHCP6REBIND` (rfc3315.c:925-1059).
+///
+/// Scope note: only the single client-echoed address this module tracks per
+/// IA is renewed/rebound; upstream walks every IAADDR in the IA
+/// independently (see tasks.md).
+fn dispatch_renew_rebind(
+    pkt: &Dhcp6Packet,
+    duid: &[u8],
+    contexts: &[DhcpContext],
+    lease_db: &mut LeaseDb,
+    is_rebind: bool,
+    authoritative: bool,
+    now_secs: u64,
+) -> Option<Dhcp6Reply> {
+    let client_id = extract_client_id(pkt).to_vec();
+    let (ia_data, iaid) = extract_ia(pkt)?;
+    let iaid_bytes = iaid.to_be_bytes();
+    let addr = ia_na_first_addr(ia_data)?;
+
+    let mut options = Vec::new();
+    options.extend(build_option6(OPTION6_CLIENT_ID, &client_id));
+    options.extend(build_option6(OPTION6_SERVER_ID, duid));
+
+    let has_lease = lease_db.find_v6_by_clid_iaid(&client_id, iaid, &addr).is_some();
+
+    if !has_lease {
+        // Authoritative REBIND may create a lease the server doesn't
+        // remember, as long as the address is still plausible for some
+        // context (rfc3315.c:962-972).
+        if is_rebind
+            && authoritative
+            && (address6_available(contexts, &addr) || address6_valid(contexts, &addr))
+        {
+            let (preferred, valid, t1, t2) = persist_lease(lease_db, &client_id, iaid, addr, contexts, now_secs);
+            options.extend(build_ia_na_option(iaid_bytes, t1, t2, iaaddr_suboption(addr, preferred, valid)));
+            options.extend(status_option(crate::rfc3315::STATUS_SUCCESS, "success"));
+            return Some(Dhcp6Reply { msg_type: Dhcp6MsgType::Reply, xid: pkt.xid, options });
+        }
+
+        options.extend(build_ia_na_option(
+            iaid_bytes, 0, 0,
+            status_option(crate::rfc3315::STATUS_NO_BINDING, "no binding found"),
+        ));
+        // RENEW never sets a top-level error, only Rebind does when nothing
+        // could be (re)bound at all (rfc3315.c:1048-1055).
+        if is_rebind {
+            options.extend(status_option(crate::rfc3315::STATUS_NO_ADDRS_AVAIL, "no addresses available"));
+        }
+        return Some(Dhcp6Reply { msg_type: Dhcp6MsgType::Reply, xid: pkt.xid, options });
+    }
+
+    if !(address6_available(contexts, &addr) || address6_valid(contexts, &addr)) {
+        // Address no longer valid for any live context: deprecate it
+        // (preferred=valid=0) without touching the lease (rfc3315.c:1026-1030).
+        options.extend(build_ia_na_option(iaid_bytes, 0, 0, iaaddr_suboption(addr, 0, 0)));
+        options.extend(status_option(crate::rfc3315::STATUS_SUCCESS, "success"));
+        return Some(Dhcp6Reply { msg_type: Dhcp6MsgType::Reply, xid: pkt.xid, options });
+    }
+
+    let (preferred, valid, t1, t2) = persist_lease(lease_db, &client_id, iaid, addr, contexts, now_secs);
+    options.extend(build_ia_na_option(iaid_bytes, t1, t2, iaaddr_suboption(addr, preferred, valid)));
+    options.extend(status_option(crate::rfc3315::STATUS_SUCCESS, "success"));
+    Some(Dhcp6Reply { msg_type: Dhcp6MsgType::Reply, xid: pkt.xid, options })
+}
+
+/// `DHCP6CONFIRM` (rfc3315.c:1061-1105).
+///
+/// No allocation ever happens here — only a validity check against
+/// [`address6_valid`]. Returns `None` (no reply at all) when the packet
+/// carried no address to confirm, per RFC 3315 §18.2.2.
+fn dispatch_confirm(pkt: &Dhcp6Packet, duid: &[u8], contexts: &[DhcpContext]) -> Option<Dhcp6Reply> {
+    let client_id = extract_client_id(pkt).to_vec();
+    let (ia_data, _iaid) = extract_ia(pkt)?;
+    let addr = ia_na_first_addr(ia_data)?;
+
+    let bad = !address6_valid(contexts, &addr);
+
+    let mut options = Vec::new();
+    options.extend(build_option6(OPTION6_CLIENT_ID, &client_id));
+    options.extend(build_option6(OPTION6_SERVER_ID, duid));
+    if bad {
+        options.extend(status_option(crate::rfc3315::STATUS_NOT_ON_LINK, "confirm failed"));
+    } else {
+        options.extend(status_option(crate::rfc3315::STATUS_SUCCESS, "all addresses still on link"));
+    }
+    Some(Dhcp6Reply { msg_type: Dhcp6MsgType::Reply, xid: pkt.xid, options })
+}
+
+/// `DHCP6RELEASE`/`DHCP6DECLINE` (rfc3315.c:1139-1284).
+///
+/// Both prune the matching lease (freeing the address) and both always
+/// return top-level Success regardless of whether a binding was found — only
+/// the differ in status message text and (upstream) the static-host
+/// decline-backoff/`addr_epoch` bump this module doesn't port (tasks.md).
+fn dispatch_release_or_decline(
+    pkt: &Dhcp6Packet,
+    duid: &[u8],
+    lease_db: &mut LeaseDb,
+    is_decline: bool,
+) -> Option<Dhcp6Reply> {
+    let client_id = extract_client_id(pkt).to_vec();
+
+    let mut options = Vec::new();
+    options.extend(build_option6(OPTION6_CLIENT_ID, &client_id));
+    options.extend(build_option6(OPTION6_SERVER_ID, duid));
+
+    if let Some((ia_data, iaid)) = extract_ia(pkt) {
+        let iaid_bytes = iaid.to_be_bytes();
+        if let Some(addr) = ia_na_first_addr(ia_data) {
+            if !lease_db.remove_v6_by_clid_iaid_addr(&client_id, iaid, &addr) {
+                options.extend(build_ia_na_option(
+                    iaid_bytes, 0, 0,
+                    status_option(crate::rfc3315::STATUS_NO_BINDING, "no binding found"),
+                ));
+            }
         }
     }
 
-    build_option6(OPTION6_IA_NA, &data)
+    let msg = if is_decline { "success" } else { "release received" };
+    options.extend(status_option(crate::rfc3315::STATUS_SUCCESS, msg));
+    Some(Dhcp6Reply { msg_type: Dhcp6MsgType::Reply, xid: pkt.xid, options })
+}
+
+/// `DHCP6IREQ` (rfc3315.c:1107-1136).
+///
+/// Rejects (drops) a request that carries an IA_NA/IA_TA per RFC 3315 §15.12
+/// / rfc3315.c:1110-1112 — Information-Request is for stateless option
+/// delivery only. Non-IA option delivery itself (`add_options()`: DNS
+/// servers, domain search, SNTP, ULA/link-local auto-prefix) is not ported —
+/// see tasks.md — so a valid Information-Request currently gets an
+/// options-less Reply rather than a silent drop.
+fn dispatch_inforeq(pkt: &Dhcp6Packet, duid: &[u8]) -> Option<Dhcp6Reply> {
+    use crate::dhcp6_protocol::OPTION6_IA_TA;
+    if find_option6(&pkt.options, OPTION6_IA_NA).is_some()
+        || find_option6(&pkt.options, OPTION6_IA_TA).is_some()
+    {
+        return None;
+    }
+    let client_id = extract_client_id(pkt).to_vec();
+    let mut options = Vec::new();
+    options.extend(build_option6(OPTION6_CLIENT_ID, &client_id));
+    options.extend(build_option6(OPTION6_SERVER_ID, duid));
+    Some(Dhcp6Reply { msg_type: Dhcp6MsgType::Reply, xid: pkt.xid, options })
 }
 
 /// Dispatch a parsed DHCPv6 packet using real server state.
 ///
-/// Builds a genuine IA_NA/IAADDR-bearing Advertise/Reply by allocating an
-/// address via [`address6_allocate`] over `contexts` (typically the
-/// per-interface chain built by [`complete_context6`]), keyed on the
-/// client's IAID, and stamps the server's own DUID (from [`make_duid`]) as
-/// the SERVERID option. `in_use` reports addresses already committed to a
-/// lease or static reservation — see [`address6_allocate`].
+/// Each RFC 8415 message type is handled by its own function per the
+/// module-level gap analysis in the originating issue: Solicit/Request build
+/// and (Request only, or rapid-commit Solicit) persist a fresh allocation;
+/// Renew/Rebind extend an existing lease found by (`clid`, `iaid`, `addr`) in
+/// `lease_db`, only Rebind may create one when `authoritative` is set;
+/// Confirm never allocates; Release/Decline free the matching lease.
+/// `authoritative` mirrors `--dhcp-authoritative` (`OPT_AUTHORITATIVE`, only
+/// consulted for Solicit's Preference option and Rebind's no-lease
+/// fallback); `now_secs` is UNIX-epoch seconds used to compute lease expiry.
 ///
 /// Returns `Some(Dhcp6Reply)` when a reply should be sent, `None` to drop.
 ///
-/// Port of the message-type dispatch driving `dhcp6_reply()`/
-/// `handle_solicit()`/`handle_request6()` (rfc3315.c), using this module's
-/// own flat option encoding rather than `rfc3315::Dhcp6Packet` — see the
-/// module-level gap analysis for why the crate's two DHCPv6 packet
-/// representations were not unified in this change.
+/// Port of the message-type dispatch driving `dhcp6_reply()` (rfc3315.c).
 pub fn dispatch_dhcp6(
     pkt: &Dhcp6Packet,
     duid: &[u8],
-    contexts: &[crate::types::dhcp::DhcpContext],
-    in_use: &mut dyn FnMut(&Ipv6Addr) -> bool,
+    contexts: &[DhcpContext],
+    configs: &[DhcpConfig],
+    lease_db: &mut LeaseDb,
+    authoritative: bool,
+    now_secs: u64,
 ) -> Option<Dhcp6Reply> {
     debug!("DHCPv6 {:?} xid={:#x}", pkt.msg_type, pkt.xid);
 
     match pkt.msg_type {
-        Dhcp6MsgType::Solicit | Dhcp6MsgType::Request | Dhcp6MsgType::Renew |
-        Dhcp6MsgType::Rebind | Dhcp6MsgType::Confirm => {
-            let client_id = find_option6(&pkt.options, OPTION6_CLIENT_ID).unwrap_or(&[]);
-            let iaid_bytes = match find_option6(&pkt.options, OPTION6_IA_NA) {
-                Some(d) if d.len() >= 4 => [d[0], d[1], d[2], d[3]],
-                _ => [0u8; 4],
-            };
-            let iaid = u32::from_be_bytes(iaid_bytes);
-
-            let addr = address6_allocate(contexts, client_id, iaid, &[], in_use);
-
-            let reply_type = if pkt.msg_type == Dhcp6MsgType::Solicit {
-                Dhcp6MsgType::Advertise
-            } else {
-                Dhcp6MsgType::Reply
-            };
-
-            let options = match addr {
-                // Delegate the success path to `rfc3315::handle_solicit`/
-                // `handle_request6` — the exact pairing named in the gap
-                // analysis — now fed the real DUID and a real allocated
-                // address instead of being unreachable dead code. Those
-                // functions always assume success (they take `Ipv6Addr`, not
-                // `Option<Ipv6Addr>`), so the no-address branch below still
-                // has to be built locally.
-                Some(allocated) => {
-                    let mut raw = Vec::with_capacity(4 + pkt.options.len());
-                    raw.push(pkt.msg_type as u8);
-                    raw.extend_from_slice(&pkt.xid.to_be_bytes()[1..]);
-                    raw.extend_from_slice(&pkt.options);
-                    let pkt3315 = crate::rfc3315::parse_dhcp6_packet(&raw).ok()?;
-                    let reply3315 = if pkt.msg_type == Dhcp6MsgType::Solicit {
-                        crate::rfc3315::handle_solicit(&pkt3315, duid, allocated)
-                    } else {
-                        crate::rfc3315::handle_request6(&pkt3315, duid, allocated)
-                    };
-                    flatten_dhcp6_options(&reply3315.options)
-                }
-                None => {
-                    let mut options = Vec::new();
-                    options.extend(build_option6(OPTION6_CLIENT_ID, client_id));
-                    options.extend(build_option6(OPTION6_SERVER_ID, duid));
-                    options.extend(build_ia_na_reply(iaid_bytes, None, 0, 0, 0, 0));
-                    options
-                }
-            };
-
-            Some(Dhcp6Reply { msg_type: reply_type, xid: pkt.xid, options })
-        }
-        Dhcp6MsgType::Release | Dhcp6MsgType::Decline => {
-            // No reply needed in most cases; send empty Reply to confirm receipt.
-            Some(Dhcp6Reply {
-                msg_type: Dhcp6MsgType::Reply,
-                xid:      pkt.xid,
-                options:  Vec::new(),
-            })
-        }
-        Dhcp6MsgType::InfoReq => {
-            // Information-only request — reply without IA options.
-            Some(Dhcp6Reply {
-                msg_type: Dhcp6MsgType::Reply,
-                xid:      pkt.xid,
-                options:  Vec::new(),
-            })
-        }
+        Dhcp6MsgType::Solicit => dispatch_solicit(pkt, duid, contexts, configs, lease_db, authoritative, now_secs),
+        Dhcp6MsgType::Request => dispatch_request(pkt, duid, contexts, configs, lease_db, authoritative, now_secs),
+        Dhcp6MsgType::Renew => dispatch_renew_rebind(pkt, duid, contexts, lease_db, false, authoritative, now_secs),
+        Dhcp6MsgType::Rebind => dispatch_renew_rebind(pkt, duid, contexts, lease_db, true, authoritative, now_secs),
+        Dhcp6MsgType::Confirm => dispatch_confirm(pkt, duid, contexts),
+        Dhcp6MsgType::Release => dispatch_release_or_decline(pkt, duid, lease_db, false),
+        Dhcp6MsgType::Decline => dispatch_release_or_decline(pkt, duid, lease_db, true),
+        Dhcp6MsgType::InfoReq => dispatch_inforeq(pkt, duid),
         // Relay messages handled separately by relay_dispatch().
         Dhcp6MsgType::RelayForw | Dhcp6MsgType::RelayRepl |
         Dhcp6MsgType::Advertise | Dhcp6MsgType::Reply |
@@ -805,18 +1156,6 @@ pub fn dhcp6_init(nowild: bool) -> std::io::Result<std::os::unix::io::RawFd> {
 // Receive/dispatch loop (ported from dhcp6.c:89-306, receive-loop portion)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Extract the allocated IPv6 address from a reply's IA_NA/IAADDR sub-option,
-/// if the allocation succeeded (as opposed to a Status-Code NoAddrsAvail).
-fn extract_allocated_addr(reply: &Dhcp6Reply) -> Option<Ipv6Addr> {
-    let ia_data = find_option6(&reply.options, OPTION6_IA_NA)?;
-    if ia_data.len() <= 12 {
-        return None;
-    }
-    let iaaddr = find_option6(&ia_data[12..], OPTION6_IAADDR)?;
-    let bytes: [u8; 16] = iaaddr.get(0..16)?.try_into().ok()?;
-    Some(Ipv6Addr::from(bytes))
-}
-
 /// Run the DHCPv6 receive/dispatch loop over an already-bound `[::]:547` socket.
 ///
 /// `contexts` is the "current" chain [`complete_context6`] builds from live
@@ -825,14 +1164,16 @@ fn extract_allocated_addr(reply: &Dhcp6Reply) -> Option<Ipv6Addr> {
 /// re-derive that chain per packet against the packet's arrival interface the
 /// way upstream's `dhcp6_packet()` does (dhcp6.c:89-306); see `tasks.md`.
 ///
-/// An allocated address is committed into `lease_db` only when the client
-/// sent Request/Renew/Rebind — Solicit/Advertise never commits, matching
-/// upstream (`address6_allocate()` is a pure candidate search; only
-/// `lease6_allocate()` on the Reply path persists it). `lease_db` is kept
-/// in-memory only by this loop: it does not load or write a shared
-/// `--dhcp-leasefile` — doing that safely needs one writer for the file the
-/// IPv4 loop already owns, not two independent in-memory copies of it (see
-/// `tasks.md`).
+/// Lease persistence now happens inside [`dispatch_dhcp6`] itself (each
+/// message-type handler calls `persist_lease`/`LeaseDb::remove_v6_*`
+/// directly), not as a post-processing step here — matching upstream, where
+/// `update_leases()` is called from inside the per-message-type branches of
+/// `dhcp6_reply()`, not after it returns. `lease_db` is kept in-memory only
+/// by this loop: it does not load or write a shared `--dhcp-leasefile` —
+/// doing that safely needs one writer for the file the IPv4 loop already
+/// owns, not two independent in-memory copies of it (see `tasks.md`).
+///
+/// `authoritative` mirrors `--dhcp-authoritative` (`OPT_AUTHORITATIVE`).
 ///
 /// Port of the receive-loop portion of `dhcp6_packet()` (dhcp6.c:89-306),
 /// wired to the real [`dispatch_dhcp6`] pipeline.
@@ -842,6 +1183,7 @@ pub async fn run_dhcp6_loop(
     contexts: Vec<DhcpContext>,
     configs: Vec<DhcpConfig>,
     mut lease_db: LeaseDb,
+    authoritative: bool,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     reply_port_override: Option<u16>,
 ) -> std::io::Result<()> {
@@ -862,35 +1204,12 @@ pub async fn run_dhcp6_loop(
                     continue;
                 };
 
-                let reply = {
-                    let mut in_use = |addr: &Ipv6Addr| {
-                        lease_db.find_v6_by_addr(addr).is_some()
-                            || config_find_by_address6(&configs, addr)
-                    };
-                    dispatch_dhcp6(&pkt, &duid, &contexts, &mut in_use)
-                };
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let reply = dispatch_dhcp6(&pkt, &duid, &contexts, &configs, &mut lease_db, authoritative, now_secs);
                 let Some(reply) = reply else { continue };
-
-                if matches!(
-                    pkt.msg_type,
-                    Dhcp6MsgType::Request | Dhcp6MsgType::Renew | Dhcp6MsgType::Rebind
-                ) {
-                    if let Some(addr) = extract_allocated_addr(&reply) {
-                        if lease_db.find_v6_by_addr(&addr).is_none() {
-                            let client_id = find_option6(&pkt.options, OPTION6_CLIENT_ID)
-                                .unwrap_or(&[])
-                                .to_vec();
-                            let iaid = find_option6(&pkt.options, OPTION6_IA_NA)
-                                .filter(|d| d.len() >= 4)
-                                .map(|d| u32::from_be_bytes([d[0], d[1], d[2], d[3]]))
-                                .unwrap_or(0);
-                            if let Some(lease) = lease_db.allocate_v6(addr, LEASE_NA) {
-                                lease.clid = Some(client_id);
-                                lease.iaid = iaid;
-                            }
-                        }
-                    }
-                }
 
                 let dest = dhcp6_reply_dest(src, reply_port_override);
                 if let Err(e) = socket.send_to(&reply.to_wire(), dest).await {
@@ -956,8 +1275,8 @@ mod tests {
         let data = solicit_pkt(0x1234);
         let pkt = parse_dhcp6_packet(&data).unwrap();
         let duid = vec![0x00, 0x03, 0x00, 0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
-        let mut in_use = |_: &Ipv6Addr| false;
-        let reply = dispatch_dhcp6(&pkt, &duid, &[], &mut in_use);
+        let mut db = LeaseDb::new();
+        let reply = dispatch_dhcp6(&pkt, &duid, &[], &[], &mut db, false, 0);
         assert!(reply.is_some());
         assert_eq!(reply.unwrap().msg_type, Dhcp6MsgType::Advertise);
     }
@@ -968,8 +1287,8 @@ mod tests {
         data[0] = Dhcp6MsgType::Request as u8;
         let pkt = parse_dhcp6_packet(&data).unwrap();
         let duid = vec![0x00, 0x03, 0x00, 0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
-        let mut in_use = |_: &Ipv6Addr| false;
-        let reply = dispatch_dhcp6(&pkt, &duid, &[], &mut in_use);
+        let mut db = LeaseDb::new();
+        let reply = dispatch_dhcp6(&pkt, &duid, &[], &[], &mut db, false, 0);
         assert_eq!(reply.unwrap().msg_type, Dhcp6MsgType::Reply);
     }
 
@@ -1494,6 +1813,15 @@ mod tests {
 
     // ── dispatch_dhcp6 (stateful) ─────────────────────────────────────────────
 
+    fn dispatch(
+        pkt: &Dhcp6Packet,
+        duid: &[u8],
+        contexts: &[crate::types::dhcp::DhcpContext],
+        lease_db: &mut LeaseDb,
+    ) -> Option<Dhcp6Reply> {
+        dispatch_dhcp6(pkt, duid, contexts, &[], lease_db, false, 0)
+    }
+
     #[test]
     fn dispatch_dhcp6_solicit_returns_advertise_with_allocated_address() {
         use crate::types::dhcp::CONTEXT_DHCP;
@@ -1504,9 +1832,9 @@ mod tests {
         let data = solicit_with_ia(0x1234, [0, 0, 0, 1]);
         let pkt = parse_dhcp6_packet(&data).unwrap();
         let duid = vec![0x00, 0x03, 0x00, 0x01, 1, 2, 3, 4, 5, 6];
-        let mut in_use = |_: &Ipv6Addr| false;
+        let mut db = LeaseDb::new();
 
-        let reply = dispatch_dhcp6(&pkt, &duid, &[ctx], &mut in_use).unwrap();
+        let reply = dispatch(&pkt, &duid, &[ctx], &mut db).unwrap();
         assert_eq!(reply.msg_type, Dhcp6MsgType::Advertise);
         assert_eq!(reply.xid, 0x1234);
 
@@ -1519,30 +1847,53 @@ mod tests {
         assert_eq!(iaaddr.len(), 24);
         let addr = Ipv6Addr::from(<[u8; 16]>::try_from(&iaaddr[0..16]).unwrap());
         assert!(is_same_net6(&addr, &"2001:db8::1".parse().unwrap(), 64));
+
+        // Solicit (no rapid-commit) is a pure candidate search: nothing persisted.
+        assert_eq!(db.iter().count(), 0);
     }
 
     #[test]
-    fn dispatch_dhcp6_solicit_success_delegates_to_rfc3315_handle_solicit() {
+    fn dispatch_dhcp6_solicit_lifetimes_come_from_context_lease_time_not_hardcoded() {
+        use crate::types::dhcp::CONTEXT_DHCP;
+        let mut ctx = make_v6_ctx(
+            "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(),
+            64, CONTEXT_DHCP,
+        );
+        ctx.lease_time = 100;
+        let data = solicit_with_ia(0x1234, [0, 0, 0, 1]);
+        let pkt = parse_dhcp6_packet(&data).unwrap();
+        let duid = vec![0x00, 0x03];
+        let mut db = LeaseDb::new();
+
+        let reply = dispatch(&pkt, &duid, &[ctx], &mut db).unwrap();
+        let ia_data = find_option6(&reply.options, OPTION6_IA_NA).unwrap();
+        let iaaddr = find_option6(&ia_data[12..], OPTION6_IAADDR).unwrap();
+        let preferred = u32::from_be_bytes(iaaddr[16..20].try_into().unwrap());
+        let valid = u32::from_be_bytes(iaaddr[20..24].try_into().unwrap());
+        // calculate_times(100) => preferred=100, valid=100 -- not the old
+        // hardcoded 3600/7200 regardless of context configuration.
+        assert_eq!(preferred, 100);
+        assert_eq!(valid, 100);
+    }
+
+    #[test]
+    fn dispatch_dhcp6_solicit_rapid_commit_persists_and_replies() {
         use crate::types::dhcp::CONTEXT_DHCP;
         let ctx = make_v6_ctx(
             "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(),
             64, CONTEXT_DHCP,
         );
-        let data = solicit_with_ia(0x1234, [0, 0, 0, 1]);
+        let mut data = solicit_with_ia(0x42, [0, 0, 0, 9]);
+        data.extend_from_slice(&OPTION6_RAPID_COMMIT.to_be_bytes());
+        data.extend_from_slice(&0u16.to_be_bytes());
         let pkt = parse_dhcp6_packet(&data).unwrap();
-        let duid = vec![0x00, 0x03, 0x00, 0x01, 1, 2, 3, 4, 5, 6];
-        let mut in_use = |_: &Ipv6Addr| false;
+        let duid = vec![0x00, 0x03];
+        let mut db = LeaseDb::new();
 
-        let reply = dispatch_dhcp6(&pkt, &duid, &[ctx], &mut in_use).unwrap();
-        // `rfc3315::handle_solicit`'s construction includes a top-level
-        // Status Code (Success) option alongside CLIENT_ID/SERVER_ID/IA_NA --
-        // proof the reply was actually built by calling into rfc3315.rs's
-        // real handler on the success path, not dhcp6.rs's own parallel flat
-        // option encoder (see the module-level gap analysis / tasks.md).
-        assert!(
-            find_option6(&reply.options, OPTION6_STATUS_CODE).is_some(),
-            "expected a top-level Status Code option from rfc3315::handle_solicit"
-        );
+        let reply = dispatch(&pkt, &duid, &[ctx], &mut db).unwrap();
+        assert_eq!(reply.msg_type, Dhcp6MsgType::Reply);
+        assert!(find_option6(&reply.options, OPTION6_RAPID_COMMIT).is_some());
+        assert_eq!(db.iter().count(), 1, "rapid-commit must persist the lease");
     }
 
     #[test]
@@ -1550,9 +1901,9 @@ mod tests {
         let data = solicit_with_ia(0x1, [0, 0, 0, 1]);
         let pkt = parse_dhcp6_packet(&data).unwrap();
         let duid = vec![0x00, 0x03];
-        let mut in_use = |_: &Ipv6Addr| false;
+        let mut db = LeaseDb::new();
 
-        let reply = dispatch_dhcp6(&pkt, &duid, &[], &mut in_use).unwrap();
+        let reply = dispatch(&pkt, &duid, &[], &mut db).unwrap();
         let ia_data = find_option6(&reply.options, OPTION6_IA_NA).unwrap();
         let suboptions = &ia_data[12..];
         assert!(find_option6(suboptions, OPTION6_STATUS_CODE).is_some());
@@ -1560,7 +1911,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_dhcp6_request_returns_reply_with_allocated_address() {
+    fn dispatch_dhcp6_request_returns_reply_with_allocated_address_and_persists() {
         use crate::types::dhcp::CONTEXT_DHCP;
         let ctx = make_v6_ctx(
             "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(),
@@ -1570,12 +1921,318 @@ mod tests {
         data[0] = Dhcp6MsgType::Request as u8;
         let pkt = parse_dhcp6_packet(&data).unwrap();
         let duid = vec![0x00, 0x03, 0x00, 0x01, 1, 2, 3, 4, 5, 6];
-        let mut in_use = |_: &Ipv6Addr| false;
+        let mut db = LeaseDb::new();
 
-        let reply = dispatch_dhcp6(&pkt, &duid, &[ctx], &mut in_use).unwrap();
+        let reply = dispatch(&pkt, &duid, &[ctx], &mut db).unwrap();
         assert_eq!(reply.msg_type, Dhcp6MsgType::Reply);
         let ia_data = find_option6(&reply.options, OPTION6_IA_NA).unwrap();
         assert!(find_option6(&ia_data[12..], OPTION6_IAADDR).is_some());
+        assert_eq!(db.iter().count(), 1, "Request always persists on success");
+    }
+
+    #[test]
+    fn dispatch_dhcp6_request_empty_ia_redirects_like_rapid_commit_solicit() {
+        use crate::types::dhcp::CONTEXT_DHCP;
+        let ctx = make_v6_ctx(
+            "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(),
+            64, CONTEXT_DHCP,
+        );
+        // Request whose IA_NA has IAID+T1+T2 but no IAADDR sub-option.
+        let mut data = vec![Dhcp6MsgType::Request as u8, 0, 0, 1];
+        data.extend_from_slice(&OPTION6_CLIENT_ID.to_be_bytes());
+        data.extend_from_slice(&4u16.to_be_bytes());
+        data.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        data.extend_from_slice(&OPTION6_IA_NA.to_be_bytes());
+        data.extend_from_slice(&12u16.to_be_bytes());
+        data.extend_from_slice(&[0, 0, 0, 3]);
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        let pkt = parse_dhcp6_packet(&data).unwrap();
+        let duid = vec![0x00, 0x03];
+        let mut db = LeaseDb::new();
+
+        let reply = dispatch(&pkt, &duid, &[ctx], &mut db).unwrap();
+        assert_eq!(reply.msg_type, Dhcp6MsgType::Reply);
+        let ia_data = find_option6(&reply.options, OPTION6_IA_NA).unwrap();
+        assert!(find_option6(&ia_data[12..], OPTION6_IAADDR).is_some());
+        assert_eq!(db.iter().count(), 1);
+    }
+
+    #[test]
+    fn dispatch_dhcp6_request_address_leased_to_other_client_is_unspec_fail() {
+        use crate::types::dhcp::{CONTEXT_DHCP, LEASE_NA};
+        let ctx = make_v6_ctx(
+            "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(),
+            64, CONTEXT_DHCP,
+        );
+        let taken: Ipv6Addr = "2001:db8::5".parse().unwrap();
+        let mut db = LeaseDb::new();
+        db.bind_v6(taken, &[0xFF, 0xFF], 999, LEASE_NA, None);
+
+        let mut data = solicit_pkt(1);
+        data[0] = Dhcp6MsgType::Request as u8;
+        data.extend_from_slice(&OPTION6_CLIENT_ID.to_be_bytes());
+        data.extend_from_slice(&4u16.to_be_bytes());
+        data.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        data.extend_from_slice(&OPTION6_IA_NA.to_be_bytes());
+        data.extend_from_slice(&40u16.to_be_bytes());
+        data.extend_from_slice(&[0, 0, 0, 1]);
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&OPTION6_IAADDR.to_be_bytes());
+        data.extend_from_slice(&24u16.to_be_bytes());
+        data.extend_from_slice(&taken.octets());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        let pkt = parse_dhcp6_packet(&data).unwrap();
+
+        let reply = dispatch(&pkt, &[0x00, 0x03], &[ctx], &mut db).unwrap();
+        let ia_data = find_option6(&reply.options, OPTION6_IA_NA).unwrap();
+        let status = find_option6(&ia_data[12..], OPTION6_STATUS_CODE).unwrap();
+        let code = u16::from_be_bytes([status[0], status[1]]);
+        assert_eq!(code, crate::rfc3315::STATUS_UNSPEC_FAIL);
+    }
+
+    #[test]
+    fn dispatch_dhcp6_request_address_off_link_is_not_on_link() {
+        let mut data = solicit_pkt(1);
+        data[0] = Dhcp6MsgType::Request as u8;
+        data.extend_from_slice(&OPTION6_CLIENT_ID.to_be_bytes());
+        data.extend_from_slice(&4u16.to_be_bytes());
+        data.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        data.extend_from_slice(&OPTION6_IA_NA.to_be_bytes());
+        data.extend_from_slice(&40u16.to_be_bytes());
+        data.extend_from_slice(&[0, 0, 0, 1]);
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&OPTION6_IAADDR.to_be_bytes());
+        data.extend_from_slice(&24u16.to_be_bytes());
+        data.extend_from_slice(&"2001:db8:9999::1".parse::<Ipv6Addr>().unwrap().octets());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        let pkt = parse_dhcp6_packet(&data).unwrap();
+        let mut db = LeaseDb::new();
+
+        let reply = dispatch(&pkt, &[0x00, 0x03], &[], &mut db).unwrap();
+        let ia_data = find_option6(&reply.options, OPTION6_IA_NA).unwrap();
+        let status = find_option6(&ia_data[12..], OPTION6_STATUS_CODE).unwrap();
+        let code = u16::from_be_bytes([status[0], status[1]]);
+        assert_eq!(code, crate::rfc3315::STATUS_NOT_ON_LINK);
+    }
+
+    // ── RENEW / REBIND ────────────────────────────────────────────────────────
+
+    fn renew_pkt(msg_type: Dhcp6MsgType, iaid: [u8; 4], addr: Ipv6Addr) -> Vec<u8> {
+        let mut data = vec![msg_type as u8, 0, 0, 2];
+        data.extend_from_slice(&OPTION6_CLIENT_ID.to_be_bytes());
+        data.extend_from_slice(&4u16.to_be_bytes());
+        data.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        data.extend_from_slice(&OPTION6_IA_NA.to_be_bytes());
+        data.extend_from_slice(&40u16.to_be_bytes());
+        data.extend_from_slice(&iaid);
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&OPTION6_IAADDR.to_be_bytes());
+        data.extend_from_slice(&24u16.to_be_bytes());
+        data.extend_from_slice(&addr.octets());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data
+    }
+
+    #[test]
+    fn dispatch_dhcp6_renew_extends_existing_lease() {
+        use crate::types::dhcp::{CONTEXT_DHCP, LEASE_NA};
+        let mut ctx = make_v6_ctx(
+            "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(),
+            64, CONTEXT_DHCP,
+        );
+        ctx.lease_time = 200;
+        let addr: Ipv6Addr = "2001:db8::5".parse().unwrap();
+        let clid = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        let mut db = LeaseDb::new();
+        db.bind_v6(addr, &clid, 2, LEASE_NA, None);
+
+        let data = renew_pkt(Dhcp6MsgType::Renew, [0, 0, 0, 2], addr);
+        let pkt = parse_dhcp6_packet(&data).unwrap();
+        let reply = dispatch(&pkt, &[0x00, 0x03], &[ctx], &mut db).unwrap();
+
+        assert_eq!(reply.msg_type, Dhcp6MsgType::Reply);
+        let ia_data = find_option6(&reply.options, OPTION6_IA_NA).unwrap();
+        let iaaddr = find_option6(&ia_data[12..], OPTION6_IAADDR).unwrap();
+        let preferred = u32::from_be_bytes(iaaddr[16..20].try_into().unwrap());
+        assert_eq!(preferred, 200);
+        assert!(db.find_v6_by_clid_iaid(&clid, 2, &addr).unwrap().expires.is_some());
+    }
+
+    #[test]
+    fn dispatch_dhcp6_renew_no_lease_is_no_binding_and_not_top_level_error() {
+        let addr: Ipv6Addr = "2001:db8::5".parse().unwrap();
+        let data = renew_pkt(Dhcp6MsgType::Renew, [0, 0, 0, 2], addr);
+        let pkt = parse_dhcp6_packet(&data).unwrap();
+        let mut db = LeaseDb::new();
+
+        let reply = dispatch(&pkt, &[0x00, 0x03], &[], &mut db).unwrap();
+        let ia_data = find_option6(&reply.options, OPTION6_IA_NA).unwrap();
+        let status = find_option6(&ia_data[12..], OPTION6_STATUS_CODE).unwrap();
+        let code = u16::from_be_bytes([status[0], status[1]]);
+        assert_eq!(code, crate::rfc3315::STATUS_NO_BINDING);
+        // RENEW never sets a top-level error status, only the per-IA one.
+        assert!(find_option6(&reply.options, OPTION6_STATUS_CODE).is_none());
+    }
+
+    #[test]
+    fn dispatch_dhcp6_rebind_no_lease_not_authoritative_reports_no_addrs() {
+        let addr: Ipv6Addr = "2001:db8::5".parse().unwrap();
+        let data = renew_pkt(Dhcp6MsgType::Rebind, [0, 0, 0, 2], addr);
+        let pkt = parse_dhcp6_packet(&data).unwrap();
+        let mut db = LeaseDb::new();
+
+        let reply = dispatch_dhcp6(&pkt, &[0x00, 0x03], &[], &[], &mut db, false, 0).unwrap();
+        let top_status = find_option6(&reply.options, OPTION6_STATUS_CODE).unwrap();
+        let code = u16::from_be_bytes([top_status[0], top_status[1]]);
+        assert_eq!(code, crate::rfc3315::STATUS_NO_ADDRS_AVAIL);
+    }
+
+    #[test]
+    fn dispatch_dhcp6_rebind_no_lease_authoritative_creates_lease() {
+        use crate::types::dhcp::CONTEXT_DHCP;
+        let ctx = make_v6_ctx(
+            "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(),
+            64, CONTEXT_DHCP,
+        );
+        let addr: Ipv6Addr = "2001:db8::5".parse().unwrap();
+        let data = renew_pkt(Dhcp6MsgType::Rebind, [0, 0, 0, 2], addr);
+        let pkt = parse_dhcp6_packet(&data).unwrap();
+        let mut db = LeaseDb::new();
+
+        let reply = dispatch_dhcp6(&pkt, &[0x00, 0x03], &[ctx], &[], &mut db, true, 0).unwrap();
+        let ia_data = find_option6(&reply.options, OPTION6_IA_NA).unwrap();
+        assert!(find_option6(&ia_data[12..], OPTION6_IAADDR).is_some());
+        assert_eq!(db.iter().count(), 1);
+    }
+
+    // ── CONFIRM ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn dispatch_dhcp6_confirm_no_addresses_returns_none() {
+        let data = solicit_pkt(1); // Solicit-shaped but retyped below, no IA at all
+        let mut data = data;
+        data[0] = Dhcp6MsgType::Confirm as u8;
+        let pkt = parse_dhcp6_packet(&data).unwrap();
+        let mut db = LeaseDb::new();
+        assert!(dispatch(&pkt, &[0x00, 0x03], &[], &mut db).is_none());
+    }
+
+    #[test]
+    fn dispatch_dhcp6_confirm_valid_address_is_success() {
+        use crate::types::dhcp::CONTEXT_DHCP;
+        let ctx = make_v6_ctx(
+            "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(),
+            64, CONTEXT_DHCP,
+        );
+        let addr: Ipv6Addr = "2001:db8::5".parse().unwrap();
+        let mut data = renew_pkt(Dhcp6MsgType::Confirm, [0, 0, 0, 2], addr);
+        data[0] = Dhcp6MsgType::Confirm as u8;
+        let pkt = parse_dhcp6_packet(&data).unwrap();
+        let mut db = LeaseDb::new();
+
+        let reply = dispatch(&pkt, &[0x00, 0x03], &[ctx], &mut db).unwrap();
+        let status = find_option6(&reply.options, OPTION6_STATUS_CODE).unwrap();
+        let code = u16::from_be_bytes([status[0], status[1]]);
+        assert_eq!(code, crate::rfc3315::STATUS_SUCCESS);
+    }
+
+    #[test]
+    fn dispatch_dhcp6_confirm_invalid_address_is_not_on_link() {
+        let addr: Ipv6Addr = "2001:db8::5".parse().unwrap();
+        let mut data = renew_pkt(Dhcp6MsgType::Confirm, [0, 0, 0, 2], addr);
+        data[0] = Dhcp6MsgType::Confirm as u8;
+        let pkt = parse_dhcp6_packet(&data).unwrap();
+        let mut db = LeaseDb::new();
+
+        let reply = dispatch(&pkt, &[0x00, 0x03], &[], &mut db).unwrap();
+        let status = find_option6(&reply.options, OPTION6_STATUS_CODE).unwrap();
+        let code = u16::from_be_bytes([status[0], status[1]]);
+        assert_eq!(code, crate::rfc3315::STATUS_NOT_ON_LINK);
+    }
+
+    // ── RELEASE / DECLINE ────────────────────────────────────────────────────
+
+    #[test]
+    fn dispatch_dhcp6_release_removes_lease_and_frees_address() {
+        use crate::types::dhcp::LEASE_NA;
+        let addr: Ipv6Addr = "2001:db8::5".parse().unwrap();
+        let clid = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        let mut db = LeaseDb::new();
+        db.bind_v6(addr, &clid, 2, LEASE_NA, None);
+
+        let mut data = renew_pkt(Dhcp6MsgType::Release, [0, 0, 0, 2], addr);
+        data[0] = Dhcp6MsgType::Release as u8;
+        let pkt = parse_dhcp6_packet(&data).unwrap();
+        let reply = dispatch(&pkt, &[0x00, 0x03], &[], &mut db).unwrap();
+
+        assert_eq!(reply.msg_type, Dhcp6MsgType::Reply);
+        let status = find_option6(&reply.options, OPTION6_STATUS_CODE).unwrap();
+        assert_eq!(u16::from_be_bytes([status[0], status[1]]), crate::rfc3315::STATUS_SUCCESS);
+        assert!(db.find_v6_by_addr(&addr).is_none(), "released lease must be freed");
+    }
+
+    #[test]
+    fn dispatch_dhcp6_release_unknown_lease_reports_no_binding_but_top_level_success() {
+        let addr: Ipv6Addr = "2001:db8::5".parse().unwrap();
+        let mut data = renew_pkt(Dhcp6MsgType::Release, [0, 0, 0, 2], addr);
+        data[0] = Dhcp6MsgType::Release as u8;
+        let pkt = parse_dhcp6_packet(&data).unwrap();
+        let mut db = LeaseDb::new();
+
+        let reply = dispatch(&pkt, &[0x00, 0x03], &[], &mut db).unwrap();
+        let ia_data = find_option6(&reply.options, OPTION6_IA_NA).unwrap();
+        let ia_status = find_option6(&ia_data[12..], OPTION6_STATUS_CODE).unwrap();
+        assert_eq!(u16::from_be_bytes([ia_status[0], ia_status[1]]), crate::rfc3315::STATUS_NO_BINDING);
+        let top_status = find_option6(&reply.options, OPTION6_STATUS_CODE).unwrap();
+        assert_eq!(u16::from_be_bytes([top_status[0], top_status[1]]), crate::rfc3315::STATUS_SUCCESS);
+    }
+
+    #[test]
+    fn dispatch_dhcp6_decline_removes_lease() {
+        use crate::types::dhcp::LEASE_NA;
+        let addr: Ipv6Addr = "2001:db8::5".parse().unwrap();
+        let clid = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        let mut db = LeaseDb::new();
+        db.bind_v6(addr, &clid, 2, LEASE_NA, None);
+
+        let mut data = renew_pkt(Dhcp6MsgType::Decline, [0, 0, 0, 2], addr);
+        data[0] = Dhcp6MsgType::Decline as u8;
+        let pkt = parse_dhcp6_packet(&data).unwrap();
+        let reply = dispatch(&pkt, &[0x00, 0x03], &[], &mut db).unwrap();
+
+        assert_eq!(reply.msg_type, Dhcp6MsgType::Reply);
+        assert!(db.find_v6_by_addr(&addr).is_none(), "declined lease must be freed");
+    }
+
+    // ── INFOREQ ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn dispatch_dhcp6_inforeq_without_ia_gets_reply() {
+        let mut data = solicit_pkt(1);
+        data[0] = Dhcp6MsgType::InfoReq as u8;
+        data.extend_from_slice(&OPTION6_CLIENT_ID.to_be_bytes());
+        data.extend_from_slice(&4u16.to_be_bytes());
+        data.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let pkt = parse_dhcp6_packet(&data).unwrap();
+        let mut db = LeaseDb::new();
+        let reply = dispatch(&pkt, &[0x00, 0x03], &[], &mut db).unwrap();
+        assert_eq!(reply.msg_type, Dhcp6MsgType::Reply);
+    }
+
+    #[test]
+    fn dispatch_dhcp6_inforeq_with_ia_is_dropped() {
+        let mut data = solicit_with_ia(1, [0, 0, 0, 1]);
+        data[0] = Dhcp6MsgType::InfoReq as u8;
+        let pkt = parse_dhcp6_packet(&data).unwrap();
+        let mut db = LeaseDb::new();
+        assert!(dispatch(&pkt, &[0x00, 0x03], &[], &mut db).is_none());
     }
 
     // ── dhcp6_init ────────────────────────────────────────────────────────────
@@ -1608,7 +2265,7 @@ mod tests {
         let server = std::sync::Arc::new(server);
         let loop_task = tokio::spawn(run_dhcp6_loop(
             server.clone(), duid, vec![ctx], vec![],
-            crate::lease::LeaseDb::new(), shutdown_rx,
+            crate::lease::LeaseDb::new(), false, shutdown_rx,
             Some(client.local_addr().unwrap().port()),
         ));
 
@@ -1644,7 +2301,7 @@ mod tests {
         let server = std::sync::Arc::new(server);
         let loop_task = tokio::spawn(run_dhcp6_loop(
             server.clone(), duid, vec![ctx], vec![],
-            crate::lease::LeaseDb::new(), shutdown_rx,
+            crate::lease::LeaseDb::new(), true, shutdown_rx,
             Some(client.local_addr().unwrap().port()),
         ));
 
@@ -1689,7 +2346,7 @@ mod tests {
         let server = std::sync::Arc::new(server);
         let loop_task = tokio::spawn(run_dhcp6_loop(
             server, vec![], vec![], vec![],
-            crate::lease::LeaseDb::new(), shutdown_rx, None,
+            crate::lease::LeaseDb::new(), false, shutdown_rx, None,
         ));
 
         shutdown_tx.send(true).unwrap();
