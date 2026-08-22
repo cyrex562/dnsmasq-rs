@@ -677,6 +677,7 @@ pub fn daemon_forward_config(daemon: &Daemon) -> crate::forward::ForwardConfig {
         port:           daemon.port,
         conntrack:      daemon.option_bool(OPT_CONNTRACK),
         ipsets:         daemon.ipsets.clone(),
+        nftsets:        daemon.nftsets.clone(),
         cmark_alst_en:  daemon.option_bool(OPT_CMARK_ALST_EN),
         allowlists:     daemon.allowlists.clone(),
         allowlist_mask: daemon.allowlist_mask,
