@@ -989,50 +989,81 @@ mod tests {
 
     // ── close_fds ────────────────────────────────────────────────────────────
 
+    // close_fds() closes every fd in the process, including ones Tokio
+    // runtimes on other test threads depend on (epoll/eventfd/timerfd), so it
+    // must never run in-process inside the shared `cargo test` binary. Fork
+    // first, exactly like helper.rs's
+    // close_inherited_fds_closes_unrelated_descriptors, so the real close-all
+    // only ever happens in a throwaway child.
     #[test]
-    #[ignore] // Modifies global fd state; run with --ignored
     #[cfg(target_os = "linux")]
     fn close_fds_skips_directory_fd() {
+        use nix::sys::wait::waitpid;
+        use nix::unistd::{fork, pipe, ForkResult};
+        use std::io::{Read, Write};
         use std::os::unix::io::AsRawFd;
 
-        // Create a pipe to have fds we want to spare
-        let (read_fd, write_fd) = nix::unistd::pipe().expect("pipe failed");
-        let spare_write_fd = write_fd.as_raw_fd();
-        let spare_read_fd = read_fd.as_raw_fd();
-        let max_fd = spare_write_fd as i64 + 10;
+        let (result_r, result_w) = pipe().expect("pipe failed");
 
-        // Verify spare_write_fd works before close_fds
-        let test_write = unsafe { libc::write(spare_write_fd, b"test" as *const u8 as *const libc::c_void, 4) };
-        assert_eq!(test_write, 4, "spare_write_fd should be writable initially");
+        match unsafe { fork() }.expect("fork failed") {
+            ForkResult::Child => {
+                drop(result_r);
+                // close_fds() closes every fd except its spares, including
+                // this one — it must be spared too or the child can never
+                // report its result back to the parent.
+                let result_w_fd = result_w.as_raw_fd();
 
-        // Create some other fds that should get closed
-        let fd1 = unsafe { libc::open(b"/dev/null\0".as_ptr() as *const i8, libc::O_WRONLY) };
-        let fd2 = unsafe { libc::open(b"/dev/null\0".as_ptr() as *const i8, libc::O_WRONLY) };
+                // Create a pipe to have fds we want to spare.
+                let (spare_read, spare_write) = nix::unistd::pipe().expect("pipe failed");
+                let spare_write_fd = spare_write.as_raw_fd();
+                let spare_read_fd = spare_read.as_raw_fd();
+                let max_fd = spare_write_fd as i64 + 10;
 
-        assert!(fd1 > 2 && fd1 != spare_write_fd, "test fd1 should be > 2 and != spare_write_fd");
-        assert!(fd2 > 2 && fd2 != spare_write_fd, "test fd2 should be > 2 and != spare_write_fd");
+                // Create some other fds that should get closed.
+                let fd1 = unsafe { libc::open(b"/dev/null\0".as_ptr() as *const i8, libc::O_WRONLY) };
+                let fd2 = unsafe { libc::open(b"/dev/null\0".as_ptr() as *const i8, libc::O_WRONLY) };
 
-        // Forget the OwnedFds so they don't try to close them (we'll do it manually or via close_fds)
-        std::mem::forget(read_fd);
-        std::mem::forget(write_fd);
+                let mut ok = fd1 > 2 && fd1 != spare_write_fd && fd2 > 2 && fd2 != spare_write_fd;
 
-        // Call close_fds, sparing stdin/stdout/stderr and both pipe ends
-        close_fds(max_fd, spare_write_fd, spare_read_fd, -1);
+                // Forget the OwnedFds so close_fds is the only thing that
+                // touches them from here on.
+                std::mem::forget(spare_read);
+                std::mem::forget(spare_write);
 
-        // Verify that fd1 and fd2 are closed (writing should fail with EBADF)
-        let write_result = unsafe { libc::write(fd1, b"test" as *const u8 as *const libc::c_void, 4) };
-        assert_eq!(write_result, -1, "fd1 should be closed after close_fds");
+                // Call close_fds, sparing stdin/stdout/stderr, both pipe
+                // ends, and the result-reporting fd. If close_fds closed its
+                // own /proc/self/fd directory fd mid-scan, this call would
+                // misbehave (panic, loop incorrectly, or fail to close
+                // fd1/fd2) rather than return cleanly.
+                close_fds(max_fd, spare_write_fd, spare_read_fd, result_w_fd);
 
-        // Verify that spare_write_fd is still open and functional (should be able to write to it)
-        let write_result = unsafe {
-            libc::write(spare_write_fd, b"X" as *const u8 as *const libc::c_void, 1)
-        };
-        assert_eq!(write_result, 1, "spare_write_fd should still be open and writable after close_fds");
+                // fd1/fd2 should now be closed (EBADF on write).
+                let write_result = unsafe { libc::write(fd1, b"test" as *const u8 as *const libc::c_void, 4) };
+                ok &= write_result == -1;
 
-        // Clean up spare_write_fd and spare_read_fd since we forgot them
-        unsafe {
-            libc::close(spare_write_fd);
-            libc::close(spare_read_fd);
+                // spare_write_fd must still be open and functional.
+                let write_result = unsafe {
+                    libc::write(spare_write_fd, b"X" as *const u8 as *const libc::c_void, 1)
+                };
+                ok &= write_result == 1;
+
+                unsafe {
+                    libc::close(spare_write_fd);
+                    libc::close(spare_read_fd);
+                }
+
+                let mut f = std::fs::File::from(result_w);
+                let _ = f.write_all(&[u8::from(ok)]);
+                unsafe { libc::_exit(0) };
+            }
+            ForkResult::Parent { child } => {
+                drop(result_w);
+                let mut f = std::fs::File::from(result_r);
+                let mut buf = [0u8; 1];
+                f.read_exact(&mut buf).expect("child did not report a result");
+                waitpid(child, None).expect("waitpid failed");
+                assert_eq!(buf[0], 1, "close_fds misbehaved when run against its own directory fd");
+            }
         }
     }
 }
