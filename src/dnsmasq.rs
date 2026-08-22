@@ -106,6 +106,18 @@ pub fn init_daemon_with(mut daemon: Daemon) -> DaemonHandle {
         }
     }
 
+    // Mirrors `inotify_dnsmasq_init()` being called once at startup
+    // (`dnsmasq.c:437`): opens the inotify fd and watches each configured
+    // resolv-file's containing directory. `--hostsdir`/dynamic-dir watches
+    // need the cache to exist first, so those are set up later in
+    // `run_main_loop_with` via `inotify::set_dynamic_inotify`. Upstream
+    // `die()`s if a resolv directory is missing; this logs and continues,
+    // consistent with the `ipset_init` handling just above.
+    #[cfg(feature = "inotify")]
+    if let Err(err) = crate::inotify::inotify_dnsmasq_init(&mut daemon) {
+        tracing::error!("failed to set up inotify watches: {err}");
+    }
+
     Arc::new(RwLock::new(daemon))
 }
 
@@ -1322,6 +1334,27 @@ fn spawn_netlink_watch_task() -> Option<tokio::task::JoinHandle<()>> {
     None
 }
 
+/// Spawn the background task that drains inotify events (resolv-file and
+/// `--hostsdir`/`--dhcp-hostsdir`/`--dhcp-optsdir` directory changes) for as
+/// long as the daemon runs.
+///
+/// The inotify fd itself was already opened and the resolv-file watches
+/// already established by [`inotify_dnsmasq_init`](crate::inotify::inotify_dnsmasq_init)
+/// in [`init_daemon_with`]; this only spawns the [`crate::inotify::watch_inotify_changes`]
+/// readiness loop that reacts to them, mirroring [`spawn_netlink_watch_task`]'s
+/// `AsyncFd`-based structure.
+#[cfg(feature = "inotify")]
+fn spawn_inotify_watch_task(
+    daemon_handle: DaemonHandle,
+    cache: crate::cache::SharedDnsCache,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(e) = crate::inotify::watch_inotify_changes(daemon_handle, cache).await {
+            tracing::warn!("inotify watch loop exited: {e}");
+        }
+    })
+}
+
 /// Run the main daemon event loop, binding its own sockets.
 ///
 /// This function:
@@ -1497,6 +1530,22 @@ pub async fn run_main_loop_with(
         }
     };
 
+    // ── inotify: dynamic-dir initial scan + watch task ───────────────────────
+    //
+    // Resolv-file directory watches were already established synchronously in
+    // `init_daemon_with` (`inotify_dnsmasq_init`); `--hostsdir`/dynamic-dir
+    // watches need the cache to exist first, so `set_dynamic_inotify` (the
+    // watch-then-initial-scan step, mirroring `dnsmasq.c:437`) runs here,
+    // before `cache` is moved into the forwarding task below.
+    #[cfg(feature = "inotify")]
+    {
+        let mut d = daemon_handle.write().await;
+        let mut c = cache.lock().await;
+        crate::inotify::set_dynamic_inotify(&mut d, &mut c);
+    }
+    #[cfg(feature = "inotify")]
+    let inotify_task = spawn_inotify_watch_task(daemon_handle.clone(), cache.clone());
+
     // ── Spawn the forwarding engine ──────────────────────────────────────────
     let fwd_task = tokio::spawn(async move {
         if let Err(e) = run_forward_loop_on(dns_listeners, arrival_filter, fwd_config, cache).await {
@@ -1639,6 +1688,8 @@ pub async fn run_main_loop_with(
             if let Some(task) = netlink_task.as_ref() {
                 task.abort();
             }
+            #[cfg(feature = "inotify")]
+            inotify_task.abort();
             #[cfg(feature = "dbus")]
             if let Some(task) = dbus_task.as_ref() {
                 task.abort();
@@ -1671,6 +1722,8 @@ pub async fn run_main_loop_with(
             if let Some(task) = netlink_task.as_ref() {
                 task.abort();
             }
+            #[cfg(feature = "inotify")]
+            inotify_task.abort();
             #[cfg(feature = "dbus")]
             if let Some(task) = dbus_task.as_ref() {
                 task.abort();
@@ -1703,6 +1756,8 @@ pub async fn run_main_loop_with(
     if let Some(task) = netlink_task {
         task.abort();
     }
+    #[cfg(feature = "inotify")]
+    inotify_task.abort();
     #[cfg(feature = "dbus")]
     if let Some(task) = dbus_task {
         task.abort();
@@ -1811,20 +1866,33 @@ pub fn spawn_alarm_task(
 /// (`dnsmasq.c:1546-1565`):
 /// * `clear_cache_and_reload()` (`dnsmasq.c:1807`) → flush and rebuild the
 ///   `F_HOSTS` cache entries from `/etc/hosts` and `--addn-hosts`, here via
-///   [`crate::cache::reload_hosts`].
+///   [`crate::cache::reload_hosts`], then (when the `inotify` feature is
+///   enabled) re-scan `--hostsdir` directories via
+///   [`crate::inotify::set_dynamic_inotify`] to repopulate what that flush
+///   just wiped — mirroring `cache_reload()`'s own
+///   `set_dynamic_inotify(AH_HOSTS, ...)` call at `cache.c:1709`.
 /// * `reload_servers()` (`network.c:1699`) → re-read each `--resolv-file`
 ///   into `daemon->servers`, replacing only the previous `SERV_FROM_RESOLV`
 ///   entries so explicitly configured (`--server=`) servers survive.
 ///
-/// Two deliberate simplifications versus upstream, both tracked in
-/// `tasks.md`:
+/// Deliberate simplifications versus upstream, tracked in `tasks.md`:
 /// * Upstream only preserves `F_DHCP` cache entries across the flush; this
 ///   port's cache never receives `F_DHCP` records yet, so a full flush is
 ///   currently equivalent and needs revisiting once DHCP leases feed the
 ///   cache.
-/// * Upstream gates the resolv-file re-read on `OPT_NO_POLL`, because without
-///   it a periodic poll/inotify watch is expected to pick up the change
-///   instead; this port has no such watch, so SIGHUP always re-reads.
+/// * Upstream gates the *SIGHUP* resolv-file re-read on `OPT_NO_POLL`
+///   (`dnsmasq.c:1553`): when polling/inotify is active, the ordinary
+///   inotify-triggered reload ([`crate::inotify::watch_inotify_changes`])
+///   is expected to already keep `daemon->servers` current, so SIGHUP
+///   doesn't force a redundant read on top of it. This port still re-reads
+///   resolv-files unconditionally on every SIGHUP regardless of
+///   `--no-poll` — harmless, since the re-read is idempotent
+///   (`clear_cache_and_reload_idempotent`), but not a byte-for-byte match.
+/// * Real inotify watches now exist (`src/inotify.rs`), but the
+///   `--hostsdir` re-scan above only covers `AH_HOSTS` directories, not
+///   `dhcp-hostsdir`/`dhcp-optsdir` (`AH_DHCP_HST`/`AH_DHCP_OPT`) — matching
+///   `set_dynamic_inotify`'s existing scope limits (see the `src/inotify.rs`
+///   module doc).
 pub async fn clear_cache_and_reload(daemon_handle: &DaemonHandle, cache: &crate::cache::SharedDnsCache) {
     use tracing::{info, warn};
     use crate::types::constants::OPT_NO_HOSTS;
@@ -1846,6 +1914,22 @@ pub async fn clear_cache_and_reload(daemon_handle: &DaemonHandle, cache: &crate:
     {
         let mut c = cache.lock().await;
         crate::cache::reload_hosts(&hosts_paths, local_ttl, &mut c);
+    }
+
+    // `reload_hosts` just flushed the *entire* cache, which also wiped any
+    // `--hostsdir`-loaded records. Upstream's `cache_reload()` re-scans
+    // dynamic hosts directories in the same call (`cache.c:1709`,
+    // `set_dynamic_inotify(AH_HOSTS, ...)`) precisely to repopulate what it
+    // just flushed; do the same here rather than leaving those records gone
+    // until their directory happens to receive another filesystem event.
+    // `dhcp-hostsdir`/`dhcp-optsdir` entries are unaffected (`set_dynamic_inotify`
+    // only re-scans `AH_HOSTS` directories), matching the module's existing
+    // scope limits (see `src/inotify.rs` module doc).
+    #[cfg(feature = "inotify")]
+    {
+        let mut d = daemon_handle.write().await;
+        let mut c = cache.lock().await;
+        crate::inotify::set_dynamic_inotify(&mut d, &mut c);
     }
 
     // Re-read resolv-file-style server lists, if any are configured.  A file
@@ -3276,6 +3360,49 @@ mod tests {
         assert!(
             c.lookup_by_name("reloaded.test", crate::types::constants::F_IPV4, now).is_some(),
             "reload must load --addn-hosts entries into the cache",
+        );
+    }
+
+    /// `reload_hosts` flushes the *entire* cache, including any
+    /// `--hostsdir`-loaded records, since it has no notion of which UIDs
+    /// belong to a dynamic directory versus `/etc/hosts`. Upstream's
+    /// `cache_reload()` (`cache.c:1709`) re-scans dynamic hosts directories
+    /// in the same call (`set_dynamic_inotify(AH_HOSTS, ...)`) precisely to
+    /// repopulate what it just flushed; without an equivalent call here, a
+    /// `--hostsdir` entry would be silently and permanently gone after the
+    /// first SIGHUP.
+    #[tokio::test]
+    #[cfg(feature = "inotify")]
+    async fn clear_cache_and_reload_rescans_hostsdir_entries() {
+        use crate::types::network::{DynDir, AH_HOSTS, AH_WD_DONE};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hosts1"), "192.0.2.50 dynamic.test\n").unwrap();
+
+        let handle = init_daemon();
+        {
+            let mut d = handle.write().await;
+            d.set_option(crate::types::constants::OPT_NO_HOSTS);
+            // `AH_WD_DONE` is already set and `wd` already valid, as they
+            // would be after the real startup path (`set_dynamic_inotify`
+            // called once from `run_main_loop_with`) has run once — the
+            // watch itself isn't what's under test here, the re-scan is.
+            d.dynamic_dirs.push(DynDir {
+                files: vec![],
+                flags: AH_HOSTS | AH_WD_DONE,
+                dname: dir.path().to_str().unwrap().to_string(),
+                wd: 999,
+            });
+        }
+        let cache = crate::cache::new_shared_cache(150, 0, 0);
+
+        clear_cache_and_reload(&handle, &cache).await;
+
+        let mut c = cache.lock().await;
+        assert!(
+            c.lookup_by_name("dynamic.test", crate::types::constants::F_IPV4, Instant::now())
+                .is_some(),
+            "reload must rescan --hostsdir directories and repopulate their entries",
         );
     }
 
