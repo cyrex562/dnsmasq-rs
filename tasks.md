@@ -794,8 +794,9 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     because there is no TCP DNS serving loop; binding a listening TCP socket that nothing
     `accept()`s would open a port that silently swallows connections. Upstream binds the
     UDP/TCP pair. Whoever adds TCP DNS service must flip this and add a TCP accept loop.
-    TFTP listeners (`OPT_TFTP` → `iface->tftp_ok`) are likewise not created; `tftp_ok` is
-    computed by `iface_allowed_*` and then discarded.
+    TFTP listeners are now bound and served (`dnsmasq::bind_tftp_listeners` +
+    `tftp::run_tftp_loop`, wired into `run_main_loop_with`) — see the dedicated TFTP
+    section below for what that runtime still leaves out.
   - **Replies are sent with `send_to`, not `send_from`.** Upstream answers a wildcard-socket
     query from the datagram's recorded destination address via `IP_PKTINFO` on the way out
     (`forward.c` `send_from`); here the kernel picks the source by route lookup, which can
@@ -2166,6 +2167,88 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   Required tests: call-site tests proving RA scheduling and the router-lifetime wire field reflect
   per-interface `ra-param` config (interval, lifetime, including the lifetime=0 "no default route" case) — done, see `radv.rs` and `option.rs` test modules.
   Done when: RA interval/lifetime are actually derived from `RaInterface` at every upstream call site — done; remaining RA work is the gaps listed above.
+
+- [x] TFTP server: real sockets, real file I/O, transfer table (Issue #42 / T3-tftp).
+  `src/tftp.rs` now binds real listener sockets (`dnsmasq::bind_tftp_listeners`,
+  wired into `Listeners`/`run_main_loop_with`), opens real files
+  (`open_tftp_file`, port of `check_tftp_fileperm`), and drives a real
+  transfer table (`run_tftp_loop`, port of `check_tftp_listeners` +
+  `tftp_request` + `handle_tftp` + `free_transfer`) with retransmit/backoff
+  timers, the 120s abandoned-transfer timeout, 16-bit ACK block-number
+  wraparound (`block_hi`), `--tftp-single-port` shared-socket mode vs.
+  per-transfer ephemeral sockets (with `--tftp-port-range` retry), and
+  same-file fd dedup by (dev, inode, filename) across concurrent transfers.
+  `blksize`/`tsize`/`timeout`/`windowsize` negotiate against real files and
+  real MTUs (`network::interface_mtu`); `/../` traversal outside
+  `--tftp-root` is rejected. Verified end-to-end over real loopback sockets
+  and a real tempfile in `tftp::tests::end_to_end_download_over_real_sockets`
+  / `end_to_end_path_traversal_is_rejected`.
+  Explicitly **not** covered — scope cuts, not silent no-ops:
+  - **Per-interface `--tftp-prefix=<prefix>,<interface>` (`if_prefix`)** isn't
+    parsed anywhere in `option.rs`/`Daemon` yet (only the single global
+    `--tftp-root` prefix exists), so `run_tftp_loop` has nothing to consult
+    for it either.
+  - **`--tftp-unique-root=mac`** always falls back to "no MAC subdirectory"
+    (same as upstream when the MAC can't be resolved): wiring the live DHCP
+    lease table or a continuously-refreshed ARP cache into the TFTP request
+    path is cross-loop plumbing this change doesn't add. IP-based
+    `--tftp-unique-root`/`=ip` is fully implemented.
+  - **Wildcard-bind (no `--bind-interfaces`/`--bind-dynamic`) per-packet
+    interface permission checking** only consults the dedicated
+    `--enable-tftp=iface,...` allowlist; it does not also re-check
+    `dhcp-except`-style denial the way `iface_allowed_v4`/`_v6` do for the
+    bound-listener case. Bound-listener mode (the common
+    `--interface`+`--bind-interfaces` deployment) gets full enforcement via
+    `bind_tftp_listeners`.
+  - **`do_tftp_script_run`'s completion hook** builds the right
+    `ScriptData::for_tftp(...)` payload (already ported in `helper.rs`) but
+    isn't fed to `helper::create_helper`/`HelperHandle`: no daemon subsystem
+    (DHCP included) currently wires that pipeline into the running main
+    loop, since `create_helper` must fork before the tokio runtime starts.
+    Completed/failed/timed-out transfers are logged instead.
+  - **Non-Unix targets**: `run_tftp_loop` is a no-op stub off `unix`, matching
+    the rest of this port's raw-fd-based socket code (`send_from`,
+    `recv_with_dest`).
+  Required tests: done (unit tests for option parsing/path building/permission
+  checks/block wraparound/netascii expansion, plus the two real-socket
+  end-to-end tests above).
+  Done when: a real TFTP client can download a file end to end, options
+  negotiate against real files, and traversal is rejected — done.
+  Fix (issue #42 follow-up), three judge-flagged option-negotiation/timing
+  deviations:
+  - **Negative option values now wrap instead of flooring.** Upstream's
+    option loop does `unsigned int val = atoi(arg);` (`tftp.c:383`) — a
+    negative value's signed-to-unsigned reinterpretation wraps to a huge
+    unsigned number, so `if (val < 1) val = 1;`-style floor checks never
+    fire; the value instead clamps *down* to whichever ceiling applies
+    (`packet_buff_sz - 4` / MTU-minus-overhead / 255 / `TFTP_MAX_WINDOW`).
+    `parse_request_options` used to preserve the sign (`atoi_like` returns
+    `i64`), so e.g. `blksize=-1` clamped to the *floor* (1 byte) instead of
+    the ceiling (~2259 bytes with default settings) — a real, wire-visible
+    parity break. Added `atoi_as_c_uint` (truncate to `i32`, the real return
+    type of `atoi`, then reinterpret as `u32`) and applied it to all three
+    of `blksize`/`timeout`/`windowsize`, matching `unsigned int val =
+    atoi(arg)` exactly.
+  - **Removed the invented `TFTP_MAX_BLKSIZE = 65464` ceiling.** Confirmed
+    via `grep -rn "TFTP_MAX_BLKSIZE" original_dnsmasq_src/` that no such
+    constant or independent RFC 2348-style ceiling exists upstream —
+    `tftp.c:387-393` clamps `blksize` only via `packet_buff_sz - 4` and the
+    MTU-minus-overhead check. A large `--edns-packet-max` can therefore
+    negotiate a blksize above what this port used to allow.
+  - **Retransmit deadline is now additive from the previous deadline, not
+    from `now`.** Upstream: `transfer->retransmit += transfer->timeout +
+    (1<<(backoff/2))` (`tftp.c:689`). Both `process_transfer_packet`'s
+    ACK-driven send and `sweep_transfers`' timeout-driven resend used to
+    compute `now + timeout + backoff-shift` instead. For the ACK-driven
+    path this was a no-op (`transfer.retransmit` had just been set to `now`
+    by `handle_tftp_packet`), but for the timeout-driven sweep path, under
+    scheduling delay (a busy event loop or a coarse tick interval firing
+    after the deadline it's servicing), computing from `now` instead of the
+    missed deadline pushes every subsequent retry later than upstream's
+    cadence.
+  Covered by `tftp::tests::options_{blksize,timeout,windowsize}_negative_*`,
+  `options_blksize_has_no_independent_ceiling`, and
+  `sweep_transfers_retransmit_deadline_is_additive_from_previous_deadline_not_now`.
 
 - [ ] Reassess DNSSEC claims against actual implementation status.
   Source of truth: `src/dnssec.rs`, `src/crypto.rs`, existing TODO notes, parity outcomes.
