@@ -1402,6 +1402,7 @@ pub fn answer_request(
             answers.push(DnsRr {
                 name: name.clone(), rtype: t.class, class: 1, ttl, rdata: t.txt.clone(),
             });
+            log(F_CONFIG | F_RRNAME, Some(&name), None, None, t.class);
             ans  = true;
             auth = true;
         }
@@ -1708,6 +1709,15 @@ pub fn answer_request(
         nxdomain = !check_for_local_domain(&name, config, &*cache, now);
         let flags = F_CONFIG | F_NEG | if nxdomain { F_NXDOMAIN } else { 0 };
         log(flags, Some(&name), None, None, 0);
+    }
+
+    // 6b. A domain with a `SERV_LITERAL_ADDRESS` server entry and no
+    // upstream (`local=/domain/` with no address, or `rev-server` with the
+    // server part omitted) is never forwarded, for any query type — answer
+    // NXDOMAIN instead of falling through to forwarding.
+    if !ans && domain_matches_any_suffix(&name, config.literal_domains) {
+        ans      = true;
+        nxdomain = true;
     }
 
     if !ans {
@@ -3342,8 +3352,12 @@ mod tests {
 
     /// `--log-queries` must not be a silent no-op: turning it on and
     /// answering a real query from every major local-answer branch (host
-    /// records, TXT, cache hit, cache negative, CHAOS stat) must not panic
-    /// and must still produce the same answer as with logging off.
+    /// records, TXT, cache hit, cache negative, CHAOS stat, arbitrary
+    /// cached-RR) must not panic and must still produce the same answer as
+    /// with logging off. The arbitrary cached-RR branch specifically guards
+    /// against regressing the missing `log(F_CONFIG | F_RRNAME, ...)` call
+    /// found in issue #23's review: every other local-answer branch here
+    /// logs, and this one has to as well.
     #[test]
     fn log_queries_enabled_does_not_change_answers_or_panic() {
         use crate::types::dns_records::{HostRecord, TxtRecord};
@@ -3354,9 +3368,14 @@ mod tests {
         let stat = TxtRecord {
             name: "cachesize.bind".into(), txt: Vec::new(), class: 3, stat: crate::cache::TXT_STAT_CACHESIZE,
         };
+        let caa = TxtRecord {
+            name: "example.com".into(), txt: b"\x00\x05issue".to_vec(),
+            class: crate::dns_protocol::RrType::CAA as u16, stat: 0,
+        };
         let cfg = LocalConfig {
             host_records: std::slice::from_ref(&hr),
             txt_records:  std::slice::from_ref(&stat),
+            rr_records:   std::slice::from_ref(&caa),
             log_opts: crate::cache::LogQueryOptions { log: true, extralog: true, ..Default::default() },
             ..empty_config()
         };
@@ -3365,6 +3384,12 @@ mod tests {
         let mut cache = DnsCache::new(100);
         let a = answer_request(&make_query("myhost.local", 1), &mut cache, now, &cfg);
         assert!(a.is_some());
+
+        let mut cache = DnsCache::new(100);
+        let rr = answer_request(&make_query("example.com", crate::dns_protocol::RrType::CAA as u16), &mut cache, now, &cfg)
+            .expect("arbitrary cached-RR (--dns-rr) should answer with logging enabled");
+        assert_eq!(rr.answers.len(), 1);
+        assert_eq!(rr.answers[0].rtype, crate::dns_protocol::RrType::CAA as u16);
 
         let mut cache = DnsCache::new(100);
         let stat_resp = answer_request(&make_query_class("cachesize.bind", 16, 3), &mut cache, now, &cfg);

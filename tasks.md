@@ -471,9 +471,10 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     `cache::tests::log_query_*`. It is a pure function returning `Option<String>`
     (`LogQueryOptions` gates it, no hidden global state) rather than calling `my_syslog`
     directly, so callers own emission; `rfc1035::answer_request` wires it into: the config/cached
-    CNAME chain, cached NXDOMAIN, local TXT/MX/SRV/NAPTR records, host_records and cached A/AAAA
-    (positive and negative), PTR from host_records/cache, `--domain-needed`'s local NXDOMAIN/NOERR
-    decision, and the new CHAOS NOTIMP fallback.
+    CNAME chain, cached NXDOMAIN, local TXT/MX/SRV/NAPTR records, the arbitrary cached-RR branch
+    (`--dns-rr`, `t.class` passed as the type argument matching `rfc1035.c:1783`'s `t->class`),
+    host_records and cached A/AAAA (positive and negative), PTR from host_records/cache,
+    `--domain-needed`'s local NXDOMAIN/NOERR decision, and the new CHAOS NOTIMP fallback.
     `forward.rs` (the dominant real-world path — a fresh, uncached query that gets forwarded)
     now logs the three points `forward.c`'s `udp_request()`/`process_reply()` do: every incoming
     client query (`F_QUERY[|F_CONFIG]`, `run_forward_loop_on`'s query-receipt branch, mirroring
