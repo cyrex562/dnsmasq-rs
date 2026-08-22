@@ -1601,6 +1601,34 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   Done when: the lease-store-sharing gap above is closed as part of general
   DHCP-loop live-state-sharing work (tracked separately, not yet a task here).
 
+- [x] Protocol header completeness: DNS RR types and IPv6 address predicates (Issue #53 / T3-protocol-consts).
+  Source of truth: `dns-protocol.h:44-79`, `dhcp6-protocol.h:71-77`, `ip6addr.h:24-32`.
+  Implemented, tested:
+  - `RrType::from_u16` now round-trips all 27 declared variants — added 17 missing match arms
+    (MD, MF, MB, MG, MR, MINFO, RP, AFSDB, RT, SIG, PX, NXT, KX, DNAME, TKEY, TSIG, MAILB).
+    New unit test `rrtype_from_u16_legacy_types` verifies full coverage. Call sites
+    (`rfc1035.rs` lines 201, 244, 548; `auth.rs` line 387) benefit immediately without
+    signature changes.
+  - Added `is_ula_zero_v6(addr)` and `is_link_local_zero_v6(addr)` to `src/network.rs`,
+    checking for exactly `fd00::` and `fe80::` respectively (used by upstream `radv.c:479-501`
+    and `rfc3315.c:1342-1365` to elide RA/DHCPv6 options). Unit tests verify exact-match
+    semantics and reject non-zero suffixes and out-of-range addresses.
+  - DHCP6 status codes were already ported (research finding #2 is stale): constants exist as
+    `STATUS_SUCCESS`, `STATUS_UNSPEC_FAIL`, etc. in `src/rfc3315.rs:648-658` and as the
+    `Dhcp6Status` enum in `src/dhcp6_protocol/mod.rs:88-97` under different naming convention.
+    No new implementation needed — the checklist item is resolved as-is under the existing
+    constants/enum, with the caveat that no reply logic ever emits failure statuses (a
+    separate `rfc3315.c` behavior gap, not a header-completeness one).
+  Still open (tracked, not silently dropped):
+  - The new `is_ula_zero_v6` and `is_link_local_zero_v6` predicates have no production callers
+    yet — `radv.rs` and `rfc3315.rs` lack the surrounding decision logic from upstream
+    (RA prefix-lifetime elision, DHCPv6 address-substitution). Adding the predicate satisfies
+    "macro has a Rust equivalent" but not "affects runtime behavior"; wiring these into live
+    reply paths is follow-up work outside this issue's scope.
+  Required tests: `cargo test` passes cleanly (2132 lib tests + 2132 bin tests, all passing).
+  Done when: all requirements met above — all match arms added, new predicates tested, no
+  behavioral impact from these additions (intentional, as they lack callers in this build).
+
 - [ ] Finish behavior-critical gaps in DNS forwarding and cache interaction.
   Focus: upstream retry behavior, server rotation, reply matching, cache insertion edge cases, AD bit and EDNS0 semantics.
   Required tests: unit tests, property tests where appropriate, parity harness DNS scenarios.
