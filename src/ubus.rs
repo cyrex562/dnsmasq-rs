@@ -33,15 +33,27 @@
 //!   or exercised against a live `ubusd` — this sandboxed environment has no
 //!   network access and no `libubox`/`libubus` headers or binary available
 //!   to check against (attempts to fetch them were blocked; see `tasks.md`).
-//!   Treat the `blobmsg` layer as high-confidence but not yet verified, and
-//!   the outer `ubus_msghdr`/`UBUS_MSG_*`/`UBUS_ATTR_*` session envelope
-//!   (module [`envelope`]) — reconstructed from memory of `libubus`'s
-//!   `ubusmsg.h`, including this port's own stream-framing length prefix,
-//!   which `blob_attr` itself has no equivalent for — as lower-confidence
-//!   still and **not** verified against a vendored header or a live `ubusd`.
-//!   Closing that gap needs either real `libubox`/`libubus` headers to check
-//!   against or a live-`ubusd` interop smoke test; neither was available
-//!   here.
+//!   Treat the `blobmsg` layer as high-confidence but not yet verified.
+//! - The outer session envelope (module [`envelope`]) had a second-pass
+//!   structural fix: an earlier version added a 4-byte stream-framing
+//!   length prefix ahead of the `ubus_msghdr` — an invented addition no real
+//!   `ubusd` sends or expects — and wrote the `UBUS_ATTR_*` attrs as bare
+//!   top-level siblings instead of nesting them inside one wrapping
+//!   `blob_attr`. Real `libubus` (`ubusmsg.h`'s `struct ubus_msgbuf { struct
+//!   ubus_msghdr hdr; struct blob_attr data[]; }`) needs no separate length
+//!   field at all: the message is the 8-byte `ubus_msghdr` immediately
+//!   followed by exactly one self-describing `blob_attr` (id 0, matching
+//!   `blob_buf_init(&b, 0)`) whose own 24-bit length says how many more
+//!   bytes belong to the message — the same self-describing property this
+//!   module's own `blob` layer already relies on. [`envelope::encode`]/
+//!   [`envelope::decode`] now match that shape. This closes the specific
+//!   structural defects identified in review; the exact `ubus_msghdr` field
+//!   byte order (version/type/seq/peer) and the `UBUS_MSG_*`/`UBUS_ATTR_*`
+//!   numeric assignments are still reasoned from memory rather than diffed
+//!   against a vendored header or exercised against a live `ubusd` —
+//!   closing that residual gap needs either real `libubox`/`libubus`
+//!   headers to check against or a live-`ubusd` interop smoke test; neither
+//!   was available here.
 
 // ─────────────────────────────────────────────────────────────────────────
 // blob_attr: the raw TLV primitive (libubox/blob.h)
@@ -639,12 +651,22 @@ pub mod blobmsg {
 // ─────────────────────────────────────────────────────────────────────────
 
 pub mod envelope {
-    //! One framed ubus message on the wire: a stream-framing length prefix
-    //! (this port's own addition — `blob_attr` itself carries no top-level
-    //! length, and a Unix *stream* socket needs one), an 8-byte
-    //! `ubus_msghdr` (version, message type, sequence number, peer/client
-    //! id), and a body of concatenated top-level [`super::blob`] attributes
-    //! keyed by `UBUS_ATTR_*`.
+    //! One ubus message on the wire, matching `ubusmsg.h`'s `struct
+    //! ubus_msgbuf { struct ubus_msghdr hdr; struct blob_attr data[]; }`: an
+    //! 8-byte `ubus_msghdr` (version, message type, sequence number,
+    //! peer/client id) immediately followed by exactly ONE self-describing
+    //! [`super::blob`] `blob_attr` (id 0, matching `blob_buf_init(&b, 0)`),
+    //! whose data is the flat concatenation of the individual plain
+    //! (non-`blobmsg`, non-extended) `UBUS_ATTR_*` attrs. There is no extra
+    //! stream-framing length prefix on the wire — the outer attr's own
+    //! 24-bit length field is what tells a stream reader how many bytes
+    //! make up the rest of this message, the same self-describing property
+    //! `blob_attr` already has. A prior version of this port added a 4-byte
+    //! length prefix ahead of the `ubus_msghdr` (which no real `ubusd`
+    //! sends or expects) and left the `UBUS_ATTR_*` attrs as bare top-level
+    //! siblings instead of nested inside that one container attr — either
+    //! would desync a real peer's byte-parsing immediately during the
+    //! `HELLO` handshake. Both are fixed here.
 
     use super::blob::{self, BlobError};
 
@@ -709,45 +731,52 @@ pub mod envelope {
         Blob(#[from] BlobError),
     }
 
-    /// Encode one framed message: `[be32 body length][ubus_msghdr][body]`.
+    /// Encode one message: `ubus_msghdr` (8 bytes) followed by exactly one
+    /// self-describing `blob_attr` (id 0) wrapping the flat concatenation of
+    /// `msg.attrs`, each written as a plain (non-extended) `blob_attr` keyed
+    /// by its `UBUS_ATTR_*` id — see the module doc for why there is no
+    /// separate length prefix.
     pub fn encode(msg: &Message) -> Vec<u8> {
-        let mut body = Vec::new();
-        body.push(UBUS_VERSION);
-        body.push(msg.msg_type);
-        body.extend_from_slice(&msg.seq.to_be_bytes());
-        body.extend_from_slice(&msg.peer.to_be_bytes());
+        let mut children = Vec::new();
         for (id, payload) in &msg.attrs {
-            blob::put(&mut body, *id, payload).expect("ubus attr ids/payloads stay within limits");
+            blob::put(&mut children, *id, payload).expect("ubus attr ids/payloads stay within limits");
         }
+        let mut container = Vec::new();
+        blob::put(&mut container, 0, &children).expect("ubus attr container stays within limits");
 
-        let mut out = Vec::with_capacity(4 + body.len());
-        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        out.extend_from_slice(&body);
+        let mut out = Vec::with_capacity(HDR_LEN + container.len());
+        out.push(UBUS_VERSION);
+        out.push(msg.msg_type);
+        out.extend_from_slice(&msg.seq.to_be_bytes());
+        out.extend_from_slice(&msg.peer.to_be_bytes());
+        out.extend_from_slice(&container);
         out
     }
 
-    /// Decode one framed message from the front of `input`, returning it
-    /// plus the number of bytes consumed.
+    /// Decode one message from the front of `input`: the fixed 8-byte
+    /// `ubus_msghdr`, then one `blob_attr` whose own length field says how
+    /// many more bytes belong to this message — no separate length prefix
+    /// to consult. Returns the message plus the total number of bytes
+    /// consumed (`HDR_LEN` + the container attr's own length), so a
+    /// pipelined next message's bytes are left untouched.
     pub fn decode(input: &[u8]) -> Result<(Message, usize), EnvelopeError> {
-        if input.len() < 4 {
+        if input.len() < HDR_LEN {
             return Err(EnvelopeError::Truncated);
         }
-        let body_len = u32::from_be_bytes(input[0..4].try_into().unwrap()) as usize;
-        if input.len() < 4 + body_len {
-            return Err(EnvelopeError::Truncated);
-        }
-        let body = &input[4..4 + body_len];
-        if body.len() < HDR_LEN {
-            return Err(EnvelopeError::Truncated);
-        }
-        let msg_type = body[1];
-        let seq = u16::from_be_bytes([body[2], body[3]]);
-        let peer = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
-        let attrs = blob::parse_all(&body[HDR_LEN..])?
+        let msg_type = input[1];
+        let seq = u16::from_be_bytes([input[2], input[3]]);
+        let peer = u32::from_be_bytes([input[4], input[5], input[6], input[7]]);
+
+        let (container, consumed) = match blob::parse_one(&input[HDR_LEN..]) {
+            Ok(v) => v,
+            Err(BlobError::Truncated) => return Err(EnvelopeError::Truncated),
+            Err(e) => return Err(EnvelopeError::Blob(e)),
+        };
+        let attrs = blob::parse_all(container.data)?
             .into_iter()
             .map(|a| (a.id, a.data.to_vec()))
             .collect();
-        Ok((Message { msg_type, seq, peer, attrs }, 4 + body_len))
+        Ok((Message { msg_type, seq, peer, attrs }, HDR_LEN + consumed))
     }
 
     #[cfg(test)]
@@ -772,16 +801,57 @@ pub mod envelope {
         }
 
         #[test]
-        fn truncated_length_prefix_errors() {
+        fn truncated_msghdr_errors() {
             assert!(matches!(decode(&[0u8; 2]), Err(EnvelopeError::Truncated)));
         }
 
         #[test]
-        fn truncated_body_errors() {
-            let mut data = vec![0u8; 4];
-            data[0..4].copy_from_slice(&100u32.to_be_bytes());
-            data.extend_from_slice(&[0u8; 5]);
+        fn truncated_container_body_errors() {
+            // A full 8-byte ubus_msghdr followed by a blob_attr header that
+            // claims a 100-byte total length with only 4 bytes actually
+            // present.
+            let mut data = vec![0u8; HDR_LEN];
+            let mut fake_attr = vec![0u8; 4];
+            fake_attr[3] = 100;
+            data.extend_from_slice(&fake_attr);
             assert!(matches!(decode(&data), Err(EnvelopeError::Truncated)));
+        }
+
+        /// Pins the real `libubus` wire shape (`ubusmsg.h`'s `struct
+        /// ubus_msgbuf { struct ubus_msghdr hdr; struct blob_attr data[]; }`):
+        /// an 8-byte `ubus_msghdr` immediately followed by exactly ONE
+        /// self-describing `blob_attr` (id 0, matching `blob_buf_init(&b,
+        /// 0)`) whose data is the flat concatenation of the individual
+        /// plain (non-extended) `UBUS_ATTR_*` attrs. No extra stream-framing
+        /// length prefix exists on the wire — a prior version of this port
+        /// invented one, and left the `UBUS_ATTR_*` attrs as bare top-level
+        /// siblings instead of nesting them inside that one container attr;
+        /// both would desync a real `ubusd`'s byte-parsing immediately.
+        #[test]
+        fn encode_matches_the_real_hdr_plus_one_self_describing_attr_shape() {
+            let msg = Message {
+                msg_type: UBUS_MSG_INVOKE,
+                seq: 7,
+                peer: 42,
+                attrs: vec![(ATTR_METHOD, b"metrics".to_vec())],
+            };
+            let bytes = encode(&msg);
+
+            assert_eq!(bytes[0], 0); // UBUS_VERSION
+            assert_eq!(bytes[1], UBUS_MSG_INVOKE);
+            assert_eq!(&bytes[2..4], &7u16.to_be_bytes());
+            assert_eq!(&bytes[4..8], &42u32.to_be_bytes());
+
+            let (container, consumed) = blob::parse_one(&bytes[HDR_LEN..]).unwrap();
+            assert_eq!(container.id, 0);
+            assert!(!container.extended);
+            assert_eq!(HDR_LEN + consumed, bytes.len());
+
+            let children = blob::parse_all(container.data).unwrap();
+            assert_eq!(children.len(), 1);
+            assert_eq!(children[0].id, ATTR_METHOD);
+            assert!(!children[0].extended);
+            assert_eq!(children[0].data, b"metrics");
         }
 
         #[test]

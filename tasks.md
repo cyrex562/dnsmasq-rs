@@ -2069,6 +2069,30 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     part the issue is titled for and is high-confidence; the envelope's
     exact byte layout is a documented residual risk — see the module doc's
     "Confidence notes" in `ubus.rs`.
+  Third-pass fix (same issue, after review flagged the envelope itself as
+  still using an invented, incompatible shape): `envelope::encode`/`decode`
+  added a 4-byte stream-framing length prefix ahead of the `ubus_msghdr`
+  (real `ubusd` sends/expects no such prefix — `blob_attr`'s own
+  self-describing length already serves that purpose) and wrote the
+  `UBUS_ATTR_*` attrs as bare top-level siblings directly after the header,
+  instead of nesting them inside one wrapping `blob_attr` the way real
+  `libubus` does (`ubusmsg.h`'s `struct ubus_msgbuf { struct ubus_msghdr
+  hdr; struct blob_attr data[]; }` — one `blob_attr` per message, full
+  stop). Both were structural, not cosmetic: either would desync a real
+  `ubusd`'s byte-parsing during the `HELLO` handshake. Fixed: a message is
+  now exactly the 8-byte `ubus_msghdr` followed by one self-describing
+  `blob_attr` (id 0, matching `blob_buf_init(&b, 0)`) whose data is the flat
+  concatenation of the individual plain (non-extended) `UBUS_ATTR_*` attrs;
+  `decode` reads the `blob_attr`'s own length field to know how many bytes
+  belong to the message, with no separate length field to consult. All
+  `envelope` codec tests, the mock-`ubusd` handshake/reconnect tests in
+  `connection`, and the end-to-end `INVOKE`/`NOTIFY` integration tests were
+  re-run against the new shape and pass. This still does not amount to
+  byte-for-byte verification against a real vendored header or a live
+  `ubusd` (unavailable in this sandboxed environment, as before) — the
+  `ubus_msghdr` field byte order and `UBUS_MSG_*`/`UBUS_ATTR_*` numeric
+  assignments remain reasoned from memory, not diffed against source. Do
+  not upgrade this to "verified" without one of those.
   - `ubus::connection` — a persistent connection/object-registration runtime
     (`ubus_init()`/`ubus_destroy()`/`ubus_disconnect_cb` analogues), process-
     global like upstream's own `daemon->ubus`/`ubus_object` statics rather
