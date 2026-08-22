@@ -1360,6 +1360,33 @@ pub async fn run_dhcp_loop(
                     &pkt, &mut cfg, &mut lease_db, &mut ping_cache, probe.as_ref(), arrival.as_ref(),
                 );
 
+                // `ubus_event_bcast("dhcp.ack"/"dhcp.release", ...)`
+                // (rfc2131.c:1956,1958): fires on every lease grant/release,
+                // not just the connmark-allowlist path forward.rs already
+                // wires up — mirrors upstream calling this unconditionally
+                // from the same place `record_lease`/`handle_release` commit.
+                #[cfg(feature = "ubus")]
+                {
+                    let hw_len = usize::from(pkt.hlen).min(DHCP_CHADDR_MAX);
+                    let mac = crate::util::print_mac(&pkt.chaddr[..hw_len]);
+                    let hostname = find_option(&pkt.options, OPTION_HOSTNAME)
+                        .and_then(|raw| std::str::from_utf8(raw).ok());
+                    let iface = opts.relay_iface_name.as_deref();
+                    if let Some(d) = dispatched.as_ref() {
+                        if d.reply.msg_type == DhcpMsgType::Ack
+                            && get_message_type(&pkt.options) != Some(DhcpMsgType::Inform)
+                        {
+                            let ip = d.reply.yiaddr.to_string();
+                            crate::ubus::ubus_event_bcast("dhcp.ack", Some(&mac), Some(&ip), hostname, iface);
+                        }
+                    } else if get_message_type(&pkt.options) == Some(DhcpMsgType::Release)
+                        && handle_release(&pkt, cfg.pool_start, cfg.pool_end)
+                    {
+                        let ip = pkt.ciaddr.to_string();
+                        crate::ubus::ubus_event_bcast("dhcp.release", Some(&mac), Some(&ip), hostname, iface);
+                    }
+                }
+
                 // Port of the slaac_add_addrs() call chain that upstream
                 // triggers from lease_set_hwaddr()/lease_set_interface()
                 // (lease.c:992-993,1157-1158) every time a commit could have
