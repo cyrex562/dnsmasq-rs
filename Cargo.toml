@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["dhcp", "dhcp6", "dnssec", "auth", "tftp", "loop", "inotify", "dump", "bpf"]
+default = ["dhcp", "dhcp6", "dnssec", "auth", "tftp", "loop", "inotify", "dump"]
 dhcp     = []
 dhcp6    = ["dhcp"]
 dnssec   = []
@@ -13,7 +13,6 @@ tftp     = []
 loop     = []
 inotify  = []
 dump     = []
-bpf      = []
 conntrack = []
 dbus     = ["dep:zbus"]
 ubus     = []

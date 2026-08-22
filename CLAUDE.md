@@ -123,7 +123,7 @@ Integration tests in `tests/` import through the library (`dnsmasq_rs::*`), so t
 
 ### Feature flags
 
-Cargo features mirror upstream's compile-time `HAVE_*` defines. Defaults: `dhcp dhcp6 dnssec auth tftp loop inotify dump bpf`. `dhcp6` implies `dhcp`. Non-default: `conntrack`, `dbus` (pulls `zbus`), `ubus`, `ipset`, `nftset`.
+Cargo features mirror upstream's compile-time `HAVE_*` defines. Defaults: `dhcp dhcp6 dnssec auth tftp loop inotify dump`. `dhcp6` implies `dhcp`. Non-default: `conntrack`, `dbus` (pulls `zbus`), `ubus`, `ipset`, `nftset`. There is no `bpf` feature — `src/bpf.rs` was speculative classic-BPF filter code with no upstream counterpart and no caller; it was removed (see `tasks.md` P5). Upstream `bpf.c` is BSD/Solaris-only routing-socket code with no Linux relevance; its Linux analog is `netlink.rs`.
 
 Gates apply both to `pub mod` declarations (in *both* `lib.rs` and `main.rs`) and inside modules. Gate leakage is a live bug class — see the `--no-default-features` failure above.
 

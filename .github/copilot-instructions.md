@@ -66,7 +66,7 @@ All async tasks receive a clone of `DaemonHandle`. Never store a raw `Daemon` â€
 
 ### Feature Flags
 
-All optional subsystems are gated behind Cargo features that mirror dnsmasq's compile-time `HAVE_*` defines. Default features: `dhcp dhcp6 dnssec auth tftp loop inotify dump bpf`. Feature-gated code uses `#[cfg(feature = "...")]` on both `mod` declarations in `lib.rs`/`main.rs` and inside modules.
+All optional subsystems are gated behind Cargo features that mirror dnsmasq's compile-time `HAVE_*` defines. Default features: `dhcp dhcp6 dnssec auth tftp loop inotify dump`. Feature-gated code uses `#[cfg(feature = "...")]` on both `mod` declarations in `lib.rs`/`main.rs` and inside modules. There is no `bpf` feature â€” `src/bpf.rs` was speculative classic-BPF filter code with no upstream counterpart and no caller; it was removed. Upstream `bpf.c` is BSD/Solaris-only routing-socket code with no Linux relevance; its Linux analog is `netlink.rs`.
 
 | Cargo feature | Enables |
 |---|---|
@@ -74,7 +74,7 @@ All optional subsystems are gated behind Cargo features that mirror dnsmasq's co
 | `dhcp6` | `dhcp6`, `rfc3315`, `radv`, `slaac` (implies `dhcp`) |
 | `dnssec` | `crypto`, `dnssec` |
 | `dbus` | `dbus` (pulls in `zbus`) |
-| `bpf`, `conntrack`, `ipset`, `nftset`, `ubus`, `inotify`, `dump`, `tftp`, `auth`, `loop` | respective modules |
+| `conntrack`, `ipset`, `nftset`, `ubus`, `inotify`, `dump`, `tftp`, `auth`, `loop` | respective modules |
 
 ## Key Conventions
 
