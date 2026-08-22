@@ -2147,6 +2147,14 @@ mod tests {
             valid: 0,
             #[cfg(feature = "dhcp6")]
             preferred: 0,
+            #[cfg(feature = "dhcp6")]
+            ra_time: 0,
+            #[cfg(feature = "dhcp6")]
+            ra_short_period_start: 0,
+            #[cfg(feature = "dhcp6")]
+            saved_valid: 0,
+            #[cfg(feature = "dhcp6")]
+            address_lost_time: 0,
         }
     }
 

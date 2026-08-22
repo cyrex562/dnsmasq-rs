@@ -1937,14 +1937,113 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   Required tests: unit coverage plus parity fixture exchanges.
   Done when: supported DHCPv6 and RA scenarios are behaviorally aligned with upstream.
 
-- [ ] Wire `radv::calc_interval` / `radv::calc_lifetime` (radv.rs) into real RA scheduling and packet
+- [x] Wire `radv::calc_interval` / `radv::calc_lifetime` (radv.rs) into real RA scheduling and packet
   construction, matching upstream call sites `calc_interval(find_iface_param(iface_name))` /
-  `calc_lifetime(find_iface_param(iface_name))` at radv.c:281, 293, 422, 981. Both functions now
-  reproduce upstream clamp semantics exactly (Issue #16) but have no production callers — `new_timeout`
-  and RA packet building still use ad hoc interval/lifetime values instead of these helpers.
+  `calc_lifetime(find_iface_param(iface_name))` at radv.c:281, 293, 422, 981.
+  Update (Issue #36 / T3-radv): `radv.rs` now has a real ICMPv6 socket, send path, prefix
+  construction, and timer, all driven through `calc_interval`/`calc_lifetime`/`calc_prio`/
+  `find_iface_param`. Summary of what changed:
+  - `types::dhcp::DhcpContext` gained `ra_time`/`ra_short_period_start`/`saved_valid`/
+    `address_lost_time` (unix-epoch-seconds `u64`/`u32`, `0` = unset), replacing the old
+    `radv::RaSchedule`/`RaPriority`/`priority_byte` reimagining that had no real callers — deleted.
+  - `radv::RaInterfaceParam` was a second, parallel type to `types::dhcp::RaInterface` (already
+    declared on `Daemon` but never populated); `calc_interval`/`calc_lifetime`/`calc_prio`/
+    `find_iface_param` now take `&RaInterface` directly. Note `RaInterface.prio` holds the raw
+    RFC 4191 flag byte (`0x00`/`0x08`/`0x18`) exactly as upstream's `ra->prio` does — the old
+    `RaInterfaceParam` tests' `0`/`1`/`2` convention was a port deviation, fixed along the way.
+  - `option.rs`: `ra-param=<iface>,[mtu:<value>|<interface>|off,][high|low,]<intval>[,<lifetime>]`
+    now parses into `daemon.ra_interfaces` (was a silent no-op); `normalize_config` computes
+    `daemon.doing_ra` from `--enable-ra`/`CONTEXT_RA` contexts (dnsmasq.c:289-305).
+  - `radv::add_prefix_for_addr`/`build_ra_for_interface`: real port of `add_prefixes`/
+    `send_ra_alias`'s content-building half, including the ULA/link-local selection, the
+    `CONTEXT_OLD` deprecated-prefix continuation and expiry, and the default (self-as-resolver)
+    RDNSS fallback. `RouterAdvertisement`/`RaPrefix` gained `prio`/`router`/`adv_interval_ms`/
+    `mtu`/`source_lla`/`rdnss_lifetime` fields so `build_ra`/`parse_ra` round-trip every option
+    `send_ra_alias` can emit.
+  - `radv::periodic_ra`/`new_timeout_context`/`ra_start_unsolicited_all`/`_one`: real port of
+    `periodic_ra`/`iface_search`/`new_timeout`/`ra_start_unsolicited`, operating on
+    `DhcpContext.ra_time` etc. directly instead of the retired `RaSchedule`.
+  - `dnsmasq.rs`: `RadvSocket` (raw `SOCK_RAW`/`IPPROTO_ICMPV6`, hop-limit/TCLASS/PKTINFO/
+    `ICMP6_FILTER` setup — `libc` doesn't expose `icmp6_filter`/`ICMP6_FILTER` on this target, so
+    both are reproduced locally), `run_radv_loop` (the async send/receive/timer loop —
+    `tokio::io::unix::AsyncFd` for the raw fd, `tokio::time::sleep_until` for the periodic-RA
+    deadline), `handle_icmp6_packet` (RS dispatch, including `--bridge-interface` alias
+    redirection), and `send_ra_with_aliases` (unsolicited-RA alias fan-out). Wired into
+    `run_main_loop_with` alongside the DHCPv6 socket, gated on `daemon.doing_ra`; a failed
+    `RadvSocket::new()` is a hard startup failure (matching upstream's `die()`), same convention
+    already used for a failed DHCPv6 bind in that function.
+  Follow-up fix: the first pass left `--interface`/`--except-interface`/`--listen-address`
+  filtering out of both the RA send and receive paths — `RadvConfig` carried `dhcp_except`/
+  `bridges` but never `daemon.if_names`/`if_except`/`if_addrs`, and `periodic_ra`'s doc comment
+  incorrectly claimed the caller had already applied `iface_check`. Fixed:
+  - `network::iface_check_name` added — the `iface_check(AF_LOCAL, NULL, name, NULL)` form
+    (name-only, no `--listen-address` match, since the RS/RA call sites have no specific address
+    to check against it).
+  - `radv::periodic_ra` gained an `iface_allowed` closure param, applied both inside the live-
+    interface candidate scan (radv.c:934-935) and uniformly on whichever interface name was
+    found — including the `CONTEXT_OLD` branch, which has no candidate scan of its own and was
+    previously ungated by either `iface_check` or `--no-dhcp-interface` (radv.c:833-834, 836-839).
+  - `dnsmasq::handle_icmp6_packet` now calls `iface_check_name` on the arrival interface before
+    dispatching a Router Solicitation reply (radv.c:178), and `RadvConfig`/`run_radv_loop` thread
+    an `IfaceCheckConfig` through from `iface_check_config(daemon)` (already used for DNS listener
+    binding) end to end.
+  - Also fixed: the bridge-alias branch in `handle_icmp6_packet` now matches upstream's loop
+    exactly (radv.c:228-247) — a `--bridge-interface` whose own interface doesn't currently
+    resolve (`if_nametoindex` fails) is skipped in favour of the next bridge, rather than
+    unconditionally dropping the RS. Only when no bridge claims the RS does it fall through to a
+    direct reply on the arrival interface.
+  Follow-up fix 2: `parse_rs_source_mac` was fully ported and unit-tested but never called from
+  `handle_icmp6_packet` — decorative. Wired in: `handle_icmp6_packet` now runs the source-LLA scan
+  unconditionally (matching radv.c:206-223's bail-out-on-malformed-option behavior regardless of
+  `--quiet-ra`) and only gates the resulting `RTR-SOLICIT(<iface>) <mac>` log line on
+  `--quiet-ra`/`OPT_QUIET_RA`, which `RadvConfig`/`run_radv_loop` now thread through end to end.
+  Known gaps, left for a follow-up:
+  - `--dhcp-option6=option6:dns-server/domain-search`-driven RDNSS/DNSSL tag-filtered substitution
+    (radv.c:454-525) is not implemented; only the default "advertise ourselves" RDNSS fallback is.
+    This needs the `option_filter`/`DHOPT_TAGOK` netid-matching infrastructure for v6 options,
+    which doesn't exist anywhere in this crate yet (a separate, larger `dhcp-option6` gap).
+  - `ICMP6_ECHO_REPLY` (SLAAC address-guessing probe replies) is filtered in when a
+    `CONTEXT_RA_NAME` context exists, but `handle_icmp6_packet` doesn't dispatch it to
+    `lease.rs`/`slaac.rs`'s ping-probe logic yet — it's just dropped.
+  - The Source Link-Layer Address option (`add_lla`, wired into `build_ra`) is never populated at
+    the call site: resolving the outgoing interface's own MAC needs an `AF_LOCAL`/hwaddr
+    enumeration this crate doesn't have (`RaBuildParams.mac` is always `None` from
+    `dnsmasq.rs::build_ra_packet`).
+  - DAD-tentative address detection (`IFACE_TENTATIVE`) always reports `false`
+    (`enumerate_live_ifaces6`) since the `if-addrs` crate doesn't surface it — same caveat already
+    documented on `network::enumerate_live_addrs6`.
+  - No parity-harness fixture exercises RA yet (the harness's own scope note already excludes
+    DHCP/RA pending `NET_ADMIN`/`NET_RAW` in the container).
+  - `run_radv_loop`'s `contexts: Vec<DhcpContext>` is a one-time `.clone()` taken at startup
+    (`dnsmasq.rs`'s `radv_config` build, before `run_radv_loop` is spawned) and then owned solely
+    by the RA task for the life of the process — nothing feeds it updates afterward. Upstream
+    reconstructs contexts on netlink interface/address changes and marks stale ones `CONTEXT_OLD`
+    (the normal way an advertised prefix tracks a live interface); that reconstruction path
+    doesn't exist here at all (ties to the still-stub SIGHUP/reload path noted under "Architecture
+    > Runtime flow" in CLAUDE.md), so it never reaches the running RA loop. Concretely this means:
+    - `add_prefix_for_addr`'s `CONTEXT_RA_DONE`/`CONTEXT_OLD` bookkeeping only ever sees the
+      context set as it existed at startup.
+    - `ra_start_unsolicited_one` (radv.c:125-130, the per-context seed upstream uses when a *new*
+      context needs a timer after startup) has no call site — there is no path that ever adds a
+      context to the running RA loop's vector — and is currently exercised only by its own unit
+      test.
+    - Upstream's `new_timeout(parm.found_context, ...)` transfer, which hands an expiring
+      `CONTEXT_OLD` context's RA timer to the live context that replaced it (radv.c:342-343), has
+      no Rust counterpart: `build_ra_for_interface`'s `CONTEXT_OLD` branch just drops the expired
+      context once its `saved_valid` window elapses (`radv.rs`'s old-prefix drain loop). Restoring
+      this needs `RaParam.found_context` to go back from a `bool` to an index/reference into
+      `contexts`, which the current pure-function shape (`add_prefix_for_addr` taking `&mut
+      [DhcpContext]`) doesn't support without a larger signature change.
+    Net effect: "Prefix options reflect live interface addresses" holds for the addresses present
+    at startup, but an interface/subnet change afterward (add, remove, renumber) is not picked up
+    by the running daemon without a restart. Fixing this for real needs the DHCPv6 side to publish
+    context updates (e.g. via a shared `Arc<RwLock<Vec<DhcpContext>>>` or a watch channel) that
+    `run_radv_loop` consumes each tick, plus the `found_context` index change above — tracked here
+    rather than attempted in this pass to avoid a broad, risky refactor of both `radv.rs`'s pure
+    functions and the DHCPv6/RA startup wiring in the same change.
   Required tests: call-site tests proving RA scheduling and the router-lifetime wire field reflect
-  per-interface `ra-param` config (interval, lifetime, including the lifetime=0 "no default route" case).
-  Done when: RA interval/lifetime are actually derived from `RaInterfaceParam` at every upstream call site.
+  per-interface `ra-param` config (interval, lifetime, including the lifetime=0 "no default route" case) — done, see `radv.rs` and `option.rs` test modules.
+  Done when: RA interval/lifetime are actually derived from `RaInterface` at every upstream call site — done; remaining RA work is the gaps listed above.
 
 - [ ] Reassess DNSSEC claims against actual implementation status.
   Source of truth: `src/dnssec.rs`, `src/crypto.rs`, existing TODO notes, parity outcomes.

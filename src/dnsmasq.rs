@@ -2,7 +2,7 @@
 //!
 //! Mirrors the startup logic in `dnsmasq.c` (the original 2478-line C file).
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::RwLock;
@@ -1540,6 +1540,29 @@ pub async fn run_main_loop_with(
         daemon_dhcp6_runtime(&mut d)
     };
 
+    // Router Advertisements piggyback on the same "current chain" contexts
+    // DHCPv6 just built (`dhcp_construct_contexts` folds live addresses in),
+    // so this snapshot has to happen before the RA-unrelated `dhcp6_runtime`
+    // spawn block below takes ownership of `rt.contexts`.
+    #[cfg(feature = "dhcp6")]
+    let radv_config = {
+        let d = daemon_handle.read().await;
+        if d.doing_ra {
+            Some(RadvConfig {
+                contexts: dhcp6_runtime.as_ref().map(|rt| rt.contexts.clone()).unwrap_or_default(),
+                ra_interfaces: d.ra_interfaces.clone(),
+                dhcp_except: d.dhcp_except.clone(),
+                bridges: d.bridges.clone(),
+                opt_ra: d.option_bool(crate::types::constants::OPT_RA),
+                is_dns_server: d.port == crate::dns_protocol::NAMESERVER_PORT,
+                quiet_ra: d.option_bool(crate::types::constants::OPT_QUIET_RA),
+                iface_check: iface_check_config(&d),
+            })
+        } else {
+            None
+        }
+    };
+
     // ── Adopt sockets bound before the fork, or bind them now ────────────────
     //
     // `main` binds while still privileged and hands them over; the in-process
@@ -1763,6 +1786,54 @@ pub async fn run_main_loop_with(
     // ── Netlink address-change watcher ───────────────────────────────────────
     let netlink_task = spawn_netlink_watch_task();
 
+    // ── Router Advertisements ────────────────────────────────────────────────
+    //
+    // `ra_init()`'s raw ICMPv6 socket failure is fatal upstream (`die()`);
+    // matched here rather than degrading gracefully like `IcmpPinger` does,
+    // since `--enable-ra`/a `ra-only` `dhcp-range` is an explicit request for
+    // RA service the daemon can't silently skip — the same convention this
+    // function already applies to a failed DHCPv6 socket bind above.
+    #[cfg(feature = "dhcp6")]
+    let (radv_task, radv_shutdown_tx) = if let Some(cfg) = radv_config {
+        let want_echo_reply = cfg.contexts.iter().any(|c| c.flags & crate::types::dhcp::CONTEXT_RA_NAME != 0);
+        let socket = match RadvSocket::new(want_echo_reply) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("cannot create ICMPv6 socket for Router Advertisements: {e}");
+                fwd_task.abort();
+                #[cfg(feature = "dhcp")]
+                {
+                    if let Some(tx) = dhcp_shutdown_tx.as_ref() {
+                        let _ = tx.send(true);
+                    }
+                    if let Some(task) = dhcp_task.as_ref() {
+                        task.abort();
+                    }
+                }
+                if let Some(tx) = dhcp6_shutdown_tx.as_ref() {
+                    let _ = tx.send(true);
+                }
+                if let Some(task) = dhcp6_task.as_ref() {
+                    task.abort();
+                }
+                return RunResult::IoError;
+            }
+        };
+        info!("sending Router Advertisements");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            if let Err(e) = run_radv_loop(
+                socket, cfg.contexts, cfg.ra_interfaces, cfg.dhcp_except, cfg.bridges,
+                cfg.opt_ra, cfg.is_dns_server, cfg.quiet_ra, cfg.iface_check, shutdown_rx,
+            ).await {
+                error!("radv loop exited: {e}");
+            }
+        });
+        (Some(task), Some(shutdown_tx))
+    } else {
+        (None, None)
+    };
+
     // ── Signal handling ──────────────────────────────────────────────────────
     let mut sigterm = match signal(SignalKind::terminate()) {
         Ok(s) => s,
@@ -1782,6 +1853,12 @@ pub async fn run_main_loop_with(
                     let _ = tx.send(true);
                 }
                 if let Some(task) = dhcp6_task.as_ref() {
+                    task.abort();
+                }
+                if let Some(tx) = radv_shutdown_tx.as_ref() {
+                    let _ = tx.send(true);
+                }
+                if let Some(task) = radv_task.as_ref() {
                     task.abort();
                 }
             }
@@ -1817,6 +1894,12 @@ pub async fn run_main_loop_with(
                     let _ = tx.send(true);
                 }
                 if let Some(task) = dhcp6_task.as_ref() {
+                    task.abort();
+                }
+                if let Some(tx) = radv_shutdown_tx.as_ref() {
+                    let _ = tx.send(true);
+                }
+                if let Some(task) = radv_task.as_ref() {
                     task.abort();
                 }
             }
@@ -1880,6 +1963,12 @@ pub async fn run_main_loop_with(
             let _ = tx.send(true);
         }
         if let Some(task) = dhcp6_task {
+            let _ = task.await;
+        }
+        if let Some(tx) = radv_shutdown_tx {
+            let _ = tx.send(true);
+        }
+        if let Some(task) = radv_task {
             let _ = task.await;
         }
     }
@@ -2320,6 +2409,501 @@ impl crate::dhcp::AddressProbe for IcmpPinger {
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Router Advertisement transport (radv.c:71-140, 257-584, 789-919)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// The raw ICMPv6 socket Router Advertisements are sent/received on, plus the
+/// hop limit `ra_init()` reads back from the kernel.
+///
+/// Every byte-pushing and scheduling decision lives in `crate::radv` as plain
+/// socket-free Rust (see that module's doc comment); this struct is the thin
+/// layer that actually opens the socket and moves bytes, mirroring the
+/// `crate::dhcp::AddressProbe` / [`IcmpPinger`] split above.
+/// `IPPROTO_ICMPV6`-level sockopt name for the kernel-side ICMPv6 type
+/// filter (`<netinet/icmp6.h>`'s `ICMP6_FILTER`, value `1` on Linux). Not
+/// exposed by the `libc` crate on this target.
+#[cfg(feature = "dhcp6")]
+const ICMP6_FILTER: libc::c_int = 1;
+
+/// Mirrors C's `struct icmp6_filter { uint32_t icmp6_filt[8]; }` — one bit
+/// per ICMPv6 type (0-255); a set bit blocks that type, matching
+/// `ICMP6_FILTER_SETBLOCKALL`/`SETPASS`'s semantics.
+#[cfg(feature = "dhcp6")]
+#[repr(C)]
+struct Icmp6Filter {
+    icmp6_filt: [u32; 8],
+}
+
+/// Everything [`run_radv_loop`] needs besides the socket itself, gathered
+/// from the `DaemonHandle` once at startup by [`run_main_loop_with`].
+#[cfg(feature = "dhcp6")]
+pub struct RadvConfig {
+    pub contexts: Vec<crate::types::dhcp::DhcpContext>,
+    pub ra_interfaces: Vec<crate::types::dhcp::RaInterface>,
+    pub dhcp_except: Vec<crate::types::network::Iname>,
+    pub bridges: Vec<crate::types::daemon::DhcpBridge>,
+    pub opt_ra: bool,
+    pub is_dns_server: bool,
+    /// `--quiet-ra` — suppresses the `RTR-SOLICIT` log line (radv.c:222-223).
+    pub quiet_ra: bool,
+    /// The `--interface`/`--except-interface`/`--listen-address` filter,
+    /// applied via [`crate::network::iface_check_name`] to both the RA send
+    /// path ([`crate::radv::periodic_ra`]) and the receive path
+    /// ([`handle_icmp6_packet`]) — radv.c:178, :934-935.
+    pub iface_check: crate::network::IfaceCheckConfig,
+}
+
+#[cfg(feature = "dhcp6")]
+pub struct RadvSocket {
+    socket: socket2::Socket,
+    pub hop_limit: i32,
+}
+
+#[cfg(feature = "dhcp6")]
+impl std::os::unix::io::AsRawFd for RadvSocket {
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.socket.as_raw_fd()
+    }
+}
+
+#[cfg(feature = "dhcp6")]
+impl RadvSocket {
+    /// Open and configure the ICMPv6 socket RA needs.
+    ///
+    /// Port of `ra_init()` (radv.c:71-116): `SOCK_RAW`/`IPPROTO_ICMPV6`,
+    /// hop limits forced to 255, `IPV6_PKTINFO` for arrival-interface
+    /// lookups, and an `ICMP6_FILTER` that passes only Router Solicitations
+    /// (plus Echo Replies when `want_echo_reply` is set — SLAAC
+    /// address-guessing probes; wiring that reply to `lease_ping_reply` is
+    /// tracked as a gap in `tasks.md`).
+    ///
+    /// Requires `CAP_NET_RAW`. Upstream calls `die()` on failure; here the
+    /// error is returned instead so the caller can decide (this crate's
+    /// `run_main_loop_with` treats it the same way it already treats a failed
+    /// DHCPv6 socket bind — a hard startup failure when RA was configured —
+    /// while tests can skip when the capability just isn't available).
+    pub fn new(want_echo_reply: bool) -> std::io::Result<Self> {
+        use socket2::{Domain, Protocol, Socket};
+        use std::os::unix::io::AsRawFd;
+
+        let socket = Socket::new(Domain::IPV6, socket2::Type::RAW, Some(Protocol::ICMPV6))?;
+        let fd = socket.as_raw_fd();
+
+        let mut hop_limit: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd, libc::IPPROTO_IPV6, libc::IPV6_UNICAST_HOPS,
+                &mut hop_limit as *mut _ as *mut libc::c_void, &mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        // Best-effort: absence of IPV6_TCLASS support isn't fatal upstream either.
+        #[cfg(target_os = "linux")]
+        {
+            const IPTOS_CLASS_CS6: libc::c_int = 0xc0;
+            let class: libc::c_int = IPTOS_CLASS_CS6;
+            unsafe {
+                libc::setsockopt(
+                    fd, libc::IPPROTO_IPV6, libc::IPV6_TCLASS,
+                    &class as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+
+        crate::network::fix_fd(fd)?;
+        crate::network::set_ipv6pktinfo(fd)?;
+
+        let val: libc::c_int = 255;
+        for opt in [libc::IPV6_UNICAST_HOPS, libc::IPV6_MULTICAST_HOPS] {
+            let rc = unsafe {
+                libc::setsockopt(
+                    fd, libc::IPPROTO_IPV6, opt,
+                    &val as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+
+        // ICMP6_FILTER_SETBLOCKALL then selectively SETPASS (radv.c:92-98).
+        // `libc` doesn't expose `icmp6_filter`/`ICMP6_FILTER` on this target,
+        // so both the struct and the sockopt name are reproduced here from
+        // `<netinet/icmp6.h>`.
+        let mut filter = Icmp6Filter { icmp6_filt: [0xffff_ffffu32; 8] };
+        let pass = |filter: &mut Icmp6Filter, ty: u8| {
+            let ty = ty as u32;
+            filter.icmp6_filt[(ty / 32) as usize] &= !(1u32 << (ty % 32));
+        };
+        pass(&mut filter, crate::radv::ND_ROUTER_SOLICIT);
+        if want_echo_reply {
+            pass(&mut filter, crate::radv::ICMP6_ECHO_REPLY);
+        }
+        let rc = unsafe {
+            libc::setsockopt(
+                fd, libc::IPPROTO_ICMPV6, ICMP6_FILTER,
+                &filter as *const _ as *const libc::c_void,
+                std::mem::size_of::<Icmp6Filter>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        Ok(Self { socket, hop_limit })
+    }
+
+    /// Receive one ICMPv6 datagram plus its arrival interface index.
+    pub fn recv(&self, buf: &mut [u8]) -> std::io::Result<crate::network::RecvMeta> {
+        use std::os::unix::io::AsRawFd;
+        crate::network::recv_with_dest(self.socket.as_raw_fd(), buf)
+    }
+
+    /// Send an RA. `dest = None` multicasts to `ff02::1` on `iface_index`
+    /// (unsolicited/periodic RAs); `Some(addr)` unicasts a solicited reply.
+    /// Port of `send_ra_alias`'s destination selection (radv.c:543-561).
+    pub fn send(&self, iface_index: u32, dest: Option<Ipv6Addr>, packet: &[u8]) -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let fd = self.socket.as_raw_fd();
+
+        let addr = match dest {
+            Some(d) => d,
+            None => {
+                unsafe {
+                    libc::setsockopt(
+                        fd, libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_IF,
+                        &iface_index as *const _ as *const libc::c_void,
+                        std::mem::size_of::<u32>() as libc::socklen_t,
+                    );
+                }
+                "ff02::1".parse().unwrap()
+            }
+        };
+        let scope_id = if radv_dest_needs_scope_id(addr) { iface_index } else { 0 };
+        let sockaddr = std::net::SocketAddrV6::new(addr, 0, 0, scope_id);
+        self.socket.send_to(packet, &sockaddr.into())?;
+        Ok(())
+    }
+}
+
+/// `IN6_IS_ADDR_LINKLOCAL(dest) || IN6_IS_ADDR_MC_LINKLOCAL(dest)` (radv.c:553-554).
+#[cfg(feature = "dhcp6")]
+fn radv_dest_needs_scope_id(addr: Ipv6Addr) -> bool {
+    if crate::network::is_link_local_v6(addr) {
+        return true;
+    }
+    let o = addr.octets();
+    addr.is_multicast() && (o[1] & 0x0f) == 0x02
+}
+
+/// Live IPv6-capable interfaces, shaped for [`crate::radv::periodic_ra`].
+///
+/// DAD-tentative detection (`IFACE_TENTATIVE`) isn't exposed by the `if-addrs`
+/// crate this enumeration is built on, so `tentative` is always `false` — see
+/// `crate::network::enumerate_live_addrs6`'s doc comment for the same caveat,
+/// and `tasks.md` for tracking.
+#[cfg(feature = "dhcp6")]
+fn enumerate_live_ifaces6() -> Vec<crate::radv::LiveIface6> {
+    crate::network::enumerate_interfaces()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|i| {
+            let std::net::IpAddr::V6(addr) = i.addr else { return None };
+            let prefix = match i.netmask {
+                Some(std::net::IpAddr::V6(mask)) => crate::network::netmask_to_prefix6(mask),
+                _ => 64,
+            };
+            Some(crate::radv::LiveIface6 {
+                if_index: i.index,
+                name: i.name,
+                addr,
+                prefix,
+                tentative: false,
+            })
+        })
+        .collect()
+}
+
+/// Resolve the MTU option value for `iface_name`'s RA, applying `--ra-param`'s
+/// `mtu:<value>|<interface>|off` override and, for the "auto" case, the same
+/// `/proc/sys/net/ipv6/conf/<iface>/mtu` fallback upstream reads under Linux
+/// (radv.c:425-443). Returns `None` to omit the MTU option entirely.
+#[cfg(feature = "dhcp6")]
+fn resolve_ra_mtu(ra_interfaces: &[crate::types::dhcp::RaInterface], iface_name: &str) -> Option<u32> {
+    let cfg = crate::radv::find_iface_param(ra_interfaces, iface_name);
+    let mtu = cfg.map(|c| c.mtu).unwrap_or(0);
+    if mtu < 0 {
+        return None; // "off"
+    }
+    if mtu > 0 {
+        return Some(mtu as u32);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let name = cfg.and_then(|c| c.mtu_name.as_deref()).unwrap_or(iface_name);
+        if let Ok(s) = std::fs::read_to_string(format!("/proc/sys/net/ipv6/conf/{name}/mtu")) {
+            if let Ok(m) = s.trim().parse::<u32>() {
+                return Some(m);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(feature = "dhcp6")]
+fn radv_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Build one RA's wire bytes for `iface_name`/`if_index`'s current live
+/// address/context state, or `None` when there's nothing to advertise
+/// (radv.c:311-312, 411-412).
+///
+/// `--dhcp-option6`-driven RDNSS/DNSSL substitution and the Source-LLA
+/// option (needing an AF_LOCAL MAC lookup this crate doesn't have yet) are
+/// not applied here — tracked in `tasks.md`.
+#[cfg(feature = "dhcp6")]
+fn build_ra_packet(
+    socket: &RadvSocket,
+    if_index: u32,
+    iface_name: &str,
+    contexts: &mut Vec<crate::types::dhcp::DhcpContext>,
+    ra_interfaces: &[crate::types::dhcp::RaInterface],
+    opt_ra: bool,
+    is_dns_server: bool,
+) -> Option<Vec<u8>> {
+    let live_addrs = crate::network::enumerate_live_addrs6().unwrap_or_default();
+    let params = crate::radv::RaBuildParams {
+        now: radv_now_secs(),
+        if_index,
+        iface_name,
+        opt_ra,
+        is_dns_server,
+        hop_limit: socket.hop_limit.clamp(0, 255) as u8,
+        mtu: resolve_ra_mtu(ra_interfaces, iface_name),
+        mac: None,
+    };
+    crate::radv::build_ra_for_interface(&params, &live_addrs, contexts, ra_interfaces)
+        .map(|ra| crate::radv::build_ra(&ra))
+}
+
+/// Send an RA on `if_index`/`iface_name` (multicast, or unicast to `dest`),
+/// plus on every live interface matching a `--bridge-interface` alias of it
+/// (radv.c:846-892's `send_ra_to_aliases` fan-out for unsolicited/periodic
+/// RAs; the same fan-out for a solicited reply is upstream's `icmp6_packet`
+/// alias lookup, handled separately in [`run_radv_loop`]'s RS branch since it
+/// picks the *source* interface's bridge, not the destination's).
+#[cfg(feature = "dhcp6")]
+#[allow(clippy::too_many_arguments)]
+fn send_ra_with_aliases(
+    socket: &RadvSocket,
+    if_index: u32,
+    iface_name: &str,
+    contexts: &mut Vec<crate::types::dhcp::DhcpContext>,
+    ra_interfaces: &[crate::types::dhcp::RaInterface],
+    bridges: &[crate::types::daemon::DhcpBridge],
+    live_ifaces: &[crate::radv::LiveIface6],
+    opt_ra: bool,
+    is_dns_server: bool,
+) {
+    if let Some(packet) = build_ra_packet(socket, if_index, iface_name, contexts, ra_interfaces, opt_ra, is_dns_server) {
+        if let Err(e) = socket.send(if_index, None, &packet) {
+            tracing::warn!("failed to send RA on {iface_name}: {e}");
+        }
+    }
+
+    let live_pairs: Vec<(String, u32)> = live_ifaces.iter().map(|f| (f.name.clone(), f.if_index)).collect();
+    for bridge in bridges.iter().filter(|b| crate::network::nametoindex(&b.iface) == if_index) {
+        for (alias_name, alias_idx) in crate::radv::bridge_alias_targets(bridge, &live_pairs) {
+            if let Some(packet) = build_ra_packet(socket, if_index, iface_name, contexts, ra_interfaces, opt_ra, is_dns_server) {
+                if let Err(e) = socket.send(*alias_idx, None, &packet) {
+                    tracing::warn!("failed to send bridged RA on {alias_name} (alias of {iface_name}): {e}");
+                }
+            }
+        }
+    }
+}
+
+/// The RA reply destination for `handle_icmp6_packet`'s two branches.
+///
+/// Port of radv.c:241 vs radv.c:249's differing `dest` argument to
+/// `send_ra_alias`/`send_ra`: a bridge-aliased reply (`send_ra_alias(now,
+/// bridge_index, bridge->iface, NULL, if_index)`) is always multicast to the
+/// arrival interface regardless of the Router Solicitation's source address;
+/// only the direct (non-bridge) reply unicasts back to the solicitor.
+#[cfg(feature = "dhcp6")]
+fn ra_reply_dest(is_bridge_alias: bool, solicitor: Option<std::net::Ipv6Addr>) -> Option<std::net::Ipv6Addr> {
+    if is_bridge_alias { None } else { solicitor }
+}
+
+/// Handle one received ICMPv6 datagram: dispatch a Router Solicitation to a
+/// (possibly bridge-redirected) RA reply. Echo Replies (SLAAC probes) are not
+/// yet wired to `lease_ping_reply` — tracked in `tasks.md`.
+///
+/// Port of `icmp6_packet()` (radv.c:141-255).
+#[cfg(feature = "dhcp6")]
+#[allow(clippy::too_many_arguments)]
+fn handle_icmp6_packet(
+    socket: &RadvSocket,
+    data: &[u8],
+    if_index: u32,
+    src: std::net::SocketAddr,
+    contexts: &mut Vec<crate::types::dhcp::DhcpContext>,
+    ra_interfaces: &[crate::types::dhcp::RaInterface],
+    bridges: &[crate::types::daemon::DhcpBridge],
+    dhcp_except: &[crate::types::network::Iname],
+    iface_check: &crate::network::IfaceCheckConfig,
+    opt_ra: bool,
+    is_dns_server: bool,
+    quiet_ra: bool,
+) {
+    if data.len() < 8 || data[1] != 0 {
+        return;
+    }
+    if data[0] != crate::radv::ND_ROUTER_SOLICIT {
+        return; // ICMP6_ECHO_REPLY (SLAAC probe) dispatch not yet wired — tasks.md
+    }
+
+    let Some(name) = crate::network::indextoname(if_index) else { return };
+    // radv.c:178 — `--interface`/`--except-interface`/`--listen-address`.
+    if !crate::network::iface_check_name(&name, iface_check) {
+        return;
+    }
+    if crate::radv::blocked_by_dhcp_except(&name, dhcp_except) {
+        return;
+    }
+
+    // radv.c:206-223 — link-layer address option, extracted for logging only.
+    // The scan (and its malformed-option bail-out) runs unconditionally
+    // upstream; only the resulting `my_syslog` call is gated on `quiet_ra`.
+    let mac = match crate::radv::parse_rs_source_mac(data) {
+        Ok(mac) => mac,
+        Err(_) => return, // malformed option — upstream bails out here too
+    };
+    if !quiet_ra {
+        let mac = mac.as_deref().map(crate::util::print_mac).unwrap_or_default();
+        tracing::info!("RTR-SOLICIT({name}) {mac}");
+    }
+
+    let dest = match src {
+        std::net::SocketAddr::V6(s) if !s.ip().is_unspecified() => Some(*s.ip()),
+        _ => None,
+    };
+
+    // radv.c:228-247: a bridge only "claims" the RS when its own interface
+    // resolves AND one of its aliases matches the arrival interface: an
+    // unresolvable bridge (`if_nametoindex` fails, e.g. configured but not
+    // currently present) is skipped in favour of the next bridge, not treated
+    // as a match that silently drops the RS — falling through to the direct
+    // reply below if no bridge ends up claiming it.
+    for bridge in bridges {
+        let bridge_idx = crate::network::nametoindex(&bridge.iface);
+        if bridge_idx == 0 {
+            continue;
+        }
+        if !bridge.aliases.iter().any(|a| crate::util::wildcard_matchn(a, &name, libc::IF_NAMESIZE)) {
+            continue;
+        }
+        if let Some(packet) = build_ra_packet(socket, bridge_idx, &bridge.iface, contexts, ra_interfaces, opt_ra, is_dns_server) {
+            if let Err(e) = socket.send(if_index, ra_reply_dest(true, dest), &packet) {
+                tracing::warn!("failed to send bridged RA reply on {name}: {e}");
+            }
+        }
+        return;
+    }
+
+    if let Some(packet) = build_ra_packet(socket, if_index, &name, contexts, ra_interfaces, opt_ra, is_dns_server) {
+        if let Err(e) = socket.send(if_index, ra_reply_dest(false, dest), &packet) {
+            tracing::warn!("failed to send RA reply on {name}: {e}");
+        }
+    }
+}
+
+/// The Router Advertisement main loop: sends unsolicited RAs on their
+/// scheduled interval and replies to incoming Router Solicitations.
+///
+/// Port of `periodic_ra()` + `icmp6_packet()`'s event-driven halves
+/// (radv.c:141-255, 789-897), run here as one `tokio::select!` loop instead
+/// of upstream's shared `select()`-based main loop.
+#[cfg(feature = "dhcp6")]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_radv_loop(
+    socket: RadvSocket,
+    mut contexts: Vec<crate::types::dhcp::DhcpContext>,
+    ra_interfaces: Vec<crate::types::dhcp::RaInterface>,
+    dhcp_except: Vec<crate::types::network::Iname>,
+    bridges: Vec<crate::types::daemon::DhcpBridge>,
+    opt_ra: bool,
+    is_dns_server: bool,
+    quiet_ra: bool,
+    iface_check: crate::network::IfaceCheckConfig,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    use tokio::io::unix::AsyncFd;
+
+    crate::radv::ra_start_unsolicited_all(&mut contexts, radv_now_secs(), crate::util::rand16);
+
+    let async_fd = AsyncFd::new(socket)?;
+    let mut deadline = tokio::time::Instant::now();
+    let mut recv_buf = vec![0u8; 1500];
+
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                match changed {
+                    Ok(()) if *shutdown.borrow() => return Ok(()),
+                    Ok(()) => continue,
+                    Err(_) => return Ok(()),
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                let live_ifaces = enumerate_live_ifaces6();
+                let now = radv_now_secs();
+                let (targets, next) = crate::radv::periodic_ra(
+                    now, &mut contexts, &live_ifaces, &ra_interfaces, &dhcp_except,
+                    crate::util::rand16, crate::network::indextoname,
+                    |name| crate::network::iface_check_name(name, &iface_check),
+                );
+                for target in &targets {
+                    send_ra_with_aliases(
+                        async_fd.get_ref(), target.if_index, &target.name, &mut contexts,
+                        &ra_interfaces, &bridges, &live_ifaces, opt_ra, is_dns_server,
+                    );
+                }
+                deadline = tokio::time::Instant::now() + match next {
+                    Some(n) => Duration::from_secs(n.saturating_sub(now).max(1)),
+                    None => Duration::from_secs(600),
+                };
+            }
+            ready = async_fd.readable() => {
+                let mut guard = match ready {
+                    Ok(g) => g,
+                    Err(_) => continue,
+                };
+                let result = guard.get_inner().recv(&mut recv_buf);
+                guard.clear_ready();
+                if let Ok(meta) = result {
+                    handle_icmp6_packet(
+                        async_fd.get_ref(), &recv_buf[..meta.len], meta.if_index, meta.src,
+                        &mut contexts, &ra_interfaces, &bridges, &dhcp_except, &iface_check,
+                        opt_ra, is_dns_server, quiet_ra,
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2384,6 +2968,14 @@ mod tests {
             valid: 0,
             #[cfg(feature = "dhcp6")]
             preferred: 0,
+            #[cfg(feature = "dhcp6")]
+            ra_time: 0,
+            #[cfg(feature = "dhcp6")]
+            ra_short_period_start: 0,
+            #[cfg(feature = "dhcp6")]
+            saved_valid: 0,
+            #[cfg(feature = "dhcp6")]
+            address_lost_time: 0,
         }
     }
 
@@ -2913,6 +3505,10 @@ mod tests {
             if_index: 0,
             valid: 0,
             preferred: 0,
+            ra_time: 0,
+            ra_short_period_start: 0,
+            saved_valid: 0,
+            address_lost_time: 0,
         };
 
         let daemon = Daemon {
@@ -3155,6 +3751,14 @@ mod tests {
             valid: 0,
             #[cfg(feature = "dhcp6")]
             preferred: 0,
+            #[cfg(feature = "dhcp6")]
+            ra_time: 0,
+            #[cfg(feature = "dhcp6")]
+            ra_short_period_start: 0,
+            #[cfg(feature = "dhcp6")]
+            saved_valid: 0,
+            #[cfg(feature = "dhcp6")]
+            address_lost_time: 0,
         });
         daemon.dhcp_server_port = 1067;
         daemon.dhcp_reply_delays.push(DhcpReplyDelay {
@@ -3217,6 +3821,14 @@ mod tests {
             valid: 0,
             #[cfg(feature = "dhcp6")]
             preferred: 0,
+            #[cfg(feature = "dhcp6")]
+            ra_time: 0,
+            #[cfg(feature = "dhcp6")]
+            ra_short_period_start: 0,
+            #[cfg(feature = "dhcp6")]
+            saved_valid: 0,
+            #[cfg(feature = "dhcp6")]
+            address_lost_time: 0,
         });
         daemon.dhcp_server_port = 1067;
         daemon.dhcp_client_port = 1068;
@@ -3273,6 +3885,14 @@ mod tests {
             valid: 0,
             #[cfg(feature = "dhcp6")]
             preferred: 0,
+            #[cfg(feature = "dhcp6")]
+            ra_time: 0,
+            #[cfg(feature = "dhcp6")]
+            ra_short_period_start: 0,
+            #[cfg(feature = "dhcp6")]
+            saved_valid: 0,
+            #[cfg(feature = "dhcp6")]
+            address_lost_time: 0,
         });
 
         // Matches the bound interface's own address: should get iface_index bound.
@@ -3334,6 +3954,10 @@ mod tests {
             if_index: 0,
             valid: 0,
             preferred: 0,
+            ra_time: 0,
+            ra_short_period_start: 0,
+            saved_valid: 0,
+            address_lost_time: 0,
         }
     }
 
@@ -4116,5 +4740,176 @@ mod tests {
         }
         let pinger = IcmpPinger::new(50);
         assert!(!AddressProbe::in_use(&pinger, Ipv4Addr::new(192, 168, 1, 1)));
+    }
+
+    // ── RadvSocket / run_radv_loop ────────────────────────────────────────────
+
+    /// Regression test for the bridge-alias reply-destination bug (radv.c:241):
+    /// a bridge-aliased RA reply must always be multicast (`None`), regardless
+    /// of the Router Solicitation's source address, while the direct reply
+    /// unicasts back to the solicitor unchanged.
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn ra_reply_dest_bridge_alias_is_always_multicast_direct_reply_unicasts_to_solicitor() {
+        let solicitor = Some(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+        assert_eq!(ra_reply_dest(true, solicitor), None);
+        assert_eq!(ra_reply_dest(true, None), None);
+        assert_eq!(ra_reply_dest(false, solicitor), solicitor);
+        assert_eq!(ra_reply_dest(false, None), None);
+    }
+
+    /// Whether this process can open a raw `IPPROTO_ICMPV6` socket
+    /// (`CAP_NET_RAW` or root) — see `have_raw_icmp_socket` above for the v4
+    /// equivalent and why tests gate on this instead of a hard-coded result.
+    #[cfg(feature = "dhcp6")]
+    fn have_raw_icmp6_socket() -> bool {
+        socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::RAW, Some(socket2::Protocol::ICMPV6)).is_ok()
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn radv_socket_new_without_capability_errors() {
+        if have_raw_icmp6_socket() {
+            return;
+        }
+        assert!(RadvSocket::new(false).is_err());
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn radv_socket_new_reads_hop_limit() {
+        if !have_raw_icmp6_socket() {
+            return;
+        }
+        let sock = RadvSocket::new(false).expect("raw socket should open with CAP_NET_RAW");
+        assert!(sock.hop_limit > 0, "IPV6_UNICAST_HOPS should be a positive default");
+    }
+
+    /// End-to-end proof that `ra_init`'s `ICMP6_FILTER` actually filters:
+    /// sending ourselves both a passed type (Router Solicitation) and a
+    /// blocked type over loopback, only the former should ever come back out
+    /// of `recv()` — a real kernel round trip, not just a unit test of the
+    /// bit-twiddling.
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn radv_socket_filter_passes_rs_and_blocks_other_types() {
+        if !have_raw_icmp6_socket() {
+            return;
+        }
+        let socket = match RadvSocket::new(false) {
+            Ok(s) => s,
+            Err(_) => return, // e.g. IPv6 loopback disabled in this sandbox
+        };
+
+        let blocked_type_packet = vec![200u8, 0, 0, 0, 0, 0, 0, 0];
+        let rs_packet = vec![crate::radv::ND_ROUTER_SOLICIT, 0, 0, 0, 0, 0, 0, 0];
+        let _ = socket.send(0, Some(Ipv6Addr::LOCALHOST), &blocked_type_packet);
+        let _ = socket.send(0, Some(Ipv6Addr::LOCALHOST), &rs_packet);
+
+        let mut buf = [0u8; 64];
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut got_rs = false;
+        while std::time::Instant::now() < deadline {
+            match socket.recv(&mut buf) {
+                Ok(meta) if meta.len >= 1 => {
+                    assert_ne!(buf[0], 200, "ICMP6_FILTER should have blocked type 200");
+                    if buf[0] == crate::radv::ND_ROUTER_SOLICIT {
+                        got_rs = true;
+                        break;
+                    }
+                }
+                _ => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        assert!(got_rs, "the passed Router Solicitation type should have come back through recv()");
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn radv_dest_needs_scope_id_for_link_local_and_multicast() {
+        assert!(radv_dest_needs_scope_id("fe80::1".parse().unwrap()));
+        assert!(radv_dest_needs_scope_id("ff02::1".parse().unwrap()));
+        assert!(!radv_dest_needs_scope_id("2001:db8::1".parse().unwrap()));
+        assert!(!radv_dest_needs_scope_id("ff0e::1".parse().unwrap())); // global-scope multicast
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn resolve_ra_mtu_explicit_value() {
+        let ifaces = vec![crate::types::dhcp::RaInterface {
+            name: "eth0".into(), mtu_name: None, interval: 0, lifetime: -1, prio: 0, mtu: 1500,
+        }];
+        assert_eq!(resolve_ra_mtu(&ifaces, "eth0"), Some(1500));
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn resolve_ra_mtu_off_is_none() {
+        let ifaces = vec![crate::types::dhcp::RaInterface {
+            name: "eth0".into(), mtu_name: None, interval: 0, lifetime: -1, prio: 0, mtu: -1,
+        }];
+        assert_eq!(resolve_ra_mtu(&ifaces, "eth0"), None);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn resolve_ra_mtu_no_config_is_none_off_linux_or_missing_proc_entry() {
+        // No matching `ra-param` at all: mtu defaults to 0 ("auto"), which
+        // falls through to a `/proc` read that won't resolve for a
+        // nonexistent interface name, so this should come back `None`.
+        assert_eq!(resolve_ra_mtu(&[], "nonexistent-iface-xyz"), None);
+    }
+
+    #[cfg(feature = "dhcp6")]
+    #[tokio::test]
+    async fn run_radv_loop_sends_unsolicited_ra_when_capability_available() {
+        if !have_raw_icmp6_socket() {
+            return;
+        }
+        let socket = match RadvSocket::new(false) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        // A DHCPv6 context on whatever interface actually has a live address
+        // right now, so `build_ra_for_interface` has a link-local source to
+        // advertise from — a synthetic interface would never match a live
+        // address and `run_radv_loop` would (correctly) send nothing.
+        let live = crate::network::enumerate_live_addrs6().unwrap_or_default();
+        let Some(global) = live.iter().find(|a| {
+            let ip = a.addr;
+            !ip.is_loopback() && !ip.is_multicast() && !crate::network::is_link_local_v6(ip)
+        }) else {
+            // No non-link-local IPv6 address anywhere on this host/sandbox;
+            // nothing to build a meaningful context from.
+            return;
+        };
+
+        let ctx = crate::types::dhcp::DhcpContext {
+            lease_time: 3600, addr_epoch: 0,
+            netmask: Ipv4Addr::UNSPECIFIED, broadcast: Ipv4Addr::UNSPECIFIED,
+            local: Ipv4Addr::UNSPECIFIED, router: Ipv4Addr::UNSPECIFIED,
+            start: Ipv4Addr::UNSPECIFIED, end: Ipv4Addr::UNSPECIFIED,
+            flags: crate::types::dhcp::CONTEXT_RA | crate::types::dhcp::CONTEXT_CONSTRUCTED,
+            netid: crate::types::dhcp::DhcpNetid { net: String::new() },
+            filter: vec![],
+            start6: global.addr, end6: global.addr, local6: Ipv6Addr::UNSPECIFIED,
+            prefix: global.prefix, if_index: global.if_index as i32,
+            valid: 0, preferred: 0,
+            ra_time: 0, ra_short_period_start: 0, saved_valid: 0, address_lost_time: 0,
+        };
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_radv_loop(
+            socket, vec![ctx], vec![], vec![], vec![], false, false, false,
+            crate::network::IfaceCheckConfig::default(), shutdown_rx,
+        ));
+
+        // `ra_start_unsolicited_all` schedules within 0-5s; give it a moment
+        // to fire, then shut the loop down cleanly either way.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        shutdown_tx.send(true).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), task).await;
+        assert!(result.is_ok(), "run_radv_loop should stop promptly on shutdown");
     }
 }
