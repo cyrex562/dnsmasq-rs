@@ -304,6 +304,17 @@ pub struct Daemon {
     pub duid_config:     Option<Vec<u8>>,
     #[cfg(feature = "dhcp6")]
     pub duid_enterprise: u32,
+    /// `daemon->doing_dhcp6` (`dnsmasq.h:1238`): set at startup when any
+    /// `dhcp6` context carries `CONTEXT_DHCP` (`dnsmasq.c:288-296`). Not
+    /// directly config-set; derived from `dhcp6` at `init_daemon_with` time.
+    #[cfg(feature = "dhcp6")]
+    pub doing_dhcp6:     bool,
+    /// `daemon->doing_ra` (`dnsmasq.h:1238`): set at startup from
+    /// `option_bool(OPT_RA)` and/or any `dhcp6` context carrying
+    /// `CONTEXT_RA` (`dnsmasq.c:288-296`). Not directly config-set; derived
+    /// from `dhcp6`/`OPT_RA` at `init_daemon_with` time.
+    #[cfg(feature = "dhcp6")]
+    pub doing_ra:        bool,
 
     // ── DNSSEC (feature-gated) ────────────────────────────────────────────────
     #[cfg(feature = "dnssec")]
@@ -544,6 +555,10 @@ impl Default for Daemon {
             duid_config: None,
             #[cfg(feature = "dhcp6")]
             duid_enterprise: 0,
+            #[cfg(feature = "dhcp6")]
+            doing_dhcp6: false,
+            #[cfg(feature = "dhcp6")]
+            doing_ra: false,
 
             #[cfg(feature = "dnssec")]
             ds: vec![],

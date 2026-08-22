@@ -1299,6 +1299,19 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     are ported and can now be fed real `Daemon` state, but nothing calls
     `add_edns0_config` from the forward path yet — see the `edns0.c` entry
     above.
+  - `doing_ra`/`doing_dhcp6` (`dnsmasq.h:1238`) are not directly config-set —
+    upstream derives them at startup (`dnsmasq.c:288-296`) from whether any
+    `dhcp6` context is configured, `option_bool(OPT_RA)` (the `enable-ra`
+    directive), and each context's `CONTEXT_DHCP`/`CONTEXT_RA` flags. Both
+    fields now exist on `Daemon` (`dhcp6`-gated) and are populated in
+    `dnsmasq::init_daemon_with`, mirroring the upstream gating exactly
+    (the whole block is skipped when `daemon.dhcp6` is empty, so `OPT_RA`
+    alone never sets `doing_ra` without at least one `dhcp6` context). No
+    consumer reads them yet — the RA/DHCPv6 socket bring-up and poll-loop
+    dispatch that upstream gates on these flags
+    (`dnsmasq.c:337,413,1010,1146,1149,1316,1319`; `network.c:1787-1806`;
+    `radv.c:93,114`) has no Rust equivalent, consistent with the broader
+    startup/runtime gap tracked under CLAUDE.md priority #3.
   Required tests: `src/option.rs` directive-level tests for every directive
   above (`apply_dhcp_broadcast_*`, `apply_dhcp_proxy_*`,
   `apply_dhcp_pxe_vendor`, `apply_pxe_prompt_*`, `apply_pxe_service_*`,
