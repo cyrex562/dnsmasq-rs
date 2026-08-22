@@ -2694,6 +2694,11 @@ pub async fn run_forward_loop_on(
             // ── Periodic expiry cleanup ───────────────────────────────────────
             _ = ticker.tick() => {
                 let _expired = engine.expire_queries();
+                // Drain any backlog in the syslog queue (log.c's
+                // `check_log_writer`, normally driven by `POLLOUT`
+                // readiness on the log fd; see `src/log.rs` for why a
+                // periodic drain is the substitute here).
+                crate::log::check_log_writer(true);
             }
         }
     }

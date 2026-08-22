@@ -527,16 +527,30 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     "process is missing required capability NET_ADMIN" (`dnsmasq.c:576-583`); here a
     capability that is not permitted surfaces later as a `capset` failure during the drop.
     Both are fatal, but the Rust diagnostic is worse.
-  - No syslog *socket*. `src/log.rs` ports `log_start`/`log_reopen`/`my_syslog` and is now
-    wired into startup, but with no `log-facility` the fallback is stderr, not
-    `/dev/log` — so a backgrounded daemon with no `log-facility` still logs nowhere,
-    where upstream would reach syslog. Consequently `log-facility=<facility-name>`
-    (`daemon`, `local0`, …) and `log-facility=-` are treated as file paths rather than as
-    facility selectors, and `log_fac`/`log-async` queueing are parsed but inert.
-    `log_start` also does not `fchown` the log file to the run user (log.c), so a
-    root-created log file stays root-owned after the drop.
+  - `src/log.rs` now has a real syslog client (Issue #51 / T3-log): a non-blocking
+    `AF_UNIX SOCK_DGRAM` connection to `/dev/log` (falling back to `SOCK_STREAM` on
+    `EPROTOTYPE`), a `max_logs`-bounded queue with the `EAGAIN`/`EPIPE`/`ECONNREFUSED`/
+    `ENOTCONN`/`EDESTADDRREQ`/`ECONNRESET`/`ENOBUFS` recovery state machine from
+    `log_write()` (log.c:164-284), and the exponential nanosleep-backoff retry from
+    `my_syslog()` (log.c:406-442). With no `--log-facility`, output now reaches the real
+    syslog socket by default (previously it reached nowhere but stderr/tracing).
+    `--log-facility=<name>` (`daemon`, `local0`, …) is looked up against a facility table
+    and sets `daemon.log_fac`; `--log-facility=<path-or-->` still sets `daemon.log_file`
+    (`option.c:2279-2298`). A permanently unreachable/closed socket falls back to a
+    blocking `openlog()`/`syslog()` call, matching `my_syslog`'s `log_fd == -1` branch —
+    the one place either implementation deliberately blocks.
+    `set_log_writer`/`check_log_writer` are wired to `forward.rs`'s existing 1-second
+    ticker rather than to `POLLOUT` fd-readiness (no generic poll-registration exists to
+    hook into); since every write is already non-blocking this costs at most one tick of
+    latency, never correctness. Still not ported: `fchown`-ing a log file to the run user,
+    `log-facility=-` duplicating `STDERR_FILENO` instead of being treated as a filename
+    named `-`, and the Android/Solaris branches (`__android_log_vprint`, the
+    `HAVE_SOLARIS_NETWORK` no-socket path) — all deliberately out of scope for a
+    Linux-only port.
   - `my_syslog` output now passes through the `tracing` `EnvFilter`, so `RUST_LOG` can
     suppress records upstream would always write. Upstream filters only on `MS_DEBUG`.
+    This is additive, not a replacement: the real `/dev/log` delivery above happens
+    regardless of what `tracing`/`RUST_LOG` does with the same message.
   - Solaris `priv_set`/`setppriv` (`dnsmasq.c:775-795`) is deliberately out of scope; the
     capability path is Linux-only and other platforms just `setgroups`/`setgid`/`setuid`.
   - `helper::create_helper` (a real port of `create_helper`, helper.c:79-691: forks a

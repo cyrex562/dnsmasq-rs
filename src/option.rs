@@ -1105,8 +1105,18 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
         }
 
         "log-facility" => {
+            // `option.c:2279-2298`: a value containing `/` or exactly `-` is
+            // a file path; anything else is looked up as a facility name
+            // (`daemon`, `local0`, ...) and rejected if it isn't one.
             let v = require_value("log-facility")?;
-            daemon.log_file = Some(v.to_string());
+            if v.contains('/') || v == "-" {
+                daemon.log_file = Some(v.to_string());
+            } else {
+                match crate::log::facility_by_name(v) {
+                    Some(fac) => daemon.log_fac = fac as i32,
+                    None => return Err(invalid(v, "bad log facility")),
+                }
+            }
         }
 
         "log-async" => {
@@ -7354,6 +7364,47 @@ mod tests {
         let resolved =
             resolve_config(&parse_config_text("pid-file=", "test.conf").unwrap()).unwrap();
         assert_eq!(resolved.daemon.runfile, None);
+    }
+
+    // ── log-facility: filename vs. facility name (log.c:64-69, option.c:2279-2298) ──
+
+    /// A bare facility name sets `log_fac` and leaves `log_file` unset — this is
+    /// the branch that was entirely missing before: every value used to be
+    /// treated as a file path.
+    #[test]
+    fn log_facility_name_sets_log_fac_not_log_file() {
+        let resolved =
+            resolve_config(&parse_config_text("log-facility=local0", "test.conf").unwrap()).unwrap();
+        assert_eq!(resolved.daemon.log_fac, crate::log::LOG_LOCAL0 as i32);
+        assert_eq!(resolved.daemon.log_file, None);
+    }
+
+    #[test]
+    fn log_facility_daemon_name_maps_to_log_daemon() {
+        let resolved =
+            resolve_config(&parse_config_text("log-facility=daemon", "test.conf").unwrap()).unwrap();
+        assert_eq!(resolved.daemon.log_fac, crate::log::LOG_DAEMON as i32);
+        assert_eq!(resolved.daemon.log_file, None);
+    }
+
+    /// A value containing `/` is a file path, matching `option.c:2281`'s
+    /// `strchr(arg, '/')` check.
+    #[test]
+    fn log_facility_path_sets_log_file_not_log_fac() {
+        let resolved = resolve_config(
+            &parse_config_text("log-facility=/tmp/dnsmasq.log", "test.conf").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resolved.daemon.log_file.as_deref(), Some("/tmp/dnsmasq.log"));
+        assert_eq!(resolved.daemon.log_fac, -1);
+    }
+
+    #[test]
+    fn log_facility_unknown_name_is_rejected() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("log-facility=not-a-facility", "test.conf").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "log-facility"));
     }
 
     #[test]

@@ -146,7 +146,17 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
     // talking to the terminal even when `log-facility` points at a file.
     let log_path = daemon.log_file.as_deref().map(std::path::Path::new);
     let log_debug = daemon.option_bool(types::constants::OPT_LOG_DEBUG);
-    if let Err(e) = log::log_start(log_path, None, debug, log_debug) {
+    // `daemon->log_fac != -1` wins; otherwise `-d` defaults to `LOG_LOCAL0`
+    // and everything else defaults to `LOG_DAEMON` inside `log_start`
+    // (log.c:64-69).
+    let log_fac = if daemon.log_fac != -1 {
+        Some(daemon.log_fac as u32)
+    } else if debug {
+        Some(log::LOG_LOCAL0)
+    } else {
+        None
+    };
+    if let Err(e) = log::log_start(log_path, log_fac, debug, log_debug, daemon.max_logs) {
         let target = daemon.log_file.as_deref().unwrap_or("");
         return Err(format!("failed to open log file {target}: {e}").into());
     }
