@@ -395,15 +395,23 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     `forward::domain_find_sets`/`IpSet` — nothing constructs an `IpSet` from parsed config,
     so unifying the two types is still follow-up work) and reports every matched A/AAAA address
     via `ExtractOutcome::ipset_hits`; `forward::cache_upstream_reply` now calls
-    `ipset::add_to_ipset` for each hit (feature = `ipset`, Linux only), which opens a
-    `NETLINK_NETFILTER` socket and sends the `IPSET_CMD_ADD` built by the existing
-    `ipset::build_ipset_msg`, mirroring `add_to_ipset()`/`new_add_to_ipset()`
-    (`ipset.c:104-141,177-193`) fire-and-forget (no ACK is awaited, matching upstream). Off
-    Linux or without the `ipset` feature, the match is still logged via `tracing::debug!` so it
-    stays observable. Not ported: the pre-2.6.32 `SOL_IP`/`getsockopt` fallback (`old_kernel` in
-    `ipset.c` — this crate tracks no `kernel_version` to gate it on) and reusing a single
-    persistent socket across calls the way `ipset_init()` does (a socket is opened and closed
-    per call here instead; correctness is unaffected, only efficiency).
+    `ipset::add_to_ipset` for each hit (feature = `ipset`, Linux only), which sends the
+    `IPSET_CMD_ADD` built by the existing `ipset::build_ipset_msg`, mirroring
+    `add_to_ipset()`/`new_add_to_ipset()` (`ipset.c:104-141,177-193`) fire-and-forget (no ACK is
+    awaited, matching upstream). Off Linux or without the `ipset` feature, the match is still
+    logged via `tracing::debug!` so it stays observable. `ipset::ipset_init()` now ports the
+    new-kernel half of `ipset_init()` (`ipset.c:86-100`): it opens and binds one persistent
+    `NETLINK_NETFILTER` socket, called from `dnsmasq::init_daemon_with` when `daemon.ipsets` is
+    non-empty (mirroring `dnsmasq.c:352-358`), and every `add_to_ipset` call reuses that socket
+    when present, falling back to a per-call socket otherwise (e.g. `ipset_init` was never
+    called, or failed). Unlike upstream's `die()` on socket failure, `ipset_init` returns `Err`
+    for the caller to log; this port doesn't kill the whole daemon over an ipset socket failure,
+    and every call site still degrades to the working per-call fallback. Not ported: the
+    pre-2.6.32 `SOL_IP`/`getsockopt` fallback (`old_kernel` in `ipset.c` — this crate tracks no
+    `kernel_version` to gate it on). `ipset::parse_ipset_list` (parses `/proc/net/ip_set`) has no
+    upstream counterpart and no caller anywhere in the crate — it's invented, documented as such
+    in its doc comment, and kept only as a potential building block for a future startup sanity
+    check that has not been implemented.
 
   - **nftset now uses upstream's real mechanism (libnftables FFI), not raw netlink.** The
     previous `nftset.rs` built a raw `NEWSETELEM` nfnetlink message with attribute numbers that
