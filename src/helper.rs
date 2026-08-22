@@ -517,18 +517,38 @@ pub fn create_helper(command: Option<String>, drop_to: Option<(Uid, Gid)>, log_d
 fn close_inherited_fds(keep: std::os::unix::io::RawFd) {
     use std::os::unix::io::RawFd;
 
-    let fds: Vec<RawFd> = match std::fs::read_dir("/proc/self/fd") {
-        Ok(entries) => entries
-            .flatten()
-            .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<RawFd>().ok()))
-            .collect(),
-        Err(_) => return,
-    };
-
-    for fd in fds {
-        if fd > 2 && fd != keep {
-            unsafe { libc::close(fd) };
+    unsafe {
+        let d = libc::opendir(b"/proc/self/fd\0".as_ptr() as *const i8);
+        if d.is_null() {
+            return; // Silently skip if /proc/self/fd can't be opened
         }
+
+        let dirfd = libc::dirfd(d);
+        if dirfd < 0 {
+            libc::closedir(d);
+            return;
+        }
+
+        loop {
+            let entry_ptr = libc::readdir(d);
+            if entry_ptr.is_null() {
+                break;
+            }
+
+            let entry = &*entry_ptr;
+            // Try to parse the directory entry name as an fd number
+            let name_cstr = std::ffi::CStr::from_ptr(entry.d_name.as_ptr());
+            if let Ok(name) = name_cstr.to_str() {
+                if let Ok(fd) = name.parse::<RawFd>() {
+                    // Skip stdin/stdout/stderr, the keep fd, and the directory fd itself
+                    if fd > 2 && fd != keep && fd != dirfd {
+                        libc::close(fd);
+                    }
+                }
+            }
+        }
+
+        libc::closedir(d);
     }
 }
 

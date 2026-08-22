@@ -1,6 +1,9 @@
 /target
 /parity/artifacts
 
+# Core dumps from crashed test binaries
+core.[0-9]*
+
 # Python bytecode from the harness tooling
 __pycache__/
 *.pyc

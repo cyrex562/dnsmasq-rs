@@ -444,20 +444,34 @@ pub fn close_fds(max_fd: i64, spare1: i32, spare2: i32, spare3: i32) {
 
     #[cfg(target_os = "linux")]
     {
-        if let Ok(dir) = std::fs::read_dir("/proc/self/fd") {
-            for entry in dir.flatten() {
-                if let Ok(name) = entry.file_name().into_string() {
-                    if let Ok(fd) = name.parse::<i32>() {
-                        // Skip the fd used by read_dir itself (we can't know
-                        // it exactly, but it will be ≥ 3; just skip spares).
-                        if spares.contains(&fd) {
-                            continue;
+        unsafe {
+            let d = libc::opendir(b"/proc/self/fd\0".as_ptr() as *const i8);
+            if !d.is_null() {
+                let dirfd = libc::dirfd(d);
+                if dirfd >= 0 {
+                    loop {
+                        let entry_ptr = libc::readdir(d);
+                        if entry_ptr.is_null() {
+                            break;
                         }
-                        unsafe { libc::close(fd) };
+                        let entry = &*entry_ptr;
+                        // Try to parse the directory entry name as an fd number
+                        let name_cstr = std::ffi::CStr::from_ptr(entry.d_name.as_ptr());
+                        if let Ok(name) = name_cstr.to_str() {
+                            if let Ok(fd) = name.parse::<i32>() {
+                                // Skip the directory fd itself (matching util.c:848 "fd == dirfd(d)")
+                                // and all the standard spare fds
+                                let is_spare = spares.contains(&fd);
+                                if fd != dirfd && !is_spare {
+                                    libc::close(fd);
+                                }
+                            }
+                        }
                     }
                 }
+                libc::closedir(d);
+                return;
             }
-            return;
         }
     }
 
@@ -567,18 +581,43 @@ pub fn expand_workspace(workspace: &mut Vec<Vec<u8>>, needed: usize) -> bool {
 
 #[cfg(target_os = "linux")]
 pub fn kernel_version() -> u32 {
-    use std::process::Command;
-    let output = Command::new("uname").arg("-r").output().ok();
-    let release = output
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
-    let parts: Vec<u32> = release.trim().splitn(4, '.').take(3)
-        .map(|p| p.split(|c: char| !c.is_ascii_digit()).next().unwrap_or("0")
-            .parse().unwrap_or(0))
-        .collect();
-    (parts.get(0).copied().unwrap_or(0) << 16)
-        | (parts.get(1).copied().unwrap_or(0) << 8)
-        | parts.get(2).copied().unwrap_or(0)
+    use std::ffi::CStr;
+
+    unsafe {
+        let mut utsname: libc::utsname = std::mem::zeroed();
+        if libc::uname(&mut utsname) < 0 {
+            // uname failed (should never happen on Linux), return 0.0.0
+            return 0;
+        }
+
+        let release_cstr = CStr::from_ptr(utsname.release.as_ptr());
+        let release = release_cstr.to_string_lossy();
+
+        let mut version = 0u32;
+        let mut part_count = 0;
+
+        for part in release.split('.') {
+            if part_count >= 3 {
+                break;
+            }
+
+            let num_str = part.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>();
+
+            let num = num_str.parse::<u32>().unwrap_or(0);
+            version = (version << 8) | (num & 0xFF);
+            part_count += 1;
+        }
+
+        // Shift left to account for any missing parts
+        while part_count < 3 {
+            version = version << 8;
+            part_count += 1;
+        }
+
+        version
+    }
 }
 
 // ── Domain name validation (ported from util.c:137-202) ──────────────────────
@@ -933,5 +972,98 @@ mod tests {
     #[test]
     fn check_hostname_label_empty() {
         assert!(!check_hostname_label(""));
+    }
+
+    // ── kernel_version ───────────────────────────────────────────────────────
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn kernel_version_returns_valid_version() {
+        let version = kernel_version();
+        // Should return a non-zero packed version int (major.minor.patch)
+        // At minimum, should be > 0 on any real Linux system
+        assert!(version > 0, "kernel_version should return non-zero on Linux");
+        // Sanity check: major version should be at most 2 bytes (< 256 << 16)
+        assert!(version < (256u32 << 16), "major version seems unreasonably high");
+    }
+
+    // ── close_fds ────────────────────────────────────────────────────────────
+
+    // close_fds() closes every fd in the process, including ones Tokio
+    // runtimes on other test threads depend on (epoll/eventfd/timerfd), so it
+    // must never run in-process inside the shared `cargo test` binary. Fork
+    // first, exactly like helper.rs's
+    // close_inherited_fds_closes_unrelated_descriptors, so the real close-all
+    // only ever happens in a throwaway child.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn close_fds_skips_directory_fd() {
+        use nix::sys::wait::waitpid;
+        use nix::unistd::{fork, pipe, ForkResult};
+        use std::io::{Read, Write};
+        use std::os::unix::io::AsRawFd;
+
+        let (result_r, result_w) = pipe().expect("pipe failed");
+
+        match unsafe { fork() }.expect("fork failed") {
+            ForkResult::Child => {
+                drop(result_r);
+                // close_fds() closes every fd except its spares, including
+                // this one — it must be spared too or the child can never
+                // report its result back to the parent.
+                let result_w_fd = result_w.as_raw_fd();
+
+                // Create a pipe to have fds we want to spare.
+                let (spare_read, spare_write) = nix::unistd::pipe().expect("pipe failed");
+                let spare_write_fd = spare_write.as_raw_fd();
+                let spare_read_fd = spare_read.as_raw_fd();
+                let max_fd = spare_write_fd as i64 + 10;
+
+                // Create some other fds that should get closed.
+                let fd1 = unsafe { libc::open(b"/dev/null\0".as_ptr() as *const i8, libc::O_WRONLY) };
+                let fd2 = unsafe { libc::open(b"/dev/null\0".as_ptr() as *const i8, libc::O_WRONLY) };
+
+                let mut ok = fd1 > 2 && fd1 != spare_write_fd && fd2 > 2 && fd2 != spare_write_fd;
+
+                // Forget the OwnedFds so close_fds is the only thing that
+                // touches them from here on.
+                std::mem::forget(spare_read);
+                std::mem::forget(spare_write);
+
+                // Call close_fds, sparing stdin/stdout/stderr, both pipe
+                // ends, and the result-reporting fd. If close_fds closed its
+                // own /proc/self/fd directory fd mid-scan, this call would
+                // misbehave (panic, loop incorrectly, or fail to close
+                // fd1/fd2) rather than return cleanly.
+                close_fds(max_fd, spare_write_fd, spare_read_fd, result_w_fd);
+
+                // fd1/fd2 should now be closed (EBADF on write).
+                let write_result = unsafe { libc::write(fd1, b"test" as *const u8 as *const libc::c_void, 4) };
+                ok &= write_result == -1;
+
+                // spare_write_fd must still be open and functional.
+                let write_result = unsafe {
+                    libc::write(spare_write_fd, b"X" as *const u8 as *const libc::c_void, 1)
+                };
+                ok &= write_result == 1;
+
+                unsafe {
+                    libc::close(spare_write_fd);
+                    libc::close(spare_read_fd);
+                }
+
+                let mut f = std::fs::File::from(result_w);
+                let _ = f.write_all(&[u8::from(ok)]);
+                unsafe { libc::_exit(0) };
+            }
+            ForkResult::Parent { child } => {
+                drop(result_w);
+                let mut f = std::fs::File::from(result_r);
+                let mut buf = [0u8; 1];
+                f.read_exact(&mut buf).expect("child did not report a result");
+                waitpid(child, None).expect("waitpid failed");
+                assert_eq!(buf[0], 1, "close_fds misbehaved when run against its own directory fd");
+            }
+        }
     }
 }
