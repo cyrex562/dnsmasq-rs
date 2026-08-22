@@ -579,6 +579,7 @@ impl DnsmasqInterface {
         Ok(())
     }
 
+    #[zbus(name = "SetFilterWin2KOption")]
     async fn set_filter_win2k_option(&self, enabled: bool) {
         let mut d = self.ctx.daemon.write().await;
         apply_bool_option(&mut d, OPT_FILTER, enabled);
@@ -589,6 +590,7 @@ impl DnsmasqInterface {
         apply_filter_a(&mut d, enabled);
     }
 
+    #[zbus(name = "SetFilterAAAA")]
     async fn set_filter_aaaa(&self, enabled: bool) {
         let mut d = self.ctx.daemon.write().await;
         apply_filter_aaaa(&mut d, enabled);
@@ -1154,5 +1156,27 @@ mod tests {
             .expect("GetVersion call should succeed against our own connection");
         let version: String = reply.body().deserialize().expect("GetVersion should reply with a string");
         assert_eq!(version, get_version());
+
+        // Regression check for the pascal_case-derived member-name trap:
+        // zbus's `#[interface]` macro auto-derives D-Bus member names from
+        // the Rust method identifier and only capitalizes the first letter
+        // of each `_`-separated segment, so `set_filter_win2k_option` would
+        // otherwise register as `SetFilterWin2kOption` and `set_filter_aaaa`
+        // as `SetFilterAaaa` — neither matches the upstream wire name a real
+        // caller (dbus-send, NetworkManager) actually invokes. Reuses this
+        // test's already-established connection/name rather than a second
+        // bus name, since this sandbox's D-Bus policy only allows this one.
+        for (method, enabled) in [("SetFilterWin2KOption", true), ("SetFilterAAAA", false)] {
+            connection
+                .call_method(
+                    Some("uk.org.thekelleys.dnsmasq.test"),
+                    DNSMASQ_DBUS_PATH,
+                    Some(DNSMASQ_DBUS_INTERFACE),
+                    method,
+                    &(enabled,),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{method} should be reachable under its upstream wire name: {e}"));
+        }
     }
 }
