@@ -3149,25 +3149,81 @@ Both are reference-only. Do not treat either tree as code to edit in place.
 
 ## P4 Test Harness And Tooling
 
-- [ ] Build reusable parity fixtures.
+- [x] Build reusable parity fixtures (Issue #124).
   Include: config files, hosts files, resolv files, zone-like local data, deterministic query sets, DHCP packet traces.
   Done when: the same fixture directory can drive both upstream dnsmasq and `dnsmasq-rs`.
+  Update: expanded `parity/fixtures/dns/` from the single `basic` fixture to four —
+  `basic` (host/CNAME/TXT/MX/SRV/PTR), `negative` (NXDOMAIN/NODATA shape), `local-block`
+  (`--address=/domain/ip`, `--address=/domain/#` NULL address, `--address=/domain/`/
+  `--server=/domain/` block, `--address=/#/ip` wildcard vs. a more specific `host-record`),
+  and `cname-chain` (multi-hop CNAME resolution, dead-end CNAME NODATA). DHCP packet traces
+  are still out of scope — this lane needs `NET_ADMIN`/`NET_RAW` container capabilities not
+  yet wired up (see `parity/README.md`'s "Next Expansion Points").
 
-- [ ] Build a test runner that launches both binaries in isolation.
+- [x] Build a test runner that launches both binaries in isolation (Issue #124).
   Requirements: temp directories, isolated ports, deterministic inputs, normalized output capture, cleanup on failure.
   Done when: one command can execute a parity suite and emit actionable diffs.
+  Update: `parity/run-suite.sh` builds both images once and runs every fixture directory
+  under `parity/fixtures/dns/` in turn (`parity_probe` per fixture), printing a pass/fail
+  summary; `parity/run-major.sh` remains for single-fixture runs (what `harness/gate.sh
+  --parity` calls). Also added `.dockerignore` at the repo root — its absence meant every
+  build transferred the entire `target/` directory (tens of GB) as Docker build context,
+  turning each run into a 10+ minute (sometimes multi-hour) context transfer for no benefit;
+  neither Dockerfile reads a pre-built `target/`.
 
-- [ ] Normalize comparison outputs to behavior, not brittle incidental details.
+- [x] Normalize comparison outputs to behavior, not brittle incidental details (Issue #124).
   Compare: DNS replies, DHCP replies, cache/reload effects, exit status, accepted or rejected configs, stable log signals where useful.
   Do not overcompare: nondeterministic timestamps, unstable ordering, environment-specific formatting.
   Done when: failures point to real semantic differences.
+  Update: `src/bin/parity_probe.rs` already did this (rcode/TC/sorted-RR normalization,
+  lowercased names) before this pass touched it; confirmed still accurate — no changes needed
+  here, the expansion above was fixtures/runner, not the comparator.
+
+- [x] Add regression fixtures for every upstream mismatch found (Issue #124).
+  Done when: parity bugs stay fixed after refactors.
+  Update: running the new fixtures against real containers (not just unit tests) surfaced
+  three real behavioral bugs, all fixed and now covered by both a fixture and a unit test:
+  1. **A query with no local match and zero upstream servers configured was silently
+     dropped instead of answered REFUSED.** `ForwardEngine::forward_query`'s
+     `self.config.upstreams.is_empty()` check returned `ForwardOutcome::Dropped`; traced to
+     upstream's `forward_query()` (`forward.c:344-350`): `lookup_domain()` failing sets
+     `flags = 0`/`ede = EDE_NOT_READY` and jumps to `reply:`, where `setup_reply()`'s
+     catch-all "nowhere to forward to" branch answers REFUSED (`rfc1035.c:1291-1298`), never
+     drops silently. Fixed to return `ForwardOutcome::Refused` (already wired to
+     `make_refused_answer`). This also corrected a previously-wrong test expectation in
+     `tests/local_answer_integration.rs` (`unknown_name_is_not_answered_locally` asserted
+     "the client must see nothing", which was the same misconception that caused the bug).
+     Covered by the `negative` fixture and `forward::tests::forward_query_refuses_when_no_upstreams_are_configured`.
+  2. **`address=/domain/#` (the NULL-address / RFC-1918-blackhole form) was misparsed as an
+     `<address>#<port>` string with an empty address**, producing a hard config error
+     ("invalid value '' for 'address': expected an IP address") instead of the documented
+     0.0.0.0/:: behavior. `option.c:3093-3097` only gives `#` this meaning when it is the
+     *entire* address argument (`option == 'A'`, `--address`-only — `--server`/`--local`
+     don't get this special case). Fixed in `parse_server_or_address` with an exact
+     `addr_part == "#"` check before the port-split logic, setting `SERV_ALL_ZEROS` (the
+     RR-emission side already existed and was tested — only the parser was missing this
+     form). Covered by the `local-block` fixture and
+     `option::tests::apply_address_hash_creates_null_address_server`.
+  3. **`address=/#/ip` (the wildcard-catch-all form) never matched anything** — the parser
+     stored the domain as the literal string `"#"`, which the domain-matching engine has no
+     special handling for, so every query fell through to the (now-REFUSED, previously
+     silently-dropped) "no match" path instead of the wildcard's configured address.
+     Upstream doesn't special-case `"#"` in the matching engine either — it rewrites `#` to
+     an *empty* domain string at parse time (`option.c:3136-3138`, "address=/#/ matches the
+     same as without domain"), reusing the general/fallback server-entry mechanism a bare
+     `address=1.2.3.4` (no `/domain/` prefix) already relies on. Fixed by making the same
+     rewrite in the domain-splitting step, keeping the empty-string entry in the domain list
+     (rather than filtering it out as a stray empty split segment) so a mixed directive like
+     `/specific.test/#/1.2.3.4` still produces one entry per domain, wildcard included.
+     Covered by the `local-block` fixture and
+     `option::tests::apply_address_specific_domain_plus_wildcard_creates_two_entries`.
+  All three were caught only by running real containers against real upstream `dnsmasq` —
+  none were visible from unit/property tests alone, which is exactly the gap this parity
+  harness exists to close.
 
 - [ ] Expand property-based coverage where it protects porting work best.
   Priority areas: config parsing invariants, DNS name and RR roundtrips, DHCP option handling, cache and lease state invariants.
   Done when: new parser and protocol work ships with panic-freedom and roundtrip properties where appropriate.
-
-- [ ] Add regression fixtures for every upstream mismatch found.
-  Done when: parity bugs stay fixed after refactors.
 
 ## P5 Cleanup And Documentation
 

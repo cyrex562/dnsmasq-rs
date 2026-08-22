@@ -118,11 +118,18 @@ async fn cname_chain_answered_with_no_upstream_configured() {
 async fn unknown_name_is_not_answered_locally() {
     let Some((server, task)) = spawn_local_only_server().await else { return };
 
-    // Not in local data: upstream would forward this.  With no upstream
-    // configured there is nowhere to send it, so the client must see nothing —
-    // proving local answering did not fabricate a reply.
-    let reply = ask(server, &query_wire("not-local.test", 1, 0x2222)).await;
-    assert!(reply.is_none(), "non-local name must not be answered from local data");
+    // Not in local data: upstream would forward this. With no upstream
+    // configured there is nowhere to send it — C's `lookup_domain()` fails to
+    // find any server-array entry at all, sets `flags = 0`/`ede =
+    // EDE_NOT_READY`, and `setup_reply()`'s catch-all "nowhere to forward to"
+    // branch answers REFUSED rather than staying silent (`forward.c:344-350`,
+    // `rfc1035.c:1291-1298`). This also proves local answering did not
+    // fabricate a positive reply: the rcode is REFUSED, not NOERROR.
+    let reply = ask(server, &query_wire("not-local.test", 1, 0x2222))
+        .await
+        .expect("a query with nowhere to forward to must still get a REFUSED reply");
+    assert_eq!(reply.header.id, 0x2222);
+    assert_eq!(reply.header.rcode(), 5, "RCODE REFUSED");
 
     task.abort();
 }

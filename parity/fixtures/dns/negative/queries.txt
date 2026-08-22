@@ -1,0 +1,18 @@
+# qname qtype
+# Sanity check: the one name that does exist must still resolve normally
+# alongside the negative cases below.
+known.test A
+
+# Completely unknown names of several types - no local data, no forwarding,
+# so both daemons must independently produce the same NXDOMAIN shape.
+totally-unknown.test A
+totally-unknown.test AAAA
+totally-unknown.test MX
+totally-unknown.test TXT
+no-such-name.invalid A
+
+# A subdomain of a known name that was never itself registered.
+sub.known.test A
+
+# NODATA case: a name that exists (has an A record) but not the queried type.
+known.test AAAA
