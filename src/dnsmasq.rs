@@ -106,6 +106,18 @@ pub fn init_daemon_with(mut daemon: Daemon) -> DaemonHandle {
         }
     }
 
+    // Mirrors `inotify_dnsmasq_init()` being called once at startup
+    // (`dnsmasq.c:437`): opens the inotify fd and watches each configured
+    // resolv-file's containing directory. `--hostsdir`/dynamic-dir watches
+    // need the cache to exist first, so those are set up later in
+    // `run_main_loop_with` via `inotify::set_dynamic_inotify`. Upstream
+    // `die()`s if a resolv directory is missing; this logs and continues,
+    // consistent with the `ipset_init` handling just above.
+    #[cfg(feature = "inotify")]
+    if let Err(err) = crate::inotify::inotify_dnsmasq_init(&mut daemon) {
+        tracing::error!("failed to set up inotify watches: {err}");
+    }
+
     Arc::new(RwLock::new(daemon))
 }
 
@@ -1322,6 +1334,27 @@ fn spawn_netlink_watch_task() -> Option<tokio::task::JoinHandle<()>> {
     None
 }
 
+/// Spawn the background task that drains inotify events (resolv-file and
+/// `--hostsdir`/`--dhcp-hostsdir`/`--dhcp-optsdir` directory changes) for as
+/// long as the daemon runs.
+///
+/// The inotify fd itself was already opened and the resolv-file watches
+/// already established by [`inotify_dnsmasq_init`](crate::inotify::inotify_dnsmasq_init)
+/// in [`init_daemon_with`]; this only spawns the [`crate::inotify::watch_inotify_changes`]
+/// readiness loop that reacts to them, mirroring [`spawn_netlink_watch_task`]'s
+/// `AsyncFd`-based structure.
+#[cfg(feature = "inotify")]
+fn spawn_inotify_watch_task(
+    daemon_handle: DaemonHandle,
+    cache: crate::cache::SharedDnsCache,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(e) = crate::inotify::watch_inotify_changes(daemon_handle, cache).await {
+            tracing::warn!("inotify watch loop exited: {e}");
+        }
+    })
+}
+
 /// Run the main daemon event loop, binding its own sockets.
 ///
 /// This function:
@@ -1497,6 +1530,22 @@ pub async fn run_main_loop_with(
         }
     };
 
+    // ── inotify: dynamic-dir initial scan + watch task ───────────────────────
+    //
+    // Resolv-file directory watches were already established synchronously in
+    // `init_daemon_with` (`inotify_dnsmasq_init`); `--hostsdir`/dynamic-dir
+    // watches need the cache to exist first, so `set_dynamic_inotify` (the
+    // watch-then-initial-scan step, mirroring `dnsmasq.c:437`) runs here,
+    // before `cache` is moved into the forwarding task below.
+    #[cfg(feature = "inotify")]
+    {
+        let mut d = daemon_handle.write().await;
+        let mut c = cache.lock().await;
+        crate::inotify::set_dynamic_inotify(&mut d, &mut c);
+    }
+    #[cfg(feature = "inotify")]
+    let inotify_task = spawn_inotify_watch_task(daemon_handle.clone(), cache.clone());
+
     // ── Spawn the forwarding engine ──────────────────────────────────────────
     let fwd_task = tokio::spawn(async move {
         if let Err(e) = run_forward_loop_on(dns_listeners, arrival_filter, fwd_config, cache).await {
@@ -1639,6 +1688,8 @@ pub async fn run_main_loop_with(
             if let Some(task) = netlink_task.as_ref() {
                 task.abort();
             }
+            #[cfg(feature = "inotify")]
+            inotify_task.abort();
             #[cfg(feature = "dbus")]
             if let Some(task) = dbus_task.as_ref() {
                 task.abort();
@@ -1671,6 +1722,8 @@ pub async fn run_main_loop_with(
             if let Some(task) = netlink_task.as_ref() {
                 task.abort();
             }
+            #[cfg(feature = "inotify")]
+            inotify_task.abort();
             #[cfg(feature = "dbus")]
             if let Some(task) = dbus_task.as_ref() {
                 task.abort();
@@ -1703,6 +1756,8 @@ pub async fn run_main_loop_with(
     if let Some(task) = netlink_task {
         task.abort();
     }
+    #[cfg(feature = "inotify")]
+    inotify_task.abort();
     #[cfg(feature = "dbus")]
     if let Some(task) = dbus_task {
         task.abort();

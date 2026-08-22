@@ -943,9 +943,11 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     (`cache_unhash_dhcp`-adjacent logic in `cache_reload()`); this port's cache never
     receives `F_DHCP` records yet, so a full flush is currently equivalent but must be
     revisited once DHCP leases feed the cache.
-  - Upstream gates the resolv-file re-read on `OPT_NO_POLL` (`dnsmasq.c:1552`) because
-    otherwise a periodic poll/inotify watch is expected to catch the change; this port
-    has no such watch, so SIGHUP always re-reads regardless of `--no-poll`.
+  - Upstream gates the resolv-file re-read on `OPT_NO_POLL` (`dnsmasq.c:1552`) for the
+    *SIGHUP* path specifically; SIGHUP always re-reads regardless of `--no-poll`, matching
+    upstream (SIGHUP's own reload path is independent of the inotify/poll gate). The
+    inotify-triggered reload (see below) does honor `--no-poll`, matching
+    `dnsmasq.c:1236`.
   - `--servers-file` re-read (`read_servers_file()`) and DHCP reload
     (`reread_dhcp`/`dhcp_read_ethers`/`lease_update_from_configs`/`rerun_scripts`) are not
     implemented — SIGHUP is DNS-only for now.
@@ -953,6 +955,48 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     already-running forward task's `ForwardConfig` (upstream list, host-records, CNAMEs)
     is still a one-time snapshot, so a resolv-file-driven server-list change only takes
     effect on the next process start, not the next query.
+
+- [x] `inotify.c` — real watch establishment, initial scan, and event dispatch (Issue #50).
+  Previously only the byte-parsing helpers (`parse_inotify_event`/`to_watch_event`) existed
+  with zero non-test callers; no watches were ever established and `--no-poll` was parsed
+  but read nowhere. Now implemented in `src/inotify.rs`:
+  - `inotify_dnsmasq_init` (called once from `dnsmasq::init_daemon_with`): opens the
+    inotify fd, follows symlinks (bounded `MAXSYMLINKS`-style loop via
+    `resolve_symlink_chain`) for each `--resolv-file`, and watches its containing
+    directory (`IN_CLOSE_WRITE | IN_MOVED_TO`).
+  - `set_dynamic_inotify` (called once from `dnsmasq::run_main_loop_with`, after the cache
+    exists): watches each `daemon.dynamic_dirs` entry
+    (`IN_CLOSE_WRITE | IN_MOVED_TO | IN_DELETE`), then — watch-then-scan, matching upstream's
+    race avoidance — for `AH_HOSTS` (`--hostsdir`) entries only, loads any pre-existing
+    files into the cache via `cache::load_hosts_file`.
+  - `inotify_check` + `watch_inotify_changes` (an `AsyncFd` readiness loop spawned by
+    `dnsmasq::spawn_inotify_watch_task`, mirroring the existing netlink-watch task
+    pattern): drains events, flags a resolv-file hit for the caller, and for `AH_HOSTS`
+    hits flushes the previous load via `DnsCache::remove_by_uid` and reloads unless the
+    event was a deletion.
+  - `--no-poll` (`OPT_NO_POLL`) now has a real effect: `should_force_resolv_reload` gates
+    the inotify-triggered resolv reload exactly as `dnsmasq.c:1236` does
+    (`daemon->port != 0 && !option_bool(OPT_NO_POLL)`).
+  - Covered by `inotify::tests::*` (29 tests): symlink resolution (relative, cycle-bounded,
+    missing-path), watch establishment (including missing-directory error path), initial
+    scan (existing files loaded, dotfiles/emacs-backups/lock-files ignored), and the event
+    cascade (new/modified/deleted file in a watched `--hostsdir`, ignored dotfile events,
+    resolv-file hit detection, `--no-poll` gating) — all against a real kernel inotify fd
+    and real temp-directory filesystem changes, not a mock.
+
+  Deliberate simplifications, still open:
+  - `dhcp-hostsdir`/`dhcp-optsdir` (`AH_DHCP_HST`/`AH_DHCP_OPT`) directories are watched
+    (so `inotify_check` recognizes their `wd` rather than erroring) but not scanned or
+    read back on change: this port has no `option_read_dynfile` /
+    `dhcp_update_configs`/`lease_update_from_configs`/`lease_update_file`/`lease_update_dns`
+    equivalent yet — only whole-config `reread_dhcp` (SIGHUP) exists. Building the
+    per-file DHCP dynfile reader is a separate, larger chunk of work than this issue's
+    scope (Issue #50 / T3-inotify targeted `inotify.c` itself, not `option.c`'s
+    `option_read_dynfile`).
+  - No mtime-based polling fallback exists for builds without the `inotify` feature
+    (`--no-default-features`); upstream's non-`HAVE_INOTIFY` build polls resolv-file
+    mtime once per second instead. The dead-code `dnsmasq::ResolvMonitor`/`poll_resolv`
+    (still uncalled) would be the natural basis for that fallback if it's ever needed.
 
 - [x] Wire `LeaseDb` into DHCPv4 dispatch and reach Release/Decline/Inform.
   `LeaseDb` (`src/lease.rs`) had zero callers outside its own tests; `dispatch_dhcp_with_meta`

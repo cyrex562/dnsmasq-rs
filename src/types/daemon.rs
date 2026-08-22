@@ -161,6 +161,10 @@ pub struct Daemon {
     pub dhcp_hosts_file: Vec<HostsFile>,
     pub dhcp_opts_file:  Vec<HostsFile>,
     pub dynamic_dirs:    Vec<DynDir>,
+    /// Raw inotify fd opened by `inotify::inotify_dnsmasq_init`; `-1` if
+    /// unopened (init not yet run, or `inotify_init1` failed).
+    #[cfg(feature = "inotify")]
+    pub inotify_fd:      i32,
     pub soa_sn:          u32,
     pub soa_refresh:     u32,
     pub soa_retry:       u32,
@@ -386,6 +390,8 @@ impl Default for Daemon {
             dhcp_hosts_file: vec![],
             dhcp_opts_file: vec![],
             dynamic_dirs: vec![],
+            #[cfg(feature = "inotify")]
+            inotify_fd: -1,
             soa_sn: 0,
             soa_refresh: 1200,
             soa_retry: 180,
