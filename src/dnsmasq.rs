@@ -891,6 +891,9 @@ fn daemon_dhcp_runtime(daemon: &Daemon) -> Option<DhcpDaemonRuntime> {
             leasequery_addr: daemon.leasequery_addr.clone(),
             leasequery_enabled: daemon.option_bool(crate::types::constants::OPT_LEASEQUERY),
             leasequery_source: Ipv4Addr::UNSPECIFIED,
+            #[cfg(feature = "ubus")]
+            quiet_dhcp: daemon.option_bool(crate::types::constants::OPT_QUIET_DHCP)
+                && !daemon.option_bool(crate::types::constants::OPT_LOG_OPTS),
         },
         loop_opts: crate::dhcp::DhcpLoopOptions {
             reply_port_override: (client_port != 68).then_some(client_port),
@@ -1837,6 +1840,27 @@ pub async fn run_main_loop_with(
     #[cfg(feature = "inotify")]
     let inotify_task = spawn_inotify_watch_task(daemon_handle.clone(), cache.clone());
 
+    // ── UBus (`--ubus`) ───────────────────────────────────────────────────────
+    //
+    // Mirrors upstream calling `ubus_init()` once at startup and then
+    // draining events via `set_ubus_listeners()`/`check_ubus_listeners()`
+    // from the main `poll()` loop (dnsmasq.c) — collapsed into one spawned
+    // task since this codebase has no raw `poll()` loop to hook a listener
+    // into; see `ubus::run_ubus_task`'s doc comment.
+    #[cfg(feature = "ubus")]
+    let ubus_task = {
+        let opt_ubus = {
+            let d = daemon_handle.read().await;
+            d.option_bool(crate::types::constants::OPT_UBUS)
+        };
+        if opt_ubus {
+            let ctx = crate::ubus::UbusContext { daemon: daemon_handle.clone() };
+            Some(tokio::spawn(crate::ubus::run_ubus_task(ctx)))
+        } else {
+            None
+        }
+    };
+
     // ── Spawn the forwarding engine ──────────────────────────────────────────
     let arp_housekeeping_state = arp_state.clone();
     let fwd_task = tokio::spawn(async move {
@@ -2093,6 +2117,10 @@ pub async fn run_main_loop_with(
             }
             #[cfg(feature = "tftp")]
             if let Some(t) = tftp_task.as_ref() { t.abort(); }
+            #[cfg(feature = "ubus")]
+            if let Some(task) = ubus_task.as_ref() {
+                task.abort();
+            }
             fwd_task.abort();
             arp_task.abort();
             return RunResult::IoError;
@@ -2136,6 +2164,10 @@ pub async fn run_main_loop_with(
             }
             #[cfg(feature = "tftp")]
             if let Some(t) = tftp_task.as_ref() { t.abort(); }
+            #[cfg(feature = "ubus")]
+            if let Some(task) = ubus_task.as_ref() {
+                task.abort();
+            }
             fwd_task.abort();
             arp_task.abort();
             return RunResult::IoError;
@@ -2176,6 +2208,10 @@ pub async fn run_main_loop_with(
         task.abort();
     }
     arp_task.abort();
+    #[cfg(feature = "ubus")]
+    if let Some(task) = ubus_task {
+        task.abort();
+    }
     #[cfg(feature = "dhcp")]
     {
         if let Some(tx) = dhcp_shutdown_tx {
