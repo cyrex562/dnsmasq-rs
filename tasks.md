@@ -2367,6 +2367,21 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     `HAVE_BSD_NETWORK`/`HAVE_SOLARIS_NETWORK`; its Linux analog is `netlink.rs`, already
     ported. Future audits should diff `bpf.c` against `netlink.rs`, not this module.
 
+- [x] Removed the dead `tables.rs` module (issue #57): it claimed to port
+  `tables.c` (BSD PF ipset support, gated `HAVE_BSD_IPSET` upstream) but every
+  path — including the `#[cfg(target_os = "openbsd")]` branch — returned
+  `Err(PfError::NotSupported)` without ever calling `ioctl` or touching
+  `/dev/pf`. It also used non-upstream function names (`add_to_table`/
+  `del_from_table` instead of `add_to_ipset`/`ipset_init`) and had zero
+  callers anywhere in the codebase. Same disposition as `bpf.rs` (see above):
+  BSD/PF is out of scope for this Linux-targeted port, and the Linux
+  equivalent of upstream's `add_to_ipset`/`ipset_init` interface is already
+  fully implemented and wired up in `ipset.rs` (netlink-based, called from
+  `forward.rs` and `dnsmasq.rs`). Do not resurrect `tables.rs`; if BSD PF
+  support is ever wanted, port `tables.c`'s ioctl sequence
+  (`DIOCRADDTABLES`/`DIOCRADDADDRS`/`DIOCRDELADDRS`) fresh against the real
+  `add_to_ipset`/`ipset_init` signatures, not the old stub's invented ones.
+
 - [x] Align Cargo feature defaults with upstream config.h (issue #55).
   - Removed `dnssec` from default feature list (upstream config.h:206 leaves `HAVE_DNSSEC`
     commented out as it requires external crypto libraries).
