@@ -943,11 +943,26 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     (`cache_unhash_dhcp`-adjacent logic in `cache_reload()`); this port's cache never
     receives `F_DHCP` records yet, so a full flush is currently equivalent but must be
     revisited once DHCP leases feed the cache.
-  - Upstream gates the resolv-file re-read on `OPT_NO_POLL` (`dnsmasq.c:1552`) for the
-    *SIGHUP* path specifically; SIGHUP always re-reads regardless of `--no-poll`, matching
-    upstream (SIGHUP's own reload path is independent of the inotify/poll gate). The
+  - Upstream gates the resolv-file re-read on `OPT_NO_POLL` (`dnsmasq.c:1553`) for the
+    *SIGHUP* path specifically — `if (daemon->resolv_files && option_bool(OPT_NO_POLL))
+    reload_servers(...)` — because when polling/inotify is active, the ordinary
+    inotify-triggered reload (see below) is expected to already keep `daemon->servers`
+    current, so SIGHUP doesn't force a redundant read on top of it. This port's SIGHUP
+    path (`clear_cache_and_reload`) always re-reads resolv-files regardless of
+    `--no-poll` — a real, if harmless (re-reading is idempotent), divergence from
+    upstream's gating, not a match as an earlier version of this note claimed. The
     inotify-triggered reload (see below) does honor `--no-poll`, matching
     `dnsmasq.c:1236`.
+  - `clear_cache_and_reload` (`src/dnsmasq.rs`) now calls `inotify::set_dynamic_inotify`
+    (gated `#[cfg(feature = "inotify")]`) right after `cache::reload_hosts` flushes the
+    cache, so `--hostsdir` entries are rescanned and repopulated on every SIGHUP —
+    mirroring `cache_reload()`'s own `set_dynamic_inotify(AH_HOSTS, ...)` call
+    (`cache.c:1709`). Before this fix, a `--hostsdir`-loaded record was silently and
+    permanently dropped by the first SIGHUP after it loaded, since nothing re-triggered
+    the initial-scan step that originally populated it. Covered by
+    `dnsmasq::tests::clear_cache_and_reload_rescans_hostsdir_entries`. Only `AH_HOSTS`
+    directories are rescanned this way; `dhcp-hostsdir`/`dhcp-optsdir` are not, matching
+    `set_dynamic_inotify`'s existing scope limits below.
   - `--servers-file` re-read (`read_servers_file()`) and DHCP reload
     (`reread_dhcp`/`dhcp_read_ethers`/`lease_update_from_configs`/`rerun_scripts`) are not
     implemented — SIGHUP is DNS-only for now.
