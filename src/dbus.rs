@@ -196,7 +196,14 @@ pub fn apply_set_servers_ex(daemon: &mut Daemon, entries: &[Vec<String>]) -> Res
             return Err("Empty IP address".to_string());
         }
         let (sock, addr_flags) = parse_dbus_addr(addr_str)?;
-        push_dbus_servers(daemon, addr_flags | SERV_FROM_DBUS, &entry[1..], &sock);
+        // dbus.c:464-468: "0.0.0.0 for server address == NULL, for Dbus" —
+        // a literal v4 0.0.0.0 means "answer locally, never forward".
+        let literal_flags = if matches!(sock.ip(), std::net::IpAddr::V4(a) if a.is_unspecified()) {
+            SERV_LITERAL_ADDRESS
+        } else {
+            0
+        };
+        push_dbus_servers(daemon, addr_flags | literal_flags | SERV_FROM_DBUS, &entry[1..], &sock);
     }
 
     cleanup_servers(&mut daemon.servers);
@@ -391,7 +398,13 @@ pub mod dhcp_leases {
             Some(String::from_utf8_lossy(trimmed).into_owned())
         };
 
-        let expires = UNIX_EPOCH + Duration::from_secs(now + lease_duration as u64);
+        // lease.c:890-901: len == 0xffffffff means an infinite (non-expiring)
+        // lease, not "now + 0xffffffff seconds".
+        let expires = if lease_duration == 0xFFFF_FFFF {
+            None
+        } else {
+            Some(UNIX_EPOCH + Duration::from_secs(now + lease_duration as u64))
+        };
 
         let lease = DhcpLease {
             clid: if clid.is_empty() { None } else { Some(clid.to_vec()) },
@@ -399,7 +412,7 @@ pub mod dhcp_leases {
             fqdn: None,
             old_hostname: None,
             flags: 0,
-            expires: Some(expires),
+            expires,
             hwaddr: hwaddr_fixed,
             hwaddr_len: hw.len(),
             // Upstream only assigns `ARPHRD_ETHER` when `parse_hex` didn't
@@ -944,6 +957,17 @@ mod tests {
         assert!(apply_set_servers_ex(&mut d, &[vec!["".to_string()]]).is_err());
     }
 
+    #[test]
+    fn set_servers_ex_zero_address_is_literal_never_forward() {
+        // dbus.c:464-468: "0.0.0.0 for server address == NULL, for Dbus" —
+        // a v4 0.0.0.0 entry means "answer locally, never forward", same as
+        // SetDomainServers' empty-address form.
+        let mut d = Daemon::default();
+        apply_set_servers_ex(&mut d, &[vec!["0.0.0.0".to_string(), "example.com".to_string()]]).unwrap();
+        assert_eq!(d.servers.len(), 1);
+        assert!(d.servers[0].flags & SERV_LITERAL_ADDRESS != 0);
+    }
+
     // ── apply_set_servers ────────────────────────────────────────────────────
 
     #[test]
@@ -1074,6 +1098,17 @@ mod tests {
             let mut db = LeaseDb::new();
             assert!(add_lease(&mut db, "192.168.0.10", "aa:bb:cc:dd:ee:ff", b"", &[], 3600, 1, false, 0).is_err());
             assert!(add_lease(&mut db, "192.168.0.10", "aa:bb:cc:dd:ee:ff", b"", &[], 3600, 0, true, 0).is_err());
+        }
+
+        #[test]
+        fn add_lease_with_infinite_duration_never_expires() {
+            // lease.c:890-901: lease_set_expires treats len == 0xffffffff as
+            // an infinite lease (exp = 0), not "now + 0xffffffff seconds".
+            let mut db = LeaseDb::new();
+            add_lease(&mut db, "192.168.0.10", "aa:bb:cc:dd:ee:ff", b"", &[], 0xFFFF_FFFF, 0, false, 1_000)
+                .unwrap();
+            let lease = db.find_by_addr("192.168.0.10".parse().unwrap()).unwrap();
+            assert_eq!(lease.expires, None);
         }
 
         #[test]
