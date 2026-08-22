@@ -1450,6 +1450,39 @@ pub async fn run_main_loop_with(
         return RunResult::IoError;
     }
 
+    // ── D-Bus (`--enable-dbus`) ───────────────────────────────────────────────
+    //
+    // Mirrors `dbus_init()` being called once at startup (`dnsmasq.c:461`);
+    // the retry-while-bus-not-up-yet behavior (`dnsmasq.c:1263`) lives inside
+    // `run_dbus_task` itself — see its doc comment for why that's a spawned
+    // async task rather than a per-tick poll here.
+    #[cfg(feature = "dbus")]
+    let dbus_task = {
+        let opt_dbus = {
+            let d = daemon_handle.read().await;
+            d.option_bool(crate::types::constants::OPT_DBUS)
+        };
+        if opt_dbus {
+            let d = daemon_handle.read().await;
+            let dbus_name = d.dbus_name.clone().unwrap_or_else(|| crate::dbus::DNSMASQ_DBUS_INTERFACE.to_string());
+            #[cfg(feature = "dhcp")]
+            let lease_file = d.lease_file.clone();
+            drop(d);
+            let ctx = crate::dbus::DbusContext {
+                daemon: daemon_handle.clone(),
+                cache: cache.clone(),
+                #[cfg(feature = "dhcp")]
+                leases: Arc::new(tokio::sync::Mutex::new(crate::lease::LeaseDb::new())),
+                #[cfg(feature = "dhcp")]
+                lease_file,
+                dbus_name,
+            };
+            Some(tokio::spawn(crate::dbus::run_dbus_task(ctx)))
+        } else {
+            None
+        }
+    };
+
     // ── Spawn the forwarding engine ──────────────────────────────────────────
     let fwd_task = tokio::spawn(async move {
         if let Err(e) = run_forward_loop_on(dns_listeners, arrival_filter, fwd_config, cache).await {
@@ -1592,6 +1625,10 @@ pub async fn run_main_loop_with(
             if let Some(task) = netlink_task.as_ref() {
                 task.abort();
             }
+            #[cfg(feature = "dbus")]
+            if let Some(task) = dbus_task.as_ref() {
+                task.abort();
+            }
             fwd_task.abort();
             return RunResult::IoError;
         }
@@ -1620,6 +1657,10 @@ pub async fn run_main_loop_with(
             if let Some(task) = netlink_task.as_ref() {
                 task.abort();
             }
+            #[cfg(feature = "dbus")]
+            if let Some(task) = dbus_task.as_ref() {
+                task.abort();
+            }
             fwd_task.abort();
             return RunResult::IoError;
         }
@@ -1646,6 +1687,10 @@ pub async fn run_main_loop_with(
 
     fwd_task.abort();
     if let Some(task) = netlink_task {
+        task.abort();
+    }
+    #[cfg(feature = "dbus")]
+    if let Some(task) = dbus_task {
         task.abort();
     }
     #[cfg(feature = "dhcp")]

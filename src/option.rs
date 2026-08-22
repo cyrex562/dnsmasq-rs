@@ -825,7 +825,15 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
         "dhcp-ignore-clid" => daemon.set_option(OPT_IGNORE_CLID),
         "dhcp-client-update" => daemon.set_option(OPT_FQDN_UPDATE),
         "dhcp-fqdn"    => daemon.set_option(OPT_DHCP_FQDN),
-        "enable-dbus"  => daemon.set_option(OPT_DBUS),
+        "enable-dbus"  => {
+            daemon.set_option(OPT_DBUS);
+            #[cfg(feature = "dbus")]
+            {
+                daemon.dbus_name = Some(
+                    cl.value.as_deref().unwrap_or(crate::dbus::DNSMASQ_DBUS_INTERFACE).to_string(),
+                );
+            }
+        }
         "no-ping"      => daemon.set_option(OPT_NO_PING),
         "lease-ro" | "leasefile-ro" => daemon.set_option(OPT_LEASE_RO),
         "conntrack"    => daemon.set_option(OPT_CONNTRACK),
@@ -5551,6 +5559,26 @@ mod tests {
         assert_eq!(d.tftp_interfaces[0].flags, INAME_4 | INAME_6);
         assert_eq!(d.tftp_interfaces[1].name, Some("br-lan".to_string()));
         assert_eq!(d.tftp_interfaces[1].flags, INAME_4 | INAME_6);
+    }
+
+    #[test]
+    #[cfg(feature = "dbus")]
+    fn apply_enable_dbus_defaults_service_name() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("enable-dbus", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_DBUS));
+        assert_eq!(d.dbus_name.as_deref(), Some("uk.org.thekelleys.dnsmasq"));
+    }
+
+    #[test]
+    #[cfg(feature = "dbus")]
+    fn apply_enable_dbus_with_custom_name() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("enable-dbus=uk.org.thekelleys.dnsmasq.custom", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_DBUS));
+        assert_eq!(d.dbus_name.as_deref(), Some("uk.org.thekelleys.dnsmasq.custom"));
     }
 
     #[test]
