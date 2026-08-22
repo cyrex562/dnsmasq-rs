@@ -2285,6 +2285,25 @@ Both are reference-only. Do not treat either tree as code to edit in place.
 
 ## P5 Cleanup And Documentation
 
+- [x] Removed three orphaned modules with zero call sites (issue #54): `blockdata.rs`,
+  `outpacket.rs`, `bpf.rs`, plus the redundant `types::cache::Blockdata` stub and the
+  now-dead `KEYBLOCK_LEN` constant, and the `bpf` Cargo feature (removed from `default`
+  too).
+  - `blockdata.rs`: DNSSEC key/RR pooling was intentionally dropped — `dnssec.rs` stores
+    signatures/keys/digests as plain `Vec<u8>`, which is upstream-behavior-equivalent
+    (the C slab allocator is a fragmentation optimization, not observable protocol
+    behavior). Do not resurrect this module to route DNSSEC storage through it.
+  - `outpacket.rs`: ported upstream's `new_opt6`/`end_opt6` in-place TLV-patching
+    pattern for DHCPv6 option building, but `dhcp6.rs`'s `build_option6`/
+    `build_ia_na_option` independently reimplemented the same TLV logic via
+    build-then-wrap `Vec<u8>` construction. Both produce identical wire bytes; keeping
+    `dhcp6.rs`'s simpler approach and deleting the duplicate is not a parity loss.
+  - `bpf.rs`: built Linux classic-BPF `sock_filter` programs with no upstream
+    counterpart (`grep sock_filter original_dnsmasq_src` = zero hits) and no call site.
+    Upstream `bpf.c` is BSD/Solaris-only routing-socket code gated on
+    `HAVE_BSD_NETWORK`/`HAVE_SOLARIS_NETWORK`; its Linux analog is `netlink.rs`, already
+    ported. Future audits should diff `bpf.c` against `netlink.rs`, not this module.
+
 - [ ] Keep `CLAUDE.md` and `agents.md` aligned with actual repo status.
   Done when: they reflect current test reality, parity expectations, and porting priorities without optimistic completion claims.
 

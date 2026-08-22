@@ -6,7 +6,6 @@ use crate::types::addr::AllAddr;
 use crate::dns_protocol::MAXDNAME;
 
 pub const SMALLDNAME: usize = 25;
-pub const KEYBLOCK_LEN: usize = 40;
 
 /// A single DNS cache entry, equivalent to `struct crec`.
 ///
@@ -52,23 +51,6 @@ impl Crec {
     }
 }
 
-/// A block allocator chunk for storing variable-length DNSSEC key / RR data.
-/// In Rust, we model this as a plain `Vec<u8>` slab; the cache module manages
-/// the chain.
-#[derive(Debug, Clone)]
-pub struct Blockdata {
-    pub data: Vec<u8>,
-}
-
-impl Blockdata {
-    pub fn new(data: impl Into<Vec<u8>>) -> Self {
-        Self { data: data.into() }
-    }
-
-    pub fn len(&self) -> usize { self.data.len() }
-    pub fn is_empty(&self) -> bool { self.data.is_empty() }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,12 +67,5 @@ mod tests {
     fn crec_not_expired_when_no_ttd() {
         let c = Crec::new("example.com", 0);
         assert!(!c.is_expired());
-    }
-
-    #[test]
-    fn blockdata_len() {
-        let b = Blockdata::new(vec![1, 2, 3]);
-        assert_eq!(b.len(), 3);
-        assert!(!b.is_empty());
     }
 }

@@ -20,11 +20,9 @@ pub mod types;
 pub mod rfc1035;
 pub mod edns0;
 pub mod rrfilter;
-pub mod blockdata;
 pub mod domain;
 pub mod domain_match;
 pub mod log;
-pub mod outpacket;
 pub mod pattern;
 pub mod poll;
 pub mod util;
@@ -81,8 +79,6 @@ pub mod ubus;
 pub mod dnssec;
 #[cfg(feature = "dbus")]
 pub mod dbus;
-#[cfg(feature = "bpf")]
-pub mod bpf;
 pub mod tables;
 
 use dnsmasq::{Listeners, StartupPipe};
