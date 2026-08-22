@@ -422,9 +422,15 @@ fn decorate_reply(
     } else {
         lease_time
     };
+    // Upstream's BOOTP call site passes NULL for req_options and -1 for
+    // pxearch unconditionally (rfc2131.c:684-685) — a BOOTP request that
+    // happens to carry option 55 (parameter request list) or option 93
+    // (client arch, legal without option 53) is answered as plain BOOTP,
+    // never treated as a DHCP/PXE options request.
+    let is_bootp = reply.msg_type == DhcpMsgType::Bootp;
     let mut opt_cfg = DoOptionsConfig {
         context,
-        req_options: find_option(&pkt.options, OPTION_REQUESTED_OPTIONS),
+        req_options: if is_bootp { None } else { find_option(&pkt.options, OPTION_REQUESTED_OPTIONS) },
         hostname: config.and_then(|c| c.hostname.as_deref()),
         domain: config
             .and_then(|c| c.domain.as_deref())
@@ -433,7 +439,7 @@ fn decorate_reply(
         subnet_addr: None,
         fqdn_flags: 0,
         null_term: false,
-        pxe_arch: requested_arch(pkt),
+        pxe_arch: if is_bootp { -1 } else { requested_arch(pkt) },
         uuid: None,
         vendor_class: find_option(&pkt.options, OPTION_VENDOR_ID),
         lease_time: do_options_lease_time,
@@ -987,9 +993,6 @@ fn dispatch_bootp(
     {
         existing.addr
     } else {
-        if !bootp_dynamic_allowed(&cfg.bootp_dynamic, &bootp_tags) {
-            return None; // "no address configured"
-        }
         address_allocate(
             contexts.as_ref(),
             lease_db,
@@ -1006,6 +1009,15 @@ fn dispatch_bootp(
     };
 
     narrow_context(contexts.as_ref(), yiaddr)?; // "wrong network"
+
+    // `bootp_dynamic` gates any non-nailed resolution — reused lease or
+    // fresh allocation alike (rfc2131.c:659-666) — not just fresh
+    // allocation. Checked here, after the address is known, so a rule
+    // change takes effect on the very next renewal of an existing lease
+    // instead of only on the next fresh allocation.
+    if !nailed && !bootp_dynamic_allowed(&cfg.bootp_dynamic, &bootp_tags) {
+        return None; // "no address configured"
+    }
 
     let mut reply = handle_bootp(pkt, yiaddr, cfg.server_ip);
     decorate_reply(&mut reply, pkt, cfg, &bootp_tags, config);
@@ -1267,6 +1279,17 @@ pub async fn run_dhcp_loop(
                     continue;
                 };
 
+                // Non-standard extension: giaddr == 255.255.255.255 means "reply
+                // to the source address of this packet" — lets stand-alone
+                // leasequery clients skip source-address determination
+                // themselves. Cleared here, before anything else looks at
+                // giaddr, to avoid the relay-dispatch and is_relayed() logic
+                // below mistaking this for a relayed packet (dhcp.c:255-260).
+                let is_relay_use_source = pkt.giaddr == Ipv4Addr::new(255, 255, 255, 255);
+                if is_relay_use_source {
+                    pkt.giaddr = Ipv4Addr::UNSPECIFIED;
+                }
+
                 // Relay dispatch (rfc2131.c relay_reply4/relay_upstream4, called
                 // from dhcp.c:305/:366). A reply matching one of our relays is
                 // forwarded straight to the client and never reaches local
@@ -1306,9 +1329,18 @@ pub async fn run_dhcp_loop(
                     }
                 }
 
-                cfg.leasequery_source = match src.ip() {
-                    IpAddr::V4(v4) => v4,
-                    IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
+                // `leasequery_source = is_relay_use_source ? <UDP source> :
+                // giaddr` (dhcp.c:373-375). Standard RFC 4388 leasequery
+                // clients set giaddr to identify themselves; only the
+                // stand-alone-client extension above falls back to the raw
+                // UDP source.
+                cfg.leasequery_source = if is_relay_use_source {
+                    match src.ip() {
+                        IpAddr::V4(v4) => v4,
+                        IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
+                    }
+                } else {
+                    pkt.giaddr
                 };
 
                 let arrival = arrival_interface(meta.if_index);
@@ -3627,6 +3659,91 @@ mod tests {
         loop_task.await.unwrap().unwrap();
     }
 
+    /// `leasequery_source` must come from `giaddr`, not the raw UDP source,
+    /// for a standard RFC 4388 leasequery client (dhcp.c:373-375). A packet
+    /// arriving from an always-allowed loopback address but carrying a
+    /// `giaddr` outside every configured `leasequery-addr` prefix must be
+    /// rejected — the old code derived `leasequery_source` from the UDP
+    /// source alone and would have wrongly allowed it.
+    #[tokio::test]
+    async fn run_dhcp_loop_leasequery_source_comes_from_giaddr_not_udp_source() {
+        let Some(server) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+        let Some(client) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+        let Some(receiver) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+
+        let receiver_addr = receiver.local_addr().unwrap();
+        let server = std::sync::Arc::new(server);
+        let mut cfg = default_cfg();
+        cfg.leasequery_enabled = true;
+        // Only 127.0.0.1/32 is allowed. The UDP source (127.0.0.1) matches
+        // this; the packet's giaddr (203.0.113.9) does not.
+        cfg.leasequery_addr = vec![crate::types::dns_records::BogusAddr {
+            is6: false,
+            addr: crate::types::addr::AllAddr::Addr4(Ipv4Addr::new(127, 0, 0, 1)),
+            prefix: 32,
+        }];
+        let opts = DhcpLoopOptions { reply_port_override: Some(receiver_addr.port()), ..Default::default() };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, LeaseDb::new(), shutdown_rx, Box::new(NullProbe)));
+
+        let mut pkt = leasequery_packet(Ipv4Addr::new(10, 0, 0, 150));
+        pkt.giaddr = Ipv4Addr::new(203, 0, 113, 9);
+        let wire = packet_to_wire(&pkt);
+        client.send_to(&wire, server.local_addr().unwrap()).await.unwrap();
+
+        // Confirm no reply arrives: `leasequery_source` was correctly
+        // rejected on giaddr, not wrongly accepted on the UDP source.
+        let outcome = tokio::time::timeout(Duration::from_millis(200), receiver.recv_from(&mut [0u8; 512])).await;
+        assert!(outcome.is_err(), "leasequery with a disallowed giaddr must not get a reply");
+
+        shutdown_tx.send(true).unwrap();
+        loop_task.await.unwrap().unwrap();
+    }
+
+    /// The non-standard "stand-alone leasequery client" extension: giaddr ==
+    /// 255.255.255.255 means "use the UDP source instead" (dhcp.c:255-260).
+    /// A client using this extension from an allowed address must still get
+    /// a reply.
+    #[tokio::test]
+    async fn run_dhcp_loop_leasequery_giaddr_broadcast_sentinel_falls_back_to_udp_source() {
+        let Some(server) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+        let Some(client) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+        let Some(receiver) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+
+        let receiver_addr = receiver.local_addr().unwrap();
+        let server = std::sync::Arc::new(server);
+        let mut cfg = default_cfg();
+        cfg.leasequery_enabled = true;
+        cfg.leasequery_addr = vec![crate::types::dns_records::BogusAddr {
+            is6: false,
+            addr: crate::types::addr::AllAddr::Addr4(Ipv4Addr::new(127, 0, 0, 1)),
+            prefix: 32,
+        }];
+        let opts = DhcpLoopOptions { reply_port_override: Some(receiver_addr.port()), ..Default::default() };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, LeaseDb::new(), shutdown_rx, Box::new(NullProbe)));
+
+        // ciaddr left UNSPECIFIED: with giaddr also UNSPECIFIED after the
+        // sentinel is consumed, `loop_reply_dest` falls back to the packet's
+        // real UDP source — this test's `receiver` — rather than routing to
+        // whatever address a query happened to name.
+        let mut pkt = leasequery_packet(Ipv4Addr::UNSPECIFIED);
+        pkt.giaddr = Ipv4Addr::new(255, 255, 255, 255);
+        let wire = packet_to_wire(&pkt);
+        client.send_to(&wire, server.local_addr().unwrap()).await.unwrap();
+
+        let mut buf = [0u8; 512];
+        let (len, _) = tokio::time::timeout(Duration::from_millis(250), receiver.recv_from(&mut buf))
+            .await
+            .expect("stand-alone leasequery client from an allowed source should get a reply")
+            .unwrap();
+        let reply = parse_dhcp_packet(&buf[..len]).expect("loop reply should parse");
+        assert_eq!(get_message_type(&reply.options), Some(DhcpMsgType::LeaseUnknown));
+
+        shutdown_tx.send(true).unwrap();
+        loop_task.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn run_dhcp_loop_forwards_relayed_request_upstream() {
         let Some(relay_sock) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
@@ -5076,6 +5193,33 @@ mod tests {
         assert!(is_same_net(reply.yiaddr, Ipv4Addr::new(10, 0, 0, 0), Ipv4Addr::new(255, 255, 255, 0)));
     }
 
+    /// Upstream's `bootp_dynamic` gate applies to *any* non-nailed
+    /// resolution (rfc2131.c:659-666) — reusing an already-leased address,
+    /// not just a fresh allocation. If an admin narrows/removes a
+    /// `bootp-dynamic` rule, an existing non-nailed BOOTP lease must stop
+    /// renewing on its very next request, not silently keep renewing until
+    /// it expires.
+    #[test]
+    fn bootp_dynamic_gate_also_applies_when_reusing_an_existing_lease() {
+        let pkt = bootp_packet();
+        let mut cfg = default_cfg();
+        cfg.contexts = vec![make_ctx(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 200), Ipv4Addr::UNSPECIFIED, 0)];
+        cfg.bootp_dynamic = vec![vec![]]; // matches everyone: allocation is allowed
+        let mut lease_db = LeaseDb::new();
+
+        let first = dispatch_dhcp(&pkt, &cfg, &mut lease_db).expect("first request should allocate");
+        assert_eq!(first.msg_type, DhcpMsgType::Bootp);
+
+        // Narrow the rule so this client no longer matches. A second request
+        // from the same client would take the "reuse existing lease" branch,
+        // which must be gated exactly like fresh allocation.
+        cfg.bootp_dynamic = vec![vec![crate::types::dhcp::DhcpNetid { net: "not-this-client".to_string() }]];
+        assert!(
+            dispatch_dhcp(&pkt, &cfg, &mut lease_db).is_none(),
+            "reusing an existing non-nailed lease must still be gated by bootp-dynamic"
+        );
+    }
+
     // ── DHCPLEASEQUERY (RFC 4388, rfc2131.c:1067-1235) ─────────────────────
 
     fn leasequery_packet(ciaddr: Ipv4Addr) -> DhcpPacket {
@@ -5157,7 +5301,7 @@ mod tests {
         let mut lease_db = LeaseDb::new();
         let addr = Ipv4Addr::new(10, 0, 0, 150);
         lease_db.allocate_v4(addr);
-        lease_db.set_hwaddr(addr, &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff], 1, None);
+        lease_db.set_hwaddr(addr, &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff], 1, None, false);
         lease_db.set_expires(addr, 3600);
 
         let pkt = leasequery_packet(addr);
@@ -5182,7 +5326,7 @@ mod tests {
         let mut lease_db = LeaseDb::new();
         let addr = Ipv4Addr::new(10, 0, 0, 150);
         lease_db.allocate_v4(addr);
-        lease_db.set_hwaddr(addr, &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff], 1, None);
+        lease_db.set_hwaddr(addr, &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff], 1, None, false);
         lease_db.set_expires(addr, 3600);
 
         // Request only OPTION_LEASE_TIME — not netmask or broadcast.
@@ -5213,7 +5357,7 @@ mod tests {
         let mut lease_db = LeaseDb::new();
         let addr = Ipv4Addr::new(10, 0, 0, 150);
         lease_db.allocate_v4(addr);
-        lease_db.set_hwaddr(addr, &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff], 1, None);
+        lease_db.set_hwaddr(addr, &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff], 1, None, false);
         lease_db.set_expires(addr, 3600);
 
         const CUSTOM_OPT: u8 = 200;
