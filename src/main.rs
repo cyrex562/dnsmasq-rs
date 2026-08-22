@@ -79,7 +79,6 @@ pub mod ubus;
 pub mod dnssec;
 #[cfg(feature = "dbus")]
 pub mod dbus;
-pub mod tables;
 
 use dnsmasq::{Listeners, StartupPipe};
 use types::constants::{OPT_DEBUG, OPT_NO_FORK};
