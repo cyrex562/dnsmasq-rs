@@ -405,17 +405,40 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     persistent socket across calls the way `ipset_init()` does (a socket is opened and closed
     per call here instead; correctness is unaffected, only efficiency).
 
-    **nftset is explicitly out of scope**, and differently so than ipset: upstream's
-    `add_to_nftset()` (`nftset.c:41-93`) does not build a raw netlink message at all — it shells
-    out to `libnftables` (`nft_run_cmd_from_buffer()`) with a textual `add element <set> { <ip> }`
-    command. That is an FFI dependency this crate does not have (no `libnftables`/`nftables`
-    binding in `Cargo.toml`), so `nftset.rs`'s existing raw-`NEWSETELEM`-netlink builder does not
-    actually match upstream's mechanism and could not be wired to real behavior without adding a
-    new C library dependency — a materially bigger change than this ticket's scope. `nftset=`
-    directive parsing is also still explicitly rejected
-    (`option::apply_nftset_is_explicitly_unsupported`), so there is no config path that could
-    reach it yet either; `ExtractConfig`/`ForwardConfig` carry `ipsets` only, matching what can
-    actually be configured today.
+  - **nftset now uses upstream's real mechanism (libnftables FFI), not raw netlink.** The
+    previous `nftset.rs` built a raw `NEWSETELEM` nfnetlink message with attribute numbers that
+    were, by its own comment, "simplified" and did not correspond to real `NFTA_*` constants, and
+    never sent it anywhere — a different mechanism from upstream, which never opens a netlink
+    socket itself (`nftset.c`, `#include <nftables/libnftables.h>`). `nftset.rs` is now a thin
+    hand-written FFI binding to the five libnftables entry points `nftset.c` actually calls
+    (`nft_ctx_new`, `nft_ctx_free`, `nft_ctx_buffer_error`, `nft_run_cmd_from_buffer`,
+    `nft_ctx_get_error_buffer`) — declared directly rather than via `bindgen`, since the surface is
+    small and stable, so no header dependency is added, only a link-time one. `build.rs` (new)
+    links `libnftables` when the `nftset` feature is enabled and the target is Linux; it falls back
+    to symlinking a versioned runtime-only install (no `-dev` package, just `libnftables.so.*`)
+    into `OUT_DIR` when no unversioned `libnftables.so` is found, since a bare `-lnftables` only
+    ever looks for the unversioned name. `add_to_nftset(setname, addr, flags, remove)` formats the
+    exact `"add element <set> { <ip> }"` / `"delete element <set> { <ip> }"` text upstream sends
+    (`nftset.c:28-29,64-79`), strips a `"4 "`/`"6 "` family prefix and filters by `F_IPV4`/`F_IPV6`
+    before running anything (`nftset.c:53-62`), and on a non-zero return, logs and returns the
+    first line of libnftables' own error buffer (`nftset.c:82-95`) instead of dropping it. `nftset=`
+    config parsing is wired in (`option::parse_nftset`, sharing `option::parse_ipset`'s syntax and
+    `struct ipsets` storage, differing only in the `#`→space substitution `option.c:3268-3271`
+    applies per set-name token) into a new `Daemon::nftsets`, threaded through
+    `ExtractConfig::nftsets`/`ForwardConfig::nftsets` in lockstep with the existing `ipsets` fields;
+    `rfc1035::extract_addresses` reports matches via `ExtractOutcome::nftset_hits`, and
+    `forward::cache_upstream_reply` calls `nftset::add_to_nftset` for each hit (feature = `nftset`,
+    Linux only), mirroring the `ipset_hits`/`add_to_ipset` dispatch added for ipset.
+
+    Divergences kept, documented as efficiency-only (observable behavior is unaffected): upstream
+    keeps one `static struct nft_ctx *ctx` for the process lifetime, created once by
+    `nftset_init()` at startup (`dnsmasq.c:365`) and reused by every `add_to_nftset()` call; this
+    port creates and frees a context per call instead (the same shape `ipset::open_ipset_socket`
+    already uses for its per-call netlink socket instead of a persistent one) — so there is no
+    `nftset_init()` call from `dnsmasq.rs` at startup, and no `need_cap_net_admin` signal
+    (`dnsmasq.c:362-368`) is set for it. Not ported at all: `libnftables`'s own JSON/native output
+    modes and anything beyond the five functions `nftset.c` calls — this binding is intentionally
+    narrow to that surface, not a general libnftables wrapper.
   - `find_soa` (`rfc1035.rs`, port of `rfc1035.c:519-650`) does not apply DNSSEC TTL capping
     from a per-answer signature-validity array (`daemon->rr_status[i + ancount]`,
     `rfc1035.c:609-618`) — that array does not exist anywhere in the DNSSEC path yet

@@ -1090,7 +1090,11 @@ pub fn cache_reply(
 
     let packet = match DnsPacket::parse(wire) {
         Ok(p) => p,
-        Err(_) => return ExtractOutcome { result: ExtractResult::BadPacket, ipset_hits: Vec::new() },
+        Err(_) => return ExtractOutcome {
+            result: ExtractResult::BadPacket,
+            ipset_hits: Vec::new(),
+            nftset_hits: Vec::new(),
+        },
     };
 
     extract_addresses(&packet, cache, Instant::now(), config)

@@ -1774,8 +1774,8 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
         }
 
         "nftset" => {
-            let _ = require_value("nftset")?;
-            return Err(invalid("", "nftset is not implemented yet"));
+            let v = require_value("nftset")?;
+            daemon.nftsets.extend(parse_nftset(v, cl)?);
         }
 
         // ── alias ─────────────────────────────────────────────────────────
@@ -3343,41 +3343,60 @@ fn parse_auth_zone_interface(token: &str, cl: &ConfigLine) -> Result<AuthNameEnt
 }
 
 fn parse_ipset(value: &str, cl: &ConfigLine) -> Result<Vec<Ipsets>, ConfigError> {
+    parse_ipset_family(value, cl, "ipset", false)
+}
+
+/// `--nftset` (`LOPT_NFTSET`, `option.c:3199-3280`): shares its config syntax
+/// and `struct ipsets` storage with `--ipset` entirely — the only difference
+/// is that every `#` in a set-name token becomes a space (`option.c:3268-3271`,
+/// "Use '#' to delimit table and set"), which is how `nftset=/domain/4#table#set`
+/// becomes the `"4 table set"` family-prefixed form `add_to_nftset()` parses
+/// (`nftset.c:53-62`).
+fn parse_nftset(value: &str, cl: &ConfigLine) -> Result<Vec<Ipsets>, ConfigError> {
+    parse_ipset_family(value, cl, "nftset", true)
+}
+
+fn parse_ipset_family(
+    value: &str,
+    cl: &ConfigLine,
+    directive: &str,
+    hash_to_space: bool,
+) -> Result<Vec<Ipsets>, ConfigError> {
     if !value.starts_with('/') {
-        return Err(invalid_value_for(cl, "ipset", value, "expected /domain[/domain...]/set[,set...]"));
+        return Err(invalid_value_for(cl, directive, value, "expected /domain[/domain...]/set[,set...]"));
     }
 
     let inner = value.trim_start_matches('/');
     let slash = inner.rfind('/').ok_or_else(|| {
-        invalid_value_for(cl, "ipset", value, "expected domains followed by one or more set names")
+        invalid_value_for(cl, directive, value, "expected domains followed by one or more set names")
     })?;
 
     let domains_part = &inner[..slash];
     let sets_part = &inner[slash + 1..];
     if domains_part.is_empty() || sets_part.trim().is_empty() {
-        return Err(invalid_value_for(cl, "ipset", value, "expected domains followed by one or more set names"));
+        return Err(invalid_value_for(cl, directive, value, "expected domains followed by one or more set names"));
     }
 
     let set_names: Vec<String> = split_csv(sets_part)
         .into_iter()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
+        .map(|s| if hash_to_space { s.replace('#', " ") } else { s.to_string() })
         .collect();
     if set_names.is_empty() {
-        return Err(invalid_value_for(cl, "ipset", value, "expected at least one set name"));
+        return Err(invalid_value_for(cl, directive, value, "expected at least one set name"));
     }
 
     let mut out = Vec::new();
     for domain in domains_part.split('/').filter(|d| !d.trim().is_empty()) {
         out.push(Ipsets {
-            domain: parse_domain_token(domain, "ipset", cl)?,
+            domain: parse_domain_token(domain, directive, cl)?,
             sets: set_names.clone(),
         });
     }
 
     if out.is_empty() {
-        return Err(invalid_value_for(cl, "ipset", value, "expected at least one domain"));
+        return Err(invalid_value_for(cl, directive, value, "expected at least one domain"));
     }
 
     Ok(out)
@@ -7987,9 +8006,35 @@ mod tests {
     }
 
     #[test]
-    fn apply_nftset_is_explicitly_unsupported() {
+    fn apply_nftset_multiple_domains() {
         let mut d = Daemon::default();
-        let lines = parse_config_text("nftset=/example.com/table#family#set", "test").unwrap();
+        let lines = parse_config_text("nftset=/example.com/internal.example/inet#filter#vpn", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.nftsets.len(), 2);
+        assert_eq!(d.nftsets[0].domain, "example.com");
+        // '#' becomes ' ' (option.c:3268-3271) so `add_to_nftset` can later
+        // split off a leading "4 "/"6 " family prefix (nftset.c:53-62).
+        assert_eq!(d.nftsets[0].sets, vec!["inet filter vpn".to_string()]);
+        assert_eq!(d.nftsets[1].domain, "internal.example");
+    }
+
+    #[test]
+    fn apply_nftset_dual_family_syntax_parses() {
+        let mut d = Daemon::default();
+        let lines =
+            parse_config_text("nftset=/example.com/4#inet#filter#set4,6#inet#filter#set6", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.nftsets.len(), 1);
+        assert_eq!(
+            d.nftsets[0].sets,
+            vec!["4 inet filter set4".to_string(), "6 inet filter set6".to_string()]
+        );
+    }
+
+    #[test]
+    fn apply_nftset_requires_domain_list() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("nftset=example.com/vpn", "test").unwrap();
         let err = apply_config(&mut d, &lines).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "nftset"));
     }

@@ -111,6 +111,7 @@ pub struct Daemon {
     pub tftp_interfaces: Vec<Iname>,
     pub interface_addrs: Vec<Addrlist>,
     pub ipsets:        Vec<Ipsets>,
+    pub nftsets:       Vec<Ipsets>,
     pub allowlists:    Vec<Allowlist>,
     pub allowlist_mask: u32,
 
@@ -341,6 +342,7 @@ impl Default for Daemon {
             tftp_interfaces: vec![],
             interface_addrs: vec![],
             ipsets: vec![],
+            nftsets: vec![],
             allowlists: vec![],
             allowlist_mask: 0,
             port: 53,

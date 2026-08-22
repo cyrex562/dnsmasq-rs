@@ -1138,6 +1138,8 @@ pub struct ForwardConfig {
     pub conntrack: bool,
     /// `--ipset` (`daemon->ipsets`). See [`ExtractConfig::ipsets`].
     pub ipsets: Vec<Ipsets>,
+    /// `--nftset` (`daemon->nftsets`). See [`ExtractConfig::nftsets`].
+    pub nftsets: Vec<Ipsets>,
     /// `--connmark-allowlist-enable` (`OPT_CMARK_ALST_EN`): look up the
     /// client connection's firewall mark on reply and, if it is allow-listed
     /// for this query's answer, broadcast the resolved name(s) via ubus
@@ -1201,6 +1203,7 @@ impl Default for ForwardConfig {
             port:          53,
             conntrack:     false,
             ipsets:        Vec::new(),
+            nftsets:       Vec::new(),
             cmark_alst_en: false,
             allowlists:    Vec::new(),
             allowlist_mask: 0,
@@ -1236,6 +1239,7 @@ impl ForwardConfig {
             secure:       false,
             cache_rr:     self.cache_rr.clone(),
             ipsets:       self.ipsets.clone(),
+            nftsets:      self.nftsets.clone(),
         }
     }
 }
@@ -2314,9 +2318,7 @@ fn cache_upstream_reply(
     let outcome = crate::cache::cache_reply(pkt, cache, &config.extract_config(&qname));
     // Push each match into the kernel ipset, mirroring `add_to_ipset()`
     // (`ipset.c:177-193`) being called from the `F_IPV4`/`F_IPV6` branch of
-    // `extract_addresses()` (`rfc1035.c:1016`). `nftset=` config parsing is
-    // explicitly rejected today (see `tasks.md`), so there is never an nftset
-    // hit to deliver here yet.
+    // `extract_addresses()` (`rfc1035.c:1016`).
     for hit in &outcome.ipset_hits {
         #[cfg(all(feature = "ipset", target_os = "linux"))]
         {
@@ -2329,6 +2331,30 @@ fn cache_upstream_reply(
         #[cfg(not(all(feature = "ipset", target_os = "linux")))]
         {
             tracing::debug!(set = %hit.set_name, addr = %hit.addr, "matched configured ipset (ipset feature/platform not enabled)");
+        }
+    }
+    // Same, for `--nftset`, mirroring `add_to_nftset()` being called from the
+    // same site in upstream (`rfc1035.c:1016`, `nftset.c:41-98`). Family
+    // filtering (the `4 `/`6 ` prefix check) happens inside `add_to_nftset`
+    // itself, not here — see `nftset.rs`.
+    for hit in &outcome.nftset_hits {
+        #[cfg(all(feature = "nftset", target_os = "linux"))]
+        {
+            // `flags` only needs to carry F_IPV4/F_IPV6 here — that's the only
+            // bit `add_to_nftset`'s family-prefix filter inspects.
+            let flags = match hit.addr {
+                std::net::IpAddr::V4(_) => crate::types::constants::F_IPV4,
+                std::net::IpAddr::V6(_) => crate::types::constants::F_IPV6,
+            };
+            if let Err(e) = crate::nftset::add_to_nftset(&hit.set_name, hit.addr, flags, false) {
+                tracing::warn!(set = %hit.set_name, addr = %hit.addr, error = %e, "failed to update nftset");
+            } else {
+                tracing::debug!(set = %hit.set_name, addr = %hit.addr, "added to nftset");
+            }
+        }
+        #[cfg(not(all(feature = "nftset", target_os = "linux")))]
+        {
+            tracing::debug!(set = %hit.set_name, addr = %hit.addr, "matched configured nftset (nftset feature/platform not enabled)");
         }
     }
     match outcome.result {
@@ -2969,10 +2995,10 @@ fn attach_ede(pkt: &[u8], ede: Ede) -> Option<Vec<u8>> {
 ///
 /// Not yet ported, and tracked in `tasks.md`: DNSSEC validation itself (so C's
 /// `bogusanswer`/`cache_secure` are always false here and the AD bit is never
-/// *set*), `--alias` address rewriting (`do_doctor`), the NXDOMAIN→NODATA
-/// conversion for locally-known names, and actually sending a matched
-/// `--ipset` address to the kernel (the matching itself now happens in
-/// `extract_addresses` — see `cache_upstream_reply`).
+/// *set*), `--alias` address rewriting (`do_doctor`), and the NXDOMAIN→NODATA
+/// conversion for locally-known names. `--ipset`/`--nftset` matching happens
+/// in `extract_addresses`, and delivery to the kernel in
+/// `cache_upstream_reply` (see there).
 ///
 /// Returns `false` when the reply must be discarded outright rather than
 /// delivered — currently only `check_source()`'s ECS-mismatch case

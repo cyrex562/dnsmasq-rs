@@ -583,6 +583,9 @@ pub struct ExtractConfig {
     /// names via [`ExtractOutcome::ipset_hits`]. Actually adding the address to
     /// the kernel ipset is not yet implemented — see `tasks.md`.
     pub ipsets: Vec<Ipsets>,
+    /// `--nftset` (`daemon->nftsets`): same domain-suffix → set-name matching
+    /// as [`Self::ipsets`], reported via [`ExtractOutcome::nftset_hits`].
+    pub nftsets: Vec<Ipsets>,
 }
 
 impl Default for ExtractConfig {
@@ -596,6 +599,7 @@ impl Default for ExtractConfig {
             secure: false,
             cache_rr: Vec::new(),
             ipsets: Vec::new(),
+            nftsets: Vec::new(),
         }
     }
 }
@@ -653,14 +657,15 @@ pub enum ExtractResult {
 pub struct ExtractOutcome {
     pub result: ExtractResult,
     /// Addresses extracted for a query name that matched a configured
-    /// `--ipset`/`--nftset` domain entry (`rfc1035.c:1009-1028`). Actually
-    /// adding these to the kernel set is not yet implemented — see `tasks.md`.
+    /// `--ipset` domain entry (`rfc1035.c:1009-1028`).
     pub ipset_hits: Vec<IpsetHit>,
+    /// Same, for a configured `--nftset` domain entry.
+    pub nftset_hits: Vec<IpsetHit>,
 }
 
 /// Lets every existing `assert_eq!(extract_addresses(...), ExtractResult::X)`
 /// call keep comparing against the bare result, without threading
-/// `ipset_hits` through call sites that don't care about it.
+/// `ipset_hits`/`nftset_hits` through call sites that don't care about them.
 impl PartialEq<ExtractResult> for ExtractOutcome {
     fn eq(&self, other: &ExtractResult) -> bool {
         self.result == *other
@@ -807,20 +812,32 @@ pub fn extract_addresses(
     // `new_chain` and commits it in `cache_end_insert()` (`rfc1035.c:1128`).
     let mut staged: Vec<CacheRecord> = Vec::new();
     let mut ipset_hits: Vec<IpsetHit> = Vec::new();
+    let mut nftset_hits: Vec<IpsetHit> = Vec::new();
 
-    let bad_packet = |ipset_hits| ExtractOutcome { result: ExtractResult::BadPacket, ipset_hits };
-    let rebind_blocked =
-        |ipset_hits| ExtractOutcome { result: ExtractResult::RebindBlocked, ipset_hits };
-    let cached = |ipset_hits| ExtractOutcome { result: ExtractResult::Cached, ipset_hits };
+    let bad_packet = |ipset_hits, nftset_hits| ExtractOutcome {
+        result: ExtractResult::BadPacket,
+        ipset_hits,
+        nftset_hits,
+    };
+    let rebind_blocked = |ipset_hits, nftset_hits| ExtractOutcome {
+        result: ExtractResult::RebindBlocked,
+        ipset_hits,
+        nftset_hits,
+    };
+    let cached = |ipset_hits, nftset_hits| ExtractOutcome {
+        result: ExtractResult::Cached,
+        ipset_hits,
+        nftset_hits,
+    };
 
     // Only process replies with exactly one question.
     if packet.questions.len() != 1 {
-        return bad_packet(ipset_hits);
+        return bad_packet(ipset_hits, nftset_hits);
     }
     let q = &packet.questions[0];
     // Only cache IN (class 1) answers.
     if q.qclass != 1 {
-        return cached(ipset_hits);
+        return cached(ipset_hits, nftset_hits);
     }
     let header = &packet.header;
 
@@ -845,7 +862,7 @@ pub fn extract_addresses(
                 let mut off = 0usize;
                 let target = match extract_name(&rr.rdata, &mut off) {
                     Ok(t)  => t,
-                    Err(_) => return bad_packet(ipset_hits),
+                    Err(_) => return bad_packet(ipset_hits, nftset_hits),
                 };
                 let ttl = clamp_ttl(rr.ttl, config.max_ttl);
                 staged.push(CacheRecord {
@@ -861,11 +878,11 @@ pub fn extract_addresses(
             }
             if found {
                 commit_staged(cache, staged, header, now);
-                return cached(ipset_hits);
+                return cached(ipset_hits, nftset_hits);
             }
         }
         // For PTR queries with no PTR answer we do not cache a negative entry.
-        return cached(ipset_hits);
+        return cached(ipset_hits, nftset_hits);
     }
 
     // ── Forward lookup (A, AAAA, or arbitrary RR) ─────────────────────────────
@@ -894,6 +911,7 @@ pub fn extract_addresses(
     // A/AAAA address extracted below regardless of which name in the chain it
     // belongs to (`rfc1035.c:1005-1028`).
     let ipset_match = domain_find_sets(&config.ipsets, &qname_lower);
+    let nftset_match = domain_find_sets(&config.nftsets, &qname_lower);
 
     // Follow the CNAME chain beginning at the question name.
     let mut current_name = qname_lower.clone();
@@ -911,7 +929,7 @@ pub fn extract_addresses(
                 let mut off = 0usize;
                 let target = match extract_name(&rr.rdata, &mut off) {
                     Ok(t)  => t.to_lowercase(),
-                    Err(_) => return bad_packet(ipset_hits),
+                    Err(_) => return bad_packet(ipset_hits, nftset_hits),
                 };
                 if insert {
                     staged.push(CacheRecord {
@@ -945,22 +963,22 @@ pub fn extract_addresses(
 
             let addr = match qtype {
                 1 /* A */ => {
-                    if rr.rdata.len() < 4 { return bad_packet(ipset_hits); }
+                    if rr.rdata.len() < 4 { return bad_packet(ipset_hits, nftset_hits); }
                     let ip = Ipv4Addr::new(
                         rr.rdata[0], rr.rdata[1], rr.rdata[2], rr.rdata[3],
                     );
                     if config.check_rebind && private_net(ip, !config.local_rebind_ok) {
-                        return rebind_blocked(ipset_hits);
+                        return rebind_blocked(ipset_hits, nftset_hits);
                     }
                     AllAddr::Addr4(ip)
                 }
                 28 /* AAAA */ => {
-                    if rr.rdata.len() < 16 { return bad_packet(ipset_hits); }
+                    if rr.rdata.len() < 16 { return bad_packet(ipset_hits, nftset_hits); }
                     let mut b = [0u8; 16];
                     b.copy_from_slice(&rr.rdata[..16]);
                     let ip = Ipv6Addr::from(b);
                     if config.check_rebind && private_net6(&ip, !config.local_rebind_ok) {
-                        return rebind_blocked(ipset_hits);
+                        return rebind_blocked(ipset_hits, nftset_hits);
                     }
                     AllAddr::Addr6(ip)
                 }
@@ -976,6 +994,11 @@ pub fn extract_addresses(
             if let (Some(set), Some(ip)) = (ipset_match, addr.as_ip()) {
                 for set_name in &set.sets {
                     ipset_hits.push(IpsetHit { set_name: set_name.clone(), addr: ip });
+                }
+            }
+            if let (Some(set), Some(ip)) = (nftset_match, addr.as_ip()) {
+                for set_name in &set.sets {
+                    nftset_hits.push(IpsetHit { set_name: set_name.clone(), addr: ip });
                 }
             }
             if insert {
@@ -1042,7 +1065,7 @@ pub fn extract_addresses(
     }
 
     commit_staged(cache, staged, header, now);
-    cached(ipset_hits)
+    cached(ipset_hits, nftset_hits)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2778,6 +2801,46 @@ mod tests {
         };
         let outcome = extract_addresses(&dp, &mut cache, now, &cfg);
         assert!(outcome.ipset_hits.is_empty());
+    }
+
+    #[test]
+    fn extract_addresses_reports_nftset_hits_for_a_matching_domain() {
+        let mut pkt = reply_header(10, 1, 1, 0, 0);
+        push_question(&mut pkt, "www.example.com", 1);
+        push_rr(&mut pkt, "www.example.com", 1, 300, &[10, 20, 30, 40]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+
+        let cfg = ExtractConfig {
+            nftsets: vec![Ipsets { domain: "example.com".into(), sets: vec!["inet filter vpn".into()] }],
+            ..Default::default()
+        };
+        let outcome = extract_addresses(&dp, &mut cache, now, &cfg);
+        assert_eq!(outcome, ExtractResult::Cached);
+        assert_eq!(
+            outcome.nftset_hits,
+            vec![IpsetHit { set_name: "inet filter vpn".into(), addr: IpAddr::V4(Ipv4Addr::new(10, 20, 30, 40)) }]
+        );
+        // ipset and nftset matching are independent of each other.
+        assert!(outcome.ipset_hits.is_empty());
+    }
+
+    #[test]
+    fn extract_addresses_reports_no_nftset_hits_for_a_non_matching_domain() {
+        let mut pkt = reply_header(11, 1, 1, 0, 0);
+        push_question(&mut pkt, "www.other.com", 1);
+        push_rr(&mut pkt, "www.other.com", 1, 300, &[10, 20, 30, 40]);
+        let dp = DnsPacket::parse(&pkt).unwrap();
+        let mut cache = DnsCache::new(100);
+        let now = Instant::now();
+
+        let cfg = ExtractConfig {
+            nftsets: vec![Ipsets { domain: "example.com".into(), sets: vec!["inet filter vpn".into()] }],
+            ..Default::default()
+        };
+        let outcome = extract_addresses(&dp, &mut cache, now, &cfg);
+        assert!(outcome.nftset_hits.is_empty());
     }
 
     #[test]
