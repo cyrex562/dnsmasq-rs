@@ -136,6 +136,12 @@ pub fn build_ipset_msg(msg: &IpsetMsg) -> Vec<u8> {
     buf
 }
 
+/// The persistent `NETLINK_NETFILTER` socket opened once by [`ipset_init`],
+/// mirroring upstream's file-static `ipset_sock` (`ipset.c:73`) that survives
+/// for the process lifetime instead of being opened and closed per call.
+#[cfg(target_os = "linux")]
+static IPSET_SOCK: std::sync::OnceLock<std::os::unix::io::RawFd> = std::sync::OnceLock::new();
+
 /// Open a `NETLINK_NETFILTER` socket for ipset control, the new-kernel path of
 /// `ipset_init()` (`ipset.c:88-99`). The pre-2.6.32 `SOL_IP`/`getsockopt`
 /// fallback for `old_kernel` is not ported — this crate does not track a
@@ -163,15 +169,69 @@ fn open_ipset_socket() -> std::io::Result<std::os::unix::io::RawFd> {
     Ok(fd)
 }
 
+/// One-time startup init, mirroring `ipset_init()` (`ipset.c:86-100`) being
+/// called from `dnsmasq.c:355` when any `--ipset` directive is configured.
+/// Opens and binds the persistent `NETLINK_NETFILTER` socket that every
+/// subsequent [`add_to_ipset`] call reuses via [`IPSET_SOCK`], instead of
+/// upstream's `die()` on failure this returns `Err` for the caller to log —
+/// killing the whole daemon over an ipset socket failure is a harsher
+/// failure mode than this port wants to commit to, and every call site still
+/// has a working (if less efficient) fallback: opening a fresh socket
+/// per-call when no persistent one has been installed.
+#[cfg(target_os = "linux")]
+pub fn ipset_init() -> std::io::Result<()> {
+    if IPSET_SOCK.get().is_some() {
+        return Ok(());
+    }
+    let fd = open_ipset_socket()?;
+    if IPSET_SOCK.set(fd).is_err() {
+        // Lost a race with a concurrent initializer — don't leak our fd.
+        unsafe { libc::close(fd) };
+    }
+    Ok(())
+}
+
+/// No-op on non-Linux targets — nothing to initialize, matching
+/// [`add_to_ipset`]'s non-Linux stub returning `Unsupported` rather than
+/// this failing startup.
+#[cfg(not(target_os = "linux"))]
+pub fn ipset_init() -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Send a built ipset netlink message to the kernel on `fd`.
+///
+/// No ACK is read, matching upstream's `new_add_to_ipset()`, which only
+/// checks `errno` from the `sendto()` itself (`ipset.c:139,144-147`).
+#[cfg(target_os = "linux")]
+fn send_ipset_msg(fd: std::os::unix::io::RawFd, buf: &[u8]) -> std::io::Result<()> {
+    // Destination: sockaddr_nl for the kernel (pid = 0).
+    let mut dest = [0u8; 12];
+    dest[0..2].copy_from_slice(&(libc::AF_NETLINK as u16).to_ne_bytes());
+    let sent = unsafe {
+        libc::sendto(
+            fd,
+            buf.as_ptr() as *const libc::c_void,
+            buf.len(),
+            0,
+            dest.as_ptr() as *const libc::sockaddr,
+            dest.len() as libc::socklen_t,
+        )
+    };
+    if sent == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+}
+
 /// Add (or remove) an address in a kernel ipset over netlink.
 ///
 /// Mirrors `add_to_ipset()` / `new_add_to_ipset()` (`ipset.c:104-141,177-193`):
-/// fire-and-forget, like upstream — the message is handed to the kernel socket
-/// and this returns without waiting for or parsing an ACK, since upstream's own
-/// `new_add_to_ipset()` never reads a reply either (it only checks `errno` from
-/// the `sendto()` itself, `ipset.c:139`). A failure here (no `ip_set` kernel
-/// module, missing set, no permission) is `Err` for the caller to log, matching
+/// fire-and-forget, like upstream. A failure here (no `ip_set` kernel module,
+/// missing set, no permission) is `Err` for the caller to log, matching
 /// `add_to_ipset()`'s `my_syslog(LOG_ERR, ...)` (`ipset.c:172-173`).
+///
+/// Reuses the persistent socket installed by [`ipset_init`] when present,
+/// matching upstream's file-static `ipset_sock`; falls back to opening (and
+/// closing) a fresh one otherwise, e.g. when `ipset_init` was never called or
+/// failed at startup.
 #[cfg(target_os = "linux")]
 pub fn add_to_ipset(setname: &str, addr: IpAddr, remove: bool) -> std::io::Result<()> {
     let family = match addr {
@@ -186,23 +246,15 @@ pub fn add_to_ipset(setname: &str, addr: IpAddr, remove: bool) -> std::io::Resul
     };
     let buf = build_ipset_msg(&msg);
 
-    let fd = open_ipset_socket()?;
-    // Destination: sockaddr_nl for the kernel (pid = 0).
-    let mut dest = [0u8; 12];
-    dest[0..2].copy_from_slice(&(libc::AF_NETLINK as u16).to_ne_bytes());
-    let sent = unsafe {
-        libc::sendto(
-            fd,
-            buf.as_ptr() as *const libc::c_void,
-            buf.len(),
-            0,
-            dest.as_ptr() as *const libc::sockaddr,
-            dest.len() as libc::socklen_t,
-        )
-    };
-    let result = if sent == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) };
-    unsafe { libc::close(fd) };
-    result
+    match IPSET_SOCK.get() {
+        Some(&fd) => send_ipset_msg(fd, &buf),
+        None => {
+            let fd = open_ipset_socket()?;
+            let result = send_ipset_msg(fd, &buf);
+            unsafe { libc::close(fd) };
+            result
+        }
+    }
 }
 
 /// No-op stub on non-Linux targets — ipset is a Linux kernel facility, same
@@ -214,6 +266,14 @@ pub fn add_to_ipset(_setname: &str, _addr: IpAddr, _remove: bool) -> std::io::Re
 
 /// Parse an ipset name list from `/proc/net/ip_set` format.
 /// Each line looks like: `<index> <name> ...` — we return the name tokens.
+///
+/// Invented: `ipset.c` has no counterpart to this function or to reading
+/// `/proc/net/ip_set` at all — upstream never enumerates existing sets, it
+/// just fires `IPSET_CMD_ADD`/`DEL` at the kernel and lets that fail if the
+/// set doesn't exist (`ipset.c:210-213`'s `my_syslog` on `errno`). This has no
+/// caller anywhere in the crate; it is kept only as a potential building
+/// block for a future startup sanity check (warn if a configured `--ipset`
+/// set name doesn't exist yet) that has not been implemented.
 pub fn parse_ipset_list(text: &str) -> Vec<String> {
     text.lines()
         .filter_map(|line| {
@@ -309,5 +369,51 @@ Name
         )
         .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    /// Mirrors `ipset_init()` opening one persistent socket at startup
+    /// (`ipset.c:86-100`) and every `add_to_ipset()` call reusing it
+    /// (`ipset.c:144`, `sendto(ipset_sock, ...)` on the file-static `ipset_sock`)
+    /// instead of opening and closing a fresh one per call. Proven by counting
+    /// this process's open file descriptors: once `ipset_init()` has installed
+    /// the persistent socket, two `add_to_ipset()` calls must not change the
+    /// count, since neither should open (or close) a socket of its own.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn add_to_ipset_reuses_persistent_socket_after_init() {
+        if ipset_init().is_err() {
+            // Sandbox denies AF_NETLINK entirely — nothing to prove here, and
+            // that's a valid outcome (see `add_to_ipset_does_not_panic`).
+            return;
+        }
+
+        let fd_count = || std::fs::read_dir("/proc/self/fd").map(|d| d.count()).unwrap_or(0);
+
+        let before = fd_count();
+        let _ = add_to_ipset(
+            "dnsmasq_rs_test_reuse",
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)),
+            false,
+        );
+        let _ = add_to_ipset(
+            "dnsmasq_rs_test_reuse",
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 3)),
+            false,
+        );
+        let after = fd_count();
+
+        assert_eq!(
+            before, after,
+            "add_to_ipset should reuse the persistent socket from ipset_init, not open a new one per call"
+        );
+    }
+
+    #[test]
+    fn ipset_init_is_idempotent() {
+        // Calling ipset_init() more than once (e.g. across repeated test runs
+        // sharing the process-wide static) must never panic or double-init.
+        let first = ipset_init();
+        let second = ipset_init();
+        assert_eq!(first.is_ok(), second.is_ok());
     }
 }

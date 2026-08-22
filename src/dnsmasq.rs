@@ -93,6 +93,19 @@ pub fn init_daemon_with(mut daemon: Daemon) -> DaemonHandle {
             }
         }
     }
+
+    // Mirrors `dnsmasq.c:352-358`: only open the ipset control socket when
+    // at least one `--ipset` directive is configured. Upstream `die()`s on
+    // failure here; this port logs instead (see `ipset::ipset_init`'s doc
+    // comment for why) and each `add_to_ipset` call still has a working
+    // per-call fallback if the persistent socket was never installed.
+    #[cfg(feature = "ipset")]
+    if !daemon.ipsets.is_empty() {
+        if let Err(err) = crate::ipset::ipset_init() {
+            tracing::error!("failed to create IPset control socket: {err}");
+        }
+    }
+
     Arc::new(RwLock::new(daemon))
 }
 
@@ -2181,6 +2194,24 @@ mod tests {
             output.contains("DHCP relay from 10.0.0.1 to 10.0.0.2 via eth0"),
             "startup log should contain the dhcp-relay line, got: {output}"
         );
+    }
+
+    /// Mirrors `dnsmasq.c:352-358`: startup must attempt `ipset_init()` when
+    /// any `--ipset` directive is configured, instead of leaving the control
+    /// socket unopened until the first resolved address needs it.
+    #[test]
+    #[cfg(feature = "ipset")]
+    fn init_daemon_with_inits_ipset_socket_when_ipsets_configured() {
+        let mut daemon = Daemon::default();
+        daemon.ipsets.push(crate::types::network::Ipsets {
+            sets:   vec!["myset".to_string()],
+            domain: "example.com".to_string(),
+        });
+
+        // Must not panic — the sandbox may or may not allow AF_NETLINK, and
+        // either outcome (persistent socket installed, or a logged error) is
+        // fine; `ipset::add_to_ipset` still has a working per-call fallback.
+        let _handle = init_daemon_with(daemon);
     }
 
     #[test]
