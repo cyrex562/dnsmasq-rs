@@ -651,7 +651,7 @@ fn set_extradata_env(cmd: &mut Command, extradata: &[u8], is6: bool) {
 /// in helper.c:504-689 does — except here `std::process::Command` handles
 /// the fork+exec+wait itself, since we already are the privilege-dropped
 /// process the script must inherit from (no second privilege drop needed).
-fn run_script_child(command: &str, action_str: &str, data: &ScriptData, log_dhcp: bool) {
+pub(crate) fn run_script_child(command: &str, action_str: &str, data: &ScriptData, log_dhcp: bool) {
     let is6 = is6(data);
     let (hostname, domain) = hostname_and_domain(data);
 

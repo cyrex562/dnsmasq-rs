@@ -11,9 +11,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(feature = "dhcp")]
 use crate::dhcp_protocol::DHCP_CHADDR_MAX;
 #[cfg(feature = "dhcp")]
-use crate::helper::{format_client_id, format_mac, run_script, LeaseAction, LeaseScriptEvent};
+use crate::helper::{run_script_child, ScriptData};
 #[cfg(feature = "dhcp")]
-use crate::types::dhcp::DhcpLease;
+use crate::types::dhcp::{DhcpLease, ACTION_ADD, ACTION_DEL, ACTION_OLD};
 
 /// Errors that can occur during lease deserialisation.
 #[cfg(feature = "dhcp")]
@@ -512,41 +512,64 @@ impl LeaseDb {
     /// any new one; then leases flagged `LEASE_NEW`/`LEASE_CHANGED` fire
     /// `add`/`old` and have those flags (plus `LEASE_AUX_CHANGED` /
     /// `LEASE_EXP_CHANGED`) cleared.
-    pub fn run_lease_scripts(&mut self, command: Option<&str>) {
+    /// `leasefile_ro`/`script_on_renewal` mirror `--leasefile-ro`
+    /// (`OPT_LEASE_RO`) / `--script-on-renewal` (`OPT_LEASE_RENEW`).
+    ///
+    /// Port of `do_script_run()`'s trigger condition (lease.c:1286-1288):
+    /// `(LEASE_NEW|LEASE_CHANGED) || (LEASE_AUX_CHANGED && OPT_LEASE_RO) ||
+    /// (LEASE_EXP_CHANGED && OPT_LEASE_RENEW)`. Without the latter two
+    /// disjuncts, a pure lease renewal (no name/major change, only
+    /// `LEASE_AUX_CHANGED`/`LEASE_EXP_CHANGED` set by [`Self::set_expires`])
+    /// never fires the `old` notification `--leasefile-ro`/
+    /// `--script-on-renewal` promise, and — since the clear is gated inside
+    /// the same `if` — those flags are never cleared either.
+    pub fn run_lease_scripts(&mut self, command: Option<&str>, leasefile_ro: bool, script_on_renewal: bool) {
         use crate::types::dhcp::{LEASE_AUX_CHANGED, LEASE_CHANGED, LEASE_EXP_CHANGED, LEASE_NEW};
+
+        // `run_script_child` runs the script synchronously and in-process —
+        // this port has no live caller of `helper::create_helper`'s
+        // fork+privilege-drop child yet (see tasks.md), so there is no
+        // persistent helper to hand events to. `log_dhcp` (OPT_LOG_OPTS)
+        // isn't threaded through from `Daemon` for the same reason; `false`
+        // matches this function's previous behavior, which never set a
+        // DNSMASQ_LOG_DHCP-style var either.
+        const LOG_DHCP: bool = false;
 
         for mut lease in self.old_leases.drain(..) {
             if let Some(old_hostname) = lease.old_hostname.take() {
                 if let Some(command) = command {
-                    let ev = build_script_event(&lease, LeaseAction::Old, Some(&old_hostname));
-                    let _ = run_script(command, &ev);
+                    let ev = build_script_event(&lease, ACTION_OLD, Some(&old_hostname));
+                    run_script_child(command, "old", &ev, LOG_DHCP);
                 }
             }
             if let Some(command) = command {
-                let ev = build_script_event(&lease, LeaseAction::Del, None);
-                let _ = run_script(command, &ev);
+                let ev = build_script_event(&lease, ACTION_DEL, None);
+                run_script_child(command, "del", &ev, LOG_DHCP);
             }
         }
 
         for lease in self.leases.values_mut() {
             if let Some(old_hostname) = lease.old_hostname.take() {
                 if let Some(command) = command {
-                    let ev = build_script_event(lease, LeaseAction::Old, Some(&old_hostname));
-                    let _ = run_script(command, &ev);
+                    let ev = build_script_event(lease, ACTION_OLD, Some(&old_hostname));
+                    run_script_child(command, "old", &ev, LOG_DHCP);
                 }
             }
         }
 
         for lease in self.leases.values_mut() {
-            if lease.flags & (LEASE_NEW | LEASE_CHANGED) != 0 {
+            if lease.flags & (LEASE_NEW | LEASE_CHANGED) != 0
+                || (lease.flags & LEASE_AUX_CHANGED != 0 && leasefile_ro)
+                || (lease.flags & LEASE_EXP_CHANGED != 0 && script_on_renewal)
+            {
                 if let Some(command) = command {
-                    let action = if lease.flags & LEASE_NEW != 0 {
-                        LeaseAction::Add
+                    let (action, action_str) = if lease.flags & LEASE_NEW != 0 {
+                        (ACTION_ADD, "add")
                     } else {
-                        LeaseAction::Old
+                        (ACTION_OLD, "old")
                     };
                     let ev = build_script_event(lease, action, None);
-                    let _ = run_script(command, &ev);
+                    run_script_child(command, action_str, &ev, LOG_DHCP);
                 }
                 lease.flags &= !(LEASE_NEW | LEASE_CHANGED | LEASE_AUX_CHANGED | LEASE_EXP_CHANGED);
             }
@@ -924,30 +947,24 @@ impl LeaseDb {
 /// lease.c:1292 and the `DNSMASQ_LEASE_EXPIRES`/`DNSMASQ_CLIENT_ID` extras
 /// `helper::run_script` looks up.
 #[cfg(feature = "dhcp")]
-fn build_script_event(
-    lease: &DhcpLease,
-    action: LeaseAction,
-    hostname_override: Option<&str>,
-) -> LeaseScriptEvent {
-    let ip = std::net::IpAddr::V4(lease.addr);
-    let mac = format_mac(&lease.hwaddr[..lease.hwaddr_len.min(DHCP_CHADDR_MAX)]);
-    let hostname = hostname_override
-        .map(|s| s.to_string())
-        .or_else(|| lease.fqdn.clone())
-        .or_else(|| lease.hostname.clone());
-
-    let expires_secs = match lease.expires {
-        Some(t) => t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
-        None => 0,
+fn build_script_event(lease: &DhcpLease, action: u32, hostname_override: Option<&str>) -> ScriptData {
+    // Upstream's DEL call site (`lease.c:1255`) always passes NULL for
+    // hostname: `do_script_run`'s DEL branch calls `queue_script(ACTION_DEL,
+    // lease, lease->old_hostname, now)`, and by that point in the control
+    // flow `lease->old_hostname` is always NULL (either never set, or
+    // already consumed and freed by the prior ACTION_OLD_HOSTNAME event).
+    // Falling through to `fqdn`/`hostname` here for DEL — as ADD/OLD do —
+    // would report a deleted lease's hostname on an event upstream always
+    // sends with an empty one.
+    let hostname = if action == ACTION_DEL {
+        None
+    } else {
+        hostname_override
+            .map(|s| s.to_string())
+            .or_else(|| lease.fqdn.clone())
+            .or_else(|| lease.hostname.clone())
     };
-    let mut extra = vec![("DNSMASQ_LEASE_EXPIRES".to_string(), expires_secs.to_string())];
-    if let Some(clid) = &lease.clid {
-        if !clid.is_empty() {
-            extra.push(("DNSMASQ_CLIENT_ID".to_string(), format_client_id(clid)));
-        }
-    }
-
-    LeaseScriptEvent { action, ip, mac, hostname, extra }
+    ScriptData::for_lease(action, lease, hostname.as_deref(), SystemTime::now())
 }
 
 /// Parse a colon-separated hex string (e.g. `"de:ad:be:ef"`) into bytes.
@@ -1640,12 +1657,15 @@ mod tests {
 
         let marker = dir.join("marker.log");
         let script_path = dir.join("hook.sh");
+        // Positional args only ($1=action, $2=mac, $3=addr, $4=hostname if
+        // present) — upstream never sets DNSMASQ_ACTION/DNSMASQ_IP as env
+        // vars (helper.c:587-667 has no such names), and DNSMASQ_SUPPLIED_HOSTNAME
+        // is a distinct thing sourced from the DHCP request's extradata, not
+        // from this event's hostname field. $2 (mac) is skipped so existing
+        // "{action} {addr} {hostname}"-shaped assertions stay readable.
         std::fs::write(
             &script_path,
-            format!(
-                "#!/bin/sh\necho \"$DNSMASQ_ACTION $DNSMASQ_IP $DNSMASQ_SUPPLIED_HOSTNAME\" >> {}\n",
-                marker.to_str().unwrap()
-            ),
+            format!("#!/bin/sh\necho \"$1 $3 $4\" >> {}\n", marker.to_str().unwrap()),
         )
         .unwrap();
         let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
@@ -1693,7 +1713,7 @@ mod tests {
         let (contents, _db) = run_scripts_until_marker_written(&marker, || {
             let mut db = LeaseDb::new();
             db.allocate_v4(addr);
-            db.run_lease_scripts(Some(script_path.to_str().unwrap()));
+            db.run_lease_scripts(Some(script_path.to_str().unwrap()), false, false);
             db
         });
 
@@ -1713,7 +1733,7 @@ mod tests {
         let (_contents, db) = run_scripts_until_marker_written(&marker, || {
             let mut db = LeaseDb::new();
             db.allocate_v4(addr);
-            db.run_lease_scripts(Some(script_path.to_str().unwrap()));
+            db.run_lease_scripts(Some(script_path.to_str().unwrap()), false, false);
             db
         });
 
@@ -1732,7 +1752,7 @@ mod tests {
             let mut db = LeaseDb::new();
             db.insert(make_lease(addr, [0x01, 0, 0, 0, 0, 0], None)); // hostname "host1"
             db.set_hostname(addr, Some("renamed"), false); // LEASE_CHANGED + old_hostname="host1"
-            db.run_lease_scripts(Some(script_path.to_str().unwrap()));
+            db.run_lease_scripts(Some(script_path.to_str().unwrap()), false, false);
             db
         });
 
@@ -1755,12 +1775,15 @@ mod tests {
             let mut db = LeaseDb::new();
             db.insert(make_lease(addr, [0x01, 0, 0, 0, 0, 0], None));
             db.remove_by_addr(addr);
-            db.run_lease_scripts(Some(script_path.to_str().unwrap()));
+            db.run_lease_scripts(Some(script_path.to_str().unwrap()), false, false);
             db
         });
 
         let first_line = contents.lines().next().unwrap();
-        assert_eq!(first_line, format!("del {addr} host1"));
+        // Upstream's DEL call site always passes NULL for hostname
+        // (lease.c:1255) — a deleted lease must not report its hostname on
+        // the del event, unlike add/old.
+        assert_eq!(first_line, format!("del {addr} "));
     }
 
     #[cfg(unix)]
@@ -1775,7 +1798,7 @@ mod tests {
             db.insert(make_lease(addr, [0x01, 0, 0, 0, 0, 0], None)); // hostname "host1"
             db.set_hostname(addr, None, false); // clears hostname, sets old_hostname = "host1"
             db.remove_by_addr(addr);
-            db.run_lease_scripts(Some(script_path.to_str().unwrap()));
+            db.run_lease_scripts(Some(script_path.to_str().unwrap()), false, false);
             db
         });
 
@@ -1797,13 +1820,13 @@ mod tests {
             let mut db = LeaseDb::new();
             db.insert(make_lease(addr, [0x01, 0, 0, 0, 0, 0], None));
             db.remove_by_addr(addr);
-            db.run_lease_scripts(Some(script_path.to_str().unwrap()));
+            db.run_lease_scripts(Some(script_path.to_str().unwrap()), false, false);
             db
         });
 
         // A second call should be a no-op: the old_leases queue was drained
         // and no lease is left with pending flags, so nothing is spawned.
-        db.run_lease_scripts(Some(script_path.to_str().unwrap()));
+        db.run_lease_scripts(Some(script_path.to_str().unwrap()), false, false);
         let contents_after = std::fs::read_to_string(&marker).unwrap();
         assert_eq!(contents_before, contents_after);
     }
@@ -1823,7 +1846,7 @@ mod tests {
         db.remove_by_addr(addr);
         assert_eq!(db.old_leases.len(), 1);
 
-        db.run_lease_scripts(None);
+        db.run_lease_scripts(None, false, false);
 
         assert!(
             db.old_leases.is_empty(),
@@ -1838,10 +1861,64 @@ mod tests {
         let addr = Ipv4Addr::new(10, 0, 0, 5);
         db.allocate_v4(addr);
 
-        db.run_lease_scripts(None);
+        db.run_lease_scripts(None, false, false);
 
         let lease = db.find_by_addr(addr).unwrap();
         assert_eq!(lease.flags & (LEASE_NEW | LEASE_CHANGED), 0);
+    }
+
+    /// Upstream's trigger condition (lease.c:1286-1288) fires on a pure
+    /// aux/expiry renewal too when `--leasefile-ro`/`--script-on-renewal`
+    /// are set, not just add/old/del. Without this, both the notification
+    /// and the flag-clearing it gates never happen for a lease that only
+    /// ever renews.
+    #[cfg(unix)]
+    #[test]
+    fn run_lease_scripts_fires_on_pure_renewal_only_when_enabled() {
+        use crate::types::dhcp::{LEASE_AUX_CHANGED, LEASE_EXP_CHANGED};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (script_path, marker) = write_marker_script(dir.path());
+        let addr = Ipv4Addr::new(10, 0, 0, 5);
+        let command = script_path.to_str().unwrap();
+
+        let mut db = LeaseDb::new();
+        db.insert(make_lease(addr, [0x01, 0, 0, 0, 0, 0], None));
+        // Clear LEASE_NEW/CHANGED first so only the renewal path is exercised.
+        db.run_lease_scripts(Some(command), false, false);
+        let _ = std::fs::remove_file(&marker);
+
+        // A pure renewal (LEASE_AUX_CHANGED | LEASE_EXP_CHANGED only) with
+        // both options off must not fire the script, and must not clear the
+        // renewal flags either — upstream gates the clear inside the same
+        // `if` as the fire.
+        db.set_expires(addr, 3600);
+        {
+            let lease = db.find_by_addr(addr).unwrap();
+            assert_ne!(lease.flags & (LEASE_AUX_CHANGED | LEASE_EXP_CHANGED), 0);
+        }
+        db.run_lease_scripts(Some(command), false, false);
+        assert!(
+            std::fs::read_to_string(&marker).unwrap_or_default().is_empty(),
+            "a pure renewal must not fire the script when leasefile-ro/script-on-renewal are both off"
+        );
+        {
+            let lease = db.find_by_addr(addr).unwrap();
+            assert_ne!(
+                lease.flags & (LEASE_AUX_CHANGED | LEASE_EXP_CHANGED), 0,
+                "renewal flags must stay set until a run that's actually allowed to fire clears them"
+            );
+        }
+
+        // The same renewal, with leasefile_ro on this time, must fire and
+        // clear the flags. `run_script_child` runs the script synchronously,
+        // so its write is complete by the time this call returns.
+        db.run_lease_scripts(Some(command), true, false);
+        let contents = std::fs::read_to_string(&marker).unwrap();
+        let first_line = contents.lines().next().unwrap();
+        assert_eq!(first_line, format!("old {addr} host1"));
+        let lease = db.find_by_addr(addr).unwrap();
+        assert_eq!(lease.flags & (LEASE_AUX_CHANGED | LEASE_EXP_CHANGED), 0);
     }
 
     // ── write_to_file / load_from_file tests ──

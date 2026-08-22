@@ -72,6 +72,12 @@ pub struct DhcpServerConfig {
     /// The dhcp-script hook command (`--dhcp-script`), run on lease
     /// add/old/del via [`crate::lease::LeaseDb::run_lease_scripts`].
     pub lease_change_command: Option<String>,
+    /// `--leasefile-ro` (`OPT_LEASE_RO`): also fire the script hook on a
+    /// pure aux-data renewal, not just add/old/del.
+    pub leasefile_ro: bool,
+    /// `--script-on-renewal` (`OPT_LEASE_RENEW`): also fire the script hook
+    /// on a pure expiry-time renewal.
+    pub script_on_renewal: bool,
     /// Option-substring classifier rules from parsed `dhcp-match`.
     pub match_rules: Vec<crate::types::dhcp::DhcpOpt>,
     /// Client-hostname classifier rules from parsed `dhcp-name-match`.
@@ -132,6 +138,8 @@ impl Default for DhcpServerConfig {
             domain_suffix: None,
             lease_file: None,
             lease_change_command: None,
+            leasefile_ro: false,
+            script_on_renewal: false,
             match_rules: Vec::new(),
             name_match_rules: Vec::new(),
             tag_rules: Vec::new(),
@@ -1400,7 +1408,7 @@ pub async fn run_dhcp_loop(
                     .lease_change_command
                     .as_deref()
                     .filter(|c| !c.is_empty());
-                lease_db.run_lease_scripts(command);
+                lease_db.run_lease_scripts(command, cfg.leasefile_ro, cfg.script_on_renewal);
 
                 let Some(dispatched) = dispatched else {
                     continue;
@@ -2447,6 +2455,8 @@ mod tests {
             domain_suffix: None,
             lease_file: None,
             lease_change_command: None,
+            leasefile_ro: false,
+            script_on_renewal: false,
             match_rules: vec![],
             name_match_rules: vec![],
             tag_rules: vec![],

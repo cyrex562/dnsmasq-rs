@@ -693,13 +693,20 @@ Both are reference-only. Do not treat either tree as code to edit in place.
 
   Explicitly **not** covered — upstream behavior still missing:
 
-  - Nothing calls `create_helper`/`HelperHandle::send` yet. `dnsmasq.rs`/`main.rs` startup
-    does not fork the helper ahead of the main privilege drop (`dnsmasq.c:744`), and
-    `lease.rs`'s `rerun_scripts` (lease.rs:439) still only flips `LEASE_CHANGED` instead of
-    building a `ScriptData::for_lease` and sending it — same for DHCP lease
-    commit/expiry paths in `dhcp.rs` and any ARP/TFTP call sites. Until that wiring lands,
-    `dhcp-script`/`dhcp-scriptuser` are parsed into `Daemon` (not a no-op) but have no
-    runtime effect.
+  - `run_dhcp_loop` (dhcp.rs) does call `LeaseDb::run_lease_scripts` every dispatch, and it
+    does build a real `ScriptData::for_lease` and run it via `helper::run_script_child` — a
+    real, synchronous, in-process execution (Issue #31 / T3-lease). `dhcp-script`/
+    `dhcp-scriptuser` are not a no-op.
+    Still missing: nothing calls `create_helper`/`HelperHandle::send`. `dnsmasq.rs`/
+    `main.rs` startup does not fork the persistent privilege-dropped helper process ahead of
+    the main privilege drop (`dnsmasq.c:744`), so every script still runs in the
+    (already-privilege-dropped) main process rather than the dedicated child — no privilege
+    boundary is crossed incorrectly, but a slow/hanging script blocks the DHCP dispatch loop
+    the way upstream's async pipe-fed helper is specifically designed to avoid. `lease.rs`'s
+    `rerun_scripts` (lease.rs:480) only flips the per-lease flags `run_lease_scripts` acts on
+    (by design — SIGHUP-triggered "re-announce everything" support); it never calls a script
+    itself. Same "runs inline, not via the persistent helper" gap applies to any future
+    ARP/TFTP call sites.
   - Lua scripting (`grab_extradata_lua`, `daemon->luascript`, helper.c:136-175,319-498) is
     deliberately out of scope, per the issue.
   - The DHCPv6-specific env vars/argv (`DNSMASQ_IAID`, `DNSMASQ_SERVER_DUID`, the
