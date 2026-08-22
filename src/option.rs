@@ -17,7 +17,7 @@ use crate::types::dns_records::{
     ADDRLIST_LITERAL, IN4, IN6, INP4, INP6,
 };
 use crate::types::network::{Allowlist, DynDir, HostsFile, Iname, Ipsets, MySubnet, AH_DHCP_HST, AH_DHCP_OPT, AH_HOSTS, INAME_4, INAME_6};
-use crate::types::server::{Server, SERV_4ADDR, SERV_6ADDR, SERV_LITERAL_ADDRESS};
+use crate::types::server::{Server, SERV_4ADDR, SERV_6ADDR, SERV_ALL_ZEROS, SERV_LITERAL_ADDRESS};
 use crate::types::daemon::{DhcpBridge, SharedNetwork};
 use crate::domain::CondDomain;
 #[cfg(feature = "dhcp")]
@@ -2190,10 +2190,19 @@ fn parse_server_or_address(
             return Err(invalid(v, "empty domain list"));
         }
         // Last entry is the address; everything before it is domain names.
+        // A domain segment that is literally `#` ("address=/#/1.2.3.4" /
+        // "server=/#/...") means "matches any domain" — upstream implements
+        // this by rewriting it to the empty string before storing the server
+        // entry (`option.c:3136-3138`: "address=/#/ matches the same as
+        // without domain"), which is exactly the general/fallback entry a
+        // bare `address=1.2.3.4` (no `/domain/` prefix at all) already
+        // produces. Doing the same rewrite here means a mixed directive like
+        // `/specific.test/#/1.2.3.4` correctly produces one entry per domain
+        // (including the wildcard), rather than silently dropping the `#`.
         let doms: Vec<String> = parts[..parts.len() - 1]
             .iter()
             .filter(|d| !d.is_empty())
-            .map(|d| d.to_string())
+            .map(|d| if *d == "#" { String::new() } else { d.to_string() })
             .collect();
         // We need addr_segment to live long enough — it points into `v`.
         // Use split_at on v to get a `&str` with the correct lifetime.
@@ -2224,6 +2233,25 @@ fn parse_server_or_address(
                     dummy_addr.clone(),
                     dummy_addr.clone(),
                 ));
+            }
+        }
+        return Ok(());
+    }
+
+    // `--address=/domain/#` (the whole address argument is literally "#",
+    // not a `<real-address>#<port>` string with a leading empty address):
+    // return the NULL address (0.0.0.0 / ::) for domain + subdomains.
+    // `--address`-only per upstream (`option.c:3093-3097`, gated on
+    // `option == 'A'`) — `--server`/`--local` don't give `#` this meaning at
+    // all, since server addresses always need a real, resolvable target.
+    if key == "address" && addr_part == "#" {
+        let dummy_addr = MySockAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0));
+        let flags = SERV_ALL_ZEROS | SERV_LITERAL_ADDRESS;
+        if domains.is_empty() {
+            daemon.servers.push(new_server(flags, String::new(), dummy_addr.clone(), dummy_addr));
+        } else {
+            for domain in domains {
+                daemon.servers.push(new_server(flags, domain, dummy_addr.clone(), dummy_addr.clone()));
             }
         }
         return Ok(());
@@ -6858,6 +6886,69 @@ mod tests {
         assert_eq!(s.domain, "example.com");
         assert_eq!(s.flags & SERV_LITERAL_ADDRESS, SERV_LITERAL_ADDRESS);
         assert_eq!(s.flags & (SERV_4ADDR | SERV_6ADDR), 0);
+    }
+
+    /// `address=/domain/#`: the whole address argument is literally `#`,
+    /// meaning "return the NULL address (0.0.0.0/::) for domain and its
+    /// subdomains" — syntactic sugar for `address=/domain/0.0.0.0` plus
+    /// `address=/domain/::` (`option.c:3093-3097`, `--address`-only: `#`
+    /// only gets this meaning under `option == 'A'`). Previously
+    /// misparsed as an `<address>#<port>` string with an empty address,
+    /// producing "invalid value '' for 'address': expected an IP address"
+    /// instead of a valid config.
+    #[test]
+    fn apply_address_hash_creates_null_address_server() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("address=/example.com/#", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.servers.len(), 1);
+        let s = &d.servers[0];
+        assert_eq!(s.domain, "example.com");
+        assert_eq!(s.flags & SERV_LITERAL_ADDRESS, SERV_LITERAL_ADDRESS);
+        assert_eq!(s.flags & SERV_ALL_ZEROS, SERV_ALL_ZEROS);
+    }
+
+    #[test]
+    fn apply_address_hash_with_no_domain_creates_catch_all_null_address_server() {
+        // `/#/` as a domain segment means "matches any domain" — upstream
+        // rewrites it to the empty string before storing the entry
+        // (option.c:3136-3138), the same general/fallback domain a bare
+        // `address=1.2.3.4` (no `/domain/` prefix) already produces.
+        let mut d = Daemon::default();
+        let lines = parse_config_text("address=/#/#", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.servers.len(), 1);
+        assert_eq!(d.servers[0].domain, "");
+        assert_eq!(d.servers[0].flags & SERV_ALL_ZEROS, SERV_ALL_ZEROS);
+    }
+
+    /// A mixed directive naming a specific domain alongside the `/#/`
+    /// wildcard must produce one entry per domain, not silently drop the
+    /// wildcard because its rewritten (empty-string) form looks like a
+    /// filtered-out empty split segment.
+    #[test]
+    fn apply_address_specific_domain_plus_wildcard_creates_two_entries() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("address=/specific.test/#/198.51.100.1", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.servers.len(), 2);
+        assert_eq!(d.servers[0].domain, "specific.test");
+        assert_eq!(d.servers[1].domain, "");
+        for s in &d.servers {
+            assert_eq!(s.addr.ip(), "198.51.100.1".parse::<std::net::IpAddr>().unwrap());
+        }
+    }
+
+    /// `#` only means "NULL address" for `--address`; `--server`/`--local`
+    /// don't give it that meaning (a server always needs a real address to
+    /// forward to), so `server=8.8.8.8#5353`-style port syntax must still
+    /// work and a bare `#` for `--server` is just an (invalid) address.
+    #[test]
+    fn apply_server_hash_is_not_treated_as_null_address() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("server=/example.com/#", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "server"));
     }
 
     #[test]

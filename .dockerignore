@@ -1,0 +1,16 @@
+# Build artifacts and VCS metadata: never needed as Docker build context,
+# and target/ in particular can be tens of GB, which turns every parity
+# harness build into a multi-minute (or multi-gigabyte-timeout) context
+# transfer for no benefit — neither Dockerfile reads a pre-built target/.
+/target/
+/.git/
+
+# Reference-only trees no Dockerfile build step touches.
+/old/
+/harness/
+/docs/
+
+# Stray crash dumps and editor/OS cruft that sometimes land in the repo root.
+core.*
+*.swp
+.DS_Store

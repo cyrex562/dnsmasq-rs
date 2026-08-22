@@ -1,0 +1,5 @@
+# qname qtype
+hop1.test A
+hop1.test AAAA
+hop2.test A
+dead-end.test A

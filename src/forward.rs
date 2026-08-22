@@ -1504,8 +1504,13 @@ impl ForwardEngine {
             return self.join_in_flight(idx, now, orig_id, client, listener).await;
         }
 
+        // No server array entry exists at all (`lookup_domain()` failing,
+        // `forward.c:344-350`): C sets `flags = 0`/`ede = EDE_NOT_READY` and
+        // jumps straight to `reply:`, where `setup_reply()`'s catch-all
+        // "nowhere to forward to" branch answers REFUSED rather than
+        // dropping the query (`rfc1035.c:1291-1298`).
         if self.config.upstreams.is_empty() {
-            return ForwardOutcome::Dropped;
+            return ForwardOutcome::Refused;
         }
         let candidates = self.candidate_servers(pkt);
         // A server whose loop probe has come back to us is excluded from
@@ -4483,6 +4488,23 @@ mod tests {
             .expect("a header-only query is still answerable");
         assert_eq!(wire[3] & 0x0F, 5, "RCODE REFUSED");
         assert_eq!(wire[2] & 0x80, 0x80, "QR set");
+    }
+
+    /// A well-formed query with zero upstream servers configured at all
+    /// (`no-resolv`, no `server=` lines) is not silently dropped: C's
+    /// `lookup_domain()` fails to find any server-array entry, sets
+    /// `flags = 0`/`ede = EDE_NOT_READY`, and jumps to `reply:`, where
+    /// `setup_reply()`'s catch-all "nowhere to forward to" branch answers
+    /// REFUSED (`forward.c:344-350`, `rfc1035.c:1291-1298`) — matching the
+    /// already-REFUSED unreadable-question case just above, not the silent
+    /// `Dropped` this used to return.
+    #[tokio::test]
+    async fn forward_query_refuses_when_no_upstreams_are_configured() {
+        let config = ForwardConfig { upstreams: vec![], ..Default::default() };
+        let mut engine = ForwardEngine::new(config);
+        let outcome = engine.forward_query(&a_query(), client_addr(), 0, None).await;
+        assert_eq!(outcome, ForwardOutcome::Refused);
+        assert_eq!(engine.table.active_count(), 0);
     }
 
     /// The limit of that: C's REFUSED is built by `make_local_answer()`, which

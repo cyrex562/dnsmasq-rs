@@ -1,0 +1,9 @@
+# qname qtype
+blocked.test A
+sub.blocked.test A
+nulled.test A
+nulled.test AAAA
+blank.test A
+serverblock.test A
+random-unmatched-name.test A
+allowed.test A
