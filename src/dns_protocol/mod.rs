@@ -102,21 +102,38 @@ impl RrType {
         match v {
             1   => Some(Self::A),
             2   => Some(Self::NS),
+            3   => Some(Self::MD),
+            4   => Some(Self::MF),
             5   => Some(Self::CNAME),
             6   => Some(Self::SOA),
+            7   => Some(Self::MB),
+            8   => Some(Self::MG),
+            9   => Some(Self::MR),
             12  => Some(Self::PTR),
+            14  => Some(Self::MINFO),
             15  => Some(Self::MX),
             16  => Some(Self::TXT),
+            17  => Some(Self::RP),
+            18  => Some(Self::AFSDB),
+            21  => Some(Self::RT),
+            24  => Some(Self::SIG),
+            26  => Some(Self::PX),
             28  => Some(Self::AAAA),
+            30  => Some(Self::NXT),
             33  => Some(Self::SRV),
             35  => Some(Self::NAPTR),
+            36  => Some(Self::KX),
+            39  => Some(Self::DNAME),
             41  => Some(Self::OPT),
             43  => Some(Self::DS),
             46  => Some(Self::RRSIG),
             47  => Some(Self::NSEC),
             48  => Some(Self::DNSKEY),
             50  => Some(Self::NSEC3),
+            249 => Some(Self::TKEY),
+            250 => Some(Self::TSIG),
             252 => Some(Self::AXFR),
+            253 => Some(Self::MAILB),
             255 => Some(Self::ANY),
             257 => Some(Self::CAA),
             _   => None,
@@ -293,5 +310,34 @@ mod tests {
         assert_eq!(RrType::from_u16(1), Some(RrType::A));
         assert_eq!(RrType::from_u16(28), Some(RrType::AAAA));
         assert_eq!(RrType::from_u16(9999), None);
+    }
+
+    #[test]
+    fn rrtype_from_u16_legacy_types() {
+        // Test all 27 declared variants round-trip through from_u16
+        assert_eq!(RrType::from_u16(1), Some(RrType::A));
+        assert_eq!(RrType::from_u16(2), Some(RrType::NS));
+        assert_eq!(RrType::from_u16(3), Some(RrType::MD));
+        assert_eq!(RrType::from_u16(4), Some(RrType::MF));
+        assert_eq!(RrType::from_u16(5), Some(RrType::CNAME));
+        assert_eq!(RrType::from_u16(6), Some(RrType::SOA));
+        assert_eq!(RrType::from_u16(7), Some(RrType::MB));
+        assert_eq!(RrType::from_u16(8), Some(RrType::MG));
+        assert_eq!(RrType::from_u16(9), Some(RrType::MR));
+        assert_eq!(RrType::from_u16(12), Some(RrType::PTR));
+        assert_eq!(RrType::from_u16(14), Some(RrType::MINFO));
+        assert_eq!(RrType::from_u16(15), Some(RrType::MX));
+        assert_eq!(RrType::from_u16(16), Some(RrType::TXT));
+        assert_eq!(RrType::from_u16(17), Some(RrType::RP));
+        assert_eq!(RrType::from_u16(18), Some(RrType::AFSDB));
+        assert_eq!(RrType::from_u16(21), Some(RrType::RT));
+        assert_eq!(RrType::from_u16(24), Some(RrType::SIG));
+        assert_eq!(RrType::from_u16(26), Some(RrType::PX));
+        assert_eq!(RrType::from_u16(30), Some(RrType::NXT));
+        assert_eq!(RrType::from_u16(36), Some(RrType::KX));
+        assert_eq!(RrType::from_u16(39), Some(RrType::DNAME));
+        assert_eq!(RrType::from_u16(249), Some(RrType::TKEY));
+        assert_eq!(RrType::from_u16(250), Some(RrType::TSIG));
+        assert_eq!(RrType::from_u16(253), Some(RrType::MAILB));
     }
 }

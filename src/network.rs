@@ -54,6 +54,22 @@ pub fn is_ula_v6(addr: Ipv6Addr) -> bool {
     (segs[0] & 0xfe00) == 0xfc00
 }
 
+/// Returns true if the address is exactly fd00:: (ULA zero sentinel).
+/// Used by upstream radv.c and rfc3315.c to indicate "elide this prefix/RA option".
+pub fn is_ula_zero_v6(addr: Ipv6Addr) -> bool {
+    let octets = addr.octets();
+    octets[0] == 0xfd && octets[1] == 0x00 && octets[2] == 0x00 && octets[3] == 0x00
+        && octets[4..].iter().all(|b| *b == 0)
+}
+
+/// Returns true if the address is exactly fe80:: (link-local zero sentinel).
+/// Used by upstream radv.c and rfc3315.c to indicate "elide this prefix/RA option".
+pub fn is_link_local_zero_v6(addr: Ipv6Addr) -> bool {
+    let octets = addr.octets();
+    octets[0] == 0xfe && octets[1] == 0x80 && octets[2] == 0x00 && octets[3] == 0x00
+        && octets[4..].iter().all(|b| *b == 0)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Interface enumeration
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2050,6 +2066,38 @@ mod tests {
         // fc00::/7 covers fc00:: and fd00::
         let fc: Ipv6Addr = "fc00::1".parse().unwrap();
         assert!(is_ula_v6(fc));
+    }
+
+    #[test]
+    fn test_is_ula_zero_v6() {
+        // Exact match: fd00::
+        let ula_zero: Ipv6Addr = "fd00::".parse().unwrap();
+        assert!(is_ula_zero_v6(ula_zero));
+        // Non-zero suffix should not match
+        let ula_nonzero: Ipv6Addr = "fd00::1".parse().unwrap();
+        assert!(!is_ula_zero_v6(ula_nonzero));
+        // Other ULA addresses should not match
+        let other_ula: Ipv6Addr = "fc00::".parse().unwrap();
+        assert!(!is_ula_zero_v6(other_ula));
+        // Non-ULA addresses should not match
+        let not_ula: Ipv6Addr = "2001:db8::".parse().unwrap();
+        assert!(!is_ula_zero_v6(not_ula));
+    }
+
+    #[test]
+    fn test_is_link_local_zero_v6() {
+        // Exact match: fe80::
+        let ll_zero: Ipv6Addr = "fe80::".parse().unwrap();
+        assert!(is_link_local_zero_v6(ll_zero));
+        // Non-zero suffix should not match
+        let ll_nonzero: Ipv6Addr = "fe80::1".parse().unwrap();
+        assert!(!is_link_local_zero_v6(ll_nonzero));
+        // Other link-local addresses should not match
+        let other_ll: Ipv6Addr = "fe80:1::".parse().unwrap();
+        assert!(!is_link_local_zero_v6(other_ll));
+        // Non-link-local addresses should not match
+        let not_ll: Ipv6Addr = "2001:db8::".parse().unwrap();
+        assert!(!is_link_local_zero_v6(not_ll));
     }
 
     // ── iface_check tests ────────────────────────────────────────────────────
