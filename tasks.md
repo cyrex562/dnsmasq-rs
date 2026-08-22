@@ -2304,6 +2304,17 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     `HAVE_BSD_NETWORK`/`HAVE_SOLARIS_NETWORK`; its Linux analog is `netlink.rs`, already
     ported. Future audits should diff `bpf.c` against `netlink.rs`, not this module.
 
+- [x] Align Cargo feature defaults with upstream config.h (issue #55).
+  - Removed `dnssec` from default feature list (upstream config.h:206 leaves `HAVE_DNSSEC`
+    commented out as it requires external crypto libraries).
+  - Added `ipset` to default feature list (upstream config.h:190 enables `HAVE_IPSET` by default).
+  - Added `script` feature to Cargo.toml and default list. `helper.rs` is now gated on both
+    `feature = "dhcp"` AND `feature = "script"` (not just `dhcp`). Directives `--dhcp-script`
+    and `--dhcp-luascript` return an error at config-parse time when `script` is disabled,
+    matching upstream option.c:2390-2391.
+  - `--dhcp-scriptuser` remains gated only on `feature = "dhcp"`, matching upstream option.c:2876-2878.
+  - Verified: `cargo check --no-default-features` now compiles cleanly (was broken with 3 errors before).
+
 - [ ] Keep `CLAUDE.md` and `agents.md` aligned with actual repo status.
   Done when: they reflect current test reality, parity expectations, and porting priorities without optimistic completion claims.
 

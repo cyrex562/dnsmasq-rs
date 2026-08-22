@@ -65,7 +65,7 @@ pub mod conntrack;
 #[cfg(feature = "loop")]
 pub mod loop_detect;
 
-#[cfg(feature = "dhcp")]
+#[cfg(all(feature = "dhcp", feature = "script"))]
 pub mod helper;
 #[cfg(feature = "inotify")]
 pub mod inotify;

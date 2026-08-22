@@ -1088,13 +1088,39 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
         }
 
         "dhcp-script" => {
-            let v = require_value("dhcp-script")?;
-            daemon.lease_change_command = Some(v.to_string());
+            #[cfg(feature = "script")]
+            {
+                let v = require_value("dhcp-script")?;
+                daemon.lease_change_command = Some(v.to_string());
+            }
+            #[cfg(not(feature = "script"))]
+            {
+                return Err(ConfigError::InvalidValue(
+                    "".to_string(),
+                    "dhcp-script".to_string(),
+                    cl.file.clone(),
+                    cl.line,
+                    "recompile with HAVE_SCRIPT defined to enable lease-change scripts".to_string(),
+                ));
+            }
         }
 
         "dhcp-luascript" => {
-            let v = require_value("dhcp-luascript")?;
-            daemon.luascript = Some(v.to_string());
+            #[cfg(feature = "script")]
+            {
+                let v = require_value("dhcp-luascript")?;
+                daemon.luascript = Some(v.to_string());
+            }
+            #[cfg(not(feature = "script"))]
+            {
+                return Err(ConfigError::InvalidValue(
+                    "".to_string(),
+                    "dhcp-luascript".to_string(),
+                    cl.file.clone(),
+                    cl.line,
+                    "recompile with HAVE_SCRIPT defined to enable lease-change scripts".to_string(),
+                ));
+            }
         }
 
         "pid-file" => {
@@ -5538,6 +5564,30 @@ mod tests {
         assert_eq!(d.lease_change_command, Some("/usr/lib/dnsmasq/dhcp-hook".to_string()));
         assert_eq!(d.luascript, Some("/usr/lib/dnsmasq/dhcp-hook.lua".to_string()));
         assert!(d.option_bool(OPT_LEASE_RENEW));
+    }
+
+    #[test]
+    #[cfg(not(feature = "script"))]
+    fn dhcp_script_rejected_without_script_feature() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-script=/usr/lib/dnsmasq/dhcp-hook", "test").unwrap();
+        let result = apply_config(&mut d, &lines);
+        assert!(result.is_err(), "dhcp-script should be rejected when script feature is disabled");
+        let err = result.unwrap_err();
+        let err_msg = format!("{}", err);
+        assert!(err_msg.contains("HAVE_SCRIPT"), "error message should mention HAVE_SCRIPT");
+    }
+
+    #[test]
+    #[cfg(not(feature = "script"))]
+    fn dhcp_luascript_rejected_without_script_feature() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-luascript=/usr/lib/dnsmasq/dhcp-hook.lua", "test").unwrap();
+        let result = apply_config(&mut d, &lines);
+        assert!(result.is_err(), "dhcp-luascript should be rejected when script feature is disabled");
+        let err = result.unwrap_err();
+        let err_msg = format!("{}", err);
+        assert!(err_msg.contains("HAVE_SCRIPT"), "error message should mention HAVE_SCRIPT");
     }
 
     #[test]
