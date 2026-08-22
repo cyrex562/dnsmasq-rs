@@ -2214,6 +2214,41 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   end-to-end tests above).
   Done when: a real TFTP client can download a file end to end, options
   negotiate against real files, and traversal is rejected — done.
+  Fix (issue #42 follow-up), three judge-flagged option-negotiation/timing
+  deviations:
+  - **Negative option values now wrap instead of flooring.** Upstream's
+    option loop does `unsigned int val = atoi(arg);` (`tftp.c:383`) — a
+    negative value's signed-to-unsigned reinterpretation wraps to a huge
+    unsigned number, so `if (val < 1) val = 1;`-style floor checks never
+    fire; the value instead clamps *down* to whichever ceiling applies
+    (`packet_buff_sz - 4` / MTU-minus-overhead / 255 / `TFTP_MAX_WINDOW`).
+    `parse_request_options` used to preserve the sign (`atoi_like` returns
+    `i64`), so e.g. `blksize=-1` clamped to the *floor* (1 byte) instead of
+    the ceiling (~2259 bytes with default settings) — a real, wire-visible
+    parity break. Added `atoi_as_c_uint` (truncate to `i32`, the real return
+    type of `atoi`, then reinterpret as `u32`) and applied it to all three
+    of `blksize`/`timeout`/`windowsize`, matching `unsigned int val =
+    atoi(arg)` exactly.
+  - **Removed the invented `TFTP_MAX_BLKSIZE = 65464` ceiling.** Confirmed
+    via `grep -rn "TFTP_MAX_BLKSIZE" original_dnsmasq_src/` that no such
+    constant or independent RFC 2348-style ceiling exists upstream —
+    `tftp.c:387-393` clamps `blksize` only via `packet_buff_sz - 4` and the
+    MTU-minus-overhead check. A large `--edns-packet-max` can therefore
+    negotiate a blksize above what this port used to allow.
+  - **Retransmit deadline is now additive from the previous deadline, not
+    from `now`.** Upstream: `transfer->retransmit += transfer->timeout +
+    (1<<(backoff/2))` (`tftp.c:689`). Both `process_transfer_packet`'s
+    ACK-driven send and `sweep_transfers`' timeout-driven resend used to
+    compute `now + timeout + backoff-shift` instead. For the ACK-driven
+    path this was a no-op (`transfer.retransmit` had just been set to `now`
+    by `handle_tftp_packet`), but for the timeout-driven sweep path, under
+    scheduling delay (a busy event loop or a coarse tick interval firing
+    after the deadline it's servicing), computing from `now` instead of the
+    missed deadline pushes every subsequent retry later than upstream's
+    cadence.
+  Covered by `tftp::tests::options_{blksize,timeout,windowsize}_negative_*`,
+  `options_blksize_has_no_independent_ceiling`, and
+  `sweep_transfers_retransmit_deadline_is_additive_from_previous_deadline_not_now`.
 
 - [ ] Reassess DNSSEC claims against actual implementation status.
   Source of truth: `src/dnssec.rs`, `src/crypto.rs`, existing TODO notes, parity outcomes.

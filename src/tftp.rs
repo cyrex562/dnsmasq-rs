@@ -252,10 +252,6 @@ pub fn tftp_err_oops(filename: &str, err: &std::io::Error) -> Vec<u8> {
 // tftp_request() (tftp.c:381-423)
 // ---------------------------------------------------------------------------
 
-/// RFC 2348's stated maximum `blksize` — the ceiling `blksize` can never
-/// exceed regardless of `daemon->packet_buff_sz`.
-pub const TFTP_MAX_BLKSIZE: usize = 65464;
-
 /// Compute `daemon->packet_buff_sz` (`dnsmasq.c:128`:
 /// `edns_pktsz + MAXDNAME + RRFIXEDSZ`), the buffer upstream's `blksize`
 /// option loop clamps against (`val > packet_buff_sz - 4`) ahead of, and
@@ -327,6 +323,17 @@ fn atoi_like(s: &str) -> i64 {
     if neg { -val } else { val }
 }
 
+/// Reinterpret an `atoi_like` result the way C's `unsigned int val =
+/// atoi(arg);` does: truncate to a 32-bit signed `int` (`atoi`'s actual
+/// return type) and reinterpret those bits as unsigned. This is why
+/// upstream's `if (val < 1) val = 1;`-style floor checks never fire for
+/// negative input — a negative value has already wrapped past any small
+/// floor by the time the check runs, and instead gets clamped *down* by
+/// whichever ceiling check comes next (`tftp.c:383-411`).
+fn atoi_as_c_uint(s: &str) -> u32 {
+    atoi_like(s) as i32 as u32
+}
+
 /// Parse and clamp the `blksize`/`tsize`/`timeout`/`windowsize` options off
 /// an RRQ, exactly as the option loop in `tftp_request` does.
 ///
@@ -336,7 +343,8 @@ fn atoi_like(s: &str) -> i64 {
 /// `daemon->packet_buff_sz` (see [`packet_buff_sz`]) — upstream clamps
 /// `blksize` to `packet_buff_sz - 4` unconditionally, before the MTU clamp,
 /// so a wide blksize can never be negotiated just because the MTU is
-/// unknown.
+/// unknown. There is no independent RFC 2348-style ceiling beyond that and
+/// the MTU clamp — upstream's option loop (`tftp.c:383-411`) has none.
 pub fn parse_request_options(
     options: &[(String, String)],
     netascii: bool,
@@ -346,23 +354,25 @@ pub fn parse_request_options(
     packet_buff_sz: usize,
 ) -> RequestOptions {
     let mut opts = RequestOptions::default();
-    let overhead: i64 = if family_v4 { 32 } else { 52 };
+    let overhead: u32 = if family_v4 { 32 } else { 52 };
 
     for (key, value) in options {
-        let val = atoi_like(value);
         match key.to_ascii_lowercase().as_str() {
             "blksize" if !no_blocksize_option => {
-                let mut v = val.max(1);
-                if v > TFTP_MAX_BLKSIZE as i64 {
-                    v = TFTP_MAX_BLKSIZE as i64;
+                let mut v = atoi_as_c_uint(value);
+                if v < 1 {
+                    v = 1;
                 }
-                let buff_max = (packet_buff_sz as i64 - 4).max(1);
+                let buff_max = (packet_buff_sz as u32).wrapping_sub(4);
                 if v > buff_max {
                     v = buff_max;
                 }
                 if let Some(mtu) = mtu {
-                    if mtu != 0 && v > (mtu as i64 - overhead) {
-                        v = (mtu as i64 - overhead).max(1);
+                    if mtu != 0 {
+                        let mtu_max = (mtu as u32).wrapping_sub(overhead);
+                        if v > mtu_max {
+                            v = mtu_max;
+                        }
                     }
                 }
                 opts.blocksize = v as usize;
@@ -372,13 +382,22 @@ pub fn parse_request_options(
                 opts.opt_transize = true;
             }
             "timeout" => {
-                let v = val.clamp(0, 255);
-                opts.timeout = v as u32;
+                let mut v = atoi_as_c_uint(value);
+                if v > 255 {
+                    v = 255;
+                }
+                opts.timeout = v;
                 opts.opt_timeout = true;
             }
             "windowsize" if !netascii => {
-                let v = val.clamp(1, TFTP_MAX_WINDOW as i64);
-                opts.windowsize = v as u32;
+                let mut v = atoi_as_c_uint(value);
+                if v < 1 {
+                    v = 1;
+                }
+                if v > TFTP_MAX_WINDOW {
+                    v = TFTP_MAX_WINDOW;
+                }
+                opts.windowsize = v;
                 opts.opt_windowsize = true;
             }
             _ => {}
@@ -1041,10 +1060,16 @@ async fn process_transfer_packet(transfer: &mut TftpTransfer, data: &[u8], confi
             // send and the timeout-driven resend are the same code path
             // (`check_tftp_listeners`'s single retransmit branch); this keeps
             // that invariant for the immediate-send path used here.
+            // Additive from the current deadline (`transfer.retransmit`, just
+            // set to `now` by `handle_tftp_packet` above), matching upstream's
+            // `transfer->retransmit += transfer->timeout + (1<<(backoff/2))`
+            // (`tftp.c:689`) rather than a fresh `now + ...` — see
+            // `sweep_transfers`'s identical computation for why this matters
+            // under scheduling delay.
             let backoff = transfer.backoff;
             let shift = (backoff / 2).min(20);
             transfer.retransmit =
-                now + Duration::from_secs(transfer.timeout as u64) + Duration::from_secs(1u64 << shift);
+                transfer.retransmit + Duration::from_secs(transfer.timeout as u64) + Duration::from_secs(1u64 << shift);
             transfer.backoff = backoff.saturating_add(1);
             let (endcon, _error) = send_window(transfer).await;
             if endcon {
@@ -1379,10 +1404,18 @@ async fn sweep_transfers(transfers: &mut Vec<TftpTransfer>, ids: &mut Vec<u64>, 
                 timeout_flag = true;
             }
         } else if now >= transfers[i].retransmit {
+            // Additive from the previous deadline, not from `now`, matching
+            // upstream's `transfer->retransmit += transfer->timeout +
+            // (1<<(backoff/2))` (`tftp.c:689`). Under scheduling delay (the
+            // sweep tick firing later than the deadline it's checking), `now`
+            // can run meaningfully ahead of `transfers[i].retransmit`; basing
+            // the next deadline on `now` instead of the missed one would push
+            // every subsequent retry later than upstream's cadence.
             let backoff = transfers[i].backoff;
             let shift = (backoff / 2).min(20);
-            transfers[i].retransmit =
-                now + Duration::from_secs(transfers[i].timeout as u64) + Duration::from_secs(1u64 << shift);
+            transfers[i].retransmit = transfers[i].retransmit
+                + Duration::from_secs(transfers[i].timeout as u64)
+                + Duration::from_secs(1u64 << shift);
             transfers[i].backoff = backoff.saturating_add(1);
             transfers[i].block = transfers[i].lastack;
 
@@ -1680,11 +1713,16 @@ mod tests {
         assert_eq!(opts.blocksize, 1);
     }
 
+    /// Upstream's option loop (`tftp.c:383-411`) has no ceiling on `blksize`
+    /// independent of `packet_buff_sz - 4` and the MTU clamp — no
+    /// RFC 2348-style hard maximum exists in the C source (confirmed by grep
+    /// across `original_dnsmasq_src/`). A large `--edns-packet-max` can
+    /// therefore negotiate a blksize far above RFC 2348's suggested 65464.
     #[test]
-    fn options_blksize_clamped_to_rfc2348_max() {
+    fn options_blksize_has_no_independent_ceiling() {
         let opts =
             parse_request_options(&[("blksize".into(), "999999".into())], false, true, None, false, 1_000_000);
-        assert_eq!(opts.blocksize, TFTP_MAX_BLKSIZE);
+        assert_eq!(opts.blocksize, 1_000_000 - 4);
     }
 
     #[test]
@@ -1696,7 +1734,25 @@ mod tests {
         let buff = packet_buff_sz(1232);
         let opts = parse_request_options(&[("blksize".into(), "9999".into())], false, true, None, false, buff);
         assert_eq!(opts.blocksize, buff - 4);
-        assert!(opts.blocksize < TFTP_MAX_BLKSIZE);
+    }
+
+    /// Upstream: `unsigned int val = atoi(arg);` — a negative value wraps to
+    /// a huge unsigned one, so the `if (val < 1) val = 1;` floor never fires;
+    /// the value instead gets clamped *down* to whichever ceiling applies
+    /// next. Real dnsmasq given `blksize=-1` therefore negotiates
+    /// `packet_buff_sz - 4` bytes, not 1.
+    #[test]
+    fn options_blksize_negative_wraps_to_huge_then_clamps_to_ceiling() {
+        let buff = packet_buff_sz(1232);
+        let opts = parse_request_options(&[("blksize".into(), "-1".into())], false, true, None, false, buff);
+        assert_eq!(opts.blocksize, buff - 4);
+    }
+
+    #[test]
+    fn options_blksize_negative_clamps_to_mtu_when_narrower_than_buff() {
+        let opts =
+            parse_request_options(&[("blksize".into(), "-1".into())], false, true, Some(1500), false, 65536);
+        assert_eq!(opts.blocksize, 1500 - 32);
     }
 
     #[test]
@@ -1745,9 +1801,28 @@ mod tests {
         assert_eq!(opts.windowsize, TFTP_MAX_WINDOW);
     }
 
+    /// Upstream: `unsigned int val = atoi(arg);` wraps a negative value to a
+    /// huge unsigned one before `if (val < 1) val = 1;` ever runs, so it gets
+    /// clamped down to `TFTP_MAX_WINDOW` by the next check instead — not
+    /// floored to 1.
+    #[test]
+    fn options_windowsize_negative_wraps_to_huge_then_clamps_to_max() {
+        let opts = parse_request_options(&[("windowsize".into(), "-1".into())], false, true, None, false, 65536);
+        assert_eq!(opts.windowsize, TFTP_MAX_WINDOW);
+    }
+
     #[test]
     fn options_timeout_clamped_to_255() {
         let opts = parse_request_options(&[("timeout".into(), "9999".into())], false, true, None, false, 65536);
+        assert_eq!(opts.timeout, 255);
+    }
+
+    /// Upstream's `timeout` clamp is `if (val > 255) val = 255;` with no
+    /// floor at all. A negative value wraps to a huge unsigned one via
+    /// `unsigned int val = atoi(arg);`, so it clamps to 255 — not 0.
+    #[test]
+    fn options_timeout_negative_wraps_to_huge_then_clamps_to_255() {
+        let opts = parse_request_options(&[("timeout".into(), "-1".into())], false, true, None, false, 65536);
         assert_eq!(opts.timeout, 255);
     }
 
@@ -1997,6 +2072,43 @@ mod tests {
         sweep_transfers(&mut transfers, &mut ids, &config).await;
         assert_eq!(transfers.len(), 1, "transfer must still be active");
         assert_eq!(transfers[0].backoff, 1, "sweep must not have re-sent (which would bump backoff again)");
+    }
+
+    #[tokio::test]
+    async fn sweep_transfers_retransmit_deadline_is_additive_from_previous_deadline_not_now() {
+        // Regression test: upstream computes the next retransmit deadline as
+        // `transfer->retransmit += transfer->timeout + (1<<(backoff/2))`
+        // (tftp.c:689) — additive from the *missed* deadline, not from `now`.
+        // Under scheduling delay (this sweep tick firing well after the
+        // deadline it's servicing), computing from `now` instead would push
+        // every later retry later than upstream's cadence.
+        let contents = vec![0x42u8; 1200]; // 3 blocks at blocksize 512 — a
+                                            // single retransmit window can't
+                                            // finish the transfer.
+        let mut t = transfer_over(&contents, 512).await;
+        t.timeout = 2;
+        t.windowsize = 1;
+        t.block = 1;
+        t.lastack = 0;
+        t.backoff = 0;
+
+        // Simulate a sweep tick that fires well after the deadline it's
+        // servicing (a busy event loop, a coarse tick interval, ...).
+        let missed_deadline = Instant::now() - Duration::from_secs(5);
+        t.retransmit = missed_deadline;
+
+        let config = TftpConfig::default();
+        let mut transfers = vec![t];
+        let mut ids = vec![0u64];
+        sweep_transfers(&mut transfers, &mut ids, &config).await;
+
+        assert_eq!(transfers.len(), 1, "3-block transfer must not finish after one retransmit window");
+        // backoff was 0, so shift = (0/2).min(20) = 0, and 1<<0 = 1.
+        let expected = missed_deadline + Duration::from_secs(2) + Duration::from_secs(1);
+        assert_eq!(
+            transfers[0].retransmit, expected,
+            "next deadline must be computed from the missed deadline, not from `now`"
+        );
     }
 
     #[tokio::test]
