@@ -5552,6 +5552,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "script")]
     fn apply_dhcp_script_paths_and_renewal_flag() {
         let mut d = Daemon::default();
         let lines = parse_config_text(
