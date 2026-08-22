@@ -82,6 +82,12 @@ pub struct DhcpServerConfig {
     /// highest leased address in the range instead of a hwaddr hash,
     /// matching dhcp.c:860-864.
     pub consec_addr: bool,
+    /// `--dhcp-ignore=<tag>[,<tag>...]` (`daemon->dhcp_ignore`,
+    /// `dnsmasq.h:1239`): a global tag-list gate, checked against a client's
+    /// derived tags independently of any matched `DhcpConfig` (rfc2131.c:614,
+    /// 851). Distinct from a per-host `dhcp-host=...,ignore` entry, which
+    /// `configs`' own `CONFIG_DISABLE` flag (checked above) already covers.
+    pub dhcp_ignore: Vec<crate::types::dhcp::DhcpNetidList>,
 }
 
 impl Default for DhcpServerConfig {
@@ -108,6 +114,7 @@ impl Default for DhcpServerConfig {
             relay4: Vec::new(),
             no_ping: false,
             consec_addr: false,
+            dhcp_ignore: Vec::new(),
         }
     }
 }
@@ -671,6 +678,12 @@ pub fn dispatch_dhcp_with_meta(
             && match_netid_wild(&c.filter, &tags)
     });
     if tag_disable {
+        return None;
+    }
+    // `--dhcp-ignore=<tag>` (`daemon->dhcp_ignore`, rfc2131.c:614,851): a
+    // global tag-list gate checked against the client's derived tags,
+    // independent of any `DhcpConfig` match above.
+    if cfg.dhcp_ignore.iter().any(|entry| context_filter_matches(&entry.list, &tags, false)) {
         return None;
     }
     let config = find_config(
@@ -2049,6 +2062,7 @@ mod tests {
             relay4: vec![],
             no_ping: false,
             consec_addr: false,
+            dhcp_ignore: vec![],
         }
     }
 
@@ -2137,6 +2151,55 @@ mod tests {
         let mut cfg = default_cfg();
         cfg.configs.push(ignore);
         assert!(dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new()).is_none());
+    }
+
+    /// `--dhcp-ignore=<tag>` gates on a client's *derived* tags directly
+    /// (rfc2131.c:614/851), independent of any matched `DhcpConfig` entry —
+    /// unlike `discover_matching_dhcp_ignore_produces_no_reply` above, no
+    /// `cfg.configs`/`CONFIG_DISABLE` entry is involved here at all.
+    #[test]
+    fn discover_matching_global_dhcp_ignore_tag_produces_no_reply() {
+        use crate::types::dhcp::{DhcpMacRule, DhcpNetid, DhcpNetidList};
+
+        let mut cfg = default_cfg();
+        cfg.mac_rules.push(DhcpMacRule {
+            netid: DhcpNetid { net: "blocked".into() },
+            hwaddr: [0x00, 0x60, 0x8c, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            hwaddr_len: 6,
+            hwaddr_type: 1,
+            wildcard_mask: 0b000111,
+        });
+        cfg.dhcp_ignore.push(DhcpNetidList { list: vec![DhcpNetid { net: "blocked".into() }] });
+
+        let mut pkt = base_packet();
+        pkt.chaddr[..6].copy_from_slice(&[0x00, 0x60, 0x8c, 0x12, 0x34, 0x56]);
+        assert!(dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new()).is_none());
+    }
+
+    #[test]
+    fn discover_not_matching_global_dhcp_ignore_tag_still_offers() {
+        use crate::types::dhcp::{DhcpNetid, DhcpNetidList};
+
+        let mut cfg = default_cfg();
+        cfg.dhcp_ignore.push(DhcpNetidList { list: vec![DhcpNetid { net: "blocked".into() }] });
+
+        let pkt = base_packet();
+        assert!(dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new()).is_some());
+    }
+
+    #[test]
+    fn discover_empty_dhcp_ignore_entry_does_not_match_anyone() {
+        // An empty tag list (from a bare `dhcp-ignore` — not actually valid
+        // upstream config, since `-J` requires a value, but exercised here
+        // for robustness) must not vacuously ignore every client: real
+        // `match_netid(check=[], pool, tagnotneeded=0)` returns false.
+        use crate::types::dhcp::DhcpNetidList;
+
+        let mut cfg = default_cfg();
+        cfg.dhcp_ignore.push(DhcpNetidList { list: vec![] });
+
+        let pkt = base_packet();
+        assert!(dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new()).is_some());
     }
 
     #[test]

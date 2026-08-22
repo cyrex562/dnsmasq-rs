@@ -808,6 +808,7 @@ fn daemon_dhcp_runtime(daemon: &Daemon) -> Option<DhcpDaemonRuntime> {
             relay4,
             no_ping: daemon.option_bool(crate::types::constants::OPT_NO_PING),
             consec_addr: daemon.option_bool(crate::types::constants::OPT_CONSEC_ADDR),
+            dhcp_ignore: daemon.dhcp_ignore.clone(),
         },
         loop_opts: crate::dhcp::DhcpLoopOptions {
             reply_port_override: (client_port != 68).then_some(client_port),

@@ -77,6 +77,11 @@ pub struct Daemon {
     /// subnet form (`daemon->cond_domain`), which this port does not yet
     /// populate — see `tasks.md`.
     pub synth_domains:  Vec<CondDomain>,
+    /// Plain `--domain=<name>,<subnet>` conditional-domain entries
+    /// (`daemon->cond_domain`, `dnsmasq.h:1196`), distinct from
+    /// `synth_domains` above (`--synth-domain`). Populated by the `"domain"`
+    /// arm in `option.rs` when a subnet fragment follows the domain name.
+    pub cond_domain:    Vec<CondDomain>,
     /// `--bridge-interface` (`daemon->bridges`, `dnsmasq.h:1316`). Declared
     /// unconditionally upstream (not gated on `HAVE_DHCP`).
     pub bridges:        Vec<DhcpBridge>,
@@ -155,6 +160,13 @@ pub struct Daemon {
     pub lease_file:      Option<String>,
     pub dns_client_id:   Option<String>,
     pub mxtarget:        Option<String>,
+    /// `--umbrella orgid:<n>` (`daemon->umbrella_org`, `dnsmasq.h:1217`).
+    pub umbrella_org:    u32,
+    /// `--umbrella assetid:<n>` (`daemon->umbrella_asset`, `dnsmasq.h:1218`).
+    pub umbrella_asset:  u32,
+    /// `--umbrella deviceid:<16 hex chars>` (`daemon->umbrella_device`,
+    /// `dnsmasq.h:1219`). Only meaningful when `OPT_UMBRELLA_DEVID` is set.
+    pub umbrella_device: [u8; 8],
     pub add_subnet4:     Option<MySubnet>,
     pub add_subnet6:     Option<MySubnet>,
     pub addn_hosts:      Vec<HostsFile>,
@@ -230,6 +242,49 @@ pub struct Daemon {
     pub min_leasetime:   u32,
     #[cfg(feature = "dhcp")]
     pub relay4:          Vec<DhcpRelay>,
+    /// `--dhcp-pxe-vendor` (`daemon->dhcp_pxe_vendors`, `dnsmasq.h:1227`).
+    #[cfg(feature = "dhcp")]
+    pub dhcp_pxe_vendors: Vec<DhcpPxeVendor>,
+    /// `--pxe-service` (`daemon->pxe_services`, `dnsmasq.h:1231`).
+    #[cfg(feature = "dhcp")]
+    pub pxe_services:    Vec<PxeService>,
+    /// `--pxe-prompt`/`--pxe-service` (`daemon->enable_pxe`, `dnsmasq.h:1237`):
+    /// set once either directive successfully registers an entry.
+    #[cfg(feature = "dhcp")]
+    pub enable_pxe:      bool,
+    /// Auto-assigned boot-service type counter for `--pxe-service` entries
+    /// that give a `basename` instead of a literal boot-service type
+    /// (`static int boottype` in `option.c`'s `LOPT_PXE_SERV` case, seeded at
+    /// `32768`). Mirrors that function-local static as explicit `Daemon`
+    /// state rather than inventing new semantics.
+    #[cfg(feature = "dhcp")]
+    pub pxe_boottype_next: u16,
+    /// `--dhcp-ignore=<tag>[,<tag>...]` (`daemon->dhcp_ignore`,
+    /// `dnsmasq.h:1239`): a global tag-list gate, distinct from a per-host
+    /// `dhcp-host=...,ignore` entry (`DhcpConfig`'s `CONFIG_DISABLE` flag).
+    #[cfg(feature = "dhcp")]
+    pub dhcp_ignore:      Vec<DhcpNetidList>,
+    /// `--dhcp-ignore-names` (`daemon->dhcp_ignore_names`, `dnsmasq.h:1239`).
+    #[cfg(feature = "dhcp")]
+    pub dhcp_ignore_names: Vec<DhcpNetidList>,
+    /// `--dhcp-generate-names` (`daemon->dhcp_gen_names`, `dnsmasq.h:1239`).
+    #[cfg(feature = "dhcp")]
+    pub dhcp_gen_names:   Vec<DhcpNetidList>,
+    /// `--dhcp-broadcast` (`daemon->force_broadcast`, `dnsmasq.h:1240`).
+    #[cfg(feature = "dhcp")]
+    pub force_broadcast:  Vec<DhcpNetidList>,
+    /// `--bootp-dynamic` (`daemon->bootp_dynamic`, `dnsmasq.h:1240`).
+    #[cfg(feature = "dhcp")]
+    pub bootp_dynamic:    Vec<DhcpNetidList>,
+    /// `--dhcp-proxy[=<addr>...]` (`daemon->override_relays`,
+    /// `dnsmasq.h:1233`): addresses this proxy DHCP server should treat as
+    /// legitimate relay agents even without `giaddr` set.
+    #[cfg(feature = "dhcp")]
+    pub override_relays:  Vec<Ipv4Addr>,
+    /// `--dhcp-proxy` (`daemon->override`, `dnsmasq.h:1236`): proxy-DHCP mode
+    /// is active.
+    #[cfg(feature = "dhcp")]
+    pub dhcp_override:    bool,
 
     #[cfg(feature = "dhcp6")]
     pub dhcp6:           Vec<DhcpContext>,
@@ -319,6 +374,7 @@ impl Default for Daemon {
             server_has_wildcard: false,
             no_rebind: vec![],
             synth_domains: vec![],
+            cond_domain: vec![],
             bridges: vec![],
             shared_networks: vec![],
             mxnames: vec![],
@@ -384,6 +440,9 @@ impl Default for Daemon {
             lease_file: None,
             dns_client_id: None,
             mxtarget: None,
+            umbrella_org: 0,
+            umbrella_asset: 0,
+            umbrella_device: [0u8; 8],
             add_subnet4: None,
             add_subnet6: None,
             addn_hosts: vec![],
@@ -450,6 +509,28 @@ impl Default for Daemon {
             min_leasetime: 120,
             #[cfg(feature = "dhcp")]
             relay4: vec![],
+            #[cfg(feature = "dhcp")]
+            dhcp_pxe_vendors: vec![],
+            #[cfg(feature = "dhcp")]
+            pxe_services: vec![],
+            #[cfg(feature = "dhcp")]
+            enable_pxe: false,
+            #[cfg(feature = "dhcp")]
+            pxe_boottype_next: 32768,
+            #[cfg(feature = "dhcp")]
+            dhcp_ignore: vec![],
+            #[cfg(feature = "dhcp")]
+            dhcp_ignore_names: vec![],
+            #[cfg(feature = "dhcp")]
+            dhcp_gen_names: vec![],
+            #[cfg(feature = "dhcp")]
+            force_broadcast: vec![],
+            #[cfg(feature = "dhcp")]
+            bootp_dynamic: vec![],
+            #[cfg(feature = "dhcp")]
+            override_relays: vec![],
+            #[cfg(feature = "dhcp")]
+            dhcp_override: false,
 
             #[cfg(feature = "dhcp6")]
             dhcp6: vec![],

@@ -385,11 +385,13 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     them yet — there is no call site in the forward path that builds an outgoing query's
     EDNS0 options at all (`--add-subnet`, `--add-mac`, `--mac-base64`/`--mac-hex`,
     `--add-cpe-id`, `--umbrella` all remain no-ops on the request side), so `FREC_NO_CACHE`
-    is still never set. `Daemon` also has no `umbrella_org`/`umbrella_asset`/
-    `umbrella_device` fields yet (see the `umbrella` entry under "Unrecognized/no-op
-    directives" below) — `add_umbrella_opt` takes them as plain parameters so it doesn't
-    need those fields to be portable, but a real caller will need them threaded through
-    once the outgoing-query path exists.
+    is still never set. `Daemon::umbrella_org`/`umbrella_asset`/`umbrella_device` now exist
+    and are populated by the `umbrella` directive's `orgid:`/`assetid:`/`deviceid:`
+    sub-options (Issue #56/T3-daemon-struct; see the "Issue #18 / Issue #56" entry
+    elsewhere in this file) — `add_umbrella_opt` still takes them as plain parameters
+    rather than reading `Daemon` directly, so a real caller only needs to thread
+    `daemon.umbrella_org`/`umbrella_asset`/`umbrella_device` through once the
+    outgoing-query path exists.
   - ipset kernel population is now wired end to end: `rfc1035::extract_addresses` matches the
     query name against `ExtractConfig::ipsets` (a local `domain_find_sets`, duplicating
     `forward::domain_find_sets`/`IpSet` — nothing constructs an `IpSet` from parsed config,
@@ -1203,10 +1205,12 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     doesn't get it preferentially.
   - **`make_fd`/`dhcp_init` socket options are still unported**: no
     `IP_MTU_DISCOVER`/`IP_PMTUDISC_DONT`, `IP_TOS`, `IP_PKTINFO`,
-    `SO_REUSEPORT`/`SO_REUSEADDR` gating, or PXE-port (4011) bind
-    (`enable_pxe`/`daemon->pxefd` don't exist in this port at all). DHCP
+    `SO_REUSEPORT`/`SO_REUSEADDR` gating, or PXE-port (4011) bind. DHCP
     socket setup in `bind_listeners` is still a plain bind + `set_nonblocking`
-    + optional `SO_BINDTODEVICE`.
+    + optional `SO_BINDTODEVICE`. `Daemon::enable_pxe` now exists and is set
+    by `pxe-prompt`/`pxe-service` (Issue #56/T3-daemon-struct), but
+    `daemon->pxefd` and the PXE-port bind/response path it would gate still
+    don't exist in this port at all.
   - **`host_from_dns` is not ported** — DHCP lease hostname resolution has
     no fallback to a reverse `F_HOSTS` cache lookup.
   - **No SIGHUP re-run of `--read-ethers`.** Upstream re-reads
@@ -1241,41 +1245,71 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   Required tests: unsupported directives must fail clearly unless intentionally no-op and documented.
   Done when: the parser never gives a false impression that a feature works when it does not.
 
-- [ ] Issue #18 remaining DHCP/PXE directives: recognized and accepted by
-  `apply_line` (`src/option.rs`) so a config carrying them no longer aborts
-  startup, but their runtime behavior is not wired:
+- [x] Issue #18 / Issue #56 (T3-daemon-struct) remaining DHCP/PXE directives:
+  recognized and accepted by `apply_line` (`src/option.rs`), and now update
+  real `Daemon` state (previously parsed-and-discarded) — but most still lack
+  a DHCP/PXE runtime consumer:
   - `dhcp-broadcast`, `dhcp-generate-names`, `dhcp-ignore-names`,
-    `bootp-dynamic` (option.c:4660-4700, shared `dhcp_netid_list` case): the
-    value is parsed and discarded. Upstream stores a tag-matched list
-    (`daemon->force_broadcast`/`dhcp_gen_names`/`dhcp_ignore_names`/
-    `bootp_dynamic`) consulted by the DHCPv4 reply path in `rfc2131.c`; none
-    of those lists or their `dhcp.rs`/`rfc2131.rs` consumers exist yet.
-  - `dhcp-proxy` (option.c:4703): value discarded. Upstream sets
-    `daemon->override = 1` and collects `override_relays` IPv4 addresses;
-    neither field exists on `Daemon`.
-  - `dhcp-pxe-vendor` (option.c:4716): value discarded. Upstream builds a
-    `dhcp_pxe_vendor` list matched against PXE client-vendor options.
-  - `pxe-prompt` / `pxe-service` (option.c:4423,4461): value discarded.
-    Upstream builds `dhcp_opt`/`pxe_service` entries that drive the PXE menu
-    the DHCP/TFTP path serves; no PXE menu support exists in this port.
-  - `conf-script` (option.c:2068): value discarded, and deliberately never
-    executed. Upstream runs the referenced file as a program and reads config
-    directives back from its stdout (`one_file(file, LOPT_CONF_SCRIPT)`).
-    Executing an arbitrary external program from config parsing is a
-    capability this port intentionally does not implement.
-  - `umbrella` (option.c:2808): only the top-level `OPT_UMBRELLA` bit is set.
-    The `deviceid:`/`orgid:`/`assetid:`/`userid:` sub-options are not parsed;
-    `Daemon` has no `umbrella_device`/`umbrella_org`/`umbrella_asset`/
-    `umbrella_user` fields yet. The option-payload side (`add_umbrella_opt`,
-    `edns0.c:517-574`) is now ported as `edns0::add_umbrella_opt`/
-    `add_edns0_config`, parameterized directly rather than reading `Daemon`, so
-    parsing these sub-options and threading them through is the only work left
-    to make `--umbrella orgid=...` etc. actually take effect — see the
-    `edns0.c` entry above for what's already wired vs. not.
-  Required tests: once each backing field/list exists, add parser tests plus
-  a `dhcp.rs`/`rfc2131.rs` consumer test.
-  Done when: each directive above either updates real `Daemon` state consumed
-  by the DHCP/PXE runtime path, or remains explicitly listed here.
+    `bootp-dynamic` (option.c:4660-4700, shared `dhcp_netid_list` case;
+    `dhcp-ignore` itself shares the parsing helper but is `ARG_REQUIRED`,
+    unlike these four's `ARG_DUP`) now populate `Daemon::force_broadcast`/
+    `dhcp_gen_names`/`dhcp_ignore_names`/`dhcp_ignore` respectively (new
+    `DhcpNetidList` type, `types/dhcp.rs`), each entry a literal tag list
+    (leading `tag:`/`net:` stripped via `is_tag_prefix`, `set:` is *not*
+    special in this shared case). `dhcp_ignore` is now wired into the DHCP
+    runtime: `dhcp::dispatch_dhcp_with_meta` checks a client's derived tags
+    against `DhcpServerConfig::dhcp_ignore` (non-wildcard `match_netid`
+    semantics, mirroring `dhcp.rs::context_filter_matches`) independently of
+    any `DhcpConfig` match, matching `rfc2131.c:614,851`. This fixed a
+    same-name-different-model bug: `dhcp-ignore` used to be routed through
+    `parse_dhcp_config_matchers`/`daemon.dhcp_conf` with `CONFIG_DISABLE` —
+    the same per-host matcher machinery `dhcp-host=...,ignore` uses — instead
+    of upstream's separate global tag-list mechanism; a `dhcp-ignore=<mac>`
+    line, for instance, now creates a literal tag named `<mac>` rather than a
+    MAC-address selector. `force_broadcast`/`dhcp_gen_names`/
+    `dhcp_ignore_names` are still parse-and-store only: no `dhcp.rs`/
+    `rfc2131.rs` consumer reads them yet.
+  - `dhcp-proxy` (option.c:4703-4714) now sets `Daemon::dhcp_override` and
+    collects `Daemon::override_relays` (`Vec<Ipv4Addr>`). Neither is consumed
+    yet — the relay-trust/server-id-override logic at `rfc2131.c:858-870` has
+    no Rust equivalent.
+  - `dhcp-pxe-vendor` (option.c:4716-4727) now populates
+    `Daemon::dhcp_pxe_vendors` (new `DhcpPxeVendor` type). Not consumed: PXE
+    client-vendor matching against it doesn't exist (no PXE runtime at all —
+    see below).
+  - `pxe-prompt` (option.c:4422-4457) now pushes a real `dhcp_opt` entry
+    (option 10, `DHOPT_VENDOR|DHOPT_VENDOR_PXE`) onto `Daemon::dhcp_opts` and
+    sets `Daemon::enable_pxe`. `pxe-service` (option.c:4461-4539) now
+    populates `Daemon::pxe_services` (new `PxeService` type), including the
+    CSA-name table, the numeric-vs-basename boot-type branch (with
+    `Daemon::pxe_boottype_next` mirroring upstream's function-local
+    `static int boottype` counter, seeded at 32768), and the
+    address-vs-hostname `server`/`sname` branch. Neither is consumed: no PXE
+    menu support (responding on the PXE port, building the boot-menu wire
+    format) exists anywhere in this port.
+  - `conf-script` (option.c:2068): value still discarded, and deliberately
+    never executed. Upstream runs the referenced file as a program and reads
+    config directives back from its stdout (`one_file(file,
+    LOPT_CONF_SCRIPT)`). Executing an arbitrary external program from config
+    parsing is a capability this port intentionally does not implement.
+  - `umbrella` (option.c:2808-2850): the `deviceid:`/`orgid:`/`assetid:`
+    sub-options (there is no `userid:` sub-option upstream) now populate
+    `Daemon::umbrella_device`/`umbrella_org`/`umbrella_asset`, and `deviceid:`
+    sets `OPT_UMBRELLA_DEVID`. `edns0::add_umbrella_opt`/`add_edns0_config`
+    are ported and can now be fed real `Daemon` state, but nothing calls
+    `add_edns0_config` from the forward path yet — see the `edns0.c` entry
+    above.
+  Required tests: `src/option.rs` directive-level tests for every directive
+  above (`apply_dhcp_broadcast_*`, `apply_dhcp_proxy_*`,
+  `apply_dhcp_pxe_vendor`, `apply_pxe_prompt_*`, `apply_pxe_service_*`,
+  `apply_umbrella_*`), plus `dhcp.rs`'s `discover_matching_global_dhcp_ignore_tag_produces_no_reply`/
+  `discover_not_matching_global_dhcp_ignore_tag_still_offers`/
+  `discover_empty_dhcp_ignore_entry_does_not_match_anyone` for the one
+  directive with a real runtime consumer.
+  Done when: `force_broadcast`/`dhcp_gen_names`/`dhcp_ignore_names`/
+  `override_relays`/`dhcp_pxe_vendors`/`pxe_services`/`enable_pxe` gain
+  DHCP/PXE runtime consumers (tracked here until then), and `umbrella`'s
+  fields get threaded into a real outgoing-EDNS0 call site.
 
 - [x] `connmark-allowlist` / `connmark-allowlist-enable` (option.c:3283-3330,
   `OPT_CMARK_ALST_EN`): parsing is gated on the `conntrack` feature (mirroring
@@ -1351,9 +1385,18 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     + `local=/<domain>/` generated automatically) is a `--domain`-only
     feature upstream (`option.c`'s `option != 's'` check) and is correctly
     *not* implemented for `synth-domain` — only `rev-server` and the bare
-    `--domain` directive have a "no address" shorthand, and `--domain`'s own
-    subnet form (`daemon->cond_domain`) is still unparsed (only the plain
-    `domain=<suffix>` form works; see `src/option.rs`'s `"domain"` arm).
+    `--domain` directive have a "no address" shorthand. `--domain`'s own
+    subnet form is now parsed (Issue #56/T3-daemon-struct: `option::parse_domain`
+    populates `Daemon::cond_domain`, including the CIDR form, the
+    `<start>[,<end>]` range form, and the `option=='s'`-only
+    subnet-from-interface fallback and `domain=#` → `OPT_RESOLV_DOMAIN`
+    special case), but the CIDR form's trailing `local` keyword is
+    accepted only syntactically — upstream's automatic PTR-zone/NS-record
+    synthesis (`domain_rev4`/`domain_rev6` + `add_update_server`) that
+    `local` triggers is **not implemented**, and nothing yet consults
+    `cond_domain` for domain-suffix selection or forward/reverse synthesis
+    the way `synth_domains` is consulted (see the `auth.c`/
+    `check_for_local_domain` entries elsewhere in this file).
   - `synth-domain`'s subnet-from-interface form (`synth-domain=<domain>,<iface>`)
     is **not implemented** — upstream restricts that fallback to `option=='s'`
     (bare `--domain`) too, so a non-address, non-CIDR second field is
@@ -1367,8 +1410,9 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     step is unported (`src/network.rs`), so a future `--domain`/`synth-domain`
     subnet-from-interface implementation has a home in both the parser and
     the matcher, but is not observable end-to-end until that population step
-    and the `--domain` subnet-form parsing into `Daemon::cond_domain`
-    (mentioned above) both land.
+    lands — `Daemon::cond_domain` is now populated for the address-range and
+    CIDR forms, but a `domain=<name>,<iface>` line only sets
+    `CondDomain.interface`, whose `al` list stays permanently empty.
   - `bridge-interface` and `shared-network` populate `Daemon::bridges` /
     `Daemon::shared_networks`, but nothing in `src/dhcp.rs`/`src/rfc2131.rs`
     consults either yet — upstream uses `bridges` to remap an arriving
@@ -1383,12 +1427,16 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     either). Retries reuse the same candidate set as the initial send
     (recomputed from `Frec.stash`), so a query only ever retries within the
     domain it was scoped to.
-  Required tests: once addressed, add a `--domain` subnet-form test, a
-  `synth-domain=...,<iface>` acceptance test, and a DHCP-request test where
-  `bridge-interface`/`shared-network` change context selection.
-  Done when: `--domain`'s subnet form populates `cond_domain` and is wired
-  the same way `synth_domains` now is, and DHCP context matching consumes
-  `bridges`/`shared_networks`.
+  Required tests: `src/option.rs`'s `apply_domain_range_form_populates_cond_domain`/
+  `apply_domain_cidr_form_populates_range`/`apply_domain_subnet_from_interface`/
+  `apply_domain_ipv6_range_form` etc. cover the new parsing. Still needed: a
+  `synth-domain=...,<iface>` acceptance test, a `cond_domain` consumer test
+  once one exists, and a DHCP-request test where `bridge-interface`/
+  `shared-network` change context selection.
+  Done when: `cond_domain` is wired into domain-suffix selection / forward
+  and reverse synthesis the same way `synth_domains` now is, the CIDR form's
+  `local` keyword actually generates PTR-zone/NS records, and DHCP context
+  matching consumes `bridges`/`shared_networks`.
 
 - [ ] Issue #21 remaining `dhcp-relay` gaps. `dhcp-relay`/`dhcp-split-relay`
   parsing (`src/option.rs::parse_dhcp_relay`) and `relay_upstream4`/
@@ -1878,9 +1926,11 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     `in_zone`/`find_subnet` before dispatching to `answer_auth`, or port `dns_auth` first.
   - `is_name_synthetic`/`is_rev_synth` (`--synth-domain` forward/reverse synthesis fallback,
     `auth.c:260,420`) are not called. `daemon.synth_domains` exists and is consulted elsewhere
-    (`rfc1035::check_for_local_domain`), but `daemon->cond_domain` (the plain `--domain` subnet
-    form) is not yet populated anywhere in this port — see the existing note on
-    `Daemon::synth_domains` in `src/types/daemon.rs`.
+    (`rfc1035::check_for_local_domain`). `daemon.cond_domain` (the plain `--domain` subnet
+    form) is now populated by `option::parse_domain` (Issue #56/T3-daemon-struct), but still
+    has no consumer anywhere in this port — see the `--domain`/`synth-domain` entry
+    elsewhere in this file and the existing note on `Daemon::cond_domain` in
+    `src/types/daemon.rs`.
   - Multi-message TCP AXFR framing is not implemented; truncation only sets `HB3_TC` on a
     single UDP-sized reply, matching the *signal* upstream's `add_resource_record` truncation
     gives but not the TCP-retry zone-transfer path itself.
