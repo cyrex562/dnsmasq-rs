@@ -863,6 +863,20 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     `--bind-interfaces` stays unbound for the life of the process. Extending
     `ArrivalFilter`'s existing ticker to also cover the nowild+DAD case is the natural next
     step and is still open.
+  - [x] **Fix (issue #39 follow-up)**: the initial-bind DAD exclusion above was gated on
+    `nowild && i.dad` — under `--bind-dynamic` (`cleverbind`) a DAD-tentative address was
+    bound immediately instead of deferred, and `ArrivalFilter::new`'s baseline was built from
+    the *unfiltered* enumeration, so even a correctly-deferred address would never be seen as
+    "newly appeared" by `refresh_dynamic`'s diff once DAD completed (it was already present in
+    `before`) — permanently unlistened-on under `--bind-dynamic` until a restart. Both the
+    initial-bind filter and the `ArrivalFilter` baseline now exclude `i.dad` unconditionally
+    (`network.c:1177-1210`'s `create_bound_listeners()` guard is unconditional across both
+    modes, not `nowild`-gated), so a DAD address under `--bind-dynamic` is correctly deferred
+    and then picked up by the very next `refresh_dynamic` tick once a fresh enumeration reports
+    it resolved. Covered by
+    `network::tests::diff_dynamic_interfaces_reports_dad_address_as_added_once_baseline_excludes_it`.
+    The `--bind-interfaces` (`nowild`) case above remains genuinely open — no periodic tick
+    exists for that mode at all.
   - [x] **`warn_wild_labels` / `warn_int_names`** (issue #39 follow-up): ported as
     `network::warn_wild_labels` (`network.c:1276-1283`) and `network::warn_int_names`
     (`network.c:1285-1292`). Wired into `bind_dns_listeners`: `warn_wild_labels` fires in

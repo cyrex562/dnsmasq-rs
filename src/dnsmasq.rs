@@ -1222,10 +1222,14 @@ fn bind_dns_listeners(
     // `listen_addr` carries the interface index into `sin6_scope_id` for
     // link-local addresses; without it the bind fails with EINVAL
     // (`network.c:617-620`).
+    //
+    // `network.c:1177-1210`'s `create_bound_listeners()` skips a DAD address
+    // (`!iface->dad`) unconditionally, in both `--bind-interfaces` and
+    // `--bind-dynamic` — not just under `nowild` as this filter used to read.
     let iface_addrs: Vec<(SocketAddr, String)> = enumerated
         .interfaces
         .iter()
-        .filter(|i| !(nowild && i.dad))
+        .filter(|i| !i.dad)
         .map(|i| (i.listen_addr(port), i.name.clone()))
         .collect();
 
@@ -1270,8 +1274,18 @@ fn bind_dns_listeners(
     // Bound listeners are arrival-checked too, except IPv4 under plain
     // --bind-interfaces (`forward.c:1612`).  Under --bind-dynamic that check is
     // the entire point of the option (`network.c:1240-1250`).
+    //
+    // The filter's baseline excludes DAD addresses too, matching the bind
+    // exclusion above: `refresh_dynamic`'s diff (`diff_dynamic_interfaces`)
+    // only reports an address as newly-appeared if it wasn't already in the
+    // previous pass's list. A DAD-tentative address left in the baseline
+    // would never be seen as "new" once DAD completes and a fresh enumeration
+    // reports it (now with `dad: false`) — it would just look unchanged and
+    // stay permanently unbound under `--bind-dynamic`.
     let filter = network::ArrivalFilter::new(
-        check, allowed_cfg, enumerated.interfaces, cleverbind,
+        check, allowed_cfg,
+        enumerated.interfaces.into_iter().filter(|i| !i.dad).collect(),
+        cleverbind,
     );
     Ok((adopt_dns_listeners(listeners, nowild)?, Some(filter)))
 }

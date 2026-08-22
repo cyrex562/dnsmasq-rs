@@ -2942,6 +2942,47 @@ mod tests {
         assert!(removed.is_empty());
     }
 
+    /// Regression test for the `--bind-dynamic` DAD-reconciliation bug
+    /// (Issue #39): a DAD-tentative address left in `ArrivalFilter`'s
+    /// baseline is already present in `before`, so once DAD completes and a
+    /// fresh enumeration reports the same address with `dad: false`,
+    /// `diff_dynamic_interfaces` (address-keyed, DAD-unaware by design) sees
+    /// no change and the address never gets a listener. `bind_dns_listeners`
+    /// now excludes DAD addresses from the baseline it hands to
+    /// `ArrivalFilter::new`, so the completed address is genuinely absent
+    /// from `before` and shows up as added on the next `refresh_dynamic` tick.
+    #[test]
+    fn diff_dynamic_interfaces_reports_dad_address_as_added_once_baseline_excludes_it() {
+        let tentative = IfaceRecord {
+            name: "eth0".into(),
+            addr: IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+            dad: true,
+            ..Default::default()
+        };
+        let resolved = IfaceRecord { dad: false, ..tentative.clone() };
+
+        // The old bug: a DAD address left in the baseline is already present
+        // in `before`, so the diff reports nothing once DAD resolves.
+        let (added, removed) = diff_dynamic_interfaces(
+            std::slice::from_ref(&tentative),
+            std::slice::from_ref(&resolved),
+            53,
+        );
+        assert!(added.is_empty(), "old baseline masks the now-resolved address");
+        assert!(removed.is_empty());
+
+        // The fix: excluding DAD addresses from the baseline (mirroring
+        // `bind_dns_listeners`'s `.filter(|i| !i.dad)`) means the resolved
+        // address is genuinely new on the next pass.
+        let baseline: Vec<IfaceRecord> =
+            vec![tentative].into_iter().filter(|i| !i.dad).collect();
+        assert!(baseline.is_empty());
+        let (added, removed) =
+            diff_dynamic_interfaces(&baseline, std::slice::from_ref(&resolved), 53);
+        assert_eq!(added, vec![resolved.listen_addr(53)]);
+        assert!(removed.is_empty());
+    }
+
     /// `--bind-interfaces` (not `--bind-dynamic`) must never report dynamic
     /// listener changes — upstream only creates/releases listeners on the fly
     /// for `OPT_CLEVERBIND` (network.c:854).
