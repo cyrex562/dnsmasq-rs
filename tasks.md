@@ -2617,17 +2617,9 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     always has kernel access when a socket is open; `find_mac`'s `can_query_kernel` parameter
     exists and is fully honored, so wiring in that distinction later needs no further change to
     the orchestrator itself.
-  - **`dhcp6::get_client_mac` still has no live caller.** This is a pre-existing, much larger gap
-    than arp.rs's own: DHCPv6 packet dispatch (`dispatch_dhcp6`/`handle_solicit`/`handle_request6`)
-    has zero callers anywhere in the tree because there is no DHCPv6 receive loop at all yet (no
-    `run_dhcp6_loop`, no bound socket) — building one is a separate, large undertaking (a DHCPv6
-    equivalent of `dhcp::run_dhcp_loop`), not something this change can bolt on safely. Now that
-    `Daemon.arp_state` is shared with the forwarding loop, wiring that loop up will make
-    `get_client_mac` resolve real addresses immediately, with no further arp.rs-side change needed.
   - **`tftp.c:470`'s MAC substitution is not addressed at all.** `src/tftp.rs` has no MAC-aware
-    filename substitution, and — same shape as DHCPv6 above — there is no TFTP receive loop in
-    this port yet either, so there is no runtime call site to wire into. `find_mac_shared` is
-    available for whoever adds one.
+    filename substitution, and there is no TFTP receive loop in this port yet either, so there is
+    no runtime call site to wire into. `find_mac_shared` is available for whoever adds one.
   - **`do_arp_script_run` now fires automatically — CLOSED.** `dnsmasq::spawn_arp_housekeeping_task`
     (spawned from `run_main_loop_with` alongside the forwarding/DHCP tasks, aborted on the same
     shutdown paths) ticks every 1s and mirrors upstream's per-select-loop-iteration housekeeping
@@ -2642,21 +2634,19 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     main startup path yet, so there is no live `HelperHandle` to hand them to. That wiring is a
     one-line change (`helper.send(&event)`) once a helper exists; it does not require touching
     `arp.rs`/`dnsmasq.rs` again.
-  - **`dhcp6::get_client_mac` still has no live caller — NOT closeable from this file.** Re-verified
-    by exhaustive grep across `src/`: `dispatch_dhcp6`, `handle_solicit`, `handle_request6`,
-    `parse_relay_msg`, `build_relay_reply`, and every other DHCPv6 packet-handling function have
-    zero callers outside their own test modules, because there is no DHCPv6 receive loop, no bound
-    `dhcp6fd`-equivalent socket, and no `run_dhcp6_loop` anywhere in this port — confirmed absent,
-    not just undiscovered. Building one is a separate, large undertaking (a DHCPv6 equivalent of
-    `dhcp::run_dhcp_loop` plus socket-binding glue in `network.rs`/`dnsmasq.rs`), and doing it
-    hastily inside an arp.c-scoped change would be actively harmful: `dispatch_dhcp6`'s
-    Solicit/Request handling currently returns stub replies with no real address-assignment logic
-    behind them, so exposing a live socket on port 547 now would put a non-functional DHCPv6
-    responder on the wire for anyone who enables `dhcp6`/`--dhcp-range` for IPv6 — worse than the
-    current, honestly-absent state. `Daemon.arp_state` is already shared with the forwarding loop
-    and the new housekeeping task, so once a real DHCPv6 receive loop lands, wiring
-    `get_client_mac` into it needs no further arp.rs-side change. Tracked as its own follow-up
-    (DHCPv6 receive loop / `rfc3315.c` runtime integration), not part of T3-arp.
+  - **`dhcp6::get_client_mac` still has no live caller — NOT closeable from this file, and the
+    reason has changed since this entry was first written.** `dispatch_dhcp6`/`run_dhcp6_loop` are
+    no longer absent: issues #34/#35 landed a real DHCPv6 receive loop with a production
+    `tokio::spawn(dhcp6::run_dhcp6_loop(...))` call site in `dnsmasq.rs`'s `run_main_loop_with`.
+    The remaining blocker is narrower and purely mechanical: `run_dhcp6_loop` takes individual
+    extracted parameters (`duid`, `contexts`, `configs`, `lease_db`, `authoritative`,
+    `reply_port_override`) rather than `&mut Daemon`, so `get_client_mac(daemon: &mut Daemon, ...)`
+    has no `Daemon` to borrow from inside that loop without a signature change threading either a
+    `Daemon` handle or (more consistently with this file's own pattern) a `SharedArpState` +
+    resolver closure into it. `Daemon.arp_state` is already shared with the forwarding loop and the
+    housekeeping task, so once `run_dhcp6_loop` gains that same plumbing, wiring `get_client_mac`
+    in needs no further arp.rs-side change. Tracked as its own follow-up (DHCPv6 loop / `Daemon`
+    ownership threading), not part of T3-arp.
   Covered by `arp::tests::find_mac_*` (cache-hit short-circuit, kernel-populate-on-miss,
   negative-entry recording, no-kernel-access child-style path, empty-entry upgrade on refresh,
   single-enumerate-per-call), `arp::tests::find_mac_for_daemon_opens_socket_and_does_not_panic`,

@@ -1385,6 +1385,8 @@ impl ForwardEngine {
         self.loop_servers
             .get(idx)
             .is_some_and(|s| s.flags & crate::types::server::SERV_LOOP != 0)
+    }
+
     /// Replace this engine's ARP state with a shared handle — used to make
     /// the forwarding loop consult the same cache `Daemon`/DHCPv6 do, rather
     /// than a private one populated only by this engine's own lookups.

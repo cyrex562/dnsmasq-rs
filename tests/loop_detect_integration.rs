@@ -115,7 +115,7 @@ async fn a_looping_upstream_server_is_detected_and_disabled() {
     let listener = DnsListener { sock: std::sync::Arc::new(listener_sock), check_dst: false };
     let cache = new_shared_cache(config.cache_size, config.min_cache_ttl, config.max_cache_ttl);
     let server_task = tokio::spawn(async move {
-        let _ = run_forward_loop_on(vec![listener], None, config, cache).await;
+        let _ = run_forward_loop_on(vec![listener], None, config, cache, dnsmasq_rs::arp::new_shared_arp_state()).await;
     });
 
     // The startup probe round `run_main_loop_with` would send once, sent here
@@ -199,7 +199,7 @@ async fn a_probe_shaped_query_with_the_wrong_uid_does_not_disable_the_server() {
     let listener = DnsListener { sock: std::sync::Arc::new(listener_sock), check_dst: false };
     let cache = new_shared_cache(config.cache_size, config.min_cache_ttl, config.max_cache_ttl);
     let server_task = tokio::spawn(async move {
-        let _ = run_forward_loop_on(vec![listener], None, config, cache).await;
+        let _ = run_forward_loop_on(vec![listener], None, config, cache, dnsmasq_rs::arp::new_shared_arp_state()).await;
     });
 
     // Deliver a probe-shaped query straight to the server's listening port,
