@@ -511,6 +511,33 @@ pub fn netlink_open() -> std::io::Result<(i32, u32)> {
     Ok((fd, pid))
 }
 
+/// An owned `NETLINK_ROUTE` socket plus the kernel-assigned pid, closed on
+/// drop. Mirrors `daemon->netlinkfd` (`netlink.c:74`), which is opened once
+/// at startup and reused for the life of the daemon rather than per-call.
+#[derive(Debug)]
+pub struct NetlinkSocket {
+    pub fd:  i32,
+    pub pid: u32,
+}
+
+impl Drop for NetlinkSocket {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+/// Open and return an owned, self-closing netlink socket. Thin wrapper over
+/// [`netlink_open`] for callers (e.g. [`crate::arp`]) that want the socket to
+/// live for the daemon's lifetime rather than manage the raw fd themselves.
+#[cfg(target_os = "linux")]
+pub fn open_netlink_socket() -> std::io::Result<NetlinkSocket> {
+    let (fd, pid) = netlink_open()?;
+    Ok(NetlinkSocket { fd, pid })
+}
+
 /// Receive a netlink message into `buf`, growing it as needed.
 ///
 /// Returns the number of bytes received, or an IO error.
@@ -879,7 +906,7 @@ fn parse_rta_attrs(attrs: &[u8], family: u8) -> (Option<IpAddr>, Option<IpAddr>)
     (dst, gateway)
 }
 
-fn parse_ip(data: &[u8], family: u8) -> Option<IpAddr> {
+pub(crate) fn parse_ip(data: &[u8], family: u8) -> Option<IpAddr> {
     match family {
         AF_INET if data.len() >= 4 => {
             Some(IpAddr::V4(Ipv4Addr::new(data[0], data[1], data[2], data[3])))
@@ -1255,5 +1282,19 @@ mod tests {
             libc::close(a);
             libc::close(b);
         }
+    }
+
+    // ── NetlinkSocket ─────────────────────────────────────────────────────────
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_netlink_socket_returns_usable_fd() {
+        // Opening a raw NETLINK_ROUTE socket for reading needs no special
+        // privilege on Linux, so this is expected to succeed in normal and
+        // sandboxed test environments alike.
+        let sock = open_netlink_socket().expect("open_netlink_socket failed");
+        assert!(sock.fd >= 0);
+        // Dropping must close the fd without panicking.
+        drop(sock);
     }
 }

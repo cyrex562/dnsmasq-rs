@@ -11,6 +11,7 @@ use crate::types::dns_records::*;
 use crate::types::network::*;
 use crate::types::server::*;
 use crate::domain::CondDomain;
+use crate::arp::SharedArpState;
 
 #[cfg(feature = "dhcp")]
 use crate::types::dhcp::*;
@@ -192,6 +193,16 @@ pub struct Daemon {
     pub dns_dirty:       bool,
     /// The next scheduled alarm time (if any).
     pub next_alarm:      Option<std::time::Instant>,
+
+    // ── ARP / neighbour cache ─────────────────────────────────────────────────
+    /// IP → MAC cache backing `find_mac()` (`arp.c`'s file-scope `arps`/`old`
+    /// lists), plus its persistent netlink socket. Consulted by EDNS0 MAC
+    /// options (`--add-mac`, `--mac-base64`, `--mac-hex`) and DHCPv6 client
+    /// MAC logging. Shared (`Arc<Mutex<_>>`, not owned outright) because the
+    /// forwarding loop only sees a `ForwardConfig` snapshot of `Daemon`
+    /// (`dnsmasq::daemon_forward_config`) and must consult this same cache,
+    /// not a private copy, to match upstream's single file-scope `arps` list.
+    pub arp_state:        SharedArpState,
 
     // ── DHCP state (feature-gated) ────────────────────────────────────────────
     #[cfg(feature = "dhcp")]
@@ -477,6 +488,7 @@ impl Default for Daemon {
             reload_count: 0,
             dns_dirty: false,
             next_alarm: None,
+            arp_state: crate::arp::new_shared_arp_state(),
 
             #[cfg(feature = "dhcp")]
             dhcp: vec![],

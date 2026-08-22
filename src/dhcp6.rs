@@ -1279,6 +1279,39 @@ async fn icmp6_recv(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Client MAC resolution (ported from dhcp6.c:307-348)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Resolve and log the DHCPv6 client's link-layer (MAC) address for `client`.
+///
+/// Port of `get_client_mac()` (`dhcp6.c:307-348`), minus the active
+/// neighbour-discovery probe: C retries up to 5 times, sending an ICMPv6
+/// Neighbour Solicitation to `client` and sleeping 100ms between attempts,
+/// to populate the kernel's neighbour cache for a host that hasn't sent
+/// traffic recently (`daemon->icmp6fd`). This port has no ICMPv6 socket
+/// wired up, so it only consults whatever [`crate::arp::find_mac`] can
+/// resolve from the kernel's *existing* neighbour table — tracked as a
+/// deliberate deviation in `tasks.md`.
+///
+/// Called from `rfc3315.c:132,2166` upstream to populate `state->mac`; this
+/// port's DHCPv6 request-handling path (`handle_solicit`/`handle_request6`
+/// in `rfc3315.rs`) has no client-MAC field to populate yet either, so this
+/// function currently has no live caller — it's ready to be wired in once
+/// that state-carrying integration lands.
+#[cfg(target_os = "linux")]
+pub fn get_client_mac(
+    daemon: &crate::types::daemon::Daemon,
+    client: Ipv6Addr,
+    now: u64,
+) -> Option<Vec<u8>> {
+    let mac = crate::arp::find_mac_for_daemon(daemon, std::net::IpAddr::V6(client), false, now);
+    if let Some(ref m) = mac {
+        debug!("DHCPv6 client {client} resolved to MAC {}", crate::util::print_mac(m));
+    }
+    mac
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2413,5 +2446,38 @@ mod tests {
             .expect("loop did not stop after shutdown signal")
             .unwrap()
             .unwrap();
+    }
+
+    // ── get_client_mac ────────────────────────────────────────────────────────
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn get_client_mac_resolves_from_arp_cache() {
+        let daemon = crate::types::daemon::Daemon::default();
+        let client: Ipv6Addr = "fe80::1".parse().unwrap();
+        let mac_bytes = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+
+        // Pre-seed the ARP cache directly so this test is deterministic and
+        // independent of the real kernel neighbour table: a fresh
+        // (not-yet-stale) cache entry is returned without ever touching the
+        // netlink socket.
+        {
+            let mut state = daemon.arp_state.lock().unwrap();
+            state.cache.begin_refresh(0);
+            state.cache.filter_mac(std::net::IpAddr::V6(client), &mac_bytes);
+            state.cache.finish_refresh();
+        }
+
+        let mac = get_client_mac(&daemon, client, 0);
+        assert_eq!(mac, Some(mac_bytes.to_vec()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn get_client_mac_none_when_unresolvable() {
+        let daemon = crate::types::daemon::Daemon::default();
+        // Documentation-only prefix (RFC 3849): never a real neighbour.
+        let client: Ipv6Addr = "2001:db8::dead:beef".parse().unwrap();
+        assert_eq!(get_client_mac(&daemon, client, 0), None);
     }
 }
