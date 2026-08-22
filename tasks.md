@@ -2107,10 +2107,36 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     reconnect-on-disconnect: this codebase has no raw `poll()` loop to hook
     a listener into, so it polls the (non-blocking) connection on a short
     interval instead, reconnecting via `ubus_init` whenever disconnected.
+  Follow-up fix (same issue, second pass, after review flagged the
+  `blobmsg` layer as itself another invented format): the original
+  `blobmsg::encode_entry` never set `blob_attr`'s `EXTENDED_BIT` (the flag a
+  real peer's `blobmsg_data()`/`blobmsg_name()` use to know a `blobmsg_hdr`
+  precedes the value at all) on any attribute, and encoded a child's
+  `namelen` as `name.len() + 1` while only writing that many further bytes —
+  one short of what `blobmsg_hdrlen(len) == offsetof(struct blobmsg_hdr,
+  name[len + 1])` requires a real peer to skip, so a real `ubusd` would have
+  misread the first value byte as name padding. Also, the top-level
+  container built by `encode_table` was itself wrapped through
+  `encode_entry`, giving it a spurious `blobmsg_hdr`/`EXTENDED_BIT` that
+  `blob_buf_init()` never puts on the root attribute. All three are fixed:
+  every child entry now sets `EXTENDED_BIT` and encodes `namelen =
+  strlen(name)` followed by `namelen + 1` name bytes; `decode` now requires
+  `EXTENDED_BIT` on every table/array child (round-tripping the check, not
+  just self-consistently ignoring it); the top-level container is a plain,
+  non-extended `blob_attr` around its children. This was reasoned from
+  memory of `libubox`'s documented `blob.h`/`blobmsg.h` layout — this
+  sandboxed environment has no network access (`curl`/`gh`/`WebFetch` to
+  fetch a vendored header were all blocked) and no `libubox`/`libubus`
+  headers or binary to diff against, so it remains **not** verified
+  byte-for-byte against a real header or a live `ubusd`, only reasoned
+  through and covered by this port's own (self-consistent) round-trip
+  tests. Do not upgrade this to "verified" without one of those.
   Deliberate, documented gaps:
-  - The envelope's exact wire bytes are unverified (see above) — do not
-    treat this as proven interoperable with a real `ubusd` until checked
-    against real `libubus` headers or a live daemon.
+  - The envelope's exact wire bytes, and now also the `blobmsg` layer's
+    exact byte-for-byte fidelity (high confidence, not verified — see the
+    follow-up note above), are unverified — do not treat this as proven
+    interoperable with a real `ubusd` until checked against real `libubus`
+    headers or a live daemon.
   - `run_ubus_task`'s reconnect is a fixed-interval poll+retry, not
     upstream's event-driven `connection_lost` callback — same class of
     "async-native stand-in for a poll-based callback" deviation already
@@ -2122,12 +2148,18 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     "`ForwardConfig` is a startup snapshot" gap called out for `loop.c` and
     `dbus.c` above, not something specific to ubus.
   - No live-binary smoke test against a real `ubusd` was run for this
-    change (no `ubusd`/root socket access in this sandboxed environment);
-    verification is the unit/integration suite in `src/ubus.rs` (35 tests,
-    including a full mock-`ubusd` handshake, subscriber-gated `NOTIFY`
-    delivery, and an end-to-end `INVOKE`→`dispatch_invoke`→reply round trip
-    through the actual `run_ubus_task` loop) plus `cargo test` / `cargo
-    check --no-default-features` clean.
+    change (no `ubusd`/root socket access, and no network access to fetch
+    real `libubox`/`libubus` headers to check against, in this sandboxed
+    environment); verification is the unit/integration suite in
+    `src/ubus.rs` (39 tests, including a full mock-`ubusd` handshake,
+    subscriber-gated `NOTIFY` delivery, an end-to-end
+    `INVOKE`→`dispatch_invoke`→reply round trip through the actual
+    `run_ubus_task` loop, and explicit assertions on `EXTENDED_BIT` and
+    `blobmsg_hdr` byte layout) plus `cargo test` / `cargo check
+    --no-default-features` clean. This proves internal self-consistency
+    (encode and decode agree with each other), not interoperability with a
+    real peer — acceptance criterion "a real ubusd accepts the connection
+    and receives events" is still open.
   Required tests: done, in `src/ubus.rs` (`blob`/`blobmsg`/`envelope` codec
   round trips and malformed-input handling; `connection` handshake,
   reconnect-state, and subscriber-gating tests against a mock `ubusd`;

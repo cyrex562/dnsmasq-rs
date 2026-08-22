@@ -9,17 +9,39 @@
 //!
 //! Confidence notes (read before relying on this for wire-level
 //! interoperability — see `tasks.md` for the tracked follow-up):
-//! - [`blob`] (the `blob_attr` TLV: 7-bit id + 24-bit length-including-header
-//!   in a big-endian `u32`, data padded to 4 bytes) and [`blobmsg`] (the
-//!   named/typed layer built on top: `BLOBMSG_TYPE_*`, `blobmsg_hdr`) are
-//!   reproduced from `libubox`'s documented layout with high confidence;
-//!   `BLOBMSG_TYPE_TABLE`/`INT32`/`ARRAY`/`STRING`'s numeric values are
-//!   corroborated by the upstream `ubus.c` source read for this port.
-//! - The outer `ubus_msghdr`/`UBUS_MSG_*`/`UBUS_ATTR_*` session envelope
-//!   (module [`envelope`]) is reconstructed from memory of `libubus`'s
-//!   `ubusmsg.h` and has **not** been verified against a vendored header or
-//!   a live `ubusd` in this environment — treat its exact constants as
-//!   best-effort pending that verification.
+//! - [`blob`] (the `blob_attr` TLV: 7-bit id + `EXTENDED_BIT` flag + 24-bit
+//!   length-including-header in a big-endian `u32`, data padded to 4 bytes)
+//!   and [`blobmsg`] (the named/typed layer built on top: `BLOBMSG_TYPE_*`,
+//!   `blobmsg_hdr`) are reproduced from `libubox`'s documented layout with
+//!   high confidence; `BLOBMSG_TYPE_TABLE`/`INT32`/`ARRAY`/`STRING`'s numeric
+//!   values are corroborated by the upstream `ubus.c` source read for this
+//!   port. A prior version of this module got two structural details wrong
+//!   — no attribute ever set `EXTENDED_BIT` (the flag a real peer's
+//!   `blobmsg_data()`/`blobmsg_name()` use to know a `blobmsg_hdr` precedes
+//!   the value at all), and a child's `namelen` field stored the
+//!   NUL-inclusive byte count instead of `strlen(name)`, which would make a
+//!   real peer skip one byte short and misread the first value byte as name
+//!   padding. Both are fixed: every [`blobmsg::encode_entry`] child now sets
+//!   `EXTENDED_BIT` and encodes `namelen = strlen(name)` followed by
+//!   `namelen + 1` name bytes (chars + NUL, matching
+//!   `blobmsg_hdrlen(len) == offsetof(struct blobmsg_hdr, name[len + 1])`),
+//!   and the top-level container built by [`blobmsg::encode_table`] is
+//!   itself a plain (non-extended, headerless) `blob_attr` around its
+//!   children, matching `blob_buf_init()`.
+//! - This was reasoned from memory of `libubox`'s documented `blob.h`/
+//!   `blobmsg.h` layout, not diffed byte-for-byte against a vendored header
+//!   or exercised against a live `ubusd` — this sandboxed environment has no
+//!   network access and no `libubox`/`libubus` headers or binary available
+//!   to check against (attempts to fetch them were blocked; see `tasks.md`).
+//!   Treat the `blobmsg` layer as high-confidence but not yet verified, and
+//!   the outer `ubus_msghdr`/`UBUS_MSG_*`/`UBUS_ATTR_*` session envelope
+//!   (module [`envelope`]) — reconstructed from memory of `libubus`'s
+//!   `ubusmsg.h`, including this port's own stream-framing length prefix,
+//!   which `blob_attr` itself has no equivalent for — as lower-confidence
+//!   still and **not** verified against a vendored header or a live `ubusd`.
+//!   Closing that gap needs either real `libubox`/`libubus` headers to check
+//!   against or a live-`ubusd` interop smoke test; neither was available
+//!   here.
 
 // ─────────────────────────────────────────────────────────────────────────
 // blob_attr: the raw TLV primitive (libubox/blob.h)
@@ -37,6 +59,14 @@ pub mod blob {
     const ID_SHIFT: u32 = 24;
     const ID_MASK: u32 = 0x7f << ID_SHIFT;
     const LEN_MASK: u32 = 0x00ff_ffff;
+    /// `BLOB_ATTR_EXTENDED` (`blob.h`): the top bit of the big-endian
+    /// `id_len` word. `blobmsg` sets this on every attribute it writes (both
+    /// named table entries and unnamed array elements) to signal that the
+    /// attribute's data begins with a `blobmsg_hdr` (name length + name)
+    /// ahead of the typed value — a plain (non-`blobmsg`) `blob_attr`, like
+    /// this module's own top-level container or [`super::envelope`]'s
+    /// session attrs, leaves this bit clear and carries no such header.
+    pub const EXTENDED_BIT: u32 = 1 << 31;
 
     #[derive(Debug, thiserror::Error, PartialEq, Eq)]
     pub enum BlobError {
@@ -54,8 +84,16 @@ pub mod blob {
         (len + 3) & !3
     }
 
-    /// Append one `blob_attr` (header + data + zero padding) to `out`.
+    /// Append one plain (non-`blobmsg`) `blob_attr` (header + data + zero
+    /// padding) to `out` — the `EXTENDED_BIT` is left clear.
     pub fn put(out: &mut Vec<u8>, id: u8, payload: &[u8]) -> Result<(), BlobError> {
+        put_ext(out, id, false, payload)
+    }
+
+    /// Append one `blob_attr`, optionally setting `EXTENDED_BIT` — used by
+    /// [`super::blobmsg`] to mark attributes whose data begins with a
+    /// `blobmsg_hdr`.
+    pub fn put_ext(out: &mut Vec<u8>, id: u8, extended: bool, payload: &[u8]) -> Result<(), BlobError> {
         if id > 0x7f {
             return Err(BlobError::IdOutOfRange(id as u32));
         }
@@ -63,7 +101,10 @@ pub mod blob {
         if total_len > LEN_MASK as usize {
             return Err(BlobError::PayloadTooLarge);
         }
-        let id_len: u32 = ((id as u32) << ID_SHIFT) | (total_len as u32 & LEN_MASK);
+        let mut id_len: u32 = ((id as u32) << ID_SHIFT) | (total_len as u32 & LEN_MASK);
+        if extended {
+            id_len |= EXTENDED_BIT;
+        }
         out.extend_from_slice(&id_len.to_be_bytes());
         out.extend_from_slice(payload);
         let padded = pad_len(total_len);
@@ -71,11 +112,13 @@ pub mod blob {
         Ok(())
     }
 
-    /// One parsed `blob_attr`: its 7-bit `id` and a slice over its payload
-    /// (excluding the 4-byte header and any trailing padding).
+    /// One parsed `blob_attr`: its 7-bit `id`, whether `EXTENDED_BIT` was
+    /// set, and a slice over its payload (excluding the 4-byte header and
+    /// any trailing padding).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Attr<'a> {
         pub id: u8,
+        pub extended: bool,
         pub data: &'a [u8],
     }
 
@@ -87,6 +130,7 @@ pub mod blob {
         }
         let id_len = u32::from_be_bytes(input[0..4].try_into().unwrap());
         let id = ((id_len & ID_MASK) >> ID_SHIFT) as u8;
+        let extended = id_len & EXTENDED_BIT != 0;
         let len = (id_len & LEN_MASK) as usize;
         if len < HDR_LEN {
             return Err(BlobError::InvalidHeader);
@@ -99,7 +143,7 @@ pub mod blob {
         // The final attribute in a buffer isn't required to carry trailing
         // padding bytes that don't exist in the underlying stream.
         let consumed = padded.min(input.len());
-        Ok((Attr { id, data }, consumed))
+        Ok((Attr { id, extended, data }, consumed))
     }
 
     /// Parse a flat sequence of back-to-back `blob_attr`s (e.g. a
@@ -152,6 +196,20 @@ pub mod blob {
         }
 
         #[test]
+        fn put_ext_sets_the_extended_bit_and_put_leaves_it_clear() {
+            let mut buf = Vec::new();
+            put_ext(&mut buf, 3, true, b"x").unwrap();
+            let (attr, _) = parse_one(&buf).unwrap();
+            assert!(attr.extended);
+            assert_eq!(attr.id, 3);
+
+            let mut buf2 = Vec::new();
+            put(&mut buf2, 3, b"x").unwrap();
+            let (attr2, _) = parse_one(&buf2).unwrap();
+            assert!(!attr2.extended);
+        }
+
+        #[test]
         fn id_over_seven_bits_is_rejected() {
             assert_eq!(put(&mut Vec::new(), 0x80, b""), Err(BlobError::IdOutOfRange(0x80)));
         }
@@ -184,9 +242,9 @@ pub mod blob {
             put(&mut buf, 3, b"").unwrap();
             let attrs = parse_all(&buf).unwrap();
             assert_eq!(attrs.len(), 3);
-            assert_eq!(attrs[0], Attr { id: 1, data: b"ab" });
-            assert_eq!(attrs[1], Attr { id: 2, data: b"cde" });
-            assert_eq!(attrs[2], Attr { id: 3, data: b"" });
+            assert_eq!(attrs[0], Attr { id: 1, extended: false, data: b"ab" });
+            assert_eq!(attrs[1], Attr { id: 2, extended: false, data: b"cde" });
+            assert_eq!(attrs[2], Attr { id: 3, extended: false, data: b"" });
         }
 
         #[test]
@@ -202,10 +260,15 @@ pub mod blob {
 
 pub mod blobmsg {
     //! `blobmsg` layers named, typed values on top of raw [`super::blob`]
-    //! attributes: a `TABLE` or `ARRAY` `blob_attr`'s data is a
-    //! concatenation of child `blob_attr`s, each prefixed with a
-    //! `blobmsg_hdr` (`be16` name length + NUL-terminated name, `namelen`
-    //! `0` for an unnamed array element) ahead of its typed value bytes.
+    //! attributes. A top-level `TABLE`/`ARRAY` container (built by
+    //! [`encode_table`]) is a plain, non-extended `blob_attr` whose data is
+    //! directly the concatenation of its children — it carries no
+    //! `blobmsg_hdr` of its own. Each *child* (built by [`encode_entry`]) is
+    //! itself a full `blob_attr` with `EXTENDED_BIT` set, whose data is a
+    //! `blobmsg_hdr` (`be16 namelen` = `strlen(name)`, `0` for an unnamed
+    //! array element, followed by `namelen + 1` name bytes — the name plus
+    //! its NUL terminator, always present even when `namelen == 0`) ahead of
+    //! its typed value bytes.
 
     use super::blob::{self, BlobError};
 
@@ -328,36 +391,49 @@ pub mod blobmsg {
     }
 
     /// Encode one table/array entry (`blobmsg_hdr` + typed value) as a full
-    /// `blob_attr` (header + data + padding). `name = None` for an array
-    /// element.
+    /// `blob_attr` (header + data + padding), with `EXTENDED_BIT` set —
+    /// `blobmsg_add_field()`'s wire layout (`blobmsg.c`). `name = None` for
+    /// an array element, matching an empty-string name (`namelen = 0`).
+    ///
+    /// The `blobmsg_hdr` wire encoding is `be16 namelen` (the name's byte
+    /// length *excluding* its NUL terminator — `0` for an array element or
+    /// an empty name) followed by exactly `namelen + 1` name bytes (the name
+    /// itself, always NUL-terminated even when empty) — `blobmsg_hdrlen(len)
+    /// == offsetof(struct blobmsg_hdr, name[len + 1])`. A prior version of
+    /// this port stored `namelen = name.len() + 1` (the NUL-inclusive count)
+    /// but then only wrote `namelen` further bytes, one short of what a real
+    /// peer would skip to find the value — this is fixed below.
     pub fn encode_entry(name: Option<&str>, v: &Value) -> Vec<u8> {
+        let name = name.unwrap_or("");
         let mut hdr_and_value = Vec::new();
-        match name {
-            Some(n) => {
-                let namelen = (n.len() + 1) as u16; // + NUL terminator
-                hdr_and_value.extend_from_slice(&namelen.to_be_bytes());
-                hdr_and_value.extend_from_slice(n.as_bytes());
-                hdr_and_value.push(0);
-            }
-            None => {
-                hdr_and_value.extend_from_slice(&0u16.to_be_bytes());
-            }
-        }
+        let namelen = name.len() as u16;
+        hdr_and_value.extend_from_slice(&namelen.to_be_bytes());
+        hdr_and_value.extend_from_slice(name.as_bytes());
+        hdr_and_value.push(0); // NUL terminator, always present
         hdr_and_value.extend_from_slice(&value_bytes(v));
 
         let mut out = Vec::new();
-        blob::put(&mut out, type_id(v), &hdr_and_value)
+        blob::put_ext(&mut out, type_id(v), true, &hdr_and_value)
             .expect("blobmsg names/values stay well under the 24-bit length limit");
         out
     }
 
-    /// Encode a top-level, unnamed `TABLE` `blob_attr` from `entries` —
-    /// what `blob_buf_init(&b, BLOBMSG_TYPE_TABLE)` plus a run of
-    /// `blobmsg_add_*` calls builds (`b.head`).
+    /// Encode a top-level `TABLE` `blob_attr` from `entries` — what
+    /// `blob_buf_init(&b, BLOBMSG_TYPE_TABLE)` plus a run of
+    /// `blobmsg_add_*` calls builds (`b.head`). Unlike [`encode_entry`]'s
+    /// children, this top-level container itself carries no `blobmsg_hdr`
+    /// and leaves `EXTENDED_BIT` clear — `blob_buf_init` writes a plain
+    /// `blob_attr` whose data is directly the concatenation of its
+    /// (individually headered) children, with no header of its own.
     pub fn encode_table(entries: &[(&str, Value)]) -> Vec<u8> {
-        let owned: Vec<(String, Value)> =
-            entries.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
-        encode_entry(None, &Value::Table(owned))
+        let mut data = Vec::new();
+        for (name, val) in entries {
+            data.extend_from_slice(&encode_entry(Some(name), val));
+        }
+        let mut out = Vec::new();
+        blob::put(&mut out, TYPE_TABLE, &data)
+            .expect("blobmsg tables stay well under the 24-bit length limit");
+        out
     }
 
     fn decode_value(type_id: u8, data: &[u8]) -> Result<Value, BlobMsgError> {
@@ -388,30 +464,38 @@ pub mod blobmsg {
         }
     }
 
-    /// Split one child's `blobmsg_hdr` (namelen + name) off the front of
-    /// its `blob_attr` data, returning `(name, value_bytes)`.
-    fn split_header(data: &[u8]) -> Result<(Option<String>, &[u8]), BlobMsgError> {
+    /// Split one child's `blobmsg_hdr` (`be16 namelen` + `namelen + 1` name
+    /// bytes, always NUL-terminated — see [`encode_entry`]'s doc comment)
+    /// off the front of its `blob_attr` data, returning `(name, value_bytes)`.
+    fn split_header(data: &[u8]) -> Result<(String, &[u8]), BlobMsgError> {
         if data.len() < 2 {
             return Err(BlobMsgError::TruncatedHeader);
         }
         let namelen = u16::from_be_bytes([data[0], data[1]]) as usize;
-        if namelen == 0 {
-            return Ok((None, &data[2..]));
-        }
-        if data.len() < 2 + namelen {
+        if data.len() < 2 + namelen + 1 {
             return Err(BlobMsgError::TruncatedHeader);
         }
         let name_bytes = &data[2..2 + namelen];
-        let name = name_bytes.strip_suffix(&[0]).unwrap_or(name_bytes);
-        let name = std::str::from_utf8(name).map_err(|_| BlobMsgError::InvalidName)?.to_string();
-        Ok((Some(name), &data[2 + namelen..]))
+        let name = std::str::from_utf8(name_bytes).map_err(|_| BlobMsgError::InvalidName)?.to_string();
+        Ok((name, &data[2 + namelen + 1..]))
+    }
+
+    /// Every child of a `blobmsg` table/array must carry `EXTENDED_BIT` —
+    /// it is what tells a real peer's `blobmsg_data()`/`blobmsg_name()` that
+    /// a `blobmsg_hdr` precedes the value at all. A non-extended child here
+    /// would mean [`split_header`] is misreading raw value bytes as a name.
+    fn require_extended(attr: &blob::Attr<'_>) -> Result<(), BlobMsgError> {
+        if !attr.extended {
+            return Err(BlobMsgError::TruncatedHeader);
+        }
+        Ok(())
     }
 
     fn decode_named_children(data: &[u8]) -> Result<Vec<(String, Value)>, BlobMsgError> {
         let mut out = Vec::new();
         for attr in blob::parse_all(data)? {
+            require_extended(&attr)?;
             let (name, value_bytes) = split_header(attr.data)?;
-            let name = name.unwrap_or_default();
             out.push((name, decode_value(attr.id, value_bytes)?));
         }
         Ok(out)
@@ -420,18 +504,21 @@ pub mod blobmsg {
     fn decode_unnamed_children(data: &[u8]) -> Result<Vec<Value>, BlobMsgError> {
         let mut out = Vec::new();
         for attr in blob::parse_all(data)? {
+            require_extended(&attr)?;
             let (_, value_bytes) = split_header(attr.data)?;
             out.push(decode_value(attr.id, value_bytes)?);
         }
         Ok(out)
     }
 
-    /// Decode one full `blob_attr` (as produced by [`encode_entry`] /
-    /// [`encode_table`]) back into a [`Value`].
+    /// Decode one top-level `TABLE`/`ARRAY` `blob_attr` (as produced by
+    /// [`encode_table`]) back into a [`Value`]. Unlike a child entry, the
+    /// top-level container carries no `blobmsg_hdr` of its own (see
+    /// [`encode_table`]'s doc comment) — its data is decoded directly as a
+    /// list of (headered) children.
     pub fn decode(bytes: &[u8]) -> Result<Value, BlobMsgError> {
         let (attr, _) = blob::parse_one(bytes)?;
-        let (_, value_bytes) = split_header(attr.data)?;
-        decode_value(attr.id, value_bytes)
+        decode_value(attr.id, attr.data)
     }
 
     #[cfg(test)]
@@ -491,12 +578,52 @@ pub mod blobmsg {
         }
 
         #[test]
-        fn array_elements_are_unnamed_on_the_wire() {
+        fn array_elements_carry_a_zero_length_name_and_its_nul_terminator() {
             let entry = encode_entry(None, &Value::I32(7));
-            // 4-byte blob_attr header + 2-byte namelen(=0) + 4-byte i32 = 10,
-            // padded to 12.
+            // 4-byte blob_attr header + 2-byte namelen(=0) + 1-byte NUL +
+            // 4-byte i32 = 11, padded to 12.
             assert_eq!(entry.len(), 12);
-            assert_eq!(&entry[4..6], &[0, 0]);
+            assert_eq!(&entry[4..6], &[0, 0]); // namelen = 0
+            assert_eq!(entry[6], 0); // the empty name's NUL terminator
+            assert_eq!(&entry[7..11], &7i32.to_be_bytes());
+        }
+
+        #[test]
+        fn named_entry_namelen_excludes_the_nul_terminator() {
+            // blobmsg_hdr.namelen is strlen(name), not name.len() + 1 — a
+            // prior version of this port stored the +1 count, which would
+            // make a real peer read one byte too few for the name field and
+            // misinterpret the first value byte as trailing name padding.
+            let entry = encode_entry(Some("ip"), &Value::I8(1));
+            assert_eq!(&entry[4..6], &2u16.to_be_bytes()); // namelen = strlen("ip") = 2
+            assert_eq!(&entry[6..8], b"ip");
+            assert_eq!(entry[8], 0); // NUL terminator
+            assert_eq!(entry[9], 1); // the I8 value
+        }
+
+        #[test]
+        fn every_blobmsg_entry_sets_the_extended_bit() {
+            let named = encode_entry(Some("x"), &Value::I8(1));
+            let (attr, _) = blob::parse_one(&named).unwrap();
+            assert!(attr.extended);
+
+            let unnamed = encode_entry(None, &Value::I8(1));
+            let (attr2, _) = blob::parse_one(&unnamed).unwrap();
+            assert!(attr2.extended);
+        }
+
+        #[test]
+        fn top_level_table_container_is_not_extended_and_has_no_header() {
+            // blob_buf_init(&b, BLOBMSG_TYPE_TABLE) writes a plain blob_attr
+            // whose data is directly its children — no blobmsg_hdr wrapping
+            // the container itself, unlike each individual child.
+            let bytes = encode_table(&[("a", Value::I8(1))]);
+            let (attr, _) = blob::parse_one(&bytes).unwrap();
+            assert!(!attr.extended);
+            assert_eq!(attr.id, TYPE_TABLE);
+            // attr.data is exactly the one child's encoded entry, with no
+            // extra header bytes ahead of it.
+            assert_eq!(attr.data, encode_entry(Some("a"), &Value::I8(1)).as_slice());
         }
 
         #[test]
