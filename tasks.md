@@ -1400,6 +1400,97 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   Done when: the SIGHUP/reload gap above is closed as part of the general
   `ForwardConfig` live-reload work.
 
+- [x] Give `dbus.c` a real bus connection and full method dispatch (Issue #46 / T3-dbus).
+  Source of truth: `dbus.c` (1106 lines), `src/dbus.rs`.
+  Previously a 101-line "stub" with 4 fake method names and zero `zbus` usage
+  despite the dependency being declared. Now a real `zbus`-backed system-bus
+  service: `dbus::connect()` mirrors `dbus_init()` (`dbus.c:950-985`) —
+  connects to the system bus, requests the configured well-known name, serves
+  the dnsmasq interface at `/uk/org/thekelleys/dnsmasq`, and emits the
+  startup `Up` signal. `dbus::run_dbus_task()` retries on a fixed backoff
+  while the bus is unreachable, an async-native stand-in for upstream's
+  poll-based `set_dbus_listeners()`/`check_dbus_listeners()` (zbus services
+  watches/dispatch on its own internal executor, so there's nothing to poll
+  once connected) — a deliberate architecture deviation, not a behavior
+  change to the interface itself. `dnsmasq::run_main_loop_with` spawns this
+  task whenever `--enable-dbus` (`OPT_DBUS`) is set; `option.rs`'s
+  `enable-dbus` now also captures the optional bus-name argument into
+  `daemon.dbus_name` (previously parsed with `set_option` only, silently
+  discarding any name argument), defaulting to `DNSMASQ_SERVICE`
+  (`uk.org.thekelleys.dnsmasq`) exactly like `option.c:2263-2268`.
+  All 15 upstream methods are implemented, not stubbed: `GetVersion`,
+  `SetServers`/`SetServersEx`/`SetDomainServers` (real `mark_servers`/
+  `add_update_server`/`cleanup_servers` mutation of `daemon.servers`, reusing
+  the same domain-fanout shape as `parse_server_or_address` for the `server=`
+  directive), `SetFilterWin2KOption`/`SetLocaliseQueriesOption`/
+  `SetBogusPrivOption` (real `OPT_*` bit toggles), `SetFilterA`/`SetFilterAAAA`
+  (real `rrlist_filter` entries), `GetMetrics`/`GetServerMetrics`/
+  `ClearMetrics` (real `metrics.rs` counters and per-server stats, matching
+  issue #103's `clear_metrics`), `ClearCache` (calls the real
+  `clear_cache_and_reload`), `GetLoopServers` (`loop` feature only, matching
+  `HAVE_LOOP`), and `AddDhcpLease`/`DeleteDhcpLease` (`dhcp` feature only,
+  matching `HAVE_DHCP`). `DhcpLeaseAdded`/`DhcpLeaseDeleted` signals are
+  emitted on successful add/delete through these two methods
+  (`dbus::emit_lease_signal`, mirroring `emit_dbus_signal`, `dbus.c:1052-1103`).
+  Deliberate, documented gaps (all in `src/dbus.rs`):
+  - `AddDhcpLease`/`DeleteDhcpLease` operate on a lease store owned by the
+    D-Bus task (`DbusContext::leases`, seeded empty and persisted to
+    `--dhcp-leasefile` if configured), **not** the `LeaseDb` the live
+    `dhcp::run_dhcp_loop` task owns internally — that loop has no shared
+    handle or event channel today (it takes a `LeaseDb` by value and keeps
+    it private). So a D-Bus-added lease won't be seen by a concurrently
+    running DHCP server in this build, and normal DHCP-protocol-driven lease
+    changes (a real client's DISCOVER/REQUEST) do not emit D-Bus signals —
+    only the D-Bus-triggered path does. Upstream avoids this because
+    `dbus_add_lease`/`dbus_del_lease` and the DHCP state machine both mutate
+    the single global `daemon->leases`, and `emit_dbus_signal` is called
+    generically from `lease.c:1258,1295` on every insert/prune regardless of
+    who triggered it. Closing this gap needs either a shared
+    `Arc<Mutex<LeaseDb>>` or an event channel out of `run_dhcp_loop`, which is
+    DHCP-loop-shaped work, not D-Bus-shaped — tracked here rather than
+    attempted as a side effect of this issue.
+  - `AddDhcpLease`/`DeleteDhcpLease` support IPv4 leases only; an IPv6 address
+    returns an explicit `InvalidArgs` error rather than silently no-oping
+    (upstream's `HAVE_DHCP6` half needs `lease6_find_by_addr`/`lease6_allocate`
+    against the same not-yet-shared lease store).
+  - `SetServers`/`SetServersEx`/`SetDomainServers` only accept literal IP
+    addresses, not hostnames — upstream's `parse_server`/`parse_server_next`
+    resolve hostnames to possibly multiple addresses via `getaddrinfo`; this
+    port's address parsing (shared with `parse_server_or_address` in
+    `option.rs`) doesn't do DNS resolution at all.
+  - Mutating `daemon.servers`/`daemon.rrlist_filter` via these methods changes
+    the canonical `Daemon` state but does not hot-reload the already-spawned
+    forward loop's `ForwardConfig` snapshot — the exact same
+    "`ForwardConfig` is a startup snapshot, not reactively updated" gap
+    called out above for `loop.c`'s SIGHUP case, not something specific to
+    D-Bus.
+  - `SetServers`'s `av` argument encodes an IPv4 address as a plain `uint32`;
+    upstream stores it via `ntohl()` into a field that's itself supposed to
+    already be network-order, which reads as an upstream quirk rather than a
+    documented contract. This port takes the unambiguous, conventional
+    reading (`Ipv4Addr::from(u32)`, i.e. the wire integer *is* the address in
+    network byte order) rather than replicating that byte-order ambiguity.
+  - `GetServerMetrics`'s reply is naturally `Vec<HashMap<String, String>>`
+    (`"aa{ss}"`, one dict per server) since that's what `dbus_get_server_metrics`
+    actually builds; upstream's own introspection XML declares the return
+    type as the (narrower, and arguably wrong) `"a{ss}"`. This port matches
+    the real per-server-dict *behavior*, not the introspection XML text.
+  - A custom `--enable-dbus=<name>` renames the *interface* upstream (the
+    introspection XML is templated with `daemon->dbus_name` for both the bus
+    name and the interface name); this port only renames the well-known bus
+    name via `.name(dbus_name)` — the D-Bus interface name served at
+    `/uk/org/thekelleys/dnsmasq` stays the fixed `DNSMASQ_DBUS_INTERFACE`
+    constant, since `zbus`'s `#[interface(name = ...)]` needs a literal.
+  Required tests: `src/dbus.rs` unit tests for every pure method body
+  (server-list mutation incl. mark/reuse/cleanup semantics, option/filter
+  toggles, metrics serialization, lease add/delete incl. validation errors);
+  a `#[tokio::test]` live-bus smoke test gated to skip (not fail) when no
+  D-Bus daemon is reachable, matching the sandboxed-environment gating
+  pattern already used for socket/interface tests elsewhere; `option.rs`
+  tests for `enable-dbus`'s default and custom bus-name argument.
+  Done when: the lease-store-sharing gap above is closed as part of general
+  DHCP-loop live-state-sharing work (tracked separately, not yet a task here).
+
 - [ ] Finish behavior-critical gaps in DNS forwarding and cache interaction.
   Focus: upstream retry behavior, server rotation, reply matching, cache insertion edge cases, AD bit and EDNS0 semantics.
   Required tests: unit tests, property tests where appropriate, parity harness DNS scenarios.
