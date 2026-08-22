@@ -69,6 +69,15 @@ pub struct DhcpServerConfig {
     pub domain_suffix: Option<String>,
     /// Path to persist the lease database to (`--dhcp-leasefile`).
     pub lease_file: Option<String>,
+    /// The dhcp-script hook command (`--dhcp-script`), run on lease
+    /// add/old/del via [`crate::lease::LeaseDb::run_lease_scripts`].
+    pub lease_change_command: Option<String>,
+    /// `--leasefile-ro` (`OPT_LEASE_RO`): also fire the script hook on a
+    /// pure aux-data renewal, not just add/old/del.
+    pub leasefile_ro: bool,
+    /// `--script-on-renewal` (`OPT_LEASE_RENEW`): also fire the script hook
+    /// on a pure expiry-time renewal.
+    pub script_on_renewal: bool,
     /// Option-substring classifier rules from parsed `dhcp-match`.
     pub match_rules: Vec<crate::types::dhcp::DhcpOpt>,
     /// Client-hostname classifier rules from parsed `dhcp-name-match`.
@@ -128,6 +137,9 @@ impl Default for DhcpServerConfig {
             boot_configs: Vec::new(),
             domain_suffix: None,
             lease_file: None,
+            lease_change_command: None,
+            leasefile_ro: false,
+            script_on_renewal: false,
             match_rules: Vec::new(),
             name_match_rules: Vec::new(),
             tag_rules: Vec::new(),
@@ -1362,13 +1374,41 @@ pub async fn run_dhcp_loop(
                 }
 
                 if lease_db.file_dirty {
-                    if let Some(path) = cfg.lease_file.as_deref() {
-                        if let Err(err) = lease_db.write_to_file(path) {
-                            warn!("failed to write DHCP lease file {path}: {err}");
-                        }
+                    let write_ok = match cfg.lease_file.as_deref() {
+                        Some(path) => match lease_db.write_to_file(path) {
+                            Ok(()) => true,
+                            Err(err) => {
+                                warn!("failed to write DHCP lease file {path}: {err}");
+                                false
+                            }
+                        },
+                        None => true,
+                    };
+                    // Only clear the dirty flag once the write actually
+                    // succeeded (or there was nothing to write); otherwise
+                    // the next dispatch would silently skip retrying it.
+                    if write_ok {
+                        lease_db.file_dirty = false;
                     }
-                    lease_db.file_dirty = false;
                 }
+
+                // Fire dhcp-script hooks (ADD/OLD/DEL) for whatever changed
+                // in this dispatch. Port of `do_script_run()`'s call site in
+                // the upstream main loop (dnsmasq.c), invoked here once per
+                // dispatch rather than looped on a "more work" return value
+                // — see `LeaseDb::run_lease_scripts` for why. Called
+                // unconditionally, even with no dhcp-script configured:
+                // upstream calls `do_script_run()` unconditionally too,
+                // since draining the `old_leases` queue and clearing
+                // per-lease flags must happen regardless of whether a
+                // script is configured to actually spawn — skipping this
+                // call when `lease_change_command` is unset would leak
+                // every released/declined lease into `old_leases` forever.
+                let command = cfg
+                    .lease_change_command
+                    .as_deref()
+                    .filter(|c| !c.is_empty());
+                lease_db.run_lease_scripts(command, cfg.leasefile_ro, cfg.script_on_renewal);
 
                 let Some(dispatched) = dispatched else {
                     continue;
@@ -2414,6 +2454,9 @@ mod tests {
             boot_configs: vec![],
             domain_suffix: None,
             lease_file: None,
+            lease_change_command: None,
+            leasefile_ro: false,
+            script_on_renewal: false,
             match_rules: vec![],
             name_match_rules: vec![],
             tag_rules: vec![],

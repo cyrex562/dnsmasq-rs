@@ -693,13 +693,20 @@ Both are reference-only. Do not treat either tree as code to edit in place.
 
   Explicitly **not** covered — upstream behavior still missing:
 
-  - Nothing calls `create_helper`/`HelperHandle::send` yet. `dnsmasq.rs`/`main.rs` startup
-    does not fork the helper ahead of the main privilege drop (`dnsmasq.c:744`), and
-    `lease.rs`'s `rerun_scripts` (lease.rs:439) still only flips `LEASE_CHANGED` instead of
-    building a `ScriptData::for_lease` and sending it — same for DHCP lease
-    commit/expiry paths in `dhcp.rs` and any ARP/TFTP call sites. Until that wiring lands,
-    `dhcp-script`/`dhcp-scriptuser` are parsed into `Daemon` (not a no-op) but have no
-    runtime effect.
+  - `run_dhcp_loop` (dhcp.rs) does call `LeaseDb::run_lease_scripts` every dispatch, and it
+    does build a real `ScriptData::for_lease` and run it via `helper::run_script_child` — a
+    real, synchronous, in-process execution (Issue #31 / T3-lease). `dhcp-script`/
+    `dhcp-scriptuser` are not a no-op.
+    Still missing: nothing calls `create_helper`/`HelperHandle::send`. `dnsmasq.rs`/
+    `main.rs` startup does not fork the persistent privilege-dropped helper process ahead of
+    the main privilege drop (`dnsmasq.c:744`), so every script still runs in the
+    (already-privilege-dropped) main process rather than the dedicated child — no privilege
+    boundary is crossed incorrectly, but a slow/hanging script blocks the DHCP dispatch loop
+    the way upstream's async pipe-fed helper is specifically designed to avoid. `lease.rs`'s
+    `rerun_scripts` (lease.rs:480) only flips the per-lease flags `run_lease_scripts` acts on
+    (by design — SIGHUP-triggered "re-announce everything" support); it never calls a script
+    itself. Same "runs inline, not via the persistent helper" gap applies to any future
+    ARP/TFTP call sites.
   - Lua scripting (`grab_extradata_lua`, `daemon->luascript`, helper.c:136-175,319-498) is
     deliberately out of scope, per the issue.
   - The DHCPv6-specific env vars/argv (`DNSMASQ_IAID`, `DNSMASQ_SERVER_DUID`, the
@@ -1178,6 +1185,95 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   - **RELEASE/DECLINE do not re-validate the server-id.** Upstream's `DHCPRELEASE`/`DHCPDECLINE`
     cases call `narrow_context`/check the server-id option before acting; `handle_release`/
     `handle_decline` only check the address against the pool bounds.
+
+- [x] Atomic lease-file persistence and dhcp-script hooks (lease.c:278-1308).
+  `LeaseDb::write_to_file` (`src/lease.rs`) was a bare `std::fs::write` — a crash or
+  write failure mid-call could truncate/corrupt the lease file, unlike upstream's
+  fsync'd rewrite. It now writes to a `.{name}.tmp` sibling in the same directory,
+  `File::sync_all()`s it, then `std::fs::rename`s it over the target — the rename is
+  atomic on the same filesystem, so readers only ever see the old complete file or the
+  new one, never a partial write. This is a stronger crash-safety guarantee than
+  upstream's `lease_update_file` (which truncates a long-lived fd in place and fsyncs),
+  while preserving the same observable property upstream cares about (durable writes
+  survive, failed writes don't corrupt the file).
+
+  `LeaseDb::run_lease_scripts(command)` is the `do_script_run()`-equivalent that was
+  entirely missing: `helper::run_script`/`build_env`/`queue_script` existed and were
+  tested but had zero callers outside their own tests, and `daemon.lease_change_command`
+  (set by `dhcp-script=`) was read nowhere. `run_lease_scripts` now fires `add`/`old`/`del`
+  events for `LEASE_NEW`/`LEASE_CHANGED` leases and for leases queued on a new
+  `LeaseDb::old_leases` list (populated by `prune`/`remove_by_addr`, mirroring lease.c's
+  `old_leases` list), including the "announce the lost hostname before the new one"
+  ordering at lease.c:1274-1283. It is wired into `run_dhcp_loop` (`src/dhcp.rs`) right
+  after the lease-file write, gated on the new `DhcpServerConfig::lease_change_command`
+  (threaded from `daemon.lease_change_command` in `daemon_dhcp_runtime`,
+  `src/dnsmasq.rs`). Also fixed while touching this code: `run_dhcp_loop` was clearing
+  `LeaseDb::file_dirty` unconditionally, even when `write_to_file` returned `Err` — a
+  failed write was silently treated as done and never retried; it now only clears the
+  flag on `Ok`.
+
+  Deliberate simplification: upstream's `do_script_run` fires one event per call and
+  relies on the main loop invoking it repeatedly (its return value signals "more work
+  pending"), because upstream's main loop is itself a single-threaded poll loop where a
+  long-running script would stall everything else. `run_lease_scripts` drains all
+  pending events in one call instead, since the caller here is one `run_dhcp_loop`
+  iteration rather than a busy-poll main loop; the fire order and env vars per event are
+  otherwise unchanged. Like upstream, a script that fails to spawn does not get retried
+  — the pending flags/queue entry are cleared regardless of `run_script`'s result.
+
+  Follow-up fix: `run_lease_scripts` originally took `command: &str` and was only called
+  from `run_dhcp_loop` inside `if let Some(command) = cfg.lease_change_command...` — so
+  with no `dhcp-script=` configured (the default), `remove_by_addr` kept pushing onto
+  `old_leases` on every RELEASE/DECLINE but nothing ever drained it, leaking one
+  `DhcpLease` per release for the life of the process. Upstream avoids this because
+  `do_script_run()` is called unconditionally from the main loop regardless of
+  `HAVE_SCRIPT`/script configuration — draining the queue and clearing per-lease flags
+  isn't gated on a script existing, only the `queue_script()` spawn is. Fixed by changing
+  the signature to `run_lease_scripts(command: Option<&str>)` and calling it
+  unconditionally from `run_dhcp_loop`; `run_script` is only invoked when `command` is
+  `Some`, but the drain/clear always happens. Covered by
+  `lease::tests::{run_lease_scripts_drains_old_leases_without_command_configured,
+  run_lease_scripts_clears_lease_flags_without_command_configured}`.
+
+  Also added: `write_to_file` now `fsync`s the containing directory (Unix only) after
+  the `rename`, so the rename entry itself is durable across a crash/power loss —
+  previously only the temp file's contents were fsync'd, which protects against a torn
+  file but not against ext4/xfs losing the rename itself on power loss.
+
+  Still open: `helper::run_script` calls `Command::status()`, a blocking wait, from
+  inside `run_dhcp_loop`'s async select arm. A slow/hung dhcp-script now stalls that
+  loop's DHCP dispatch for its duration (this was pre-existing in `helper.rs` but had no
+  caller until this change gave it one). Moving the call behind `spawn_blocking` (or
+  otherwise off the async task) is unaddressed.
+
+  Still not ported: `lease_ping_reply`, `lease_update_slaac`, `lease_find_interfaces`,
+  `lease_make_duid` (lease.c:497-556) have no Rust equivalents — these are
+  SLAAC/RA-adjacent (periodic ping-before-assign for SLAAC addresses, interface
+  enumeration for the DHCPv6 DUID, DUID generation) and out of scope for this pass;
+  `slaac.rs`/`radv.rs` may cover overlapping ground under different names but that
+  hasn't been checked. `rerun_scripts()` (which marks every lease `LEASE_CHANGED` so a
+  reload re-fires all hooks) still has no caller outside its own unit tests — wiring it
+  into the SIGHUP/reload path is tracked separately above ("DHCP reload
+  (`reread_dhcp`/.../`rerun_scripts`) are not implemented — SIGHUP is DNS-only for
+  now").
+  Covered by `lease::tests::{write_to_file_uses_tmp_file_and_rename,
+  write_to_file_failed_write_leaves_original_untouched, run_lease_scripts_fires_add_for_new_lease,
+  run_lease_scripts_fires_old_for_changed_lease, run_lease_scripts_fires_del_for_removed_lease,
+  run_lease_scripts_announces_lost_hostname_before_del, run_lease_scripts_clears_new_and_changed_flags,
+  run_lease_scripts_drains_old_leases_queue}`.
+
+  Fixed in review: `helper::run_script` only set env vars
+  (`DNSMASQ_ACTION`/`DNSMASQ_IP`/`DNSMASQ_MAC`/`DNSMASQ_SUPPLIED_HOSTNAME`) and passed
+  zero positional args, so `$1`-`$4` were empty for any invoked script. Upstream's
+  `execl(daemon->lease_change_command, basename, action_str, mac_or_duid, ip, hostname,
+  NULL)` (helper.c:681-684) is the documented calling convention (dnsmasq.8:1826-1841:
+  "The arguments to the process are 'add', 'old' or 'del', the MAC address ..., the IP
+  address, and the hostname") that real dhcp-script hooks, including dnsmasq's own
+  contrib scripts, rely on. `run_script` now does `cmd.arg(action).arg(mac).arg(ip)` and
+  conditionally `.arg(hostname)` only when `Some` — matching upstream's behavior of
+  omitting the hostname arg entirely (not passing an empty string) when
+  `execl`'s vararg list ends early. Covered by
+  `helper::tests::{run_script_passes_positional_args, run_script_omits_hostname_arg_when_none}`.
 
 - [x] Port the ICMP conflict probe, `--read-ethers`, and real per-interface
   context selection (dhcp.c: `do_icmp_ping`/`address_allocate`/
