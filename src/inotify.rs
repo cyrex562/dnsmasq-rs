@@ -629,6 +629,7 @@ mod tests {
         daemon.resolv_files.push(make_resolvc(path.to_str().unwrap()));
 
         inotify_dnsmasq_init(&mut daemon).unwrap();
+        let _guard = FdGuard(daemon.inotify_fd);
 
         assert!(daemon.inotify_fd >= 0);
         assert!(daemon.resolv_files[0].wd >= 0);
@@ -643,6 +644,7 @@ mod tests {
             .push(make_resolvc("/nonexistent-inotify-test-dir-xyz/resolv.conf"));
 
         assert!(inotify_dnsmasq_init(&mut daemon).is_err());
+        let _guard = FdGuard(daemon.inotify_fd);
         assert_eq!(daemon.resolv_files[0].wd, -1);
     }
 
@@ -654,6 +656,7 @@ mod tests {
             .push(make_resolvc("/nonexistent-inotify-test-dir-xyz/resolv.conf"));
 
         inotify_dnsmasq_init(&mut daemon).unwrap();
+        let _guard = FdGuard(daemon.inotify_fd);
 
         assert!(daemon.inotify_fd >= 0);
         assert_eq!(daemon.resolv_files[0].wd, -1);
@@ -668,6 +671,7 @@ mod tests {
             .push(make_resolvc("/nonexistent-inotify-test-dir-xyz/resolv.conf"));
 
         inotify_dnsmasq_init(&mut daemon).unwrap();
+        let _guard = FdGuard(daemon.inotify_fd);
 
         assert!(daemon.inotify_fd >= 0);
         assert_eq!(daemon.resolv_files[0].wd, -1);
@@ -679,10 +683,50 @@ mod tests {
         DynDir { files: vec![], flags: AH_HOSTS, dname: dname.to_string(), wd: -1 }
     }
 
-    fn init_test_daemon_with_fd() -> Daemon {
+    /// Closes a raw fd on drop. `inotify_dnsmasq_init` opens a real kernel
+    /// inotify fd that (like upstream) is meant to live for the daemon's
+    /// whole lifetime, so nothing in production code closes it — but tests
+    /// construct a fresh `Daemon` per case, and without this guard each test
+    /// leaked its fd for the rest of the test binary's process lifetime.
+    /// That made unrelated tests elsewhere that inspect `/proc/self/fd`
+    /// (e.g. `ipset::tests::add_to_ipset_reuses_persistent_socket_after_init`)
+    /// flaky, since a leaked fd could pop into existence mid-measurement on
+    /// another thread.
+    struct FdGuard(i32);
+
+    impl Drop for FdGuard {
+        fn drop(&mut self) {
+            if self.0 >= 0 {
+                unsafe {
+                    libc::close(self.0);
+                }
+            }
+        }
+    }
+
+    fn init_test_daemon_with_fd() -> (Daemon, FdGuard) {
         let mut daemon = Daemon { port: 0, ..Daemon::default() };
         inotify_dnsmasq_init(&mut daemon).unwrap();
-        daemon
+        let guard = FdGuard(daemon.inotify_fd);
+        (daemon, guard)
+    }
+
+    #[test]
+    fn fd_guard_closes_the_fd_on_drop() {
+        // A dedicated per-fd check (via fcntl) rather than a process-wide
+        // `/proc/self/fd` count: cargo runs tests in parallel within one
+        // process, and other threads legitimately open/close unrelated fds
+        // concurrently, so a directory-count comparison is itself racy at
+        // full-suite scale (this was tried first and flaked under
+        // `cargo test --all-features`).
+        let fd = open_inotify().unwrap();
+        {
+            let _guard = FdGuard(fd);
+        }
+
+        let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_eq!(rc, -1, "fd must be closed once its FdGuard drops");
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
     }
 
     #[test]
@@ -690,7 +734,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("hosts1"), "1.2.3.4 foo.example\n").unwrap();
 
-        let mut daemon = init_test_daemon_with_fd();
+        let (mut daemon, _guard) = init_test_daemon_with_fd();
         daemon.dynamic_dirs.push(make_hosts_dyndir(dir.path().to_str().unwrap()));
         let mut cache = DnsCache::new(1000);
 
@@ -713,7 +757,7 @@ mod tests {
         std::fs::write(dir.path().join("hosts1~"), "9.9.9.9 backup.example\n").unwrap();
         std::fs::write(dir.path().join("#hosts1#"), "9.9.9.9 lock.example\n").unwrap();
 
-        let mut daemon = init_test_daemon_with_fd();
+        let (mut daemon, _guard) = init_test_daemon_with_fd();
         daemon.dynamic_dirs.push(make_hosts_dyndir(dir.path().to_str().unwrap()));
         let mut cache = DnsCache::new(1000);
 
@@ -728,7 +772,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("host1.conf"), "dhcp-host=aa:bb:cc:dd:ee:ff,10.0.0.5\n").unwrap();
 
-        let mut daemon = init_test_daemon_with_fd();
+        let (mut daemon, _guard) = init_test_daemon_with_fd();
         daemon.dynamic_dirs.push(DynDir {
             files: vec![],
             flags: AH_DHCP_HST,
@@ -745,7 +789,7 @@ mod tests {
 
     #[test]
     fn set_dynamic_inotify_logs_and_skips_missing_directory() {
-        let mut daemon = init_test_daemon_with_fd();
+        let (mut daemon, _guard) = init_test_daemon_with_fd();
         daemon.dynamic_dirs.push(make_hosts_dyndir("/nonexistent-inotify-test-dir-xyz"));
         let mut cache = DnsCache::new(1000);
 
@@ -761,7 +805,7 @@ mod tests {
     #[test]
     fn inotify_check_picks_up_new_file_in_watched_hosts_dir_without_sighup() {
         let dir = tempfile::tempdir().unwrap();
-        let mut daemon = init_test_daemon_with_fd();
+        let (mut daemon, _guard) = init_test_daemon_with_fd();
         daemon.dynamic_dirs.push(make_hosts_dyndir(dir.path().to_str().unwrap()));
         let mut cache = DnsCache::new(1000);
         set_dynamic_inotify(&mut daemon, &mut cache);
@@ -781,7 +825,7 @@ mod tests {
         let path = dir.path().join("hosts1");
         std::fs::write(&path, "1.2.3.4 foo.example\n").unwrap();
 
-        let mut daemon = init_test_daemon_with_fd();
+        let (mut daemon, _guard) = init_test_daemon_with_fd();
         daemon.dynamic_dirs.push(make_hosts_dyndir(dir.path().to_str().unwrap()));
         let mut cache = DnsCache::new(1000);
         set_dynamic_inotify(&mut daemon, &mut cache);
@@ -805,7 +849,7 @@ mod tests {
         let path = dir.path().join("hosts1");
         std::fs::write(&path, "1.2.3.4 foo.example\n").unwrap();
 
-        let mut daemon = init_test_daemon_with_fd();
+        let (mut daemon, _guard) = init_test_daemon_with_fd();
         daemon.dynamic_dirs.push(make_hosts_dyndir(dir.path().to_str().unwrap()));
         let mut cache = DnsCache::new(1000);
         set_dynamic_inotify(&mut daemon, &mut cache);
@@ -827,6 +871,7 @@ mod tests {
         let mut daemon = Daemon { port: 53, ..Daemon::default() };
         daemon.resolv_files.push(make_resolvc(path.to_str().unwrap()));
         inotify_dnsmasq_init(&mut daemon).unwrap();
+        let _guard = FdGuard(daemon.inotify_fd);
         let mut cache = DnsCache::new(1000);
 
         std::fs::write(&path, "nameserver 8.8.8.8\n").unwrap();
@@ -837,7 +882,7 @@ mod tests {
     #[test]
     fn inotify_check_ignores_dotfile_events() {
         let dir = tempfile::tempdir().unwrap();
-        let mut daemon = init_test_daemon_with_fd();
+        let (mut daemon, _guard) = init_test_daemon_with_fd();
         daemon.dynamic_dirs.push(make_hosts_dyndir(dir.path().to_str().unwrap()));
         let mut cache = DnsCache::new(1000);
         set_dynamic_inotify(&mut daemon, &mut cache);

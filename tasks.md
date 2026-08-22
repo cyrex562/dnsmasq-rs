@@ -977,12 +977,18 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   - `--no-poll` (`OPT_NO_POLL`) now has a real effect: `should_force_resolv_reload` gates
     the inotify-triggered resolv reload exactly as `dnsmasq.c:1236` does
     (`daemon->port != 0 && !option_bool(OPT_NO_POLL)`).
-  - Covered by `inotify::tests::*` (29 tests): symlink resolution (relative, cycle-bounded,
+  - Covered by `inotify::tests::*` (30 tests): symlink resolution (relative, cycle-bounded,
     missing-path), watch establishment (including missing-directory error path), initial
-    scan (existing files loaded, dotfiles/emacs-backups/lock-files ignored), and the event
+    scan (existing files loaded, dotfiles/emacs-backups/lock-files ignored), the event
     cascade (new/modified/deleted file in a watched `--hostsdir`, ignored dotfile events,
-    resolv-file hit detection, `--no-poll` gating) — all against a real kernel inotify fd
-    and real temp-directory filesystem changes, not a mock.
+    resolv-file hit detection, `--no-poll` gating), and an `FdGuard` unit test — all against a
+    real kernel inotify fd and real temp-directory filesystem changes, not a mock. Tests that
+    open a real inotify fd close it via an `FdGuard` (`src/inotify.rs` test module) rather
+    than leaking it for the rest of the test binary's process lifetime: an earlier version of
+    this change leaked one real fd per fd-opening test, which raced with unrelated tests
+    elsewhere that inspect `/proc/self/fd` (e.g.
+    `ipset::tests::add_to_ipset_reuses_persistent_socket_after_init`) and made them flaky
+    under `cargo test --all-features`.
 
   Deliberate simplifications, still open:
   - `dhcp-hostsdir`/`dhcp-optsdir` (`AH_DHCP_HST`/`AH_DHCP_OPT`) directories are watched
