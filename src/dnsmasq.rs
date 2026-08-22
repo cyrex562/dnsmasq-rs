@@ -891,6 +891,9 @@ fn daemon_dhcp_runtime(daemon: &Daemon) -> Option<DhcpDaemonRuntime> {
             leasequery_addr: daemon.leasequery_addr.clone(),
             leasequery_enabled: daemon.option_bool(crate::types::constants::OPT_LEASEQUERY),
             leasequery_source: Ipv4Addr::UNSPECIFIED,
+            #[cfg(feature = "ubus")]
+            quiet_dhcp: daemon.option_bool(crate::types::constants::OPT_QUIET_DHCP)
+                && !daemon.option_bool(crate::types::constants::OPT_LOG_OPTS),
         },
         loop_opts: crate::dhcp::DhcpLoopOptions {
             reply_port_override: (client_port != 68).then_some(client_port),

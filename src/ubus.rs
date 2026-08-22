@@ -1717,6 +1717,136 @@ mod integration_tests {
 
         let _ = std::fs::remove_dir_all(sock_path.parent().unwrap());
     }
+
+    /// End-to-end through the real DHCP loop, not `ubus_event_bcast` called
+    /// directly: a DHCPINFORM packet (client already has an address, just
+    /// wants extra options — `rfc2131.c:1758-1785`) drives `run_dhcp_loop`,
+    /// which must both ACK it and broadcast `dhcp.ack` to a subscribed mock
+    /// `ubusd`. Also the regression test for the DHCPINFORM ciaddr/yiaddr
+    /// bug this issue's final judge round found: an Inform reply's `yiaddr`
+    /// is always `0.0.0.0` (no address is allocated), so if the broadcast
+    /// used `yiaddr` instead of `ciaddr` the notified `ip` would be
+    /// `0.0.0.0` rather than the client's real address.
+    #[tokio::test]
+    async fn run_dhcp_loop_dhcpinform_broadcasts_dhcp_ack_with_ciaddr() {
+        struct NullProbe;
+        impl crate::dhcp::AddressProbe for NullProbe {
+            fn in_use(&self, _addr: std::net::Ipv4Addr) -> bool {
+                false
+            }
+        }
+
+        let _guard = connection::test_lock();
+        connection::reset_for_test();
+        let sock_path = temp_socket_path("dhcp-inform");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            conn.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
+            let mut buf = Vec::new();
+            let hello = read_msg(&mut conn, &mut buf);
+            write_msg(&mut conn, envelope::UBUS_MSG_STATUS, hello.seq, 7, &[]);
+            let add_obj = read_msg(&mut conn, &mut buf);
+            write_msg(
+                &mut conn,
+                envelope::UBUS_MSG_STATUS,
+                add_obj.seq,
+                7,
+                &[
+                    (envelope::ATTR_STATUS, 0u32.to_be_bytes().to_vec()),
+                    (envelope::ATTR_OBJID, 42u32.to_be_bytes().to_vec()),
+                ],
+            );
+            write_msg(&mut conn, envelope::UBUS_MSG_SUBSCRIBE, 0, 7, &[]);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            read_msg(&mut conn, &mut buf)
+        });
+
+        assert_eq!(connection::ubus_init_at("dnsmasq", sock_path.to_str().unwrap()), None);
+        for _ in 0..20 {
+            if connection::check_ubus_listeners_once().is_empty()
+                && connection::subscriber_state_for_test().1
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let dhcp_server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let dhcp_server = std::sync::Arc::new(dhcp_server);
+
+        let cfg = crate::dhcp::DhcpServerConfig {
+            pool_start: std::net::Ipv4Addr::new(10, 0, 0, 100),
+            pool_end: std::net::Ipv4Addr::new(10, 0, 0, 200),
+            server_ip: std::net::Ipv4Addr::new(10, 0, 0, 1),
+            ..Default::default()
+        };
+        let opts = crate::dhcp::DhcpLoopOptions {
+            reply_port_override: Some(receiver_addr.port()),
+            ..Default::default()
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let loop_task = tokio::spawn(crate::dhcp::run_dhcp_loop(
+            dhcp_server.clone(), cfg, opts, crate::lease::LeaseDb::new(), shutdown_rx, Box::new(NullProbe),
+        ));
+
+        // `loop_reply_dest` (with `reply_port_override` set, as here) routes
+        // an Inform-triggered ACK to `ciaddr:<override port>` — so `ciaddr`
+        // must be the loopback address the `receiver` socket below is bound
+        // to, or the reply is unicast somewhere this test can't observe it.
+        let ciaddr = std::net::Ipv4Addr::new(127, 0, 0, 1);
+        let pkt = crate::dhcp_protocol::DhcpPacket {
+            op: 1,
+            htype: 1,
+            hlen: 6,
+            hops: 0,
+            xid: 0xabcd_1234,
+            secs: 0,
+            flags: 0,
+            ciaddr,
+            yiaddr: std::net::Ipv4Addr::UNSPECIFIED,
+            siaddr: std::net::Ipv4Addr::UNSPECIFIED,
+            giaddr: std::net::Ipv4Addr::UNSPECIFIED,
+            chaddr: [0u8; crate::dhcp_protocol::DHCP_CHADDR_MAX],
+            sname: [0u8; 64],
+            file: [0u8; 128],
+            options: vec![
+                crate::dhcp_protocol::OPTION_MESSAGE_TYPE, 1,
+                crate::dhcp_protocol::DhcpMsgType::Inform as u8,
+                crate::dhcp_protocol::OPTION_END,
+            ],
+        };
+        let wire = crate::dhcp::dhcp_packet_to_wire(&pkt);
+        client.send_to(&wire, dhcp_server.local_addr().unwrap()).await.unwrap();
+
+        let mut buf = [0u8; 512];
+        let (len, _) = tokio::time::timeout(std::time::Duration::from_millis(250), receiver.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for the DHCPACK reply")
+            .unwrap();
+        let reply = crate::dhcp::parse_dhcp_packet(&buf[..len]).expect("reply should parse");
+        assert_eq!(crate::dhcp_common::get_message_type(&reply.options), Some(crate::dhcp_protocol::DhcpMsgType::Ack));
+
+        shutdown_tx.send(true).unwrap();
+        loop_task.await.unwrap().unwrap();
+
+        let notify = server.join().unwrap();
+        assert_eq!(notify.msg_type, envelope::UBUS_MSG_NOTIFY);
+        assert_eq!(notify.get(envelope::ATTR_METHOD), Some(b"dhcp.ack".as_slice()));
+        let data = notify.get(envelope::ATTR_DATA).unwrap();
+        let decoded = blobmsg::decode(data).unwrap();
+        assert_eq!(
+            decoded.get("ip").and_then(blobmsg::Value::as_str),
+            Some(ciaddr.to_string().as_str()),
+            "DHCPINFORM's dhcp.ack must report ciaddr, not yiaddr (which is 0.0.0.0 for Inform)"
+        );
+
+        let _ = std::fs::remove_dir_all(sock_path.parent().unwrap());
+    }
 }
 
 #[cfg(all(unix, test))]

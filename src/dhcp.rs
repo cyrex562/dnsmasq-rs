@@ -117,6 +117,15 @@ pub struct DhcpServerConfig {
     /// [`Ipv4Addr::UNSPECIFIED`], which always rejects leasequery, matching
     /// dispatch helpers that have no real socket source to report.
     pub leasequery_source: Ipv4Addr,
+    /// `--quiet-dhcp` (`OPT_QUIET_DHCP`) with `--log-dhcp` (`OPT_LOG_OPTS`)
+    /// already factored in: true suppresses the `dhcp.ack`/`dhcp.release`
+    /// ubus broadcasts. Port of `log_packet`'s `if (!err &&
+    /// !option_bool(OPT_LOG_OPTS) && option_bool(OPT_QUIET_DHCP)) return;`
+    /// gate (`rfc2131.c:1921`, with `err` always `NULL` on the ACK/RELEASE
+    /// call sites this guards), which also gates upstream's matching syslog
+    /// line — this port has no equivalent live syslog call site to gate yet.
+    #[cfg(feature = "ubus")]
+    pub quiet_dhcp: bool,
 }
 
 impl Default for DhcpServerConfig {
@@ -152,6 +161,8 @@ impl Default for DhcpServerConfig {
             leasequery_addr: Vec::new(),
             leasequery_enabled: false,
             leasequery_source: Ipv4Addr::UNSPECIFIED,
+            #[cfg(feature = "ubus")]
+            quiet_dhcp: false,
         }
     }
 }
@@ -1361,22 +1372,27 @@ pub async fn run_dhcp_loop(
                 );
 
                 // `ubus_event_bcast("dhcp.ack"/"dhcp.release", ...)`
-                // (rfc2131.c:1956,1958): fires on every lease grant/release,
+                // (rfc2131.c:1956,1958, via the shared `log_packet` both
+                // call sites feed): fires on every lease grant/release,
                 // not just the connmark-allowlist path forward.rs already
-                // wires up — mirrors upstream calling this unconditionally
-                // from the same place `record_lease`/`handle_release` commit.
+                // wires up — including a DHCPINFORM-triggered ACK, which
+                // upstream reports with `ciaddr` rather than `yiaddr`
+                // (`rfc2131.c:1739` vs `:1785`, since Inform never
+                // allocates a new address). Gated on `--quiet-dhcp`
+                // (`OPT_QUIET_DHCP`) unless `--log-dhcp` is also set,
+                // matching `log_packet`'s own gate (`rfc2131.c:1921`),
+                // which guards this call along with the syslog line.
                 #[cfg(feature = "ubus")]
-                {
+                if !cfg.quiet_dhcp {
                     let hw_len = usize::from(pkt.hlen).min(DHCP_CHADDR_MAX);
                     let mac = crate::util::print_mac(&pkt.chaddr[..hw_len]);
                     let hostname = find_option(&pkt.options, OPTION_HOSTNAME)
                         .and_then(|raw| std::str::from_utf8(raw).ok());
                     let iface = opts.relay_iface_name.as_deref();
                     if let Some(d) = dispatched.as_ref() {
-                        if d.reply.msg_type == DhcpMsgType::Ack
-                            && get_message_type(&pkt.options) != Some(DhcpMsgType::Inform)
-                        {
-                            let ip = d.reply.yiaddr.to_string();
+                        if d.reply.msg_type == DhcpMsgType::Ack {
+                            let is_inform = get_message_type(&pkt.options) == Some(DhcpMsgType::Inform);
+                            let ip = if is_inform { pkt.ciaddr } else { d.reply.yiaddr }.to_string();
                             crate::ubus::ubus_event_bcast("dhcp.ack", Some(&mac), Some(&ip), hostname, iface);
                         }
                     } else if get_message_type(&pkt.options) == Some(DhcpMsgType::Release)

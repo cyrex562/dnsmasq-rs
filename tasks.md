@@ -2108,8 +2108,9 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     the two connmark-allowlist broadcast functions sent unconditionally to
     whatever happened to be listening on the socket path, with no
     subscriber check at all). Wired into `dhcp::run_dhcp_loop` right after
-    `dispatch_dhcp_with_arrival`: a committed DHCPACK (excluding DHCPINFORM,
-    matching upstream) fires `"dhcp.ack"`, a pool-address DHCPRELEASE
+    `dispatch_dhcp_with_arrival`: a committed DHCPACK fires `"dhcp.ack"`
+    (including a DHCPINFORM-triggered ACK — see the follow-up fix below for
+    why an earlier pass excluded it), a pool-address DHCPRELEASE
     (`handle_release` returning `true`, matching upstream's
     `lease_db.remove_by_addr` guard in `dispatch_dhcp_with_meta`) fires
     `"dhcp.release"` — the actual DHCP-lease-event path the issue's
@@ -2155,6 +2156,38 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   byte-for-byte against a real header or a live `ubusd`, only reasoned
   through and covered by this port's own (self-consistent) round-trip
   tests. Do not upgrade this to "verified" without one of those.
+  Follow-up fix (same issue, third pass, final judge round):
+  - **DHCPINFORM was wrongly excluded from the `dhcp.ack` broadcast.**
+    Upstream's `log_packet("DHCPACK", &mess->ciaddr, ...)` call for a
+    DHCPINFORM-triggered ACK (`rfc2131.c:1785`) feeds the same unconditional
+    `ubus_event_bcast("dhcp.ack", ...)` (`rfc2131.c:1956`) the
+    DHCPREQUEST→ACK path does (`rfc2131.c:1739`, using `yiaddr` instead) —
+    the second pass's code explicitly skipped the broadcast for Inform,
+    with a comment falsely claiming this matched upstream calling it
+    unconditionally. Fixed: the broadcast now fires for every ACK,
+    switching between `ciaddr` (Inform — no address was allocated, so
+    `yiaddr` would report `0.0.0.0`) and `yiaddr` (every other ACK path) to
+    match `rfc2131.c:1739` vs `:1785` exactly.
+  - **`--quiet-dhcp` gating was dropped.** Upstream's `ubus_event_bcast`
+    calls for DHCPACK/DHCPRELEASE live inside `log_packet()`, which returns
+    without broadcasting when `!err && !OPT_LOG_OPTS && OPT_QUIET_DHCP`
+    (`rfc2131.c:1918-1921`, `err` always `NULL` on these two call sites).
+    Added `DhcpServerConfig::quiet_dhcp` (feature `ubus`, computed in
+    `dnsmasq::daemon_dhcp_runtime` as `OPT_QUIET_DHCP && !OPT_LOG_OPTS`) and
+    gated the broadcast block on it. This port has no live syslog call site
+    for DHCPACK/DHCPRELEASE yet to gate the same way (a separate,
+    already-tracked gap — `rfc2131::log_packet` is a pure formatter with no
+    production caller); only the ubus side of this gate is closed.
+  - **Zero test coverage for the actual `dhcp.rs`↔`ubus` wiring.** All
+    previous tests called `ubus_event_bcast` directly with hand-supplied
+    strings; none drove a real DHCP packet through `run_dhcp_loop` and
+    asserted a mock `ubusd` received the resulting `NOTIFY`. Added
+    `ubus::integration_tests::run_dhcp_loop_dhcpinform_broadcasts_dhcp_ack_with_ciaddr`:
+    a real DHCPINFORM packet through the real `run_dhcp_loop`, asserting
+    both the DHCPACK reply and the mock `ubusd`'s received `dhcp.ack`
+    `NOTIFY` report `ciaddr` — this is also the direct regression test for
+    the ciaddr/yiaddr bug above, since a reintroduced `yiaddr` bug would
+    report `0.0.0.0` instead of the test's chosen ciaddr.
   Deliberate, documented gaps:
   - The envelope's exact wire bytes, and now also the `blobmsg` layer's
     exact byte-for-byte fidelity (high confidence, not verified — see the
