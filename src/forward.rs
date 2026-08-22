@@ -21,7 +21,8 @@ use crate::edns0::Edns0Option;
 use crate::rfc1035::{
     answer_request, DnsPacket, DnsRr, ExtractConfig, ExtractResult, LocalConfig,
 };
-use crate::types::constants::{F_IPV4, F_IPV6, F_SERVER};
+use crate::types::addr::{AllAddr, LogAddr};
+use crate::types::constants::{F_CONFIG, F_IPV4, F_IPV6, F_QUERY, F_RCODE, F_SERVER, F_UPSTREAM};
 use crate::types::dns_records::{
     BogusAddr, Cname, HostRecord, InterfaceName, MxSrvRecord, Naptr, PtrRecord, TxtRecord,
 };
@@ -1000,6 +1001,13 @@ pub struct LocalData {
     /// Sorted lookup table built once from `address_server_list` — see
     /// [`crate::rfc1035::LocalConfig::address_servers`].
     pub address_servers: crate::domain_match::ServerArray,
+    /// Domains with a `SERV_LITERAL_ADDRESS` server entry and no upstream —
+    /// see [`crate::rfc1035::LocalConfig::literal_domains`].
+    pub literal_domains: Vec<String>,
+    /// `--cache-size` — see [`crate::rfc1035::LocalConfig::cachesize`].
+    pub cachesize: i32,
+    /// `--log-queries` options — see [`crate::rfc1035::LocalConfig::log_opts`].
+    pub log_opts: crate::cache::LogQueryOptions,
 }
 
 impl Default for LocalData {
@@ -1021,6 +1029,9 @@ impl Default for LocalData {
             synth_domains: Vec::new(),
             address_server_list: Vec::new(),
             address_servers: crate::domain_match::ServerArray::build(&[], &[]),
+            literal_domains: Vec::new(),
+            cachesize:     DEFAULT_CACHE_SIZE as i32,
+            log_opts:      crate::cache::LogQueryOptions::default(),
         }
     }
 }
@@ -1043,6 +1054,9 @@ impl LocalData {
             synth_domains: &self.synth_domains,
             address_servers: &self.address_servers,
             address_server_list: &self.address_server_list,
+            literal_domains: &self.literal_domains,
+            cachesize:     self.cachesize,
+            log_opts:      self.log_opts,
         }
     }
 
@@ -1527,7 +1541,19 @@ impl ForwardEngine {
             apply_conntrack_mark(&sock, &frec_src, self.config.port);
         }
 
-        sock.send_to(&out, addr).await.is_ok()
+        let sent = sock.send_to(&out, addr).await.is_ok();
+        // C only logs once the send actually went out (`if (errno == 0) { ...
+        // log_query_mysockaddr(...) }`, `forward.c:541-557`).
+        if sent && self.config.local.log_opts.log {
+            let name = DnsPacket::parse(&out)
+                .ok()
+                .and_then(|p| p.questions.first().map(|q| q.name.to_lowercase()))
+                .unwrap_or_else(|| "query".to_string());
+            if let Some(line) = forwarded_query_log_line(&self.config.local.log_opts, &name, addr) {
+                crate::log::my_syslog(crate::log::LOG_INFO, &line);
+            }
+        }
+        sent
     }
 
     /// Validate an upstream reply against the query it claims to answer,
@@ -2049,6 +2075,89 @@ pub fn log_query_mysockaddr(
     }
 }
 
+/// Build the `--log-queries` line for a query as it arrives from a client.
+///
+/// Port of the two `log_query_mysockaddr((auth_dns ? ... : 0) | F_QUERY |
+/// F_FORWARD [| F_CONFIG], ...)` call sites at the top of `udp_request()`
+/// (`forward.c:1826-1834`) and its TCP twin (`forward.c:2472-2504`) — auth-DNS
+/// and TCP display-id bookkeeping are out of scope here (see `tasks.md`), but
+/// the observable line for a plain forwarding query is the same either way.
+/// Returns `None` when `--log-queries` is off or `pkt` cannot be read at all.
+fn incoming_query_log_line(
+    opts: &crate::cache::LogQueryOptions,
+    pkt:  &[u8],
+    src:  SocketAddr,
+) -> Option<String> {
+    if !opts.log || pkt.len() < 12 {
+        return None;
+    }
+    let opcode = (pkt[2] >> 3) & 0x0F;
+    let (flags, name, rrtype) = if opcode != 0 {
+        (F_QUERY | F_CONFIG, None, opcode as u16)
+    } else {
+        let parsed = DnsPacket::parse(pkt).ok()?;
+        let q = parsed.questions.first()?;
+        (F_QUERY, Some(q.name.to_lowercase()), q.qtype)
+    };
+    let (flags, addr) = match src.ip() {
+        IpAddr::V4(v4) => (flags | F_IPV4, AllAddr::Addr4(v4)),
+        IpAddr::V6(v6) => (flags | F_IPV6, AllAddr::Addr6(v6)),
+    };
+    crate::cache::log_query(opts, flags, name.as_deref(), Some(&addr), None, rrtype, 0, None)
+}
+
+/// Build the `--log-queries` line for a query actually sent upstream.
+///
+/// Port of `log_query_mysockaddr(F_SERVER | F_FORWARD, daemon->namebuff,
+/// &srv->addr, NULL, 0)` (`forward.c:555-557`, `forward.c:2624`) — reuses
+/// [`log_query_mysockaddr`] for the family flag / port-as-rrtype computation
+/// C's helper of the same name performs, then hands the result to
+/// [`crate::cache::log_query`] for formatting.
+fn forwarded_query_log_line(
+    opts:   &crate::cache::LogQueryOptions,
+    name:   &str,
+    server: SocketAddr,
+) -> Option<String> {
+    if !opts.log {
+        return None;
+    }
+    let (flags, _addr_str, port) = log_query_mysockaddr(F_SERVER, server);
+    let addr = match server.ip() {
+        IpAddr::V4(v4) => AllAddr::Addr4(v4),
+        IpAddr::V6(v6) => AllAddr::Addr6(v6),
+    };
+    crate::cache::log_query(opts, flags, Some(name), Some(&addr), None, port, 0, None)
+}
+
+/// Build the `--log-queries` line for a non-NOERROR/NXDOMAIN upstream rcode.
+///
+/// Port of `log_query(F_UPSTREAM | F_RCODE, "error", &a, NULL, 0)`
+/// (`forward.c:781-789`), where `a.log.rcode`/`a.log.ede` carry the error —
+/// note C passes the literal name `"error"`, not the query name.
+fn upstream_error_log_line(opts: &crate::cache::LogQueryOptions, rcode: u16) -> Option<String> {
+    if !opts.log {
+        return None;
+    }
+    let addr = AllAddr::Log(LogAddr {
+        keytag: 0,
+        algo:   0,
+        digest: 0,
+        rcode,
+        ede:    crate::cache::LOG_EDE_UNSET as i32,
+    });
+    crate::cache::log_query(opts, F_UPSTREAM | F_RCODE, Some("error"), Some(&addr), None, 0, 0, None)
+}
+
+/// Build the `--log-queries` line for a truncated upstream reply.
+///
+/// Port of `log_query(F_UPSTREAM, NULL, NULL, "truncated", 0)`
+/// (`forward.c:791-792`).
+fn upstream_truncated_log_line(opts: &crate::cache::LogQueryOptions) -> Option<String> {
+    if !opts.log {
+        return None;
+    }
+    crate::cache::log_query(opts, F_UPSTREAM, None, None, Some("truncated"), 0, 0, None)
+}
 
 ///
 /// DNS-over-TCP prefixes the message with a 2-byte big-endian length field
@@ -2486,6 +2595,12 @@ pub async fn run_forward_loop_on(
                             local,
                             crate::dump::DumpFallback::None,
                         );
+                    }
+                    // `log_query` gets called for every query C reads, before it
+                    // is known whether the answer will be local or forwarded
+                    // (`forward.c:1826-1834`).
+                    if let Some(line) = incoming_query_log_line(&local.log_opts, pkt, src) {
+                        crate::log::my_syslog(crate::log::LOG_INFO, &line);
                     }
                     // `--dns-loop-detect`: a query that is one of our own loop
                     // probes coming back marks the offending upstream server
@@ -3084,9 +3199,17 @@ pub fn process_reply(
     let rcode  = u16::from(pkt[3] & 0x0F) | (u16::from(ext_rcode) << 4);
     let opcode = (pkt[2] >> 3) & 0x0F;
 
-    // Non-QUERY opcodes, and errors other than NXDOMAIN, carry nothing worth
-    // inspecting (`forward.c:778-789`).
-    if opcode != 0 || (rcode != 0 && rcode != 3) {
+    // Non-QUERY opcodes carry nothing worth inspecting or logging
+    // (`forward.c:778-779`).
+    if opcode != 0 {
+        return true;
+    }
+    // Errors other than NXDOMAIN are logged and returned without caching
+    // (`forward.c:781-789`).
+    if rcode != 0 && rcode != 3 {
+        if let Some(line) = upstream_error_log_line(&config.local.log_opts, rcode) {
+            crate::log::my_syslog(crate::log::LOG_INFO, &line);
+        }
         return true;
     }
 
@@ -3099,6 +3222,9 @@ pub fn process_reply(
     // `tasks.md` for the missing TCP listener.
     if is_truncated(pkt) {
         tracing::debug!("upstream reply truncated");
+        if let Some(line) = upstream_truncated_log_line(&config.local.log_opts) {
+            crate::log::my_syslog(crate::log::LOG_INFO, &line);
+        }
     } else {
         ede = cache_upstream_reply(pkt, cache, now, config);
 
@@ -4430,6 +4556,107 @@ mod tests {
         let (flags, _, _) = log_query_mysockaddr(extra_flag, addr);
         assert!(flags & extra_flag != 0, "caller flags should be preserved");
         assert!(flags & F_IPV4 != 0);
+    }
+
+    // ── log_query wiring: incoming query / forwarded / upstream reply ────────
+
+    fn log_on() -> crate::cache::LogQueryOptions {
+        crate::cache::LogQueryOptions { log: true, ..Default::default() }
+    }
+
+    fn a_query() -> Vec<u8> {
+        DnsPacket {
+            header: crate::dns_protocol::DnsHeader {
+                id: 7, hb3: 0, hb4: 0, qdcount: 1, ..Default::default()
+            },
+            questions: vec![crate::rfc1035::DnsQuestion {
+                name: "example.com".into(), qtype: 1 /* A */, qclass: 1,
+            }],
+            answers: Vec::new(),
+            authority: Vec::new(),
+            additional: Vec::new(),
+        }
+        .write()
+        .to_vec()
+    }
+
+    #[test]
+    fn incoming_query_log_line_reports_name_and_client() {
+        let pkt = a_query();
+        let src: SocketAddr = "10.0.0.5:54321".parse().unwrap();
+        let line = incoming_query_log_line(&log_on(), &pkt, src).expect("logging is on");
+        assert!(line.contains("query[A]"), "line was: {line}");
+        assert!(line.contains("example.com"), "line was: {line}");
+        assert!(line.contains("from"), "line was: {line}");
+        assert!(line.contains("10.0.0.5"), "line was: {line}");
+    }
+
+    #[test]
+    fn incoming_query_log_line_is_none_when_logging_disabled() {
+        let pkt = a_query();
+        let src: SocketAddr = "10.0.0.5:54321".parse().unwrap();
+        assert_eq!(
+            incoming_query_log_line(&crate::cache::LogQueryOptions::default(), &pkt, src),
+            None
+        );
+    }
+
+    #[test]
+    fn incoming_query_log_line_reports_non_query_opcode() {
+        let pkt = DnsPacket {
+            header: crate::dns_protocol::DnsHeader {
+                id: 7, hb3: 1 << 3 /* opcode 1 == IQUERY */, hb4: 0, qdcount: 0,
+                ..Default::default()
+            },
+            questions: Vec::new(),
+            answers: Vec::new(),
+            authority: Vec::new(),
+            additional: Vec::new(),
+        }
+        .write()
+        .to_vec();
+        let src: SocketAddr = "10.0.0.5:54321".parse().unwrap();
+        let line = incoming_query_log_line(&log_on(), &pkt, src).expect("logging is on");
+        assert!(line.contains("non-query opcode"), "line was: {line}");
+    }
+
+    #[test]
+    fn forwarded_query_log_line_reports_server_address() {
+        let server: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let line = forwarded_query_log_line(&log_on(), "example.com", server)
+            .expect("logging is on");
+        assert!(line.contains("forwarded"), "line was: {line}");
+        assert!(line.contains("example.com"), "line was: {line}");
+        assert!(line.contains("to"), "line was: {line}");
+        assert!(line.contains("8.8.8.8"), "line was: {line}");
+    }
+
+    #[test]
+    fn forwarded_query_log_line_is_none_when_logging_disabled() {
+        let server: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        assert_eq!(
+            forwarded_query_log_line(
+                &crate::cache::LogQueryOptions::default(),
+                "example.com",
+                server
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn upstream_error_log_line_reports_rcode() {
+        let line = upstream_error_log_line(&log_on(), 2 /* SERVFAIL */).expect("logging is on");
+        assert!(line.contains("reply"), "line was: {line}");
+        assert!(line.contains("error"), "line was: {line}");
+        assert!(line.contains("SERVFAIL"), "line was: {line}");
+    }
+
+    #[test]
+    fn upstream_truncated_log_line_reports_truncation() {
+        let line = upstream_truncated_log_line(&log_on()).expect("logging is on");
+        assert!(line.contains("reply"), "line was: {line}");
+        assert!(line.contains("truncated"), "line was: {line}");
     }
 
     // ── set_outgoing_mark ─────────────────────────────────────────────────────

@@ -12,8 +12,8 @@ use crate::types::constants::UID_NONE;
 use crate::dns_protocol::{DnsHeader, RrType, HB3_AA, HB3_QR, HB3_TC, HB4_AD, HB4_CD, HB4_RA};
 use crate::types::addr::{AllAddr, CnameAddr, RrBlockAddr, RrDataAddr};
 use crate::types::constants::{
-    F_CNAME, F_DNSSECOK, F_FORWARD, F_IPV4, F_IPV6, F_KEYTAG, F_NEG, F_NOERR, F_NXDOMAIN, F_RCODE,
-    F_REVERSE, F_RR,
+    F_CNAME, F_CONFIG, F_DNSSECOK, F_FORWARD, F_IPV4, F_IPV6, F_KEYTAG, F_NEG,
+    F_NOERR, F_NXDOMAIN, F_RCODE, F_REVERSE, F_RR, F_RRNAME,
 };
 use crate::types::dns_records::{
     BogusAddr, Cname, Doctor, HostRecord, InterfaceName, MxSrvRecord, Naptr, PtrRecord, TxtRecord,
@@ -788,9 +788,17 @@ fn commit_staged(
     if header.hb4 & HB4_CD != 0 || header.hb4 & HB4_RA == 0 {
         return;
     }
+    // Bracket the whole reply's records in one transaction (`cache_start_insert`
+    // / `cache_insert` * n / `cache_end_insert`, `cache.c:646-905`) instead of
+    // committing each record independently: if a later record in the chain
+    // (e.g. a CNAME's terminal A/AAAA answer) fails validation, the records
+    // staged ahead of it — the CNAME itself — must not be left in the live
+    // cache pointing at nothing.
+    cache.start_insert();
     for rec in staged {
-        cache.really_insert(rec, now);
+        cache.stage_insert(rec, now);
     }
+    cache.end_insert();
 }
 
 /// Extract DNS records from a parsed reply and insert them into `cache`.
@@ -1112,6 +1120,22 @@ pub struct LocalConfig<'a> {
     /// argument to produce `address_servers` — `ServerEntry::index` looks up
     /// into this slice for the actual configured address.
     pub address_server_list: &'a [crate::types::server::Server],
+    /// Domains with a `SERV_LITERAL_ADDRESS` `server` entry and no upstream
+    /// address (`local=/domain/` with no address, or `rev-server` with the
+    /// server part omitted): never forwarded, and answered NXDOMAIN here
+    /// when nothing else matches, for any query type.
+    pub literal_domains: &'a [String],
+    /// `daemon->cachesize` (`--cache-size`), needed only to render the
+    /// `cachesize.bind` synthetic stat record — see [`Self::txt_records`]'s
+    /// `stat` field and `crate::cache::cache_make_stat`.  Whether the
+    /// built-in `*.bind` stat names are present at all is decided once, when
+    /// `crate::dnsmasq::daemon_local_data` builds `txt_records` (gated on
+    /// `!option_bool(OPT_NO_IDENT)`, `option.c:6097-6113`) — `answer_request`
+    /// itself does not need to know about `--no-ident`.
+    pub cachesize: i32,
+    /// Options gating and formatting `--log-queries` output — see
+    /// `crate::cache::log_query`.
+    pub log_opts: crate::cache::LogQueryOptions,
 }
 
 /// Port of C's `setup_reply()`.  Sets standard response flags on a DnsHeader.
@@ -1137,6 +1161,37 @@ pub fn setup_reply(header: &mut DnsHeader, flags: u32) {
         // an empty answer caches a negative result we never established.
         header.set_rcode(5); // REFUSED
     }
+}
+
+/// True when `name` equals or is a subdomain of any entry in `domains`
+/// (case-insensitive, label-boundary-aware suffix match).
+fn domain_matches_any_suffix(name: &str, domains: &[String]) -> bool {
+    domains.iter().any(|domain| {
+        let dlen = domain.len();
+        if dlen == 0 || name.len() < dlen {
+            return false;
+        }
+        let start = name.len() - dlen;
+        let suffix = &name[start..];
+        suffix.eq_ignore_ascii_case(domain)
+            && (name.len() == dlen || name.as_bytes().get(start.wrapping_sub(1)) == Some(&b'.'))
+    })
+}
+
+/// `arg` for `log_query` at a cached-answer call site.
+///
+/// C always passes `record_source(crecp->uid)` here (`rfc1035.c:1690`,
+/// `:1710`, `:1898`, `:2077`) — every cached-lookup call to `log_query`
+/// forwards the record's origin file unconditionally, regardless of whether
+/// the record actually carries `F_HOSTS`. `log_query`'s `F_HOSTS` branch is
+/// the only one that renders it (as `source`); for any other cache record
+/// (config/DHCP/upstream-derived, `uid == UID_NONE`) `record_source` falls
+/// back to `"<unknown>"`, which is computed but never displayed. Matching
+/// that call shape exactly — rather than only computing it when `F_HOSTS` is
+/// set — keeps this a literal port instead of an equivalent-but-different
+/// shortcut.
+fn cached_answer_source_arg(uid: u32) -> Option<String> {
+    Some(crate::cache::record_source(uid))
 }
 
 /// Port of C's `answer_request()`.  Answers DNS queries from local config and cache.
@@ -1182,27 +1237,29 @@ pub fn answer_request(
         additional: Vec::new(),
     };
 
-    // 4. CH class: reply NOTIMP for well-known chaos names, otherwise forward.
-    if qclass == 3 {
-        let lower = q.name.to_lowercase();
-        if lower == "bind"
-            || lower == "server"
-            || lower.ends_with(".bind")
-            || lower.ends_with(".server")
-        {
-            response.header.set_rcode(4); // NOTIMP
-            return Some(response);
-        }
-        return None;
-    }
-
-    // 5. IN class processing.
+    // 4/5. IN and CH class processing share the same local-answer machinery
+    // below — C does too (`rfc1035.c`'s `answer_request` never special-cases
+    // CH before trying local data; see `qclass == C_CHAOS` at
+    // `rfc1035.c:1757`, reached only *after* the TXT-record loop below has
+    // had a chance to match a built-in `*.bind` stat/version record).  Only
+    // if nothing local answers a `*.bind`/`*.server` CHAOS query does it get
+    // NOTIMP instead of being forwarded (`rfc1035.c:1759-1771`).
     let mut name     = q.name.to_lowercase();
     let mut answers: Vec<DnsRr> = Vec::new();
     let mut ans      = false;
     let mut nxdomain = false;
     let mut auth     = false;
+    let mut notimp   = false;
     let ttl          = config.local_ttl;
+
+    // Emit a `--log-queries` line built by `crate::cache::log_query`, or do
+    // nothing when `log_query` returns `None` (logging gated off, or this
+    // particular outcome filtered by `only_failed`/`auth-log`).
+    let log = |flags: u32, name: Option<&str>, addr: Option<&AllAddr>, arg: Option<&str>, rrtype: u16| {
+        if let Some(line) = crate::cache::log_query(&config.log_opts, flags, name, addr, arg, rrtype, 0, None) {
+            crate::log::my_syslog(crate::log::LOG_INFO, &line);
+        }
+    };
 
     // 5a. CNAME chain (max 16 hops).
     //
@@ -1214,67 +1271,127 @@ pub fn answer_request(
     // whose target has expired — the everyday CDN TTL pattern — would be served
     // as a CNAME-only NOERROR, which is a resolution failure, instead of being
     // re-resolved upstream.
-    for _ in 0..16 {
-        // Config CNAMEs first.  These are C's `F_CONFIG` cache entries, and
-        // they do answer the question on their own.
-        if let Some(c) = config.cnames.iter().find(|c| c.alias.to_lowercase() == name) {
-            let target = c.target.clone();
-            let mut rd = BytesMut::new();
-            write_name(&mut rd, &target);
-            answers.push(DnsRr { name: name.clone(), rtype: 5, class: 1, ttl, rdata: rd.to_vec() });
-            name = target.to_lowercase();
-            ans  = true;
-            if qtype == 5 /* CNAME */ {
-                break;
-            }
-            continue;
-        }
-
-        // Cached CNAME.  It carries its own TTL — `ttl` here is `local-ttl`,
-        // a static-record default that says nothing about an upstream answer.
-        let cname_target: Option<(String, u32)> = cache
-            .lookup_by_name(&name, F_CNAME, now)
-            .and_then(|r| {
-                if let Some(AllAddr::Cname(ref c)) = r.addr {
-                    c.target_name.clone().map(|t| (t, DnsCache::crec_ttl(r, now)))
-                } else {
-                    None
+    //
+    // C gates this whole loop on `qclass == C_IN` (`rfc1035.c:1669`) — the
+    // cache never holds CNAME/NXDOMAIN entries for a CHAOS query anyway, but
+    // matching the gate keeps this a faithful port rather than relying on
+    // that as an accident of what the cache happens to contain.
+    if qclass == 1 {
+        for _ in 0..16 {
+            // Config CNAMEs first.  These are C's `F_CONFIG` cache entries, and
+            // they do answer the question on their own.
+            if let Some(c) = config.cnames.iter().find(|c| c.alias.to_lowercase() == name) {
+                let target = c.target.clone();
+                let mut rd = BytesMut::new();
+                write_name(&mut rd, &target);
+                answers.push(DnsRr { name: name.clone(), rtype: 5, class: 1, ttl, rdata: rd.to_vec() });
+                log(F_CONFIG | F_CNAME, Some(&name), None, None, 0);
+                name = target.to_lowercase();
+                ans  = true;
+                if qtype == 5 /* CNAME */ {
+                    break;
                 }
-            });
-        if let Some((target, cname_ttl)) = cname_target {
-            let mut rd = BytesMut::new();
-            write_name(&mut rd, &target);
-            answers.push(DnsRr {
-                name: name.clone(), rtype: 5, class: 1, ttl: cname_ttl, rdata: rd.to_vec(),
-            });
-            name = target.to_lowercase();
-            if qtype == 5 /* CNAME */ {
-                // The CNAME *is* the answer the client asked for.
-                ans = true;
-                break;
+                continue;
             }
-            continue;
-        }
 
-        // Cached NXDOMAIN.
-        if cache.lookup_by_name(&name, F_NXDOMAIN | F_NEG, now).is_some() {
-            nxdomain = true;
-            ans      = true;
+            // Cached CNAME.  It carries its own TTL — `ttl` here is `local-ttl`,
+            // a static-record default that says nothing about an upstream answer.
+            let cname_target: Option<(String, u32, u32, u32)> = cache
+                .lookup_by_name(&name, F_CNAME, now)
+                .and_then(|r| {
+                    if let Some(AllAddr::Cname(ref c)) = r.addr {
+                        c.target_name.clone().map(|t| (t, DnsCache::crec_ttl(r, now), r.flags, r.uid))
+                    } else {
+                        None
+                    }
+                });
+            if let Some((target, cname_ttl, cname_flags, cname_uid)) = cname_target {
+                let mut rd = BytesMut::new();
+                write_name(&mut rd, &target);
+                answers.push(DnsRr {
+                    name: name.clone(), rtype: 5, class: 1, ttl: cname_ttl, rdata: rd.to_vec(),
+                });
+                log(cname_flags, Some(&name), None, cached_answer_source_arg(cname_uid).as_deref(), 0);
+                name = target.to_lowercase();
+                if qtype == 5 /* CNAME */ {
+                    // The CNAME *is* the answer the client asked for.
+                    ans = true;
+                    break;
+                }
+                continue;
+            }
+
+            // Cached NXDOMAIN.
+            if let Some(r) = cache.lookup_by_name(&name, F_NXDOMAIN | F_NEG, now) {
+                let arg = cached_answer_source_arg(r.uid);
+                log(r.flags, Some(&name), None, arg.as_deref(), 0);
+                nxdomain = true;
+                ans      = true;
+            }
+            break;
         }
-        break;
     }
 
-    // 5b. TXT (qtype 16 or ANY=255).
+    // 5b. TXT (qtype 16 or ANY=255).  Reachable for both IN and CHAOS class —
+    // this is what lets a built-in `*.bind` stat record answer a CHAOS query,
+    // matching `rfc1035.c:1725-1755` (which is not gated on qclass either;
+    // only `t->class == qclass` per record decides a match).
     if qtype == 16 || qtype == 255 {
         for t in config.txt_records.iter()
             .filter(|t| t.class == qclass && t.name.to_lowercase() == name)
         {
+            ans = true;
+            // Dynamically generate stat records (`rfc1035.c:1736-1743`):
+            // `t.stat` is the `TXT_STAT_*` discriminator, non-zero only for
+            // the synthetic `cachesize.bind`/`insertions.bind`/... entries
+            // `daemon_local_data` registers.  TTL 0 matches C — the content
+            // changes on every query, so it must never be cached.
+            let (txt_ttl, rdata) = if t.stat != 0 {
+                match crate::cache::cache_make_stat(
+                    t.stat,
+                    config.cachesize,
+                    crate::metrics::get_metric(crate::metrics::Metric::DnsCacheInserted),
+                    crate::metrics::get_metric(crate::metrics::Metric::DnsCacheLiveFreed),
+                    crate::metrics::get_metric(crate::metrics::Metric::DnsQueriesForwarded),
+                    crate::metrics::get_metric(crate::metrics::Metric::DnsLocalAnswered),
+                ) {
+                    Some(rdata) => (0, rdata),
+                    None => continue, // C: `ok = 0` — the record is skipped, not answered.
+                }
+            } else {
+                (ttl, t.txt.clone())
+            };
             answers.push(DnsRr {
-                name: name.clone(), rtype: 16, class: 1, ttl, rdata: t.txt.clone(),
+                name: name.clone(), rtype: 16, class: t.class, ttl: txt_ttl, rdata,
             });
-            ans  = true;
+            log(F_CONFIG | F_RRNAME, Some(&name), None, Some("<TXT>"), 0);
             auth = true;
         }
+    }
+
+    // CHAOS `*.bind` / `*.server` fallback: only when nothing local answered
+    // (a stat/version TXT record above may already have).  Port of
+    // `rfc1035.c:1757-1772`, argument order preserved deliberately: C calls
+    // `hostname_issubdomain("bind", name)` — literal-first, query-name-second
+    // — the reverse of every *other* call site in upstream (`name` first,
+    // `rfc1035.c:1311-1327`, `auth.c:298-397`), where `hostname_issubdomain`
+    // means "is the first arg equal to, or a subdomain of, the second".  With
+    // the arguments this way round the comment's "*.bind and *.server" is
+    // misleading: `hostname_issubdomain("bind", name)` only matches when
+    // `name` itself is `"bind"` (or shorter), because `a` must be at least as
+    // long as `b` (`util.c:426-428`) — an actual `version.bind` query never
+    // reaches this branch. Preserving the exact call, quirk included, matches
+    // this port's rule to keep observable behaviour over what looks "more
+    // correct".
+    if qclass == 3 && !ans
+        && (hostname_issubdomain("bind", &name) || hostname_issubdomain("server", &name))
+    {
+        notimp = true;
+        let addr = AllAddr::Log(crate::types::addr::LogAddr {
+            keytag: 0, algo: 0, digest: 0, rcode: 4 /* NOTIMP */, ede: 0,
+        });
+        log(F_CONFIG | F_RCODE, Some(&name), Some(&addr), None, 0);
+        ans = true;
     }
 
     // 5c. Arbitrary cached-RR (qclass IN only).
@@ -1285,13 +1402,14 @@ pub fn answer_request(
             answers.push(DnsRr {
                 name: name.clone(), rtype: t.class, class: 1, ttl, rdata: t.txt.clone(),
             });
+            log(F_CONFIG | F_RRNAME, Some(&name), None, None, t.class);
             ans  = true;
             auth = true;
         }
     }
 
-    // 5d. PTR (qtype 12 or ANY).
-    if qtype == 12 || qtype == 255 {
+    // 5d. PTR (qtype 12 or ANY, IN class only).
+    if qclass == 1 && (qtype == 12 || qtype == 255) {
         let mut found_ptr = false;
         for p in config.ptr_records.iter().filter(|p| p.name.to_lowercase() == name) {
             let mut rd = BytesMut::new();
@@ -1310,6 +1428,7 @@ pub fn answer_request(
                     answers.push(DnsRr {
                         name: name.clone(), rtype: 12, class: 1, ttl, rdata: rd.to_vec(),
                     });
+                    log(F_CONFIG | F_REVERSE, Some(&name), Some(&addr), None, 0);
                     ans       = true;
                     auth      = true;
                     found_ptr = true;
@@ -1318,9 +1437,12 @@ pub fn answer_request(
                     // Try cache reverse lookup.
                     let cached = cache
                         .lookup_by_addr(&addr, now)
-                        .map(|r| (r.name.clone(), r.flags, DnsCache::crec_ttl(r, now)));
-                    if let Some((hostname, flags, cached_ttl)) = cached {
+                        .map(|r| (r.name.clone(), r.flags, DnsCache::crec_ttl(r, now), r.uid));
+                    if let Some((hostname, flags, cached_ttl, uid)) = cached {
                         if flags & F_NXDOMAIN != 0 {
+                            // C passes NULL here (`rfc1035.c:1889`) — only the
+                            // found-a-name branch below passes `record_source`.
+                            log(flags | F_REVERSE, Some(&name), Some(&addr), None, 0);
                             nxdomain = true;
                             ans      = true;
                         } else {
@@ -1330,6 +1452,8 @@ pub fn answer_request(
                                 name: name.clone(), rtype: 12, class: 1,
                                 ttl: cached_ttl, rdata: rd.to_vec(),
                             });
+                            let arg = cached_answer_source_arg(uid);
+                            log(flags & !F_FORWARD, Some(&name), Some(&addr), arg.as_deref(), 0);
                             ans = true;
                         }
                         found_ptr = true;
@@ -1358,8 +1482,8 @@ pub fn answer_request(
         }
     }
 
-    // 5e. A / AAAA (qtype 1, 28, or ANY).
-    if qtype == 1 || qtype == 28 || qtype == 255 {
+    // 5e. A / AAAA (qtype 1, 28, or ANY, IN class only).
+    if qclass == 1 && (qtype == 1 || qtype == 28 || qtype == 255) {
         let want_a    = qtype == 1  || qtype == 255;
         let want_aaaa = qtype == 28 || qtype == 255;
         let mut found_in_host = false;
@@ -1373,6 +1497,7 @@ pub fn answer_request(
                     answers.push(DnsRr {
                         name: name.clone(), rtype: 1, class: 1, ttl, rdata: ip4.octets().to_vec(),
                     });
+                    log(F_CONFIG | F_IPV4, Some(&name), Some(&AllAddr::Addr4(ip4)), None, 0);
                     ans           = true;
                     auth          = true;
                     found_in_host = true;
@@ -1383,6 +1508,7 @@ pub fn answer_request(
                     answers.push(DnsRr {
                         name: name.clone(), rtype: 28, class: 1, ttl, rdata: ip6.octets().to_vec(),
                     });
+                    log(F_CONFIG | F_IPV6, Some(&name), Some(&AllAddr::Addr6(ip6)), None, 0);
                     ans           = true;
                     auth          = true;
                     found_in_host = true;
@@ -1394,18 +1520,23 @@ pub fn answer_request(
             if want_a {
                 let cached = cache
                     .lookup_forward(&name, F_IPV4, now)
-                    .map(|r| (r.addr.clone(), r.flags, DnsCache::crec_ttl(r, now)));
-                if let Some((addr, flags, cached_ttl)) = cached {
+                    .map(|r| (r.addr.clone(), r.flags, DnsCache::crec_ttl(r, now), r.uid));
+                if let Some((addr, flags, cached_ttl, uid)) = cached {
                     if flags & F_NEG != 0 {
                         if flags & F_NXDOMAIN != 0 {
                             nxdomain = true;
                         }
+                        // C passes NULL here (`rfc1035.c:2063`) — only the
+                        // positive-answer branch below passes `record_source`.
+                        log(flags, Some(&name), None, None, 0);
                         ans = true;
                     } else if let Some(AllAddr::Addr4(ip)) = addr {
                         answers.push(DnsRr {
                             name: name.clone(), rtype: 1, class: 1,
                             ttl: cached_ttl, rdata: ip.octets().to_vec(),
                         });
+                        let arg = cached_answer_source_arg(uid);
+                        log(flags, Some(&name), Some(&AllAddr::Addr4(ip)), arg.as_deref(), 0);
                         ans = true;
                     }
                 } else if let Some(ip4) = crate::domain::synthesize_ipv4(&name, config.synth_domains) {
@@ -1423,18 +1554,23 @@ pub fn answer_request(
             if want_aaaa {
                 let cached = cache
                     .lookup_forward(&name, F_IPV6, now)
-                    .map(|r| (r.addr.clone(), r.flags, DnsCache::crec_ttl(r, now)));
-                if let Some((addr, flags, cached_ttl)) = cached {
+                    .map(|r| (r.addr.clone(), r.flags, DnsCache::crec_ttl(r, now), r.uid));
+                if let Some((addr, flags, cached_ttl, uid)) = cached {
                     if flags & F_NEG != 0 {
                         if flags & F_NXDOMAIN != 0 {
                             nxdomain = true;
                         }
+                        // C passes NULL here (`rfc1035.c:2063`) — only the
+                        // positive-answer branch below passes `record_source`.
+                        log(flags, Some(&name), None, None, 0);
                         ans = true;
                     } else if let Some(AllAddr::Addr6(ip)) = addr {
                         answers.push(DnsRr {
                             name: name.clone(), rtype: 28, class: 1,
                             ttl: cached_ttl, rdata: ip.octets().to_vec(),
                         });
+                        let arg = cached_answer_source_arg(uid);
+                        log(flags, Some(&name), Some(&AllAddr::Addr6(ip)), arg.as_deref(), 0);
                         ans = true;
                     }
                 } else if let Some(ip6) = crate::domain::synthesize_ipv6(&name, config.synth_domains) {
@@ -1448,8 +1584,8 @@ pub fn answer_request(
         }
     }
 
-    // 5f. MX (qtype 15 or ANY).
-    if qtype == 15 || qtype == 255 {
+    // 5f. MX (qtype 15 or ANY, IN class only).
+    if qclass == 1 && (qtype == 15 || qtype == 255) {
         for m in config.mx_records.iter()
             .filter(|m| !m.is_srv && m.name.to_lowercase() == name)
         {
@@ -1457,13 +1593,14 @@ pub fn answer_request(
             rd.put_u16(m.priority as u16);
             write_name(&mut rd, &m.target);
             answers.push(DnsRr { name: name.clone(), rtype: 15, class: 1, ttl, rdata: rd.to_vec() });
+            log(F_CONFIG | F_RRNAME, Some(&name), None, Some("<MX>"), 0);
             ans  = true;
             auth = true;
         }
     }
 
-    // 5g. SRV (qtype 33 or ANY).
-    if qtype == 33 || qtype == 255 {
+    // 5g. SRV (qtype 33 or ANY, IN class only).
+    if qclass == 1 && (qtype == 33 || qtype == 255) {
         for s in config.mx_records.iter()
             .filter(|m| m.is_srv && m.name.to_lowercase() == name)
         {
@@ -1473,13 +1610,14 @@ pub fn answer_request(
             rd.put_u16(s.srv_port);
             write_name(&mut rd, &s.target);
             answers.push(DnsRr { name: name.clone(), rtype: 33, class: 1, ttl, rdata: rd.to_vec() });
+            log(F_CONFIG | F_RRNAME, Some(&name), None, Some("<SRV>"), 0);
             ans  = true;
             auth = true;
         }
     }
 
-    // 5h. NAPTR (qtype 35 or ANY).
-    if qtype == 35 || qtype == 255 {
+    // 5h. NAPTR (qtype 35 or ANY, IN class only).
+    if qclass == 1 && (qtype == 35 || qtype == 255) {
         for n in config.naptr_records.iter()
             .filter(|n| n.name.to_lowercase() == name)
         {
@@ -1494,6 +1632,7 @@ pub fn answer_request(
             rd.put_slice(n.regexp.as_bytes());
             write_name(&mut rd, &n.replace);
             answers.push(DnsRr { name: name.clone(), rtype: 35, class: 1, ttl, rdata: rd.to_vec() });
+            log(F_CONFIG | F_RRNAME, Some(&name), None, Some("<NAPTR>"), 0);
             ans  = true;
             auth = true;
         }
@@ -1568,6 +1707,17 @@ pub fn answer_request(
     if !ans && config.nodots_local && (qtype == 1 || qtype == 28 || qtype == 255) && !name.contains('.') && !name.is_empty() {
         ans = true;
         nxdomain = !check_for_local_domain(&name, config, &*cache, now);
+        let flags = F_CONFIG | F_NEG | if nxdomain { F_NXDOMAIN } else { 0 };
+        log(flags, Some(&name), None, None, 0);
+    }
+
+    // 6b. A domain with a `SERV_LITERAL_ADDRESS` server entry and no
+    // upstream (`local=/domain/` with no address, or `rev-server` with the
+    // server part omitted) is never forwarded, for any query type — answer
+    // NXDOMAIN instead of falling through to forwarding.
+    if !ans && domain_matches_any_suffix(&name, config.literal_domains) {
+        ans      = true;
+        nxdomain = true;
     }
 
     if !ans {
@@ -1598,7 +1748,10 @@ pub fn answer_request(
     response.answers        = answers;
     response.header.ancount = response.answers.len() as u16;
     response.header.arcount = response.additional.len() as u16;
-    if nxdomain {
+    if notimp {
+        response.header.set_rcode(4); // NOTIMP
+        response.header.hb3 &= !HB3_AA;
+    } else if nxdomain {
         response.header.set_rcode(3);
         response.header.hb3 &= !HB3_AA;
     } else if auth {
@@ -3053,13 +3206,17 @@ mod tests {
     // ── answer_request ────────────────────────────────────────────────────────
 
     fn make_query(name: &str, qtype: u16) -> DnsPacket {
+        make_query_class(name, qtype, 1)
+    }
+
+    fn make_query_class(name: &str, qtype: u16, qclass: u16) -> DnsPacket {
         let mut buf = BytesMut::new();
         let mut h = DnsHeader::default();
         h.qdcount = 1;
         buf.put_slice(&h.to_bytes());
         write_name(&mut buf, name);
         buf.put_u16(qtype);
-        buf.put_u16(1); // IN
+        buf.put_u16(qclass);
         DnsPacket::parse(&buf).unwrap()
     }
 
@@ -3089,6 +3246,9 @@ mod tests {
             synth_domains: &[],
             address_servers: empty_server_array(),
             address_server_list: &[],
+            literal_domains: &[],
+            cachesize: 150,
+            log_opts:  crate::cache::LogQueryOptions::default(),
         }
     }
 
@@ -3190,6 +3350,62 @@ mod tests {
         assert!(resp.header.is_aa(), "AA should be set for host_records answer");
     }
 
+    /// `--log-queries` must not be a silent no-op: turning it on and
+    /// answering a real query from every major local-answer branch (host
+    /// records, TXT, cache hit, cache negative, CHAOS stat, arbitrary
+    /// cached-RR) must not panic and must still produce the same answer as
+    /// with logging off. The arbitrary cached-RR branch specifically guards
+    /// against regressing the missing `log(F_CONFIG | F_RRNAME, ...)` call
+    /// found in issue #23's review: every other local-answer branch here
+    /// logs, and this one has to as well.
+    #[test]
+    fn log_queries_enabled_does_not_change_answers_or_panic() {
+        use crate::types::dns_records::{HostRecord, TxtRecord};
+        let hr = HostRecord {
+            ttl: 60, flags: 0, names: vec!["myhost.local".into()],
+            addr4: Some(Ipv4Addr::new(10, 0, 0, 1)), addr6: None,
+        };
+        let stat = TxtRecord {
+            name: "cachesize.bind".into(), txt: Vec::new(), class: 3, stat: crate::cache::TXT_STAT_CACHESIZE,
+        };
+        let caa = TxtRecord {
+            name: "example.com".into(), txt: b"\x00\x05issue".to_vec(),
+            class: crate::dns_protocol::RrType::CAA as u16, stat: 0,
+        };
+        let cfg = LocalConfig {
+            host_records: std::slice::from_ref(&hr),
+            txt_records:  std::slice::from_ref(&stat),
+            rr_records:   std::slice::from_ref(&caa),
+            log_opts: crate::cache::LogQueryOptions { log: true, extralog: true, ..Default::default() },
+            ..empty_config()
+        };
+        let now = Instant::now();
+
+        let mut cache = DnsCache::new(100);
+        let a = answer_request(&make_query("myhost.local", 1), &mut cache, now, &cfg);
+        assert!(a.is_some());
+
+        let mut cache = DnsCache::new(100);
+        let rr = answer_request(&make_query("example.com", crate::dns_protocol::RrType::CAA as u16), &mut cache, now, &cfg)
+            .expect("arbitrary cached-RR (--dns-rr) should answer with logging enabled");
+        assert_eq!(rr.answers.len(), 1);
+        assert_eq!(rr.answers[0].rtype, crate::dns_protocol::RrType::CAA as u16);
+
+        let mut cache = DnsCache::new(100);
+        let stat_resp = answer_request(&make_query_class("cachesize.bind", 16, 3), &mut cache, now, &cfg);
+        assert!(stat_resp.is_some());
+
+        let mut cache = DnsCache::new(100);
+        cache.insert(CacheRecord {
+            name: "nx.example.com".into(), flags: F_NXDOMAIN | F_NEG,
+            ttl: 60, expires: now + Duration::from_secs(60),
+            addr: None, rdata: None, uid: UID_NONE,
+        });
+        let neg = answer_request(&make_query("nx.example.com", 1), &mut cache, now, &cfg);
+        assert!(neg.is_some());
+        assert_eq!(neg.unwrap().header.rcode(), 3); // NXDOMAIN
+    }
+
     #[test]
     fn test_answer_request_mx() {
         use crate::types::dns_records::MxSrvRecord;
@@ -3260,6 +3476,56 @@ mod tests {
         assert_eq!(resp.answers.len(), 1);
         assert_eq!(resp.answers[0].rtype, 16);
         assert_eq!(resp.answers[0].rdata, b"\x0bv=spf1 ~all".to_vec());
+    }
+
+    /// Acceptance criterion: "Cache statistics are queryable where upstream
+    /// supports it" — a CHAOS-class `cachesize.bind` query answers with a
+    /// TXT record carrying the live cache size, matching upstream's
+    /// `cache_make_stat()` wiring (`rfc1035.c:1736-1743`).
+    #[test]
+    fn test_answer_request_chaos_cachesize_bind_stat() {
+        use crate::types::dns_records::TxtRecord;
+        let stat = TxtRecord {
+            name: "cachesize.bind".into(), txt: Vec::new(), class: 3, stat: crate::cache::TXT_STAT_CACHESIZE,
+        };
+        let cfg = LocalConfig {
+            txt_records: std::slice::from_ref(&stat),
+            cachesize: 300,
+            ..empty_config()
+        };
+        let query = make_query_class("cachesize.bind", 16, 3);
+        let mut cache = DnsCache::new(100);
+        let resp = answer_request(&query, &mut cache, Instant::now(), &cfg)
+            .expect("should answer CHAOS stat query");
+        assert_eq!(resp.header.rcode(), 0);
+        assert_eq!(resp.answers.len(), 1);
+        assert_eq!(resp.answers[0].rdata, b"\x03300".to_vec());
+        assert_eq!(resp.answers[0].ttl, 0); // dynamic content is never cached
+    }
+
+    /// A CHAOS query for a name that is neither a configured TXT record nor
+    /// a `*.bind`/`*.server` literal falls through to forwarding — matching
+    /// upstream, which never answers arbitrary CHAOS names locally.
+    #[test]
+    fn test_answer_request_chaos_unmatched_name_forwards() {
+        let cfg = empty_config();
+        let query = make_query_class("random.example", 16, 3);
+        let mut cache = DnsCache::new(100);
+        assert!(answer_request(&query, &mut cache, Instant::now(), &cfg).is_none());
+    }
+
+    /// The literal names "bind"/"server" (not real `*.bind` subdomains — see
+    /// the faithfully-preserved argument-order quirk in `answer_request`)
+    /// get NOTIMP when nothing local answers them.
+    #[test]
+    fn test_answer_request_chaos_bind_literal_gets_notimp() {
+        let cfg = empty_config();
+        let query = make_query_class("bind", 16, 3);
+        let mut cache = DnsCache::new(100);
+        let resp = answer_request(&query, &mut cache, Instant::now(), &cfg)
+            .expect("should answer NOTIMP");
+        assert_eq!(resp.header.rcode(), 4); // NOTIMP
+        assert!(resp.answers.is_empty());
     }
 
     #[test]
@@ -4400,5 +4666,62 @@ mod tests {
         // Lease has 30s remaining but local_ttl=60 → cap at 30
         let ttl = crec_ttl(130, 100, F_DHCP, 0, 60);
         assert_eq!(ttl, 30);
+    }
+
+    // ── cached_answer_source_arg ─────────────────────────────────────────────
+
+    #[test]
+    fn cached_answer_source_arg_resolves_hosts_file_path() {
+        // The gap review flagged: `answer_request`'s cached-lookup branches
+        // always passed `arg = None` to `log_query`, so an F_HOSTS-sourced
+        // answer produced a log line with an empty source field instead of
+        // naming the hosts file it came from. `cached_answer_source_arg`
+        // closes that gap the same way C's call sites do — by resolving the
+        // record's `uid` through `record_source`.
+        let mut cache = DnsCache::new(16);
+        let now = Instant::now();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        use std::io::Write;
+        writeln!(file, "10.1.2.3  cachedsourcehost").unwrap();
+        let path = file.path().to_str().unwrap().to_string();
+
+        let (uid, _count) = crate::cache::load_hosts_file(&path, 60, now, &mut cache).unwrap();
+        assert_eq!(cached_answer_source_arg(uid), Some(path));
+    }
+
+    #[test]
+    fn cached_answer_source_arg_unregistered_uid_is_unknown_placeholder() {
+        // Mirrors C computing `record_source()` unconditionally even for a
+        // non-hosts record — `log_query` only renders it when `F_HOSTS` is
+        // set, so a harmless placeholder here is correct, not a bug.
+        assert_eq!(cached_answer_source_arg(UID_NONE), Some("<unknown>".to_string()));
+    }
+
+    #[test]
+    fn answer_request_a_record_from_hosts_file_is_answered_correctly() {
+        // End-to-end: an A query answered from a cache entry loaded via
+        // `load_hosts_file` still returns the right address once the log
+        // call site threads `r.uid` through instead of discarding it.
+        let mut cache = DnsCache::new(16);
+        let now = Instant::now();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        use std::io::Write;
+        writeln!(file, "10.5.6.7  hostsfile.example").unwrap();
+        let path = file.path().to_str().unwrap().to_string();
+        crate::cache::load_hosts_file(&path, 60, now, &mut cache).unwrap();
+
+        let query = DnsPacket::parse(&{
+            let mut pkt = vec![
+                0x00, 0x01, HB3_RD, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ];
+            pkt.extend_from_slice(b"\x09hostsfile\x07example\x00");
+            pkt.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+            pkt
+        }).unwrap();
+
+        let cfg = empty_config();
+        let resp = answer_request(&query, &mut cache, now, &cfg).expect("should answer locally");
+        assert_eq!(resp.answers.len(), 1);
+        assert_eq!(resp.answers[0].rdata, vec![10, 5, 6, 7]);
     }
 }
