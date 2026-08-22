@@ -1161,6 +1161,16 @@ pub struct ForwardConfig {
     /// once at startup by [`crate::dump::DumpHandle::init`].
     #[cfg(feature = "dump")]
     pub dump: Option<crate::dump::DumpHandle>,
+    /// `--dns-loop-detect` (`OPT_LOOP_DETECT`): probe upstream servers for
+    /// forwarding loops and stop selecting any that echo our own probe back.
+    #[cfg(feature = "loop")]
+    pub loop_detect: bool,
+    /// Loop-detection state, index-aligned with `upstreams`/`server_domains`
+    /// (same `forwardable` list `daemon_forward_config` built them from).
+    /// [`ForwardEngine`] owns the live copy it mutates; this is the starting
+    /// snapshot.
+    #[cfg(feature = "loop")]
+    pub loop_servers: Vec<crate::types::server::Server>,
 }
 
 impl Default for ForwardConfig {
@@ -1199,6 +1209,10 @@ impl Default for ForwardConfig {
             add_subnet6:   None,
             #[cfg(feature = "dump")]
             dump:          None,
+            #[cfg(feature = "loop")]
+            loop_detect:   false,
+            #[cfg(feature = "loop")]
+            loop_servers:  Vec::new(),
         }
     }
 }
@@ -1291,6 +1305,13 @@ pub struct ForwardEngine {
     upstream_order:      Vec<usize>,
     /// Pool of random-port UDP sockets for query dispatch.
     pub rfd_pool:        RandFdPool,
+    /// Live loop-detection state, index-aligned with `config.upstreams`.
+    /// Seeded from `config.loop_servers` and mutated in place: cleared and
+    /// re-probed by [`crate::loop_detect::send_probes`], flagged
+    /// [`SERV_LOOP`](crate::types::server::SERV_LOOP) by
+    /// [`crate::loop_detect::detect_loop`] on the incoming-query path.
+    #[cfg(feature = "loop")]
+    pub loop_servers: Vec<crate::types::server::Server>,
 }
 
 impl ForwardEngine {
@@ -1298,12 +1319,29 @@ impl ForwardEngine {
     pub fn new(config: ForwardConfig) -> Self {
         let n = config.upstreams.len();
         let ftabsize = config.ftabsize.max(1);
+        #[cfg(feature = "loop")]
+        let loop_servers = config.loop_servers.clone();
         Self {
             upstream_order: (0..n).collect(),
             table:          FrecTable::new(ftabsize),
             rfd_pool:       RandFdPool::sized_for(ftabsize, config.randport_limit),
+            #[cfg(feature = "loop")]
+            loop_servers,
             config,
         }
+    }
+
+    /// Whether `idx` (an index into `config.upstreams`) currently carries
+    /// [`SERV_LOOP`](crate::types::server::SERV_LOOP) — set by
+    /// [`crate::loop_detect::detect_loop`] once a probe to that server has
+    /// come back to us.  A server without loop-detection state (index out of
+    /// range, or the `loop` feature disabled) is never excluded on this
+    /// basis.
+    #[cfg(feature = "loop")]
+    fn is_looping(&self, idx: usize) -> bool {
+        self.loop_servers
+            .get(idx)
+            .is_some_and(|s| s.flags & crate::types::server::SERV_LOOP != 0)
     }
 
     /// Hand any sockets freed along with a `Frec` back to the pool.
@@ -1357,6 +1395,14 @@ impl ForwardEngine {
             return ForwardOutcome::Dropped;
         }
         let candidates = self.candidate_servers(pkt);
+        // A server whose loop probe has come back to us is excluded from
+        // selection until the next probe round clears it — the runtime
+        // equivalent of `ServerArray::build` skipping `SERV_LOOP` entries
+        // (`domain_match.rs`), applied here because `ForwardEngine` selects
+        // straight from `config.upstreams` rather than through a `ServerArray`.
+        #[cfg(feature = "loop")]
+        let candidates: Vec<usize> =
+            candidates.into_iter().filter(|&i| !self.is_looping(i)).collect();
         let Some(server_idx) = next_server(&candidates, &HashSet::new(), usize::MAX) else {
             return ForwardOutcome::Dropped;
         };
@@ -2414,6 +2460,22 @@ pub async fn run_forward_loop_on(
                             local,
                             crate::dump::DumpFallback::None,
                         );
+                    }
+                    // `--dns-loop-detect`: a query that is one of our own loop
+                    // probes coming back marks the offending upstream server
+                    // and is dropped outright — no reply, no forwarding, no
+                    // local-data lookup (`detect_loop()` returning 1 makes
+                    // `udp_request()` `return;` immediately, `forward.c:1862-1863`).
+                    #[cfg(feature = "loop")]
+                    let is_loop_probe = engine.config.loop_detect
+                        && crate::rfc1035::extract_request(pkt).is_some_and(|(name, rtype)| {
+                            crate::loop_detect::detect_loop(&name, rtype as u16, &mut engine.loop_servers)
+                        });
+                    #[cfg(not(feature = "loop"))]
+                    let is_loop_probe = false;
+
+                    if is_loop_probe {
+                        continue;
                     }
                     // `--connmark-allowlist-enable`: a query whose connection
                     // mark is not allow-listed gets REFUSED here, before it

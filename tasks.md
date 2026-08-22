@@ -1362,6 +1362,44 @@ Both are reference-only. Do not treat either tree as code to edit in place.
 
 ## P3 Feature-Specific Completion
 
+- [x] Wire `loop.c` (forwarding-loop detection) into a live caller (Issue #44 / T3-loop).
+  Source of truth: `loop.c:22-111`, `src/loop_detect.rs`.
+  `loop_make_probe`/`loop_send_probes`/`detect_loop` now match upstream wire
+  format exactly (`LOOP_TEST_DOMAIN="test"`, `LOOP_TEST_TYPE=T_TXT`, uid as an
+  8-hex-digit label) instead of the previous ad hoc 16-byte-token/".invalid"
+  scheme. `Server::uid` (already present, `loop`-gated) is now actually
+  assigned a random value in `option::new_server`, mirroring
+  `add_update_server()`'s `serv->uid = rand32()` (`domain-match.c:759`) — every
+  prior build left every server's uid at `0`, so probes could never be told
+  apart.
+  Real callers: `dnsmasq::run_main_loop_with` sends one round of probes at
+  startup when `--dns-loop-detect` is set and `port != 0`, mirroring
+  `check_servers(0)` being called once after the pre-fork parent releases
+  (`dnsmasq.c:1082-1083`). `forward::run_forward_loop_on` calls `detect_loop`
+  on every incoming client query before dispatch (mirrors `forward.c:1862`)
+  and drops a matching probe outright; `ForwardEngine::forward_query` filters
+  `SERV_LOOP`-flagged servers out of candidate selection, mirroring
+  `ServerArray::build`'s existing (already-live) `SERV_LOOP` skip in
+  `domain_match.rs`.
+  Known gap, deliberately left open: upstream also re-sends probes whenever
+  `check_servers(0)` runs again — on SIGHUP reload after a resolv-file
+  re-read, and after `servers-file` re-read. `dnsmasq::clear_cache_and_reload`
+  (the SIGHUP hook) has no channel into the already-spawned forward task's
+  live `ForwardEngine::loop_servers`, so a SIGHUP-triggered `server=` change
+  does not get a fresh probe round; a server flagged `SERV_LOOP` before
+  reload also stays flagged after. This is the same "`ForwardConfig` is a
+  startup snapshot, not reactively updated on reload" gap every other
+  reload-sensitive `ForwardConfig` field already has (see the P0 startup/reload
+  blocker above) — fixing it for loop detection specifically, ahead of that
+  general reload-plumbing work, would just be a special case that immediately
+  rots once the general fix lands.
+  Required tests: `src/loop_detect.rs` unit tests (wire format, eligibility
+  filtering, uid matching, a real-socket loopback `send_probes` test);
+  `option.rs` tests for `new_server` uid randomness and `--dns-loop-detect`
+  reaching `ForwardConfig`.
+  Done when: the SIGHUP/reload gap above is closed as part of the general
+  `ForwardConfig` live-reload work.
+
 - [ ] Finish behavior-critical gaps in DNS forwarding and cache interaction.
   Focus: upstream retry behavior, server rotation, reply matching, cache insertion edge cases, AD bit and EDNS0 semantics.
   Required tests: unit tests, property tests where appropriate, parity harness DNS scenarios.

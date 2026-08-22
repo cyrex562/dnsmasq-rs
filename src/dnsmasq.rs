@@ -686,6 +686,14 @@ pub fn daemon_forward_config(daemon: &Daemon) -> crate::forward::ForwardConfig {
         client_subnet:  daemon.option_bool(OPT_CLIENT_SUBNET),
         add_subnet4:    daemon.add_subnet4.as_ref().map(&to_add_subnet_opt),
         add_subnet6:    daemon.add_subnet6.as_ref().map(&to_add_subnet_opt),
+        // `--dns-loop-detect`: `forwardable` is exactly the server list
+        // `loop_send_probes()`/`detect_loop()` iterate over in C
+        // (`daemon->servers`, minus the never-forwarded `SERV_LITERAL_ADDRESS`
+        // entries filtered above), so it doubles as the loop-detection state.
+        #[cfg(feature = "loop")]
+        loop_detect:    daemon.option_bool(crate::types::constants::OPT_LOOP_DETECT),
+        #[cfg(feature = "loop")]
+        loop_servers:   forwardable.iter().map(|s| (*s).clone()).collect(),
         ..Default::default()
     }
 }
@@ -1358,6 +1366,17 @@ pub async fn run_main_loop_with(
         let dhcp_runtime = ();
         (fwd_config, dhcp_runtime)
     };
+
+    // `--dns-loop-detect`: send the first round of loop probes once at
+    // startup, mirroring `if (daemon->port != 0) check_servers(0);` right
+    // after `main()` releases the pre-fork parent (`dnsmasq.c:1082-1083`) —
+    // that first `check_servers()` call is what fires `loop_send_probes()`
+    // before any query has ever been served. Later rounds happen as SIGHUP
+    // reload grows a live hook into the running forward task (`tasks.md`).
+    #[cfg(feature = "loop")]
+    if fwd_config.loop_detect && fwd_config.port != 0 {
+        crate::loop_detect::send_probes(&mut fwd_config.loop_servers).await;
+    }
 
     // `--dump-file`: open (or create/reopen) the pcap dump once at startup,
     // mirroring `dump_init()` being called once from `main()` (`dnsmasq.c:450`).
