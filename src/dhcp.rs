@@ -4531,6 +4531,10 @@ mod tests {
             if_index: 7,
             valid: 0,
             preferred: 0,
+            ra_time: 0,
+            ra_short_period_start: 0,
+            saved_valid: 0,
+            address_lost_time: 0,
         };
         lease_db.refresh_slaac(std::time::SystemTime::now(), &[ra_ctx], false, |_ctx| {});
 

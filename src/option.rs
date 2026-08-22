@@ -2700,7 +2700,8 @@ fn parse_ra_param(daemon: &mut Daemon, v: &str, cl: &ConfigLine) -> Result<(), C
             let val = &rest[4..];
             if val.eq_ignore_ascii_case("off") {
                 new.mtu = -1;
-            } else if let Ok(n) = val.parse::<i32>() {
+            } else if is_all_ascii_digits(val) {
+                let n = val.parse::<i32>().map_err(|_| bad())?;
                 if n < 1280 {
                     return Err(bad());
                 }
@@ -2723,14 +2724,29 @@ fn parse_ra_param(daemon: &mut Daemon, v: &str, cl: &ConfigLine) -> Result<(), C
     }
 
     let interval_str = next.ok_or_else(bad)?;
+    if !is_all_ascii_digits(interval_str) {
+        return Err(bad());
+    }
     new.interval = interval_str.parse::<i32>().map_err(|_| bad())?;
 
     if let Some(lifetime_str) = parts.next() {
+        if !is_all_ascii_digits(lifetime_str) {
+            return Err(bad());
+        }
         new.lifetime = lifetime_str.parse::<i32>().map_err(|_| bad())?;
     }
 
     daemon.ra_interfaces.push(new);
     Ok(())
+}
+
+/// Port of `numeric_check()` (`option.c:744-757`): every byte must be an
+/// ASCII digit (rejecting a leading `-`, unlike `str::parse`), matching
+/// `atoi_check()`'s gate before falling back to `atoi()`. An empty string
+/// passes, mirroring the C loop over a NUL-terminated buffer never
+/// executing its body.
+fn is_all_ascii_digits(s: &str) -> bool {
+    s.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// `shared-network=<iface>|<addr>,<addr>`.  Port of `option.c:3709`
@@ -5859,6 +5875,44 @@ mod tests {
     fn apply_ra_param_mtu_below_1280_is_rejected() {
         let mut d = Daemon::default();
         let lines = parse_config_text("ra-param=eth0,mtu:1200,60", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "ra-param"));
+    }
+
+    /// Upstream's `atoi_check` (`option.c:760-766`) rejects any non-digit
+    /// character — including a leading `-` — via `numeric_check` before
+    /// `mtu:`'s value is ever treated as numeric, so `mtu:-5` falls through
+    /// to the interface-name branch (`new->mtu_name = opt_string_alloc(arg)`)
+    /// exactly like `mtu:eth1` does, rather than being parsed as -5 and
+    /// rejected by the `< 1280` check.
+    #[test]
+    #[cfg(feature = "dhcp6")]
+    fn apply_ra_param_negative_mtu_is_treated_as_an_interface_name() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("ra-param=eth0,mtu:-5,60", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.ra_interfaces[0].mtu, 0);
+        assert_eq!(d.ra_interfaces[0].mtu_name.as_deref(), Some("-5"));
+    }
+
+    /// Unlike `mtu:`, upstream's `interval`/`lifetime` fields have no
+    /// interface-name fallback: `atoi_check` failing on either goes straight
+    /// to `goto err` (`option.c:4841-4845`), so a leading `-` is a hard
+    /// config error rather than a value `i32::parse` would silently accept.
+    #[test]
+    #[cfg(feature = "dhcp6")]
+    fn apply_ra_param_negative_interval_is_rejected() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("ra-param=eth0,-60", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "ra-param"));
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp6")]
+    fn apply_ra_param_negative_lifetime_is_rejected() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("ra-param=eth0,60,-1800", "test").unwrap();
         let err = apply_config(&mut d, &lines).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "ra-param"));
     }

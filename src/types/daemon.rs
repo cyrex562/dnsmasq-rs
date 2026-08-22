@@ -303,11 +303,6 @@ pub struct Daemon {
     pub relay6:          Vec<DhcpRelay>,
     #[cfg(feature = "dhcp6")]
     pub ra_interfaces:   Vec<RaInterface>,
-    /// `daemon->doing_ra` (dnsmasq.h:1238) — whether we send Router
-    /// Advertisements at all, computed in `normalize_config` from
-    /// `--enable-ra` and any `CONTEXT_RA` DHCPv6 context (dnsmasq.c:289-305).
-    #[cfg(feature = "dhcp6")]
-    pub doing_ra:        bool,
     /// The constructed on-wire server DUID (upstream's `daemon->duid`,
     /// `daemon->duid_len`), filled in by `dhcp6::make_duid()` at startup.
     /// `None` until `make_duid()` has run.
@@ -566,8 +561,6 @@ impl Default for Daemon {
             relay6: vec![],
             #[cfg(feature = "dhcp6")]
             ra_interfaces: vec![],
-            #[cfg(feature = "dhcp6")]
-            doing_ra: false,
             #[cfg(feature = "dhcp6")]
             duid: None,
             #[cfg(feature = "dhcp6")]

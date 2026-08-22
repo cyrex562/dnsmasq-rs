@@ -2734,6 +2734,18 @@ fn send_ra_with_aliases(
     }
 }
 
+/// The RA reply destination for `handle_icmp6_packet`'s two branches.
+///
+/// Port of radv.c:241 vs radv.c:249's differing `dest` argument to
+/// `send_ra_alias`/`send_ra`: a bridge-aliased reply (`send_ra_alias(now,
+/// bridge_index, bridge->iface, NULL, if_index)`) is always multicast to the
+/// arrival interface regardless of the Router Solicitation's source address;
+/// only the direct (non-bridge) reply unicasts back to the solicitor.
+#[cfg(feature = "dhcp6")]
+fn ra_reply_dest(is_bridge_alias: bool, solicitor: Option<std::net::Ipv6Addr>) -> Option<std::net::Ipv6Addr> {
+    if is_bridge_alias { None } else { solicitor }
+}
+
 /// Handle one received ICMPv6 datagram: dispatch a Router Solicitation to a
 /// (possibly bridge-redirected) RA reply. Echo Replies (SLAAC probes) are not
 /// yet wired to `lease_ping_reply` — tracked in `tasks.md`.
@@ -2803,7 +2815,7 @@ fn handle_icmp6_packet(
             continue;
         }
         if let Some(packet) = build_ra_packet(socket, bridge_idx, &bridge.iface, contexts, ra_interfaces, opt_ra, is_dns_server) {
-            if let Err(e) = socket.send(if_index, dest, &packet) {
+            if let Err(e) = socket.send(if_index, ra_reply_dest(true, dest), &packet) {
                 tracing::warn!("failed to send bridged RA reply on {name}: {e}");
             }
         }
@@ -2811,7 +2823,7 @@ fn handle_icmp6_packet(
     }
 
     if let Some(packet) = build_ra_packet(socket, if_index, &name, contexts, ra_interfaces, opt_ra, is_dns_server) {
-        if let Err(e) = socket.send(if_index, dest, &packet) {
+        if let Err(e) = socket.send(if_index, ra_reply_dest(false, dest), &packet) {
             tracing::warn!("failed to send RA reply on {name}: {e}");
         }
     }
@@ -4731,6 +4743,20 @@ mod tests {
     }
 
     // ── RadvSocket / run_radv_loop ────────────────────────────────────────────
+
+    /// Regression test for the bridge-alias reply-destination bug (radv.c:241):
+    /// a bridge-aliased RA reply must always be multicast (`None`), regardless
+    /// of the Router Solicitation's source address, while the direct reply
+    /// unicasts back to the solicitor unchanged.
+    #[cfg(feature = "dhcp6")]
+    #[test]
+    fn ra_reply_dest_bridge_alias_is_always_multicast_direct_reply_unicasts_to_solicitor() {
+        let solicitor = Some(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+        assert_eq!(ra_reply_dest(true, solicitor), None);
+        assert_eq!(ra_reply_dest(true, None), None);
+        assert_eq!(ra_reply_dest(false, solicitor), solicitor);
+        assert_eq!(ra_reply_dest(false, None), None);
+    }
 
     /// Whether this process can open a raw `IPPROTO_ICMPV6` socket
     /// (`CAP_NET_RAW` or root) — see `have_raw_icmp_socket` above for the v4
