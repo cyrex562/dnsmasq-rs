@@ -12,12 +12,40 @@ pub struct IfaceInfo {
     pub addr:    IpAddr,
     pub netmask: Option<IpAddr>,
     pub flags:   u32,
+    /// Interface alias/label (e.g. `"eth0:0"`), when the enumeration source
+    /// can report one distinct from `name`. `getifaddrs`-backed enumeration
+    /// (`if-addrs`) cannot supply this; only [`enumerate_interfaces_netlink`]
+    /// does, via `IFA_LABEL` (`network.c` passes this to `iface_allowed`'s
+    /// `label` parameter).
+    pub label: Option<String>,
+    /// IPv6 address still undergoing Duplicate Address Detection
+    /// (`IFA_F_TENTATIVE`, `network.c`'s `IFACE_TENTATIVE`). Always `false`
+    /// from the `if-addrs` backend, which does not expose extended `ifa_flags`.
+    pub dad: bool,
+    /// IPv6 deprecated address (`IFA_F_DEPRECATED`, `IFACE_DEPRECATED`).
+    /// Always `false` from the `if-addrs` backend.
+    pub deprecated: bool,
 }
 
 impl IfaceInfo {
     /// True when this address belongs to a loopback interface.
     pub fn is_loopback(&self) -> bool {
         self.flags & IFACE_LOOPBACK != 0
+    }
+}
+
+impl Default for IfaceInfo {
+    fn default() -> Self {
+        Self {
+            name:       String::new(),
+            index:      0,
+            addr:       IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            netmask:    None,
+            flags:      0,
+            label:      None,
+            dad:        false,
+            deprecated: false,
+        }
     }
 }
 
@@ -119,10 +147,136 @@ pub fn enumerate_interfaces() -> std::io::Result<Vec<IfaceInfo>> {
             addr,
             netmask,
             flags:   if loopback { IFACE_LOOPBACK } else { 0 },
+            ..Default::default()
         }
     }).collect();
 
     Ok(result)
+}
+
+/// Enumerate interfaces for the DNS listener set, preferring the
+/// netlink-backed source on Linux (which can report `IFA_LABEL` and the
+/// `IFA_F_TENTATIVE`/`IFA_F_DEPRECATED` flags `iface_allowed()` consults,
+/// `network.c:266-269,443-446,494,577`) and falling back to the portable
+/// `if-addrs` source when netlink is unavailable — an unprivileged container
+/// or a non-Linux host, matching how the rest of this module already treats
+/// netlink access as best-effort (`netlink::netlink_open`'s `EPERM` fallback).
+pub fn enumerate_interfaces_for_dns() -> std::io::Result<Vec<IfaceInfo>> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(v) = enumerate_interfaces_netlink() {
+            return Ok(v);
+        }
+    }
+    enumerate_interfaces()
+}
+
+/// Netlink-backed interface enumeration (`iface_enumerate()` in `netlink.c`,
+/// as called from `network.c:836,841`'s `enumerate_interfaces()`).
+///
+/// Queries `AF_INET` and `AF_INET6` addresses over a fresh `NETLINK_ROUTE`
+/// socket and resolves each record's interface name via `if_indextoname`
+/// (IPv6 records carry no `IFA_LABEL` — labels are an IPv4-only legacy-alias
+/// concept, matching the `label_exception` comment elsewhere in this module).
+#[cfg(target_os = "linux")]
+pub fn enumerate_interfaces_netlink() -> std::io::Result<Vec<IfaceInfo>> {
+    use crate::netlink;
+
+    let (fd, pid) = netlink::netlink_open()?;
+    let close_fd = scopeguard_close(fd);
+
+    let mut out = Vec::new();
+
+    let mut collect = |rec: netlink::IfaceRecord| -> bool {
+        match rec {
+            netlink::IfaceRecord::V4 { addr, if_index, label, netmask, .. } => {
+                let name = label.clone().unwrap_or_else(|| {
+                    indextoname(if_index).unwrap_or_default()
+                });
+                out.push(IfaceInfo {
+                    name,
+                    index: if_index,
+                    addr: IpAddr::V4(addr),
+                    netmask: Some(IpAddr::V4(netmask)),
+                    flags: 0,
+                    label,
+                    dad: false,
+                    deprecated: false,
+                });
+            }
+            netlink::IfaceRecord::V6 { addr, prefix_len, if_index, flags, .. } => {
+                let Some(name) = indextoname(if_index) else { return true };
+                let mask_bits: u128 = if prefix_len == 0 {
+                    0
+                } else {
+                    !0u128 << (128 - prefix_len as u32)
+                };
+                let netmask = Ipv6Addr::from(mask_bits.to_be_bytes());
+                out.push(IfaceInfo {
+                    name,
+                    index: if_index,
+                    addr: IpAddr::V6(addr),
+                    netmask: Some(IpAddr::V6(netmask)),
+                    flags: 0,
+                    label: None,
+                    dad: flags & netlink::IFACE_TENTATIVE != 0,
+                    deprecated: flags & netlink::IFACE_DEPRECATED != 0,
+                });
+            }
+            _ => {}
+        }
+        true
+    };
+
+    let enum_err = || std::io::Error::new(std::io::ErrorKind::Other, "netlink interface enumeration failed");
+    if !netlink::iface_enumerate(fd, pid, libc::AF_INET6, &mut collect).map_err(|_| enum_err())? {
+        return Err(enum_err());
+    }
+    if !netlink::iface_enumerate(fd, pid, libc::AF_INET, &mut collect).map_err(|_| enum_err())? {
+        return Err(enum_err());
+    }
+
+    drop(close_fd);
+
+    // Loopback flag isn't carried by IFA attributes; fill it in from the
+    // interface's IFF_LOOPBACK flag via a cheap ioctl-free lookup: any
+    // address whose name matches a loopback address's name (SIOCGIFFLAGS
+    // needs a socket + ioctl, which the pure `if-addrs` fallback already
+    // exercises — reuse it here rather than duplicating that logic).
+    if let Ok(if_addrs_info) = enumerate_interfaces() {
+        let loopback_names: std::collections::HashSet<&str> = if_addrs_info
+            .iter()
+            .filter(|i| i.is_loopback())
+            .map(|i| i.name.as_str())
+            .collect();
+        for info in &mut out {
+            if loopback_names.contains(info.name.as_str()) {
+                info.flags |= IFACE_LOOPBACK;
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// Closes `fd` on drop — a minimal scope guard so [`enumerate_interfaces_netlink`]
+/// closes its netlink socket on every return path without a manual `libc::close`
+/// at each early-return.
+#[cfg(target_os = "linux")]
+struct FdGuard(i32);
+
+#[cfg(target_os = "linux")]
+impl Drop for FdGuard {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            unsafe { libc::close(self.0) };
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn scopeguard_close(fd: i32) -> FdGuard {
+    FdGuard(fd)
 }
 
 /// Count the leading one-bits of an IPv6 netmask, giving a prefix length.
@@ -934,6 +1088,36 @@ pub struct Listener {
     pub iface:    Option<String>,
 }
 
+/// Take ownership of a `Listener`'s UDP socket as a `std::net::UdpSocket`,
+/// closing any TCP/TFTP descriptors it also carries.
+///
+/// Nothing downstream of this call serves TCP or TFTP on a dynamically
+/// created listener today, so those descriptors would otherwise leak; the
+/// `Listener` is consumed and never `release()`d, so this is the one place
+/// that takes responsibility for them.  Reports the address the kernel
+/// actually bound (falls back to the requested address if that lookup
+/// fails), matching what a bind of port 0 needs.
+#[cfg(unix)]
+pub fn listener_take_udp(mut l: Listener) -> std::io::Result<(std::net::UdpSocket, std::net::SocketAddr)> {
+    use std::os::unix::io::FromRawFd;
+
+    for fd in [std::mem::replace(&mut l.tcp_fd, -1), std::mem::replace(&mut l.tftp_fd, -1)] {
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+        }
+    }
+    if l.udp_fd < 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "listener has no UDP socket"));
+    }
+    // Safety: `create_listeners`/`create_listeners_checked` just returned this
+    // fd and we take sole ownership of it here; `l` is consumed and never
+    // reaches `release()`.
+    let sock = unsafe { std::net::UdpSocket::from_raw_fd(l.udp_fd) };
+    sock.set_nonblocking(true)?;
+    let addr = sock.local_addr().unwrap_or(l.addr);
+    Ok((sock, addr))
+}
+
 impl Listener {
     /// Decrement the use-counter.  When it reaches zero, close all open file
     /// descriptors and return `true`; otherwise return `false`.
@@ -1499,6 +1683,9 @@ pub struct IfaceRecord {
     /// Whether this address is a label (secondary alias) rather than the
     /// primary address of the interface.
     pub is_label:   bool,
+    /// IPv6 address still undergoing Duplicate Address Detection
+    /// (`iface->dad`, `network.c:494,577`). Always `false` for IPv4 records.
+    pub dad:        bool,
 }
 
 impl IfaceRecord {
@@ -1535,6 +1722,7 @@ impl Default for IfaceRecord {
             auth_dns:   false,
             found:      true,
             is_label:   false,
+            dad:        false,
         }
     }
 }
@@ -1550,6 +1738,51 @@ pub struct IfaceAllowedConfig {
     pub dhcp_except:   Vec<(String, u32)>,
     /// If non-empty, only these interfaces get TFTP service.
     pub tftp_ifaces:   Vec<String>,
+    /// `--auth-server=<domain>[,interface|ip-address...]` (`daemon->authinterface`).
+    /// A matching interface/address is served for auth DNS regardless of any
+    /// other allow/deny rule, and has DHCP/TFTP disabled on it.
+    pub auth_interfaces: Vec<AuthInterface>,
+}
+
+/// One entry from `--auth-server`'s interface/address list
+/// (`struct iname` as used for `daemon->authinterface`).
+#[derive(Debug, Clone)]
+pub struct AuthInterface {
+    /// Set for a name-based entry (`--auth-server=domain,eth0`).
+    pub name:  Option<String>,
+    /// Set for an address-based entry (`--auth-server=domain,192.0.2.1`), or
+    /// as a family restriction (unspecified address) alongside `name`.
+    pub addr:  Option<IpAddr>,
+    /// `INAME_4`/`INAME_6`: restricts a name-based entry to one family.
+    /// `0` (upstream's `sa_family == 0`) means "either family".
+    pub flags: u32,
+}
+
+/// Decide whether `(name, addr)` is served as an auth-DNS interface.
+///
+/// Direct port of the `daemon->authinterface` loop in `iface_check()`
+/// (`network.c:153-179`): a name-based entry matches by exact name (no
+/// wildcards) plus an optional family restriction; an address-based entry
+/// matches by exact address. The first match wins, matching upstream's `break`.
+pub fn auth_interface_match(name: &str, addr: IpAddr, entries: &[AuthInterface]) -> bool {
+    for entry in entries {
+        if let Some(ename) = &entry.name {
+            let family_ok = if entry.flags & (INAME_4 | INAME_6) == 0 {
+                true
+            } else {
+                match addr {
+                    IpAddr::V4(_) => entry.flags & INAME_4 != 0,
+                    IpAddr::V6(_) => entry.flags & INAME_6 != 0,
+                }
+            };
+            if ename == name && family_ok {
+                return true;
+            }
+        } else if entry.addr == Some(addr) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Determine whether a label (secondary IPv4 address alias) should be treated
@@ -1588,6 +1821,7 @@ pub fn iface_allowed_v4(
     addr:       Ipv4Addr,
     netmask:    Ipv4Addr,
     loopback:   bool,
+    dad:        bool,
     config:     &IfaceAllowedConfig,
     iface_check_cfg: &IfaceCheckConfig,
     used:       &mut IfaceCheckUsed,
@@ -1602,8 +1836,13 @@ pub fn iface_allowed_v4(
         addr:    IpAddr::V4(addr),
         netmask: Some(IpAddr::V4(netmask)),
         flags:   if loopback { IFACE_LOOPBACK } else { 0 },
+        ..Default::default()
     };
-    if !iface_check_used(&dummy, iface_check_cfg, used) {
+    // `--auth-server`: a match forces inclusion regardless of the check above
+    // (network.c:153-179's `*auth = 1; ret = 1;`, applied inside `iface_check`
+    // before `iface_allowed` ever sees the combined result).
+    let auth_dns = auth_interface_match(effective_name, IpAddr::V4(addr), &config.auth_interfaces);
+    if !iface_check_used(&dummy, iface_check_cfg, used) && !auth_dns {
         return None;
     }
 
@@ -1611,26 +1850,32 @@ pub fn iface_allowed_v4(
     let mut dhcp4_ok = !loopback;
     let tftp_ok_base = !loopback;
 
-    // Apply dhcp_except deny list. Matches upstream network.c:538-546: any
-    // name match disables TFTP; the family bit gates whether DHCP for this
-    // family is also disabled.
-    let mut tftp_denied = false;
-    for (pat, flags) in &config.dhcp_except {
-        if iface_name_matches(name, pat) {
-            tftp_denied = true;
-            if flags & INAME_4 != 0 {
-                dhcp4_ok = false;
+    let tftp_ok = if auth_dns {
+        // "No DHCP where we're doing auth DNS" (network.c:531-537).
+        dhcp4_ok = false;
+        false
+    } else {
+        // Apply dhcp_except deny list. Matches upstream network.c:538-546: any
+        // name match disables TFTP; the family bit gates whether DHCP for this
+        // family is also disabled.
+        let mut tftp_denied = false;
+        for (pat, flags) in &config.dhcp_except {
+            if iface_name_matches(name, pat) {
+                tftp_denied = true;
+                if flags & INAME_4 != 0 {
+                    dhcp4_ok = false;
+                }
             }
         }
-    }
 
-    // TFTP: if a dedicated list is given, only those interfaces get TFTP.
-    let tftp_ok = if tftp_denied {
-        false
-    } else if config.tftp_ifaces.is_empty() {
-        tftp_ok_base
-    } else {
-        config.tftp_ifaces.iter().any(|p| iface_name_matches(name, p))
+        // TFTP: if a dedicated list is given, only those interfaces get TFTP.
+        if tftp_denied {
+            false
+        } else if config.tftp_ifaces.is_empty() {
+            tftp_ok_base
+        } else {
+            config.tftp_ifaces.iter().any(|p| iface_name_matches(name, p))
+        }
     };
 
     // Compute prefix length from netmask.
@@ -1647,9 +1892,10 @@ pub fn iface_allowed_v4(
         dhcp4_ok,
         dhcp6_ok:   false, // IPv4 interface → no DHCPv6
         tftp_ok,
-        auth_dns:   false,
+        auth_dns,
         found:      true,
         is_label,
+        dad,
     })
 }
 
@@ -1666,6 +1912,7 @@ pub fn iface_allowed_v6(
     addr:       Ipv6Addr,
     prefix_len: u8,
     loopback:   bool,
+    dad:        bool,
     config:     &IfaceAllowedConfig,
     iface_check_cfg: &IfaceCheckConfig,
     used:       &mut IfaceCheckUsed,
@@ -1676,29 +1923,36 @@ pub fn iface_allowed_v6(
         addr:    IpAddr::V6(addr),
         netmask: None,
         flags:   if loopback { IFACE_LOOPBACK } else { 0 },
+        ..Default::default()
     };
-    if !iface_check_used(&dummy, iface_check_cfg, used) {
+    let auth_dns = auth_interface_match(name, IpAddr::V6(addr), &config.auth_interfaces);
+    if !iface_check_used(&dummy, iface_check_cfg, used) && !auth_dns {
         return None;
     }
 
     let mut dhcp6_ok = !loopback;
 
-    let mut tftp_denied = false;
-    for (pat, flags) in &config.dhcp_except {
-        if iface_name_matches(name, pat) {
-            tftp_denied = true;
-            if flags & INAME_6 != 0 {
-                dhcp6_ok = false;
+    let tftp_ok = if auth_dns {
+        dhcp6_ok = false;
+        false
+    } else {
+        let mut tftp_denied = false;
+        for (pat, flags) in &config.dhcp_except {
+            if iface_name_matches(name, pat) {
+                tftp_denied = true;
+                if flags & INAME_6 != 0 {
+                    dhcp6_ok = false;
+                }
             }
         }
-    }
 
-    let tftp_ok = if tftp_denied {
-        false
-    } else if config.tftp_ifaces.is_empty() {
-        !loopback
-    } else {
-        config.tftp_ifaces.iter().any(|p| iface_name_matches(name, p))
+        if tftp_denied {
+            false
+        } else if config.tftp_ifaces.is_empty() {
+            !loopback
+        } else {
+            config.tftp_ifaces.iter().any(|p| iface_name_matches(name, p))
+        }
     };
 
     Some(IfaceRecord {
@@ -1711,9 +1965,10 @@ pub fn iface_allowed_v6(
         dhcp4_ok:   false, // IPv6 interface → no DHCPv4
         dhcp6_ok,
         tftp_ok,
-        auth_dns:   false,
+        auth_dns,
         found:      true,
         is_label:   false,
+        dad,
     })
 }
 
@@ -1770,7 +2025,7 @@ pub fn enumerate_allowed_interfaces(
     check:   &mut IfaceCheckConfig,
     allowed: &IfaceAllowedConfig,
 ) -> std::io::Result<EnumeratedInterfaces> {
-    let live = enumerate_interfaces()?;
+    let live = enumerate_interfaces_for_dns()?;
     let mut out = EnumeratedInterfaces {
         interfaces: Vec::new(),
         used: IfaceCheckUsed::for_config(check),
@@ -1807,8 +2062,8 @@ pub fn enumerate_allowed_interfaces(
                     _ => Ipv4Addr::UNSPECIFIED,
                 };
                 iface_allowed_v4(
-                    &info.name, None, info.index, addr, mask,
-                    info.is_loopback(), allowed, check, &mut out.used,
+                    &info.name, info.label.as_deref(), info.index, addr, mask,
+                    info.is_loopback(), info.dad, allowed, check, &mut out.used,
                 )
             }
             (IpAddr::V6(addr), netmask) => {
@@ -1818,7 +2073,7 @@ pub fn enumerate_allowed_interfaces(
                 };
                 iface_allowed_v6(
                     &info.name, info.index, addr, prefix_len,
-                    info.is_loopback(), allowed, check, &mut out.used,
+                    info.is_loopback(), info.dad, allowed, check, &mut out.used,
                 )
             }
         };
@@ -1886,6 +2141,29 @@ impl ArrivalFilter {
         }
     }
 
+    /// Re-run interface enumeration and report which listen addresses newly
+    /// appeared or disappeared, for `--bind-dynamic` listener lifecycle.
+    ///
+    /// Mirrors the `OPT_CLEVERBIND` branch of `enumerate_interfaces()`
+    /// (`network.c:854-880`), which binds a listener for each newly-seen
+    /// address and releases the listener for each one no longer found.
+    /// A no-op (empty diff) outside `--bind-dynamic`: upstream only performs
+    /// this dance under `OPT_CLEVERBIND`, and `network.c:1240-1250` documents
+    /// that `--bind-interfaces` cannot track interface changes at all.
+    /// Failures leave the previous list in place, same as [`Self::refresh`].
+    pub fn refresh_dynamic(&mut self, port: u16) -> (Vec<std::net::SocketAddr>, Vec<std::net::SocketAddr>) {
+        if !self.cleverbind {
+            return (Vec::new(), Vec::new());
+        }
+        let fresh = match enumerate_allowed_interfaces(&mut self.check, &self.allowed) {
+            Ok(fresh) => fresh,
+            Err(_) => return (Vec::new(), Vec::new()),
+        };
+        let diff = diff_dynamic_interfaces(&self.interfaces, &fresh.interfaces, port);
+        self.interfaces = fresh.interfaces;
+        diff
+    }
+
     /// Decide whether a datagram that arrived on interface index `if_index`,
     /// addressed to `dest`, may be answered.
     ///
@@ -1905,6 +2183,7 @@ impl ArrivalFilter {
             netmask: None,
             flags:   0,
             name,
+            ..Default::default()
         };
         if iface_check(&info, &self.check) {
             return true;
@@ -1938,6 +2217,27 @@ impl ArrivalFilter {
 ///
 /// Returns the number of records removed.
 ///
+/// Compute which listen addresses newly appeared or disappeared between two
+/// interface enumeration passes, keyed by [`IfaceRecord::listen_addr`].
+///
+/// Mirrors the `OPT_CLEVERBIND` branch of `enumerate_interfaces()`
+/// (`network.c:854-880`): an address in `after` but not `before` needs a new
+/// listener bound (`create_bound_listeners`); one in `before` but not `after`
+/// needs its listener released (`release_listener`).
+pub fn diff_dynamic_interfaces(
+    before: &[IfaceRecord],
+    after:  &[IfaceRecord],
+    port:   u16,
+) -> (Vec<std::net::SocketAddr>, Vec<std::net::SocketAddr>) {
+    let before_set: std::collections::HashSet<_> =
+        before.iter().map(|r| r.listen_addr(port)).collect();
+    let after_set: std::collections::HashSet<_> =
+        after.iter().map(|r| r.listen_addr(port)).collect();
+    let added   = after_set.difference(&before_set).cloned().collect();
+    let removed = before_set.difference(&after_set).cloned().collect();
+    (added, removed)
+}
+
 /// Mirrors `clean_interfaces()` in `network.c`.
 pub fn clean_interfaces(ifaces: &mut Vec<IfaceRecord>) -> usize {
     let before = ifaces.len();
@@ -1974,14 +2274,24 @@ pub fn parse_resolv_conf(text: &str, dns_port: u16) -> Vec<std::net::SocketAddr>
             Some(a) => a,
             None => continue,
         };
-        // Strip scope ID for IPv6 (e.g. "fe80::1%eth0" → "fe80::1")
-        let clean = if let Some(idx) = addr_str.find('%') {
-            &addr_str[..idx]
-        } else {
-            addr_str
+        // Split off the scope ID for IPv6 (e.g. "fe80::1%eth0" → "fe80::1", "eth0").
+        // network.c:1738-1745 resolves it via `if_nametoindex()` and stores it in
+        // `sin6_scope_id` rather than discarding it — without a scope a
+        // link-local resolver address is unroutable.
+        let (clean, scope) = match addr_str.find('%') {
+            Some(idx) => (&addr_str[..idx], Some(&addr_str[idx + 1..])),
+            None => (addr_str, None),
         };
         if let Ok(ip) = clean.parse::<std::net::IpAddr>() {
-            servers.push(std::net::SocketAddr::new(ip, dns_port));
+            match (ip, scope) {
+                (std::net::IpAddr::V6(v6), Some(scope)) => {
+                    let scope_id = nametoindex(scope);
+                    servers.push(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                        v6, dns_port, 0, scope_id,
+                    )));
+                }
+                _ => servers.push(std::net::SocketAddr::new(ip, dns_port)),
+            }
         }
     }
     servers
@@ -2010,6 +2320,104 @@ pub fn is_globally_routable(addr: IpAddr) -> bool {
                 || v6 == Ipv6Addr::UNSPECIFIED)
         }
     }
+}
+
+/// Build the "LOUD WARNING" messages upstream logs when `--bind-interfaces`
+/// binds a globally-routable IPv4 address without `--bind-dynamic`.
+///
+/// Direct port of `warn_bound_listeners()` (`network.c:1251-1272`): under plain
+/// `--bind-interfaces` the kernel does not reliably report the arrival
+/// interface for IPv4, so a non-private address risks answering queries that
+/// arrived via an interface it wasn't meant to serve — the DNS-amplification
+/// concern the message calls out. Only `AF_INET` addresses are checked
+/// (upstream never checks IPv6 here), and an auth-DNS interface is exempt
+/// (`iface->dns_auth`, `network.c:1257`) since it isn't a resolver. Uses
+/// [`crate::rfc1035::private_net`] rather than [`is_globally_routable`] to
+/// match upstream's `private_net()` call exactly (CGNAT, test-nets, and the
+/// broadcast address included).
+///
+/// Returns one message per flagged interface, plus a trailing advisory to use
+/// `--bind-dynamic` when any were flagged — matching the two-`my_syslog` shape
+/// of the C function. The caller should log each line and is responsible for
+/// only calling this under `--bind-interfaces` (`OPT_NOWILD`), matching
+/// `dnsmasq.c:963-964`.
+pub fn warn_bound_listeners(interfaces: &[IfaceRecord]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for iface in interfaces {
+        if iface.auth_dns {
+            continue;
+        }
+        if let IpAddr::V4(v4) = iface.addr {
+            if !crate::rfc1035::private_net(v4, true) {
+                warnings.push(format!(
+                    "LOUD WARNING: listening on {v4} may accept requests via interfaces other than {}",
+                    iface.name
+                ));
+            }
+        }
+    }
+    if !warnings.is_empty() {
+        warnings.push(
+            "LOUD WARNING: use --bind-dynamic rather than --bind-interfaces to avoid DNS amplification attacks via these interface(s)"
+                .to_string(),
+        );
+    }
+    warnings
+}
+
+/// Port of `warn_wild_labels()` (`network.c:1276-1283`).
+///
+/// Fires once per interface record that was matched by an alias/label
+/// distinct from its real device name (`iface->label` — this module's
+/// [`IfaceRecord::is_label`]), telling the operator dnsmasq is actually
+/// listening on the base device. Only [`enumerate_interfaces_netlink`] can
+/// populate `is_label` today; the `if-addrs` fallback never sets it, so this
+/// only fires when netlink enumeration is available.
+pub fn warn_wild_labels(interfaces: &[IfaceRecord]) -> Vec<String> {
+    interfaces
+        .iter()
+        .filter(|iface| iface.found && iface.is_label)
+        .map(|iface| format!("warning: using interface {} instead", iface.name))
+        .collect()
+}
+
+/// Port of `warn_int_names()` (`network.c:1285-1292`).
+///
+/// Fires once per `--interface-name` entry with no resolved address. Since
+/// `network.c:358-457`'s per-enumeration address-list refresh for
+/// `daemon->int_names` is not yet ported (`tasks.md`), every entry has an
+/// empty `addrs` list today and this always warns — which is accurate: the
+/// directive currently resolves no addresses at all.
+pub fn warn_int_names(int_names: &[crate::types::dns_records::InterfaceName]) -> Vec<String> {
+    int_names
+        .iter()
+        .filter(|n| n.addrs.is_empty())
+        .map(|n| format!("warning: no addresses found for interface {}", n.intr))
+        .collect()
+}
+
+/// Port of `is_dad_listeners()` (`network.c:1294-1304`).
+///
+/// Upstream defers creating a listener for an address still undergoing DAD by
+/// checking `iface->dad && !iface->done` against a persistent `daemon->interfaces`
+/// list mutated in place. This architecture converts each `Listener` to a raw
+/// socket immediately at bind time rather than retaining that persistent list
+/// (see `listener_take_udp`), so `bound` — the listen addresses that already
+/// have a live socket — stands in for `iface->done`. Only meaningful under
+/// `--bind-interfaces` (`OPT_NOWILD`), matching upstream: `--bind-dynamic` and
+/// the default wildcard mode never gate on DAD state.
+pub fn is_dad_listeners(
+    interfaces: &[IfaceRecord],
+    bound:      &[std::net::SocketAddr],
+    nowild:     bool,
+    port:       u16,
+) -> bool {
+    if !nowild {
+        return false;
+    }
+    interfaces
+        .iter()
+        .any(|iface| iface.dad && !bound.contains(&iface.listen_addr(port)))
 }
 
 /// Validate an upstream server address.
@@ -2133,6 +2541,7 @@ mod tests {
             addr:    IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             netmask: None,
             flags:   0,
+            ..Default::default()
         }
     }
 
@@ -2168,7 +2577,7 @@ mod tests {
     // ── iface_check: --listen-address (network.c:130-148) ────────────────────
 
     fn make_iface_at(name: &str, addr: IpAddr) -> IfaceInfo {
-        IfaceInfo { name: name.to_string(), index: 0, addr, netmask: None, flags: 0 }
+        IfaceInfo { name: name.to_string(), index: 0, addr, netmask: None, flags: 0, ..Default::default() }
     }
 
     /// `--listen-address` alone restricts the served set: an interface whose
@@ -2306,6 +2715,47 @@ mod tests {
         assert!(!ifaces.is_empty(), "no interfaces found");
         let has_lo = ifaces.iter().any(|i| i.addr.is_loopback());
         assert!(has_lo, "no loopback address found");
+    }
+
+    /// Sandboxes vary in whether they allow an `AF_NETLINK` socket at all; skip
+    /// rather than fail when one can't be opened, per this repo's rule for
+    /// capability-dependent tests.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn enumerate_interfaces_netlink_matches_if_addrs_when_available() {
+        let netlink_result = enumerate_interfaces_netlink();
+        let Ok(netlink_ifaces) = netlink_result else {
+            eprintln!("skipping: netlink enumeration unavailable in this sandbox");
+            return;
+        };
+        assert!(!netlink_ifaces.is_empty(), "no interfaces found via netlink");
+        let has_lo = netlink_ifaces.iter().any(|i| i.addr.is_loopback());
+        assert!(has_lo, "no loopback address found via netlink");
+
+        // Every non-link-local address reported over netlink should also show
+        // up via `if-addrs`, confirming the two enumeration sources agree on
+        // the basic address set even though only netlink can supply
+        // dad/label. Link-local (`fe80::/10`) addresses are excluded:
+        // `if-addrs`'s `getifaddrs` backend drops them entirely (a known,
+        // separately tracked gap in `tasks.md`), so netlink reporting more
+        // of them than `if-addrs` is expected, not a divergence bug.
+        let portable = enumerate_interfaces().expect("if-addrs enumeration failed");
+        for nl in netlink_ifaces.iter().filter(|i| !matches!(i.addr, IpAddr::V6(a) if is_link_local_v6(a))) {
+            assert!(
+                portable.iter().any(|p| p.addr == nl.addr && p.index == nl.index),
+                "netlink-reported address {:?} on index {} missing from if-addrs enumeration",
+                nl.addr, nl.index,
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn enumerate_interfaces_for_dns_falls_back_when_netlink_unavailable() {
+        // Whatever the sandbox allows, this must never error: it always has
+        // the if-addrs fallback.
+        let result = enumerate_interfaces_for_dns();
+        assert!(result.is_ok());
     }
 
     /// The loopback interface must come back flagged and with a real index —
@@ -2447,6 +2897,122 @@ mod tests {
         );
         assert!(!filter.accepts(0, None));
         assert!(!filter.accepts(0, Some(IpAddr::V4(Ipv4Addr::LOCALHOST))));
+    }
+
+    // ── dynamic interface listener lifecycle (--bind-dynamic) ────────────────
+
+    /// Mirrors the `OPT_CLEVERBIND` branch of `enumerate_interfaces()`
+    /// (`network.c:854-880`): an address seen in `after` but not `before` must
+    /// be reported so a new listener can be bound for it, and one seen only in
+    /// `before` reported so its listener can be released.
+    #[test]
+    fn diff_dynamic_interfaces_detects_added_and_removed() {
+        let eth0 = IfaceRecord {
+            name: "eth0".into(),
+            addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            ..Default::default()
+        };
+        let eth1 = IfaceRecord {
+            name: "eth1".into(),
+            addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)),
+            ..Default::default()
+        };
+        let (added, removed) = diff_dynamic_interfaces(
+            std::slice::from_ref(&eth0),
+            std::slice::from_ref(&eth1),
+            53,
+        );
+        assert_eq!(added, vec![eth1.listen_addr(53)]);
+        assert_eq!(removed, vec![eth0.listen_addr(53)]);
+    }
+
+    #[test]
+    fn diff_dynamic_interfaces_empty_when_unchanged() {
+        let eth0 = IfaceRecord {
+            name: "eth0".into(),
+            addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            ..Default::default()
+        };
+        let (added, removed) = diff_dynamic_interfaces(
+            std::slice::from_ref(&eth0),
+            std::slice::from_ref(&eth0),
+            53,
+        );
+        assert!(added.is_empty());
+        assert!(removed.is_empty());
+    }
+
+    /// Regression test for the `--bind-dynamic` DAD-reconciliation bug
+    /// (Issue #39): a DAD-tentative address left in `ArrivalFilter`'s
+    /// baseline is already present in `before`, so once DAD completes and a
+    /// fresh enumeration reports the same address with `dad: false`,
+    /// `diff_dynamic_interfaces` (address-keyed, DAD-unaware by design) sees
+    /// no change and the address never gets a listener. `bind_dns_listeners`
+    /// now excludes DAD addresses from the baseline it hands to
+    /// `ArrivalFilter::new`, so the completed address is genuinely absent
+    /// from `before` and shows up as added on the next `refresh_dynamic` tick.
+    #[test]
+    fn diff_dynamic_interfaces_reports_dad_address_as_added_once_baseline_excludes_it() {
+        let tentative = IfaceRecord {
+            name: "eth0".into(),
+            addr: IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+            dad: true,
+            ..Default::default()
+        };
+        let resolved = IfaceRecord { dad: false, ..tentative.clone() };
+
+        // The old bug: a DAD address left in the baseline is already present
+        // in `before`, so the diff reports nothing once DAD resolves.
+        let (added, removed) = diff_dynamic_interfaces(
+            std::slice::from_ref(&tentative),
+            std::slice::from_ref(&resolved),
+            53,
+        );
+        assert!(added.is_empty(), "old baseline masks the now-resolved address");
+        assert!(removed.is_empty());
+
+        // The fix: excluding DAD addresses from the baseline (mirroring
+        // `bind_dns_listeners`'s `.filter(|i| !i.dad)`) means the resolved
+        // address is genuinely new on the next pass.
+        let baseline: Vec<IfaceRecord> =
+            vec![tentative].into_iter().filter(|i| !i.dad).collect();
+        assert!(baseline.is_empty());
+        let (added, removed) =
+            diff_dynamic_interfaces(&baseline, std::slice::from_ref(&resolved), 53);
+        assert_eq!(added, vec![resolved.listen_addr(53)]);
+        assert!(removed.is_empty());
+    }
+
+    /// `--bind-interfaces` (not `--bind-dynamic`) must never report dynamic
+    /// listener changes — upstream only creates/releases listeners on the fly
+    /// for `OPT_CLEVERBIND` (network.c:854).
+    #[test]
+    fn arrival_filter_refresh_dynamic_noop_when_not_cleverbind() {
+        let mut filter = ArrivalFilter::new(
+            IfaceCheckConfig::default(),
+            IfaceAllowedConfig::default(),
+            Vec::new(),
+            /*cleverbind=*/false,
+        );
+        let (added, removed) = filter.refresh_dynamic(53);
+        assert!(added.is_empty());
+        assert!(removed.is_empty());
+    }
+
+    /// A live host's interfaces do not change between two calls a moment
+    /// apart, so a `--bind-dynamic` filter built from a fresh enumeration must
+    /// report no changes against itself.
+    #[test]
+    fn arrival_filter_refresh_dynamic_stable_when_nothing_changed() {
+        let mut check = IfaceCheckConfig::default();
+        let allowed = IfaceAllowedConfig::default();
+        let enumerated = enumerate_allowed_interfaces(&mut check, &allowed)
+            .expect("enumeration must succeed");
+        let mut filter =
+            ArrivalFilter::new(check, allowed, enumerated.interfaces, /*cleverbind=*/true);
+        let (added, removed) = filter.refresh_dynamic(53);
+        assert!(added.is_empty(), "unexpected additions: {added:?}");
+        assert!(removed.is_empty(), "unexpected removals: {removed:?}");
     }
 
     // ── listener socket creation ──────────────────────────────────────────────
@@ -2844,7 +3410,7 @@ mod tests {
             "eth0", None, 2,
             Ipv4Addr::new(192, 168, 1, 1),
             Ipv4Addr::new(255, 255, 255, 0),
-            false,
+            false, false,
             &default_allowed_cfg(), &default_check_cfg(), &mut IfaceCheckUsed::default(),
         );
         assert!(rec.is_some());
@@ -2859,7 +3425,7 @@ mod tests {
             "lo", None, 1,
             Ipv4Addr::new(127, 0, 0, 1),
             Ipv4Addr::new(255, 0, 0, 0),
-            true,
+            true, false,
             &default_allowed_cfg(), &default_check_cfg(), &mut IfaceCheckUsed::default(),
         ).unwrap();
         assert!(!rec.dhcp4_ok, "loopback should have dhcp4 disabled");
@@ -2876,7 +3442,7 @@ mod tests {
             "eth0", None, 2,
             Ipv4Addr::new(192, 168, 1, 1),
             Ipv4Addr::new(255, 255, 255, 0),
-            false,
+            false, false,
             &cfg, &default_check_cfg(), &mut IfaceCheckUsed::default(),
         ).unwrap();
         assert!(!rec.dhcp4_ok, "dhcp_except should disable dhcp");
@@ -2894,7 +3460,7 @@ mod tests {
             "eth0", None, 2,
             Ipv4Addr::new(192, 168, 1, 1),
             Ipv4Addr::new(255, 255, 255, 0),
-            false,
+            false, false,
             &cfg, &default_check_cfg(), &mut IfaceCheckUsed::default(),
         ).unwrap();
         assert!(rec.dhcp4_ok, "no-dhcpv6-interface must not disable dhcp4");
@@ -2911,7 +3477,7 @@ mod tests {
             "eth0", 2,
             "fe80::1".parse().unwrap(),
             64,
-            false,
+            false, false,
             &cfg, &default_check_cfg(), &mut IfaceCheckUsed::default(),
         ).unwrap();
         assert!(rec.dhcp6_ok, "no-dhcpv4-interface must not disable dhcp6");
@@ -2927,7 +3493,7 @@ mod tests {
             "eth0", 2,
             "fe80::1".parse().unwrap(),
             64,
-            false,
+            false, false,
             &cfg, &default_check_cfg(), &mut IfaceCheckUsed::default(),
         ).unwrap();
         assert!(!rec.dhcp6_ok, "no-dhcpv6-interface should disable dhcp6");
@@ -2943,7 +3509,7 @@ mod tests {
             "docker0", None, 5,
             Ipv4Addr::new(172, 17, 0, 1),
             Ipv4Addr::new(255, 255, 0, 0),
-            false,
+            false, false,
             &default_allowed_cfg(), &check_cfg, &mut IfaceCheckUsed::default(),
         );
         assert!(rec.is_none(), "docker0 should be denied by check_cfg deny list");
@@ -2955,7 +3521,7 @@ mod tests {
     fn iface_allowed_v6_accepts_global_addr() {
         let addr = "2001:db8::1".parse::<Ipv6Addr>().unwrap();
         let rec = iface_allowed_v6(
-            "eth0", 2, addr, 64, false,
+            "eth0", 2, addr, 64, false, false,
             &default_allowed_cfg(), &default_check_cfg(), &mut IfaceCheckUsed::default(),
         );
         assert!(rec.is_some());
@@ -2968,11 +3534,156 @@ mod tests {
     fn iface_allowed_v6_loopback_disables_dhcp6() {
         let addr = "::1".parse::<Ipv6Addr>().unwrap();
         let rec = iface_allowed_v6(
-            "lo", 1, addr, 128, true,
+            "lo", 1, addr, 128, true, false,
             &default_allowed_cfg(), &default_check_cfg(), &mut IfaceCheckUsed::default(),
         ).unwrap();
         assert!(!rec.dhcp6_ok);
         assert!(!rec.tftp_ok);
+    }
+
+    // ── auth_interface_match / --auth-server precedence ─────────────────────────
+
+    #[test]
+    fn auth_interface_match_by_name_any_family() {
+        let entries = vec![AuthInterface { name: Some("eth0".to_string()), addr: None, flags: 0 }];
+        assert!(auth_interface_match("eth0", IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), &entries));
+        assert!(auth_interface_match("eth0", "2001:db8::1".parse().unwrap(), &entries));
+        assert!(!auth_interface_match("eth1", IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), &entries));
+    }
+
+    #[test]
+    fn auth_interface_match_by_name_family_restricted() {
+        let entries = vec![AuthInterface { name: Some("eth0".to_string()), addr: None, flags: INAME_4 }];
+        assert!(auth_interface_match("eth0", IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), &entries));
+        assert!(!auth_interface_match("eth0", "2001:db8::1".parse().unwrap(), &entries));
+    }
+
+    #[test]
+    fn auth_interface_match_by_address() {
+        let addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let entries = vec![AuthInterface { name: None, addr: Some(addr), flags: 0 }];
+        assert!(auth_interface_match("eth0", addr, &entries));
+        assert!(!auth_interface_match("eth0", IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), &entries));
+    }
+
+    #[test]
+    fn auth_interface_match_empty_list_never_matches() {
+        assert!(!auth_interface_match("eth0", IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), &[]));
+    }
+
+    #[test]
+    fn iface_allowed_v4_auth_server_forces_inclusion_past_deny_list() {
+        // Denied by --except-interface, but an --auth-server match must still
+        // force inclusion (network.c:153-179's `*auth = 1; ret = 1;`).
+        let check_cfg = IfaceCheckConfig {
+            deny: vec!["eth0".to_string()],
+            ..Default::default()
+        };
+        let allowed_cfg = IfaceAllowedConfig {
+            auth_interfaces: vec![AuthInterface { name: Some("eth0".to_string()), addr: None, flags: 0 }],
+            ..Default::default()
+        };
+        let rec = iface_allowed_v4(
+            "eth0", None, 2,
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(255, 255, 255, 0),
+            false, false,
+            &allowed_cfg, &check_cfg, &mut IfaceCheckUsed::default(),
+        ).expect("auth-server match must force inclusion despite except-interface");
+        assert!(rec.auth_dns, "matched interface must be marked dns_auth");
+        assert!(!rec.dhcp4_ok, "auth-DNS interfaces must not offer DHCP (network.c:531-537)");
+        assert!(!rec.tftp_ok, "auth-DNS interfaces must not offer TFTP (network.c:531-537)");
+    }
+
+    #[test]
+    fn iface_allowed_v4_auth_server_by_address() {
+        let addr = Ipv4Addr::new(192, 168, 1, 1);
+        let allowed_cfg = IfaceAllowedConfig {
+            auth_interfaces: vec![AuthInterface { name: None, addr: Some(IpAddr::V4(addr)), flags: 0 }],
+            ..Default::default()
+        };
+        let rec = iface_allowed_v4(
+            "eth0", None, 2, addr, Ipv4Addr::new(255, 255, 255, 0), false, false,
+            &allowed_cfg, &default_check_cfg(), &mut IfaceCheckUsed::default(),
+        ).unwrap();
+        assert!(rec.auth_dns);
+        assert!(!rec.dhcp4_ok);
+    }
+
+    #[test]
+    fn iface_allowed_v4_no_auth_server_leaves_dns_auth_false() {
+        let rec = iface_allowed_v4(
+            "eth0", None, 2,
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(255, 255, 255, 0),
+            false, false,
+            &default_allowed_cfg(), &default_check_cfg(), &mut IfaceCheckUsed::default(),
+        ).unwrap();
+        assert!(!rec.auth_dns);
+        assert!(rec.dhcp4_ok);
+    }
+
+    #[test]
+    fn iface_allowed_v6_auth_server_disables_dhcp6_and_tftp() {
+        let addr: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let allowed_cfg = IfaceAllowedConfig {
+            auth_interfaces: vec![AuthInterface { name: Some("eth0".to_string()), addr: None, flags: 0 }],
+            ..Default::default()
+        };
+        let rec = iface_allowed_v6(
+            "eth0", 2, addr, 64, false, false,
+            &allowed_cfg, &default_check_cfg(), &mut IfaceCheckUsed::default(),
+        ).unwrap();
+        assert!(rec.auth_dns);
+        assert!(!rec.dhcp6_ok);
+        assert!(!rec.tftp_ok);
+    }
+
+    // ── warn_bound_listeners ─────────────────────────────────────────────────────
+
+    #[test]
+    fn warn_bound_listeners_warns_on_globally_routable_v4() {
+        let ifaces = vec![IfaceRecord {
+            name: "eth0".to_string(),
+            addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)),
+            ..Default::default()
+        }];
+        let warnings = warn_bound_listeners(&ifaces);
+        assert_eq!(warnings.len(), 2, "one per-interface warning plus the advisory");
+        assert!(warnings[0].contains("203.0.113.5"));
+        assert!(warnings[0].contains("eth0"));
+        assert!(warnings[1].contains("--bind-dynamic"));
+    }
+
+    #[test]
+    fn warn_bound_listeners_silent_for_private_address() {
+        let ifaces = vec![IfaceRecord {
+            name: "eth0".to_string(),
+            addr: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            ..Default::default()
+        }];
+        assert!(warn_bound_listeners(&ifaces).is_empty());
+    }
+
+    #[test]
+    fn warn_bound_listeners_silent_for_auth_dns_interface() {
+        let ifaces = vec![IfaceRecord {
+            name: "eth0".to_string(),
+            addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)),
+            auth_dns: true,
+            ..Default::default()
+        }];
+        assert!(warn_bound_listeners(&ifaces).is_empty(), "auth-DNS interfaces are exempt (network.c:1257)");
+    }
+
+    #[test]
+    fn warn_bound_listeners_ignores_ipv6() {
+        let ifaces = vec![IfaceRecord {
+            name: "eth0".to_string(),
+            addr: "2001:db8::1".parse().unwrap(),
+            ..Default::default()
+        }];
+        assert!(warn_bound_listeners(&ifaces).is_empty(), "upstream only checks AF_INET (network.c:1258)");
     }
 
     // ── clean_interfaces ──────────────────────────────────────────────────────
@@ -2996,6 +3707,144 @@ mod tests {
         let mut ifaces: Vec<IfaceRecord> = vec![];
         let removed = clean_interfaces(&mut ifaces);
         assert_eq!(removed, 0);
+    }
+
+    // ── warn_wild_labels / warn_int_names / is_dad_listeners ────────────────
+
+    #[test]
+    fn warn_wild_labels_warns_on_labelled_found_interface() {
+        let ifaces = vec![IfaceRecord {
+            name: "eth0".to_string(),
+            found: true,
+            is_label: true,
+            ..Default::default()
+        }];
+        let warnings = warn_wild_labels(&ifaces);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("eth0"));
+    }
+
+    #[test]
+    fn warn_wild_labels_silent_without_label() {
+        let ifaces = vec![IfaceRecord {
+            name: "eth0".to_string(),
+            found: true,
+            is_label: false,
+            ..Default::default()
+        }];
+        assert!(warn_wild_labels(&ifaces).is_empty());
+    }
+
+    #[test]
+    fn warn_wild_labels_silent_when_not_found() {
+        let ifaces = vec![IfaceRecord {
+            name: "eth0".to_string(),
+            found: false,
+            is_label: true,
+            ..Default::default()
+        }];
+        assert!(warn_wild_labels(&ifaces).is_empty(), "network.c:1281 requires iface->found too");
+    }
+
+    fn make_int_name(intr: &str, addrs: Vec<crate::types::dns_records::Addrlist>) -> crate::types::dns_records::InterfaceName {
+        crate::types::dns_records::InterfaceName {
+            name:   "example.com".to_string(),
+            intr:   intr.to_string(),
+            flags:  0,
+            proto4: None,
+            proto6: None,
+            addrs,
+        }
+    }
+
+    #[test]
+    fn warn_int_names_warns_on_empty_address_list() {
+        let names = vec![make_int_name("eth0", vec![])];
+        let warnings = warn_int_names(&names);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("eth0"));
+    }
+
+    #[test]
+    fn warn_int_names_silent_when_addresses_present() {
+        use crate::types::dns_records::Addrlist;
+        let al = Addrlist {
+            addr:         crate::types::addr::AllAddr::Addr4(Ipv4Addr::new(192, 168, 1, 1)),
+            flags:        0,
+            prefixlen:    0,
+            decline_time: None,
+        };
+        let names = vec![make_int_name("eth0", vec![al])];
+        assert!(warn_int_names(&names).is_empty());
+    }
+
+    #[test]
+    fn is_dad_listeners_true_for_unbound_dad_address_under_nowild() {
+        let ifaces = vec![IfaceRecord {
+            addr: "fe80::1".parse().unwrap(),
+            index: 3,
+            dad: true,
+            ..Default::default()
+        }];
+        assert!(is_dad_listeners(&ifaces, &[], /*nowild=*/true, 53));
+    }
+
+    #[test]
+    fn is_dad_listeners_false_once_bound() {
+        let iface = IfaceRecord {
+            addr: "fe80::1".parse().unwrap(),
+            index: 3,
+            dad: true,
+            ..Default::default()
+        };
+        let bound = vec![iface.listen_addr(53)];
+        assert!(!is_dad_listeners(std::slice::from_ref(&iface), &bound, true, 53));
+    }
+
+    #[test]
+    fn is_dad_listeners_false_outside_nowild() {
+        let ifaces = vec![IfaceRecord { dad: true, ..Default::default() }];
+        assert!(!is_dad_listeners(&ifaces, &[], /*nowild=*/false, 53),
+            "network.c:1298: only OPT_NOWILD (--bind-interfaces) gates on DAD");
+    }
+
+    #[test]
+    fn is_dad_listeners_false_without_dad_flag() {
+        let ifaces = vec![IfaceRecord { dad: false, ..Default::default() }];
+        assert!(!is_dad_listeners(&ifaces, &[], true, 53));
+    }
+
+    // ── iface_allowed_v4/v6 thread the `dad` flag into IfaceRecord ──────────
+
+    #[test]
+    fn iface_allowed_v6_threads_dad_flag_into_record() {
+        let rec = iface_allowed_v6(
+            "eth0", 2, "fe80::1".parse().unwrap(), 64, false, /*dad=*/true,
+            &default_allowed_cfg(), &default_check_cfg(), &mut IfaceCheckUsed::default(),
+        ).unwrap();
+        assert!(rec.dad, "an address mid-DAD must be recorded as such (network.c:577)");
+    }
+
+    #[test]
+    fn iface_allowed_v6_not_dad_by_default() {
+        let rec = iface_allowed_v6(
+            "eth0", 2, "2001:db8::1".parse().unwrap(), 64, false, false,
+            &default_allowed_cfg(), &default_check_cfg(), &mut IfaceCheckUsed::default(),
+        ).unwrap();
+        assert!(!rec.dad);
+    }
+
+    #[test]
+    fn iface_allowed_v4_threads_real_label_into_is_label() {
+        let rec = iface_allowed_v4(
+            "eth0", Some("eth0:0"), 2,
+            Ipv4Addr::new(192, 168, 1, 2),
+            Ipv4Addr::new(255, 255, 255, 0),
+            false, false,
+            &default_allowed_cfg(), &default_check_cfg(), &mut IfaceCheckUsed::default(),
+        ).unwrap();
+        assert!(rec.is_label, "a label distinct from the base name must set is_label (network.c:266-269)");
+        assert_eq!(rec.name, "eth0", "iface->name stays the base device name, not the label");
     }
 
     // ── parse_resolv_conf ────────────────────────────────────────────────────
@@ -3022,6 +3871,38 @@ mod tests {
         let text = "nameserver fe80::1%eth0\n";
         let servers = parse_resolv_conf(text, 53);
         assert_eq!(servers.len(), 1);
+    }
+
+    /// `network.c:1738-1745`: `reload_servers()` resolves the `%<iface>` scope
+    /// via `if_nametoindex()` and stores it in `sin6_scope_id`, not just
+    /// strips it — a link-local resolver is unroutable without it.
+    #[test]
+    fn parse_resolv_conf_ipv6_scope_resolves_interface_index() {
+        let lo_index = nametoindex("lo");
+        let text = "nameserver fe80::1%lo\n";
+        let servers = parse_resolv_conf(text, 53);
+        assert_eq!(servers.len(), 1);
+        match servers[0] {
+            std::net::SocketAddr::V6(v6) => {
+                assert_eq!(v6.scope_id(), lo_index);
+                assert_ne!(v6.scope_id(), 0, "loopback must resolve to a nonzero index");
+            }
+            other => panic!("expected an IPv6 address, got {other:?}"),
+        }
+    }
+
+    /// An unresolvable scope name must not make the whole line unparsable —
+    /// upstream's `if_nametoindex()` returns `0` for an unknown name and
+    /// still stores that as `sin6_scope_id`.
+    #[test]
+    fn parse_resolv_conf_ipv6_unknown_scope_resolves_to_zero() {
+        let text = "nameserver fe80::1%this-interface-does-not-exist\n";
+        let servers = parse_resolv_conf(text, 53);
+        assert_eq!(servers.len(), 1);
+        match servers[0] {
+            std::net::SocketAddr::V6(v6) => assert_eq!(v6.scope_id(), 0),
+            other => panic!("expected an IPv6 address, got {other:?}"),
+        }
     }
 
     #[test]

@@ -1072,6 +1072,8 @@ fn iface_check_config(daemon: &Daemon) -> crate::network::IfaceCheckConfig {
 
 /// Per-interface DHCP/TFTP permissions, for `iface_allowed_v4`/`_v6`.
 fn iface_allowed_config(daemon: &Daemon) -> crate::network::IfaceAllowedConfig {
+    use crate::types::addr::MySockAddr as Msa;
+
     let _ = daemon;
     #[allow(unused_mut)] // both fields below are feature-gated
     let mut config = crate::network::IfaceAllowedConfig::default();
@@ -1086,6 +1088,16 @@ fn iface_allowed_config(daemon: &Daemon) -> crate::network::IfaceAllowedConfig {
         config.tftp_ifaces =
             daemon.tftp_interfaces.iter().filter_map(|i| i.name.clone()).collect();
     }
+    config.auth_interfaces = daemon.auth_interfaces.iter()
+        .map(|i| crate::network::AuthInterface {
+            name:  i.name.clone(),
+            addr:  i.addr.as_ref().map(|a| match a {
+                Msa::V4(s) => std::net::IpAddr::V4(*s.ip()),
+                Msa::V6(s) => std::net::IpAddr::V6(*s.ip()),
+            }),
+            flags: i.flags,
+        })
+        .collect();
     config
 }
 
@@ -1100,27 +1112,12 @@ fn adopt_dns_listeners(
     listeners: Vec<crate::network::Listener>,
     nowild: bool,
 ) -> Result<Vec<BoundDnsSocket>, DnsmasqError> {
-    use std::os::unix::io::FromRawFd;
-
     let mut out = Vec::with_capacity(listeners.len());
-    for mut l in listeners {
-        // Nothing serves these yet, and the `Listener` is about to be dropped
-        // without running `release()`, so close them here rather than leak.
-        for fd in [std::mem::replace(&mut l.tcp_fd, -1), std::mem::replace(&mut l.tftp_fd, -1)] {
-            if fd >= 0 {
-                unsafe { libc::close(fd) };
-            }
-        }
-        if l.udp_fd < 0 {
-            continue;
-        }
-        // Safety: `create_listeners` just returned this fd and we take sole
-        // ownership of it; the `Listener` is consumed here and never released.
-        let sock = unsafe { std::net::UdpSocket::from_raw_fd(l.udp_fd) };
-        sock.set_nonblocking(true)?;
-        // Report what the kernel actually gave us, which differs from the
-        // requested address whenever port 0 was asked for.
-        let addr = sock.local_addr().unwrap_or(l.addr);
+    for l in listeners {
+        let (sock, addr) = match crate::network::listener_take_udp(l) {
+            Ok(pair) => pair,
+            Err(_) => continue, // no UDP fd on this Listener (TCP/TFTP-only)
+        };
         // forward.c:1612 — the arrival interface is always available for IPv6,
         // so only IPv4 under --bind-interfaces goes unchecked.
         let check_dst = !nowild || addr.is_ipv6();
@@ -1168,6 +1165,14 @@ fn bind_dns_listeners(
     let enumerated  = network::enumerate_allowed_interfaces(&mut check, &allowed_cfg)
         .map_err(|e| DnsmasqError::BadNet(format!("failed to find list of interfaces: {e}")))?;
 
+    // `dnsmasq.c:969`: `warn_int_names` fires unconditionally, in every bind
+    // mode — the only Rust caller (`Daemon::int_names`), so it always warns
+    // today since nothing yet populates `InterfaceName::addrs`
+    // (`network.c:358-457`, tracked separately in `tasks.md`).
+    for msg in network::warn_int_names(&daemon.int_names) {
+        tracing::warn!("{msg}");
+    }
+
     if !nowild && !cleverbind {
         let listeners = network::create_wildcard_listeners_checked(port, kinds)
             .map_err(|e| DnsmasqError::Bind(format!("0.0.0.0:{port}"), e.to_string()))?;
@@ -1177,6 +1182,11 @@ fn bind_dns_listeners(
                 "could not create any wildcard listener".to_string(),
             ));
         }
+        // `dnsmasq.c:966-967`: plain wildcard mode warns about labelled
+        // aliases dnsmasq is folding into their base device.
+        for msg in network::warn_wild_labels(&enumerated.interfaces) {
+            tracing::warn!("{msg}");
+        }
         let filter = network::ArrivalFilter::new(
             check, allowed_cfg, enumerated.interfaces, cleverbind,
         );
@@ -1184,12 +1194,42 @@ fn bind_dns_listeners(
     }
 
     // ── --bind-interfaces / --bind-dynamic ───────────────────────────────────
+    // `dnsmasq.c:963-964`: `warn_bound_listeners` fires only under plain
+    // `--bind-interfaces` (`OPT_NOWILD`), not `--bind-dynamic`, which actually
+    // rechecks the arrival interface and so isn't at risk.
+    if nowild {
+        for msg in network::warn_bound_listeners(&enumerated.interfaces) {
+            tracing::warn!("{msg}");
+        }
+    }
+
+    // `network.c:1298-1304`'s `is_dad_listeners()`: under `--bind-interfaces`
+    // an IPv6 address still completing Duplicate Address Detection is left
+    // unbound rather than bound prematurely — upstream's main loop retries it
+    // once DAD finishes (`dnsmasq.c:1104,1217-1223`). This Rust build binds
+    // once at startup and has no periodic re-check yet, so a DAD address
+    // deferred here stays unbound for the life of the process; that's a
+    // narrower port than upstream's retry loop, tracked in `tasks.md`.
+    if network::is_dad_listeners(&enumerated.interfaces, &[], nowild, port) {
+        for iface in enumerated.interfaces.iter().filter(|i| i.dad) {
+            tracing::warn!(
+                "waiting for DAD to complete on {} before binding {}",
+                iface.name, iface.addr
+            );
+        }
+    }
+
     // `listen_addr` carries the interface index into `sin6_scope_id` for
     // link-local addresses; without it the bind fails with EINVAL
     // (`network.c:617-620`).
+    //
+    // `network.c:1177-1210`'s `create_bound_listeners()` skips a DAD address
+    // (`!iface->dad`) unconditionally, in both `--bind-interfaces` and
+    // `--bind-dynamic` — not just under `nowild` as this filter used to read.
     let iface_addrs: Vec<(SocketAddr, String)> = enumerated
         .interfaces
         .iter()
+        .filter(|i| !i.dad)
         .map(|i| (i.listen_addr(port), i.name.clone()))
         .collect();
 
@@ -1234,8 +1274,18 @@ fn bind_dns_listeners(
     // Bound listeners are arrival-checked too, except IPv4 under plain
     // --bind-interfaces (`forward.c:1612`).  Under --bind-dynamic that check is
     // the entire point of the option (`network.c:1240-1250`).
+    //
+    // The filter's baseline excludes DAD addresses too, matching the bind
+    // exclusion above: `refresh_dynamic`'s diff (`diff_dynamic_interfaces`)
+    // only reports an address as newly-appeared if it wasn't already in the
+    // previous pass's list. A DAD-tentative address left in the baseline
+    // would never be seen as "new" once DAD completes and a fresh enumeration
+    // reports it (now with `dad: false`) — it would just look unchanged and
+    // stay permanently unbound under `--bind-dynamic`.
     let filter = network::ArrivalFilter::new(
-        check, allowed_cfg, enumerated.interfaces, cleverbind,
+        check, allowed_cfg,
+        enumerated.interfaces.into_iter().filter(|i| !i.dad).collect(),
+        cleverbind,
     );
     Ok((adopt_dns_listeners(listeners, nowild)?, Some(filter)))
 }
@@ -2214,20 +2264,43 @@ pub async fn clear_cache_and_reload(daemon_handle: &DaemonHandle, cache: &crate:
 
     let mut d = daemon_handle.write().await;
     if any_resolv_read {
+        use crate::domain_match::{add_update_server, cleanup_servers, mark_servers};
         use crate::types::addr::MySockAddr;
         use crate::types::server::{SERV_4ADDR, SERV_6ADDR, SERV_FROM_RESOLV};
 
-        let dummy_source = MySockAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
-        d.servers.retain(|s| s.flags & SERV_FROM_RESOLV == 0);
+        let query_port = d.query_port;
+        // network.c:1711/1766/1774 — mark every existing resolv-derived server,
+        // then let `add_update_server` reuse a marked entry (by domain — always
+        // "" here) instead of rebuilding it, so its query statistics survive an
+        // unchanged address across reload; whatever is still marked afterwards
+        // (an address that dropped out of the file) is swept away.
+        mark_servers(&mut d.servers, SERV_FROM_RESOLV);
         for addr in discovered {
+            // network.c:1729-1754 — `source_addr` is the wildcard address in the
+            // *same* family as the server, bound to `--query-port`; scope is
+            // always 0 for the source, only the destination carries it.
+            let (my_addr, source_addr) = match addr {
+                std::net::SocketAddr::V4(v4) => (
+                    MySockAddr::V4(v4),
+                    MySockAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, query_port)),
+                ),
+                std::net::SocketAddr::V6(v6) => (
+                    MySockAddr::V6(v6),
+                    MySockAddr::V6(std::net::SocketAddrV6::new(
+                        Ipv6Addr::UNSPECIFIED,
+                        query_port,
+                        0,
+                        0,
+                    )),
+                ),
+            };
             let flags = SERV_FROM_RESOLV | if addr.is_ipv6() { SERV_6ADDR } else { SERV_4ADDR };
-            d.servers.push(crate::option::new_server(
-                flags,
-                String::new(),
-                MySockAddr::from(addr),
-                dummy_source.clone(),
-            ));
+            add_update_server(
+                &mut d.servers,
+                crate::option::new_server(flags, String::new(), my_addr, source_addr),
+            );
         }
+        cleanup_servers(&mut d.servers);
     }
 
     // Mark DNS data as dirty so consumers know to refresh.
@@ -4477,6 +4550,112 @@ mod tests {
             resolv_derived, 1,
             "an unchanged resolv file must not accumulate duplicate server entries",
         );
+    }
+
+    /// Upstream's `reload_servers()` diffs via `mark_servers`/`add_update_server`/
+    /// `cleanup_servers` (`network.c:1711,1766,1774`), which *reuses* the existing
+    /// `Server` entry for an address that survives the reload rather than
+    /// replacing it — so its query statistics carry over.  A naive
+    /// retain-then-rebuild loses them on every SIGHUP.
+    #[tokio::test]
+    async fn clear_cache_and_reload_preserves_query_stats_for_unchanged_resolv_server() {
+        use crate::types::network::Resolvc;
+        use crate::types::server::SERV_FROM_RESOLV;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "nameserver 198.51.100.9\n").unwrap();
+
+        let handle = init_daemon();
+        {
+            let mut d = handle.write().await;
+            d.resolv_files.push(Resolvc {
+                is_default: false,
+                logged: false,
+                mtime: 0,
+                ino: 0,
+                name: path.to_str().unwrap().to_string(),
+                #[cfg(feature = "inotify")]
+                wd: -1,
+                #[cfg(feature = "inotify")]
+                file: None,
+            });
+        }
+        let cache = crate::cache::new_shared_cache(150, 0, 0);
+
+        clear_cache_and_reload(&handle, &cache).await;
+        {
+            let mut d = handle.write().await;
+            let server = d
+                .servers
+                .iter_mut()
+                .find(|s| s.flags & SERV_FROM_RESOLV != 0)
+                .expect("resolv-derived server must exist after the first reload");
+            server.queries = 42;
+        }
+
+        // The file is re-read with identical content; the address is unchanged.
+        clear_cache_and_reload(&handle, &cache).await;
+
+        let d = handle.read().await;
+        let server = d
+            .servers
+            .iter()
+            .find(|s| s.flags & SERV_FROM_RESOLV != 0)
+            .expect("resolv-derived server must still exist");
+        assert_eq!(
+            server.queries, 42,
+            "reload must reuse the surviving server entry, not rebuild it from scratch",
+        );
+    }
+
+    /// `network.c:1738-1754`: an IPv6 `nameserver` line builds a `source_addr`
+    /// in the *same* address family (`AF_INET6`, `in6addr_any`, scope 0), bound
+    /// to `daemon->query_port`. A source address of the wrong family cannot be
+    /// used to bind an outbound socket for that server at all.
+    #[tokio::test]
+    async fn clear_cache_and_reload_resolv_ipv6_source_addr_matches_family() {
+        use crate::types::network::Resolvc;
+        use crate::types::server::SERV_FROM_RESOLV;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "nameserver ::1\n").unwrap();
+
+        let handle = init_daemon();
+        {
+            let mut d = handle.write().await;
+            d.query_port = 5353;
+            d.resolv_files.push(Resolvc {
+                is_default: false,
+                logged: false,
+                mtime: 0,
+                ino: 0,
+                name: path.to_str().unwrap().to_string(),
+                #[cfg(feature = "inotify")]
+                wd: -1,
+                #[cfg(feature = "inotify")]
+                file: None,
+            });
+        }
+        let cache = crate::cache::new_shared_cache(150, 0, 0);
+
+        clear_cache_and_reload(&handle, &cache).await;
+
+        let d = handle.read().await;
+        let server = d
+            .servers
+            .iter()
+            .find(|s| s.flags & SERV_FROM_RESOLV != 0)
+            .expect("resolv-derived server must exist");
+        assert!(
+            matches!(server.source_addr, crate::types::addr::MySockAddr::V6(_)),
+            "an IPv6 nameserver's source_addr must also be IPv6, got {:?}",
+            server.source_addr,
+        );
+        if let crate::types::addr::MySockAddr::V6(s) = &server.source_addr {
+            assert_eq!(s.port(), 5353, "source_addr must bind to --query-port");
+        }
     }
 
     /// Explicit `--server=` entries are not `SERV_FROM_RESOLV` and must survive
