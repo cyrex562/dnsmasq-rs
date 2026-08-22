@@ -76,6 +76,14 @@ pub const BRDBAND_FORUM_IANA: u32 = 3561;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum DhcpMsgType {
+    /// Not a real option-53 value — upstream's `mess_type` stays at its `0`
+    /// initializer when option 53 is absent from the request at all
+    /// (rfc2131.c:125-133), which is how a BOOTP request (as opposed to a
+    /// DHCP message) is recognised (`mess_type == 0`, rfc2131.c:564). This
+    /// variant marks a *reply* built for that case; [`DhcpMsgType::from_u8`]
+    /// deliberately never decodes wire byte `0` into it, since `0` is not a
+    /// valid on-the-wire option-53 value.
+    Bootp           = 0,
     Discover        = 1,
     Offer           = 2,
     Request         = 3,

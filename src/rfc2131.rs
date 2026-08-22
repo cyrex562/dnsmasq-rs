@@ -31,6 +31,17 @@ pub struct DhcpReply {
     pub sname: Option<String>,
     /// Optional BOOTP boot file name (`file`).
     pub file: Option<String>,
+    /// Override for the wire `ciaddr` field. Every ordinary reply echoes the
+    /// request's `ciaddr` verbatim ([`dhcp_reply_to_wire`][crate::dhcp::dhcp_reply_to_wire]);
+    /// a `DHCPLEASEQUERY` reply instead reports the *queried* lease's address
+    /// (or explicitly zero for `DHCPLEASEUNKNOWN`), independent of whatever
+    /// `ciaddr` the query itself carried (rfc2131.c:1216-1226).
+    pub ciaddr_override: Option<Ipv4Addr>,
+    /// Override for the wire `chaddr`/`hlen`/`htype` fields (hardware
+    /// address bytes, length, type), for the same `DHCPLEASEACTIVE` case as
+    /// [`Self::ciaddr_override`] — the reply describes the lease's owner,
+    /// not the querying manager (rfc2131.c:1219-1222).
+    pub chaddr_override: Option<([u8; crate::dhcp_protocol::DHCP_CHADDR_MAX], u8, u8)>,
 }
 
 /// Encode a DHCP option-53 (message type) TLV.
@@ -87,6 +98,42 @@ fn build_reply_options(msg_type: DhcpMsgType, server_id: Ipv4Addr) -> Vec<u8> {
     opts
 }
 
+/// Turn a would-be OFFER into the immediate ACK a rapid-commit DISCOVER gets
+/// instead (`OPT_RAPID_COMMIT` + client-sent OPTION_RAPID_COMMIT,
+/// rfc2131.c:1363-1372 jumping to the `rapid_commit:` label at :1493).
+///
+/// Before committing, re-runs the same pool/static/reserved validity check
+/// the `rapid_commit:` label re-does on the offered address (rfc2131.c's
+/// `narrow_context`/`address_available`/"static lease available"/"address
+/// reserved" checks, reduced to this port's existing model — see
+/// [`handle_request`]). If that fails, upstream sends **no reply at all**
+/// ("rapid commit case: lease allocate failed but don't send DHCPNAK",
+/// rfc2131.c:1568-1569) rather than a NAK, so this returns `None`.
+///
+/// On success, keeps the already-resolved `yiaddr`/`siaddr`/`giaddr`,
+/// rebuilds the option-53/54 header as ACK, and echoes back a zero-length
+/// OPTION_RAPID_COMMIT (80) per rfc2131.c:1745-1746.
+#[cfg(feature = "dhcp")]
+pub fn make_rapid_commit_ack(
+    mut reply: DhcpReply,
+    server_id: Ipv4Addr,
+    pool_start: Ipv4Addr,
+    pool_end: Ipv4Addr,
+    static_addr: Option<Ipv4Addr>,
+    reserved_for_other: bool,
+) -> Option<DhcpReply> {
+    use crate::dhcp_protocol::OPTION_RAPID_COMMIT;
+    if !address_in_range(reply.yiaddr, pool_start, pool_end, static_addr, reserved_for_other) {
+        return None;
+    }
+    reply.msg_type = DhcpMsgType::Ack;
+    reply.options = build_reply_options(DhcpMsgType::Ack, server_id);
+    if let Some(end_pos) = reply.options.iter().position(|&b| b == OPTION_END) {
+        reply.options.splice(end_pos..end_pos, [OPTION_RAPID_COMMIT, 0]);
+    }
+    Some(reply)
+}
+
 /// Process a DHCP DISCOVER packet and produce an OFFER reply.
 ///
 /// * `pool_start` / `pool_end` – inclusive address pool range.
@@ -111,7 +158,31 @@ pub fn handle_discover(
         giaddr: pkt.giaddr,
         sname: None,
         file: None,
+        ciaddr_override: None,
+        chaddr_override: None,
     })
+}
+
+/// Shared validity gate for "is `requested` an address we should hand out to
+/// this client", used both by [`handle_request`]'s ACK/NAK decision and by
+/// the DISCOVER+rapid-commit re-validation at the `rapid_commit:` label
+/// (rfc2131.c:1493 `narrow_context`/`address_available`/"static lease
+/// available"/"address reserved" checks, reduced to this port's existing
+/// pool/static/reserved model). `reserved_for_other` is true when the
+/// address is a `dhcp-host` static reservation belonging to a *different*
+/// client (`config_find_by_address(...) != config`, rfc2131.c:1529-1530).
+#[cfg(feature = "dhcp")]
+fn address_in_range(
+    requested: Ipv4Addr,
+    pool_start: Ipv4Addr,
+    pool_end: Ipv4Addr,
+    static_addr: Option<Ipv4Addr>,
+    reserved_for_other: bool,
+) -> bool {
+    !reserved_for_other
+        && static_addr.map(|addr| requested == addr).unwrap_or_else(|| {
+            in_pool(requested, pool_start, pool_end)
+        })
 }
 
 /// Process a DHCP REQUEST packet and produce an ACK or NAK reply.
@@ -135,10 +206,7 @@ pub fn handle_request(
     let requested = find_requested_ip(&pkt.options)
         .or_else(|| (pkt.ciaddr != Ipv4Addr::UNSPECIFIED).then_some(pkt.ciaddr))?;
 
-    let in_range = !reserved_for_other
-        && static_addr.map(|addr| requested == addr).unwrap_or_else(|| {
-            in_pool(requested, pool_start, pool_end)
-        });
+    let in_range = address_in_range(requested, pool_start, pool_end, static_addr, reserved_for_other);
 
     if in_range {
         Some(DhcpReply {
@@ -149,6 +217,8 @@ pub fn handle_request(
             giaddr: pkt.giaddr,
             sname: None,
             file: None,
+            ciaddr_override: None,
+            chaddr_override: None,
         })
     } else {
         Some(DhcpReply {
@@ -159,8 +229,79 @@ pub fn handle_request(
             giaddr: pkt.giaddr,
             sname: None,
             file: None,
+            ciaddr_override: None,
+            chaddr_override: None,
         })
     }
+}
+
+/// Build a BOOTP reply (`mess_type == 0`, rfc2131.c:564-698) for an already
+/// resolved `yiaddr`.
+///
+/// Unlike every DHCP reply type, a BOOTP reply carries no OPTION_MESSAGE_TYPE
+/// (upstream never calls `option_put(..., OPTION_MESSAGE_TYPE, ...)` on this
+/// path) and no OPTION_SERVER_IDENTIFIER, so `options` starts empty rather
+/// than going through [`build_reply_options`]. `siaddr` starts at `server_id`
+/// as a stand-in for upstream's `context->local` default (do_options is
+/// shared with every other message type, which already approximates that
+/// default the same way — see [`crate::dhcp::decorate_reply`]); a matching
+/// `dhcp-boot` entry overrides it the same way it does for every other
+/// message type. The caller is responsible for capping the final options
+/// blob to BOOTP's 64-byte vendor area with [`cap_vendor_area`].
+#[cfg(feature = "dhcp")]
+pub fn handle_bootp(pkt: &DhcpPacket, yiaddr: Ipv4Addr, server_id: Ipv4Addr) -> DhcpReply {
+    DhcpReply {
+        msg_type: DhcpMsgType::Bootp,
+        yiaddr,
+        options: Vec::new(),
+        siaddr: server_id,
+        giaddr: pkt.giaddr,
+        sname: None,
+        file: None,
+        ciaddr_override: None,
+        chaddr_override: None,
+    }
+}
+
+/// Truncate a DHCP options blob to BOOTP's 64-byte vendor area
+/// (`end = mess->options + 64`, rfc2131.c:577), never splitting a TLV: it
+/// keeps every option that fits complete within `max_len - 1` bytes (the
+/// last byte is reserved for OPTION_END) and drops the rest, then appends
+/// OPTION_END. `options` must not itself already contain OPTION_PAD gaps
+/// wider than a single option boundary — the code we emit never produces
+/// those, so this only needs to recognise PAD as a 1-byte filler.
+#[cfg(feature = "dhcp")]
+pub fn cap_vendor_area(options: &mut Vec<u8>, max_len: usize) {
+    use crate::dhcp_protocol::OPTION_PAD;
+    let budget = max_len.saturating_sub(1); // reserve room for the trailing END
+    let mut i = 0;
+    let mut fit = 0usize;
+    while i < options.len() {
+        let code = options[i];
+        if code == OPTION_END {
+            break;
+        }
+        if code == OPTION_PAD {
+            if i + 1 > budget {
+                break;
+            }
+            i += 1;
+            fit = i;
+            continue;
+        }
+        if i + 1 >= options.len() {
+            break;
+        }
+        let len = options[i + 1] as usize;
+        let end = i + 2 + len;
+        if end > options.len() || end > budget {
+            break;
+        }
+        i = end;
+        fit = i;
+    }
+    options.truncate(fit);
+    options.push(OPTION_END);
 }
 
 /// Extract the requested IP address from option 50 in a raw options buffer.
@@ -192,6 +333,8 @@ pub fn handle_inform(pkt: &DhcpPacket, server_id: Ipv4Addr) -> Option<DhcpReply>
         giaddr:   pkt.giaddr,
         sname:    None,
         file:     None,
+        ciaddr_override: None,
+        chaddr_override: None,
     })
 }
 
@@ -218,6 +361,146 @@ pub fn handle_decline(pkt: &DhcpPacket, pool_start: Ipv4Addr, pool_end: Ipv4Addr
         in_pool(declined_ip, pool_start, pool_end)
     } else {
         false
+    }
+}
+
+/// Build a `DHCPLEASEQUERY` reply (RFC 4388, rfc2131.c:1067-1235).
+///
+/// `reply_type` must be one of `LeaseUnknown` / `LeaseUnassigned` /
+/// `LeaseActive` — the caller (dispatch) has already done the address/context
+/// lookups that classify the query (rfc2131.c:1094-1150) and, for
+/// `LeaseActive`, resolved `context`/`filtered_tags`/`full_lease_time` the
+/// same way an ordinary reply would. Only `LeaseActive` (`lease.is_some()`)
+/// populates anything beyond the bare message type: client-id, remaining
+/// lease time, T1/T2 (computed from *remaining* time, not the full lease
+/// time), `OPTION_LAST_TRANSACTION`, the usual `do_options` set filtered by
+/// the client's requested-options list, and finally the lease's stored
+/// agent-id echoed back as the last option (rfc2131.c:1230-1232).
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "dhcp")]
+pub fn handle_leasequery(
+    pkt: &DhcpPacket,
+    reply_type: DhcpMsgType,
+    lease: Option<&DhcpLease>,
+    req_options: Option<&[u8]>,
+    context: Option<&crate::types::dhcp::DhcpContext>,
+    filtered_tags: &[crate::types::dhcp::DhcpNetid],
+    config_opts: &mut Vec<crate::types::dhcp::DhcpOpt>,
+    domain: Option<&str>,
+    full_lease_time: u32,
+) -> DhcpReply {
+    use crate::dhcp_protocol::{
+        DHCP_CHADDR_MAX, OPTION_AGENT_ID, OPTION_CLIENT_ID, OPTION_LAST_TRANSACTION,
+        OPTION_LEASE_TIME, OPTION_T1, OPTION_T2,
+    };
+
+    let mut options = Vec::new();
+    option_put(&mut options, OPTION_MESSAGE_TYPE, u32::from(reply_type as u8), 1);
+
+    // rfc2131.c:2557-2563 `clear_packet` never touches `ciaddr`, so by default
+    // the reply echoes back whatever `ciaddr` the request carried (the
+    // queried address, for DHCPLEASEUNASSIGNED). Only DHCPLEASEUNKNOWN
+    // explicitly zeroes it (rfc2131.c:1173-1177); DHCPLEASEACTIVE overwrites
+    // it with the lease's address below.
+    let mut ciaddr_override = if reply_type == DhcpMsgType::LeaseUnknown {
+        Some(Ipv4Addr::UNSPECIFIED)
+    } else {
+        None
+    };
+    let mut chaddr_override = None;
+
+    if let Some(lease) = lease {
+        ciaddr_override = Some(lease.addr);
+        let hw_len = lease.hwaddr_len.min(DHCP_CHADDR_MAX);
+        let mut chaddr = [0u8; DHCP_CHADDR_MAX];
+        chaddr[..hw_len].copy_from_slice(&lease.hwaddr[..hw_len]);
+        chaddr_override = Some((chaddr, hw_len as u8, lease.hwaddr_type as u8));
+
+        if let Some(clid) = lease.clid.as_deref() {
+            if in_list(req_options, OPTION_CLIENT_ID) {
+                option_put_raw(&mut options, OPTION_CLIENT_ID, clid);
+            }
+        }
+
+        // `lease.expires == None` means infinite (rfc2131.c's `expires == 0`).
+        let now = std::time::SystemTime::now();
+        let remaining = lease
+            .expires
+            .map(|exp| exp.duration_since(now).map(|d| d.as_secs() as u32).unwrap_or(0));
+
+        if in_list(req_options, OPTION_LEASE_TIME) {
+            option_put(&mut options, OPTION_LEASE_TIME, remaining.unwrap_or(0xFFFF_FFFF), 4);
+        }
+
+        if let Some(remaining) = remaining {
+            if in_list(req_options, OPTION_T1) && remaining > full_lease_time / 2 {
+                option_put(&mut options, OPTION_T1, remaining - full_lease_time / 2, 4);
+            }
+            if in_list(req_options, OPTION_T2) && remaining > full_lease_time / 8 {
+                option_put(&mut options, OPTION_T2, remaining - full_lease_time / 8, 4);
+            }
+            if in_list(req_options, OPTION_LAST_TRANSACTION) && remaining < full_lease_time {
+                option_put(&mut options, OPTION_LAST_TRANSACTION, full_lease_time - remaining, 4);
+            }
+        }
+
+        let mut tmp_pkt = DhcpPacket {
+            op: BOOTREPLY,
+            htype: pkt.htype,
+            hlen: pkt.hlen,
+            hops: 0,
+            xid: pkt.xid,
+            secs: 0,
+            flags: 0,
+            ciaddr: pkt.ciaddr,
+            yiaddr: Ipv4Addr::UNSPECIFIED,
+            siaddr: Ipv4Addr::UNSPECIFIED,
+            giaddr: pkt.giaddr,
+            chaddr: pkt.chaddr,
+            sname: [0u8; 64],
+            file: [0u8; 128],
+            options,
+        };
+        let mut opt_cfg = DoOptionsConfig {
+            context,
+            req_options,
+            hostname: lease.hostname.as_deref(),
+            domain,
+            netid: filtered_tags,
+            subnet_addr: None,
+            fqdn_flags: 0,
+            null_term: false,
+            pxe_arch: -1,
+            uuid: None,
+            vendor_class: lease.vendorclass.as_deref(),
+            lease_time: u32::MAX,
+            fuzz: 0,
+            pxevendor: None,
+            config_opts,
+            boot: None,
+            dns_port: 53,
+            leasequery: true,
+        };
+        do_options(&mut tmp_pkt, &mut opt_cfg);
+        options = tmp_pkt.options;
+
+        if let Some(agent_id) = lease.agent_id.as_deref() {
+            if in_list(req_options, OPTION_AGENT_ID) {
+                option_put_raw(&mut options, OPTION_AGENT_ID, agent_id);
+            }
+        }
+    }
+
+    DhcpReply {
+        msg_type: reply_type,
+        yiaddr: Ipv4Addr::UNSPECIFIED,
+        options,
+        siaddr: Ipv4Addr::UNSPECIFIED,
+        giaddr: pkt.giaddr,
+        sname: None,
+        file: None,
+        ciaddr_override,
+        chaddr_override,
     }
 }
 
@@ -1082,6 +1365,12 @@ pub struct DoOptionsConfig<'a> {
     pub boot:             Option<&'a crate::types::dhcp::DhcpBoot>,
     /// DNS port (53 = standard, triggers auto-DNS option).
     pub dns_port:         u16,
+    /// Set for a DHCPLEASEQUERY reply (rfc2131.c's `leasequery` param,
+    /// :2621). Gates netmask/broadcast and `DHOPT_FORCE` options behind the
+    /// client's requested-options list even when they'd otherwise be sent
+    /// unconditionally, and skips vendor-encapsulated options entirely
+    /// (rfc2131.c:2787-2797, :2878, :2945).
+    pub leasequery:       bool,
 }
 
 /// Apply all configured DHCP options to `pkt`.
@@ -1143,10 +1432,15 @@ pub fn do_options(pkt: &mut DhcpPacket, cfg: &mut DoOptionsConfig<'_>) {
 
     // ── Context-derived options ──────────────────────────────────────────────
     if let Some(ctx) = cfg.context {
-        if !has_opt_raw(opts, OPTION_NETMASK) {
+        if (!cfg.leasequery || in_list(cfg.req_options, OPTION_NETMASK))
+            && !has_opt_raw(opts, OPTION_NETMASK)
+        {
             option_put(opts, OPTION_NETMASK, u32::from(ctx.netmask), 4);
         }
-        if ctx.broadcast != Ipv4Addr::UNSPECIFIED && !has_opt_raw(opts, OPTION_BROADCAST) {
+        if ctx.broadcast != Ipv4Addr::UNSPECIFIED
+            && (!cfg.leasequery || in_list(cfg.req_options, OPTION_BROADCAST))
+            && !has_opt_raw(opts, OPTION_BROADCAST)
+        {
             option_put(opts, OPTION_BROADCAST, u32::from(ctx.broadcast), 4);
         }
         if ctx.router != Ipv4Addr::UNSPECIFIED
@@ -1211,7 +1505,7 @@ pub fn do_options(pkt: &mut DhcpPacket, cfg: &mut DoOptionsConfig<'_>) {
     for opt in &config_opts_snapshot {
         let code = opt.opt as u8;
         if (opt.flags & DHOPT_TAGOK) == 0 { continue; }
-        if (opt.flags & DHOPT_FORCE) == 0 && !in_list(cfg.req_options, code) { continue; }
+        if ((opt.flags & DHOPT_FORCE) == 0 || cfg.leasequery) && !in_list(cfg.req_options, code) { continue; }
         if skip_set.contains(&code) { continue; }
         if code == OPTION_VENDOR_ID && cfg.pxe_arch != -1 { continue; }
 
@@ -1240,9 +1534,10 @@ pub fn do_options(pkt: &mut DhcpPacket, cfg: &mut DoOptionsConfig<'_>) {
 
     // ── Vendor-encapsulated options ──────────────────────────────────────────
     let force_encap = prune_vendor_opts(cfg.config_opts, cfg.netid);
-    if force_encap
-        || in_list(cfg.req_options, OPTION_VENDOR_CLASS_OPT)
-        || in_list(cfg.req_options, OPTION_VENDOR_ID)
+    if !cfg.leasequery
+        && (force_encap
+            || in_list(cfg.req_options, OPTION_VENDOR_CLASS_OPT)
+            || in_list(cfg.req_options, OPTION_VENDOR_ID))
     {
         do_encap_opts(cfg.config_opts, OPTION_VENDOR_CLASS_OPT, DHOPT_VENDOR_MATCH, opts, cfg.null_term);
     }
@@ -2170,6 +2465,7 @@ mod tests {
             config_opts: &mut config_opts,
             boot: None,
             dns_port: 53,
+            leasequery: false,
         };
         do_options(&mut pkt, &mut cfg);
         assert!(has_opt_raw(&pkt.options, crate::dhcp_protocol::OPTION_T1));
@@ -2197,6 +2493,7 @@ mod tests {
             config_opts: &mut config_opts,
             boot: None,
             dns_port: 53,
+            leasequery: false,
         };
         do_options(&mut pkt, &mut cfg);
         assert!(!has_opt_raw(&pkt.options, crate::dhcp_protocol::OPTION_T1));
@@ -2227,6 +2524,7 @@ mod tests {
             config_opts: &mut config_opts,
             boot: None,
             dns_port: 53,
+            leasequery: false,
         };
         do_options(&mut pkt, &mut cfg);
         assert!(has_opt_raw(&pkt.options, OPTION_HOSTNAME));
@@ -2253,6 +2551,7 @@ mod tests {
             config_opts: &mut config_opts,
             boot: None,
             dns_port: 53,
+            leasequery: false,
         };
         do_options(&mut pkt, &mut cfg);
         assert!(has_opt_raw(&pkt.options, crate::dhcp_protocol::OPTION_VENDOR_ID));
@@ -2450,5 +2749,92 @@ mod tests {
     #[test]
     fn find_boot_empty() {
         assert!(find_boot(&[], Some("x")).is_none());
+    }
+
+    // ── cap_vendor_area (BOOTP 64-byte vend area, rfc2131.c:577) ────────────
+
+    #[test]
+    fn cap_vendor_area_keeps_short_blob_and_terminates() {
+        let mut opts = vec![crate::dhcp_protocol::OPTION_NETMASK, 4, 255, 255, 255, 0];
+        cap_vendor_area(&mut opts, 64);
+        assert_eq!(opts, vec![crate::dhcp_protocol::OPTION_NETMASK, 4, 255, 255, 255, 0, OPTION_END]);
+    }
+
+    #[test]
+    fn cap_vendor_area_drops_options_past_the_limit_without_splitting_a_tlv() {
+        // Three 6-byte TLVs (2-byte header + 4-byte value) = 18 bytes; cap at
+        // 10 leaves room for exactly one full TLV (6 bytes) + END (1 byte).
+        let mut opts = vec![
+            1, 4, 1, 1, 1, 1, // fits (bytes 0-5)
+            3, 4, 2, 2, 2, 2, // would end at byte 12 > budget (10-1=9) — dropped
+            6, 4, 3, 3, 3, 3,
+        ];
+        cap_vendor_area(&mut opts, 10);
+        assert_eq!(opts, vec![1, 4, 1, 1, 1, 1, OPTION_END]);
+        assert!(opts.len() <= 10);
+    }
+
+    #[test]
+    fn cap_vendor_area_on_empty_options_just_terminates() {
+        let mut opts = Vec::new();
+        cap_vendor_area(&mut opts, 64);
+        assert_eq!(opts, vec![OPTION_END]);
+    }
+
+    // ── make_rapid_commit_ack ────────────────────────────────────────────────
+
+    #[test]
+    fn make_rapid_commit_ack_converts_offer_to_ack_with_option_80() {
+        let offer = DhcpReply {
+            msg_type: DhcpMsgType::Offer,
+            yiaddr: Ipv4Addr::new(10, 0, 0, 5),
+            options: build_reply_options(DhcpMsgType::Offer, Ipv4Addr::new(10, 0, 0, 1)),
+            siaddr: Ipv4Addr::new(10, 0, 0, 1),
+            giaddr: Ipv4Addr::UNSPECIFIED,
+            sname: None,
+            file: None,
+            ciaddr_override: None,
+            chaddr_override: None,
+        };
+        let ack = make_rapid_commit_ack(
+            offer,
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(10, 0, 0, 254),
+            None,
+            false,
+        )
+        .expect("address is in-range, so rapid commit should succeed");
+        assert_eq!(ack.msg_type, DhcpMsgType::Ack);
+        assert_eq!(ack.yiaddr, Ipv4Addr::new(10, 0, 0, 5));
+        assert!(option_find1(&ack.options, crate::dhcp_protocol::OPTION_RAPID_COMMIT, 0).is_some());
+        assert_eq!(option_len_at(&ack.options, option_find1(&ack.options, crate::dhcp_protocol::OPTION_RAPID_COMMIT, 0).unwrap()), 0);
+    }
+
+    #[test]
+    fn make_rapid_commit_ack_returns_none_when_address_out_of_range() {
+        let offer = DhcpReply {
+            msg_type: DhcpMsgType::Offer,
+            yiaddr: Ipv4Addr::new(192, 168, 9, 9),
+            options: build_reply_options(DhcpMsgType::Offer, Ipv4Addr::new(10, 0, 0, 1)),
+            siaddr: Ipv4Addr::new(10, 0, 0, 1),
+            giaddr: Ipv4Addr::UNSPECIFIED,
+            sname: None,
+            file: None,
+            ciaddr_override: None,
+            chaddr_override: None,
+        };
+        // yiaddr falls outside the pool and there's no static reservation for
+        // it, so upstream's re-validation at `rapid_commit:` fails and no
+        // reply is sent at all (rfc2131.c:1568-1569).
+        let ack = make_rapid_commit_ack(
+            offer,
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(10, 0, 0, 254),
+            None,
+            false,
+        );
+        assert!(ack.is_none());
     }
 }
