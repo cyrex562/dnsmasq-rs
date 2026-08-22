@@ -280,6 +280,43 @@ pub struct DhcpRelay {
     pub matchcount:  i32,
 }
 
+/// One directive invocation's tag list, from `dhcp-ignore`, `dhcp-broadcast`,
+/// `bootp-dynamic`, `dhcp-generate-names`, or `dhcp-ignore-names`
+/// (`struct dhcp_netid_list`, `dnsmasq.h:898-901`). Each repetition of the
+/// directive contributes one entry; a client matches an entry when every tag
+/// in `list` is present in its derived tags (`match_netid()`,
+/// `dhcp-common.c:224-248` — conjunction within an entry, disjunction across
+/// entries).
+#[derive(Debug, Clone, Default)]
+pub struct DhcpNetidList {
+    pub list: Vec<DhcpNetid>,
+}
+
+/// A PXE client-vendor string to accept in place of the default
+/// `"PXEClient"` (`struct dhcp_pxe_vendor`, `dnsmasq.h:1022-1025`), from
+/// `--dhcp-pxe-vendor`.
+#[derive(Debug, Clone)]
+pub struct DhcpPxeVendor {
+    pub data: String,
+}
+
+/// A PXE boot menu entry (`struct pxe_service`, `dnsmasq.h:997-1003`), from
+/// `--pxe-service`.
+#[derive(Debug, Clone)]
+pub struct PxeService {
+    /// Client System Architecture index (`CSA`).
+    pub csa:      u16,
+    /// `0` = local boot; otherwise a boot-service type, either a literal
+    /// numeric type or an auto-assigned type (starting at 32768) when a
+    /// `basename` is given instead.
+    pub boot_type: u16,
+    pub menu:     String,
+    pub basename: Option<String>,
+    pub sname:    Option<String>,
+    pub server:   Ipv4Addr,
+    pub netid:    Vec<DhcpNetid>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -82,6 +82,22 @@ pub fn init_daemon_with(mut daemon: Daemon) -> DaemonHandle {
 
         #[cfg(feature = "dhcp6")]
         {
+            // Mirrors `dnsmasq.c:288-296`: `doing_ra`/`doing_dhcp6` are
+            // runtime-derived from the configured `dhcp6` contexts, not set
+            // directly by any directive. The whole block is gated on
+            // `daemon->dhcp6` being non-empty.
+            if !daemon.dhcp6.is_empty() {
+                daemon.doing_ra = opt_ra;
+                for ctx in &daemon.dhcp6 {
+                    if ctx.flags & crate::types::dhcp::CONTEXT_DHCP != 0 {
+                        daemon.doing_dhcp6 = true;
+                    }
+                    if ctx.flags & crate::types::dhcp::CONTEXT_RA != 0 {
+                        daemon.doing_ra = true;
+                    }
+                }
+            }
+
             let v6 = std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
             for ctx in &daemon.dhcp6 {
                 for msg in crate::dhcp_common::log_context(v6, ctx, opt_ra) {
@@ -808,6 +824,7 @@ fn daemon_dhcp_runtime(daemon: &Daemon) -> Option<DhcpDaemonRuntime> {
             relay4,
             no_ping: daemon.option_bool(crate::types::constants::OPT_NO_PING),
             consec_addr: daemon.option_bool(crate::types::constants::OPT_CONSEC_ADDR),
+            dhcp_ignore: daemon.dhcp_ignore.clone(),
         },
         loop_opts: crate::dhcp::DhcpLoopOptions {
             reply_port_override: (client_port != 68).then_some(client_port),
@@ -2278,6 +2295,68 @@ mod tests {
             output.contains("DHCP relay from 10.0.0.1 to 10.0.0.2 via eth0"),
             "startup log should contain the dhcp-relay line, got: {output}"
         );
+    }
+
+    /// Mirrors `dnsmasq.c:288-296`: `doing_dhcp6` is derived from whether any
+    /// `dhcp6` context carries `CONTEXT_DHCP`.
+    #[test]
+    #[cfg(feature = "dhcp6")]
+    fn init_daemon_with_sets_doing_dhcp6_from_context_flags() {
+        let mut daemon = Daemon::default();
+        daemon.dhcp6.push(test_dhcp_context());
+
+        let handle = init_daemon_with(daemon);
+        let guard = handle.blocking_read();
+        assert!(guard.doing_dhcp6);
+        assert!(!guard.doing_ra);
+    }
+
+    /// Mirrors `dnsmasq.c:290-292`: when any `dhcp6` context exists,
+    /// `doing_ra` starts from `option_bool(OPT_RA)` even without a context
+    /// carrying `CONTEXT_RA`.
+    #[test]
+    #[cfg(feature = "dhcp6")]
+    fn init_daemon_with_sets_doing_ra_from_opt_ra_when_dhcp6_present() {
+        let mut daemon = Daemon::default();
+        daemon.set_option(crate::types::constants::OPT_RA);
+        daemon.dhcp6.push(test_dhcp_context());
+
+        let handle = init_daemon_with(daemon);
+        let guard = handle.blocking_read();
+        assert!(guard.doing_ra);
+    }
+
+    /// Mirrors `dnsmasq.c:298-299`: a context carrying `CONTEXT_RA` sets
+    /// `doing_ra` regardless of `OPT_RA`.
+    #[test]
+    #[cfg(feature = "dhcp6")]
+    fn init_daemon_with_sets_doing_ra_from_context_ra_flag() {
+        use crate::types::dhcp::CONTEXT_RA;
+
+        let mut daemon = Daemon::default();
+        daemon.dhcp6.push(crate::types::dhcp::DhcpContext {
+            flags: CONTEXT_RA,
+            ..test_dhcp_context()
+        });
+
+        let handle = init_daemon_with(daemon);
+        let guard = handle.blocking_read();
+        assert!(guard.doing_ra);
+    }
+
+    /// Mirrors `dnsmasq.c:288-296`: the whole block is gated on
+    /// `daemon->dhcp6` being non-empty, so an empty context list leaves both
+    /// flags false even with `OPT_RA` set.
+    #[test]
+    #[cfg(feature = "dhcp6")]
+    fn init_daemon_with_leaves_doing_flags_false_when_no_dhcp6_contexts() {
+        let mut daemon = Daemon::default();
+        daemon.set_option(crate::types::constants::OPT_RA);
+
+        let handle = init_daemon_with(daemon);
+        let guard = handle.blocking_read();
+        assert!(!guard.doing_ra);
+        assert!(!guard.doing_dhcp6);
     }
 
     /// Mirrors `dnsmasq.c:352-358`: startup must attempt `ipset_init()` when

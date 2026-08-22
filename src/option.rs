@@ -22,9 +22,9 @@ use crate::types::daemon::{DhcpBridge, SharedNetwork};
 use crate::domain::CondDomain;
 #[cfg(feature = "dhcp")]
 use crate::types::dhcp::{
-    CONFIG_ADDR, CONFIG_CLID, CONFIG_DISABLE, CONFIG_NAME, CONTEXT_DHCP, DhcpBoot, DhcpConfig,
-    DhcpContext, DhcpMacRule, DhcpNetid, DhcpOpt, DhcpRelay, DhcpRelayIdRule, DhcpReplyDelay, DhcpUserClassRule, DhcpVendorRule,
-    HwaddrConfig,
+    CONFIG_ADDR, CONFIG_CLID, CONFIG_DISABLE, CONFIG_NAME, CONTEXT_DHCP, DHOPT_VENDOR, DHOPT_VENDOR_PXE,
+    DhcpBoot, DhcpConfig, DhcpContext, DhcpMacRule, DhcpNetid, DhcpNetidList, DhcpOpt, DhcpPxeVendor,
+    DhcpRelay, DhcpRelayIdRule, DhcpReplyDelay, DhcpUserClassRule, DhcpVendorRule, HwaddrConfig, PxeService,
 };
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -890,12 +890,16 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
         // `--clear-on-reload` (option.c:295) is the real upstream name for the
         // bit already reachable via the pre-existing `reload-acl` alias below.
         "clear-on-reload" => daemon.set_option(OPT_RELOAD),
-        // `--umbrella` (option.c:2808): sets the main bit unconditionally, as
-        // upstream does regardless of whether sub-options are present.  The
-        // `deviceid:`/`orgid:`/`assetid:`/`userid:` sub-option parsing itself
-        // is not implemented (no corresponding `Daemon` fields yet) — see
-        // tasks.md.
-        "umbrella" => daemon.set_option(OPT_UMBRELLA),
+        // `--umbrella[=deviceid:<16 hex chars>][,orgid:<n>][,assetid:<n>]`
+        // (option.c:2808-2850): sets the main bit unconditionally, as
+        // upstream does regardless of whether sub-options are present, then
+        // parses each comma-separated sub-option into `Daemon`.
+        "umbrella" => {
+            daemon.set_option(OPT_UMBRELLA);
+            if let Some(v) = cl.value.as_deref() {
+                parse_umbrella(daemon, v, cl)?;
+            }
+        }
         "local-ttl" if cl.value.is_none() => {} // value required; handled below
 
         // ── Numeric / string options ────────────────────────────────────────
@@ -1064,9 +1068,7 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
 
         "domain" => {
             let v = require_value("domain")?;
-            // Optionally "domain=name,subnet" — we only store the name part for now.
-            let name = v.split(',').next().unwrap_or(v).trim().to_string();
-            daemon.domain_suffix = Some(name);
+            parse_domain(daemon, v, cl)?;
         }
 
         // `daemon->username = opt_string_alloc(arg)` (option.c:2868,2872), and
@@ -1415,15 +1417,49 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             { daemon.dhcp_max = _n; }
         }
 
+        // `--dhcp-ignore` (option.c:275, `ARG_REQUIRED`): unlike its four
+        // siblings below, a value is mandatory.
         "dhcp-ignore" => {
             let v = require_value("dhcp-ignore")?;
             #[cfg(feature = "dhcp")]
             {
-                daemon.dhcp_conf.push(parse_dhcp_ignore(v, cl)?);
+                daemon.dhcp_ignore.push(parse_dhcp_netid_list(v, cl, "dhcp-ignore")?);
             }
             #[cfg(not(feature = "dhcp"))]
             {
                 let _ = v;
+            }
+        }
+
+        // ── dhcp-ignore-names / dhcp-generate-names / dhcp-broadcast /
+        //    bootp-dynamic ───────────────────────────────────────────────
+        //
+        // Shared upstream case (option.c:4659-4700): each is a global
+        // tag-list gate (`struct dhcp_netid_list`), populated by treating
+        // every comma-separated field as a literal tag name (stripping a
+        // leading `tag:`/`net:` prefix, matching upstream's `is_tag_prefix`
+        // check exactly — `set:` is *not* special here). Unlike `dhcp-ignore`
+        // above, these four take `ARG_DUP` (option.c:296,331,347,286): a bare
+        // directive (no value) is valid and produces an entry with an empty
+        // tag list, which its consumer treats as "matches every host"
+        // (`(!id_list->list) || match_netid(...)`, e.g. `rfc2131.c:663-664`).
+        "dhcp-ignore-names" | "dhcp-generate-names" | "dhcp-broadcast" | "bootp-dynamic" => {
+            #[cfg(feature = "dhcp")]
+            {
+                let entry = match cl.value.as_deref() {
+                    None => DhcpNetidList::default(),
+                    Some(v) => parse_dhcp_netid_list(v, cl, key)?,
+                };
+                match key {
+                    "dhcp-ignore-names" => daemon.dhcp_ignore_names.push(entry),
+                    "dhcp-generate-names" => daemon.dhcp_gen_names.push(entry),
+                    "dhcp-broadcast" => daemon.force_broadcast.push(entry),
+                    _ => daemon.bootp_dynamic.push(entry),
+                }
+            }
+            #[cfg(not(feature = "dhcp"))]
+            {
+                let _ = cl.value.as_deref();
             }
         }
 
@@ -1950,29 +1986,82 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             }
         }
 
-        // ── DHCP/PXE directives accepted for config-parity but not yet wired
-        // to DHCP runtime behavior (tracked in tasks.md: "Issue #18 remaining
-        // DHCP/PXE directives").  Each still records that it saw the
-        // directive by consuming its value; none of them silently invents
-        // behavior it does not have.
-        "dhcp-broadcast" | "dhcp-generate-names" | "dhcp-ignore-names" | "bootp-dynamic" => {
-            let _ = cl.value.as_deref();
-        }
-
+        // `--dhcp-proxy[=<addr>...]` (option.c:4703-4714, `LOPT_PROXY`):
+        // enables proxy-DHCP mode and, when addresses are given, restricts
+        // which relay agents are trusted without `giaddr` set.
         "dhcp-proxy" => {
-            let _ = cl.value.as_deref();
+            #[cfg(feature = "dhcp")]
+            {
+                daemon.dhcp_override = true;
+                if let Some(v) = cl.value.as_deref() {
+                    for part in v.split(',') {
+                        if part.is_empty() {
+                            continue;
+                        }
+                        let addr: Ipv4Addr = part.parse().map_err(|_| {
+                            invalid_value_for(cl, "dhcp-proxy", part, "bad dhcp-proxy address")
+                        })?;
+                        daemon.override_relays.push(addr);
+                    }
+                }
+            }
+            #[cfg(not(feature = "dhcp"))]
+            {
+                let _ = cl.value.as_deref();
+            }
         }
 
+        // `--dhcp-pxe-vendor` (option.c:4716-4727, `LOPT_PXE_VENDOR`):
+        // additional PXE client-vendor strings to accept alongside the
+        // built-in default `"PXEClient"`.
         "dhcp-pxe-vendor" => {
-            let _ = require_value("dhcp-pxe-vendor")?;
+            let v = require_value("dhcp-pxe-vendor")?;
+            #[cfg(feature = "dhcp")]
+            {
+                for part in v.split(',') {
+                    if part.is_empty() {
+                        return Err(invalid_value_for(cl, "dhcp-pxe-vendor", v, "empty vendor string"));
+                    }
+                    daemon.dhcp_pxe_vendors.push(DhcpPxeVendor { data: part.to_string() });
+                }
+            }
+            #[cfg(not(feature = "dhcp"))]
+            {
+                let _ = v;
+            }
         }
 
+        // `--pxe-prompt` (option.c:4422-4457, `LOPT_PXE_PROMT`): builds a
+        // `dhcp_opt` for option 10 (PXE_MENU_PROMPT), flagged
+        // `DHOPT_VENDOR|DHOPT_VENDOR_PXE` so it's only sent inside a PXE
+        // vendor-encapsulated option block, and sets `enable_pxe`.
         "pxe-prompt" => {
-            let _ = require_value("pxe-prompt")?;
+            let v = require_value("pxe-prompt")?;
+            #[cfg(feature = "dhcp")]
+            {
+                daemon.dhcp_opts.push(parse_pxe_prompt(v, cl)?);
+                daemon.enable_pxe = true;
+            }
+            #[cfg(not(feature = "dhcp"))]
+            {
+                let _ = v;
+            }
         }
 
+        // `--pxe-service` (option.c:4461-4539, `LOPT_PXE_SERV`): a PXE boot
+        // menu entry.
         "pxe-service" => {
-            let _ = require_value("pxe-service")?;
+            let v = require_value("pxe-service")?;
+            #[cfg(feature = "dhcp")]
+            {
+                let svc = parse_pxe_service(daemon, v, cl)?;
+                daemon.pxe_services.push(svc);
+                daemon.enable_pxe = true;
+            }
+            #[cfg(not(feature = "dhcp"))]
+            {
+                let _ = v;
+            }
         }
 
         // `--conf-script` (option.c:2068): upstream executes the referenced
@@ -2273,6 +2362,142 @@ fn parse_rev_server(daemon: &mut Daemon, v: &str, cl: &ConfigLine) -> Result<(),
     };
 
     push_domain_servers(daemon, &domains, server_part, cl, key, v)
+}
+
+/// `domain=<name>` or `domain=<name>,<subnet>[,local]`.
+/// Port of `option.c:2622` (the `option == 's'` half of the shared
+/// `case 's': case LOPT_SYNTH:` block), covering the bare form (plain
+/// suffix, or `domain=#` to set `OPT_RESOLV_DOMAIN`) and the subnet form
+/// (populating `daemon->cond_domain`, distinct from `synth_domains`).
+fn parse_domain(daemon: &mut Daemon, v: &str, cl: &ConfigLine) -> Result<(), ConfigError> {
+    let key = "domain";
+    let mut parts = v.splitn(2, ',');
+    let domain = parts.next().unwrap_or("").trim();
+    if domain.is_empty() {
+        return Err(invalid_value_for(cl, key, v, "missing domain"));
+    }
+    let rest = match parts.next() {
+        None => {
+            if domain == "#" {
+                daemon.set_option(OPT_RESOLV_DOMAIN);
+            } else {
+                daemon.domain_suffix = Some(domain.to_string());
+            }
+            return Ok(());
+        }
+        Some(r) => r,
+    };
+
+    let mut cd = CondDomain {
+        domain: domain.to_string(),
+        prefix: None,
+        interface: None,
+        al: vec![],
+        start: Ipv4Addr::UNSPECIFIED,
+        end: Ipv4Addr::UNSPECIFIED,
+        start6: Ipv6Addr::UNSPECIFIED,
+        end6: Ipv6Addr::UNSPECIFIED,
+        is6: false,
+        indexed: false,
+        prefixlen: 0,
+    };
+
+    if let Some((net_part, tail)) = rest.split_once('/') {
+        // CIDR form: <addr>/<prefix>[,local]. Unlike `synth-domain`, a third
+        // field here must be the literal `local` keyword (option.c:2670,2711)
+        // — anything else is an error, and there is no prefix to record.
+        // `local` triggers upstream's automatic PTR-zone/NS-record synthesis
+        // (`domain_rev4`/`domain_rev6` + `add_update_server`), which this
+        // port does not implement yet (see tasks.md); the subnet itself is
+        // still recorded so `cond_domain` matching works.
+        let mut tail_parts = tail.splitn(2, ',');
+        let size_str = tail_parts.next().unwrap_or("");
+        let local_field = tail_parts.next();
+        let size: u32 = size_str.parse().map_err(|_| invalid_value_for(cl, key, v, "bad prefix length"))?;
+
+        if let Ok(addr4) = net_part.parse::<Ipv4Addr>() {
+            if !(1..=32).contains(&size) {
+                return Err(invalid_value_for(cl, key, v, "bad prefix length"));
+            }
+            let mask = (1u32 << (32 - size)) - 1;
+            let start = u32::from(addr4) & !mask;
+            cd.is6 = false;
+            cd.start = Ipv4Addr::from(start);
+            cd.end = Ipv4Addr::from(start | mask);
+        } else if let Ok(addr6) = net_part.parse::<Ipv6Addr>() {
+            if !(1..=128).contains(&size) {
+                return Err(invalid_value_for(cl, key, v, "bad prefix length"));
+            }
+            let addrpart = crate::domain::ipv6_low64(addr6);
+            let mask: u64 = if size <= 64 { u64::MAX } else { (1u64 << (128 - size)) - 1 };
+            cd.is6 = true;
+            cd.prefixlen = size;
+            cd.start6 = crate::domain::ipv6_set_low64(addr6, addrpart & !mask);
+            cd.end6 = crate::domain::ipv6_set_low64(addr6, addrpart | mask);
+        } else {
+            return Err(invalid_value_for(cl, key, v, "expected an IPv4 or IPv6 address"));
+        }
+
+        if let Some(l) = local_field {
+            if l != "local" {
+                return Err(invalid_value_for(cl, key, v, "expected 'local'"));
+            }
+        }
+    } else {
+        // Range form: <start>[,<end>][,<ignored>], or a bare interface name
+        // as a subnet-from-interface fallback (option.c:2750-2755) — a
+        // fallback `synth-domain` does not have.
+        let mut range_parts = rest.splitn(3, ',');
+        let start_str = range_parts.next().unwrap_or("");
+        let end_str = range_parts.next();
+
+        if let Ok(start4) = start_str.parse::<Ipv4Addr>() {
+            cd.is6 = false;
+            cd.start = start4;
+            cd.end = match end_str {
+                None | Some("") => start4,
+                Some(e) => e.parse().map_err(|_| invalid_value_for(cl, key, v, "expected an IPv4 address"))?,
+            };
+        } else if let Ok(start6) = start_str.parse::<Ipv6Addr>() {
+            cd.is6 = true;
+            cd.start6 = start6;
+            cd.end6 = match end_str {
+                None | Some("") => start6,
+                Some(e) => e.parse().map_err(|_| invalid_value_for(cl, key, v, "expected an IPv6 address"))?,
+            };
+        } else {
+            cd.interface = Some(start_str.to_string());
+        }
+    }
+
+    daemon.cond_domain.push(cd);
+    Ok(())
+}
+
+/// `umbrella[=deviceid:<16 hex chars>][,orgid:<n>][,assetid:<n>]`.
+/// Port of `option.c:2810-2849` (`LOPT_UMBRELLA`'s sub-option loop). Only
+/// `deviceid:`/`orgid:`/`assetid:` exist upstream — there is no `userid:`
+/// sub-option in this dnsmasq version.
+fn parse_umbrella(daemon: &mut Daemon, v: &str, cl: &ConfigLine) -> Result<(), ConfigError> {
+    let key = "umbrella";
+    for part in v.split(',') {
+        if let Some(hex) = part.strip_prefix("deviceid:") {
+            if hex.len() != 16 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(invalid_value_for(cl, key, part, "deviceid must be 16 hex characters"));
+            }
+            for (i, byte) in daemon.umbrella_device.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
+            }
+            daemon.set_option(OPT_UMBRELLA_DEVID);
+        } else if let Some(n) = part.strip_prefix("orgid:") {
+            daemon.umbrella_org = n.parse().map_err(|_| invalid_value_for(cl, key, part, "expected an integer orgid"))?;
+        } else if let Some(n) = part.strip_prefix("assetid:") {
+            daemon.umbrella_asset = n.parse().map_err(|_| invalid_value_for(cl, key, part, "expected an integer assetid"))?;
+        } else {
+            return Err(invalid_value_for(cl, key, part, "expected deviceid:/orgid:/assetid:"));
+        }
+    }
+    Ok(())
 }
 
 /// `synth-domain=<domain>,<addr>/<prefix>[,<prefix-string>]` or
@@ -3674,94 +3899,102 @@ fn parse_dhcp_host(value: &str, cl: &ConfigLine) -> Result<DhcpConfig, ConfigErr
     Ok(config)
 }
 
+/// Parse the shared `dhcp-ignore`/`dhcp-ignore-names`/`dhcp-generate-names`/
+/// `dhcp-broadcast`/`bootp-dynamic` value into one [`DhcpNetidList`] entry.
+///
+/// Port of the tag-collection loop in `option.c:4693-4699`: every
+/// comma-separated field is a literal tag name, stripped of a leading
+/// `tag:`/`net:` prefix via [`is_tag_prefix`] — never parsed as a MAC
+/// address, client-id, or any other selector.
 #[cfg(feature = "dhcp")]
-fn parse_dhcp_ignore(value: &str, cl: &ConfigLine) -> Result<DhcpConfig, ConfigError> {
-    parse_dhcp_config_matchers("dhcp-ignore", value, cl, false, CONFIG_DISABLE, true)
+fn parse_dhcp_netid_list(value: &str, cl: &ConfigLine, key: &str) -> Result<DhcpNetidList, ConfigError> {
+    let mut list = Vec::new();
+    for part in value.split(',') {
+        if part.is_empty() {
+            return Err(invalid_value_for(cl, key, value, "empty tag field"));
+        }
+        let tag = if is_tag_prefix(part) { &part[4..] } else { part };
+        list.push(DhcpNetid { net: tag.to_string() });
+    }
+    Ok(DhcpNetidList { list })
 }
 
+/// Parse `--pxe-prompt=<prompt>[,<timeout>]` into the `dhcp_opt` entry
+/// upstream stores it as (option.c:4422-4457, `LOPT_PXE_PROMT`): option 10
+/// (PXE_MENU_PROMPT), value = one timeout byte (255 if omitted) followed by
+/// the prompt text, flagged `DHOPT_VENDOR|DHOPT_VENDOR_PXE`.
 #[cfg(feature = "dhcp")]
-fn parse_dhcp_config_matchers(
-    key: &str,
-    value: &str,
-    cl: &ConfigLine,
-    allow_addr: bool,
-    extra_flags: u32,
-    allow_tag_filter: bool,
-) -> Result<DhcpConfig, ConfigError> {
-    let parts = split_csv(value);
-    if parts.is_empty() {
-        return Err(invalid_value_for(cl, key, value, "expected at least one field"));
+fn parse_pxe_prompt(value: &str, cl: &ConfigLine) -> Result<DhcpOpt, ConfigError> {
+    let key = "pxe-prompt";
+    let mut parts = value.splitn(2, ',');
+    let prompt = parts.next().unwrap_or("");
+    let timeout: u8 = match parts.next() {
+        None | Some("") => 255,
+        Some(t) => t.parse().map_err(|_| invalid_value_for(cl, key, value, "expected an integer timeout"))?,
+    };
+    let mut val = Vec::with_capacity(1 + prompt.len());
+    val.push(timeout);
+    val.extend_from_slice(prompt.as_bytes());
+    Ok(DhcpOpt {
+        opt: 10,
+        flags: DHOPT_VENDOR | DHOPT_VENDOR_PXE,
+        val: Some(val),
+        netid: vec![],
+        encap: 0,
+        vendor_class: None,
+    })
+}
+
+/// Client System Architecture names accepted as the first `pxe-service`
+/// field (option.c:4464-4466), indexed by their upstream `CSA` value.
+#[cfg(feature = "dhcp")]
+const PXE_CSA_NAMES: &[&str] = &[
+    "x86PC", "PC98", "IA64_EFI", "Alpha", "Arc_x86", "Intel_Lean_Client",
+    "IA32_EFI", "x86-64_EFI", "Xscale_EFI", "BC_EFI", "ARM32_EFI", "ARM64_EFI",
+];
+
+/// Parse `--pxe-service=<CSA>,<menu-text>[,<basename>|<boot-service-type>[,<server>]]`
+/// (option.c:4461-4539, `LOPT_PXE_SERV`).
+#[cfg(feature = "dhcp")]
+fn parse_pxe_service(daemon: &mut Daemon, value: &str, cl: &ConfigLine) -> Result<PxeService, ConfigError> {
+    let key = "pxe-service";
+    let bad = || invalid_value_for(cl, key, value, "Bad pxe-service");
+
+    let (tags, rest) = dhcp_tags(value);
+    let netid = tags.into_iter().map(|net| DhcpNetid { net }).collect();
+
+    let parts = split_csv(rest);
+    if parts.len() < 2 {
+        return Err(bad());
     }
 
-    let mut config = DhcpConfig {
-        flags: extra_flags,
-        clid: None,
-        hostname: None,
-        domain: None,
-        netid: vec![],
-        filter: vec![],
-        addr: Ipv4Addr::UNSPECIFIED,
-        decline_time: None,
-        lease_time: 0,
-        hwaddrs: vec![],
-        #[cfg(feature = "dhcp6")]
-        addr6: vec![],
+    let csa = match PXE_CSA_NAMES.iter().position(|n| n.eq_ignore_ascii_case(parts[0])) {
+        Some(i) => i as u16,
+        None => parts[0].parse::<u16>().map_err(|_| bad())?,
+    };
+    let menu = parts[1].to_string();
+
+    let (boot_type, basename) = match parts.get(2) {
+        None => (0, None),
+        Some(bt) => match bt.parse::<u16>() {
+            Ok(n) => (n, None),
+            Err(_) => {
+                let assigned = daemon.pxe_boottype_next;
+                daemon.pxe_boottype_next += 1;
+                (assigned, Some(bt.to_string()))
+            }
+        },
     };
 
-    for part in parts {
-        if part.is_empty() {
-            return Err(invalid_value_for(cl, key, value, &format!("empty field in {key}")));
-        }
+    let (server, sname) = match parts.get(3) {
+        None => (Ipv4Addr::UNSPECIFIED, None),
+        Some(s) => match s.parse::<Ipv4Addr>() {
+            Ok(addr) => (addr, None),
+            Err(_) => (Ipv4Addr::UNSPECIFIED, Some(s.to_string())),
+        },
+    };
 
-        if let Some(tag) = part.strip_prefix("tag:") {
-            if !allow_tag_filter {
-                return Err(invalid_value_for(cl, key, part, &format!("{key} does not support tag filters")));
-            }
-            if tag.is_empty() {
-                return Err(invalid_value_for(cl, key, part, "expected tag name"));
-            }
-            config.filter.push(DhcpNetid { net: tag.to_string() });
-            continue;
-        }
-
-        if let Some(rest) = part.strip_prefix("id:") {
-            config.clid = Some(rest.as_bytes().to_vec());
-            config.flags |= CONFIG_CLID;
-            continue;
-        }
-
-        if let Ok(ip) = part.parse::<Ipv4Addr>() {
-            if !allow_addr {
-                return Err(invalid_value_for(cl, key, part, &format!("{key} does not support IPv4 address matches")));
-            }
-            config.addr = ip;
-            config.flags |= CONFIG_ADDR;
-            continue;
-        }
-
-        if looks_like_mac(part) {
-            config.hwaddrs.push(parse_hwaddr_config(part, cl)?);
-            continue;
-        }
-
-        if part.contains(':') {
-            return Err(invalid_value_for(cl, key, part, &format!("unsupported {key} selector")));
-        }
-
-        let hostname = parse_domain_token(part, key, cl)?;
-        config.hostname = Some(hostname);
-        config.flags |= CONFIG_NAME;
-    }
-
-    if config.hwaddrs.is_empty()
-        && (config.flags & CONFIG_CLID) == 0
-        && (config.flags & CONFIG_NAME) == 0
-        && config.filter.is_empty()
-    {
-        return Err(invalid_value_for(cl, key, value, &format!("{key} requires a MAC, client id, or hostname")));
-    }
-
-    Ok(config)
+    Ok(PxeService { csa, boot_type, menu, basename, sname, server, netid })
 }
 
 #[cfg(feature = "dhcp")]
@@ -4454,28 +4687,6 @@ fn parse_dhcp_option_value(
 }
 
 #[cfg(feature = "dhcp")]
-fn parse_hwaddr_config(value: &str, cl: &ConfigLine) -> Result<HwaddrConfig, ConfigError> {
-    let parts: Vec<&str> = value.split(':').collect();
-    if parts.len() != 6 {
-        return Err(invalid_value_for(cl, "dhcp-host", value, "expected 6-byte MAC address"));
-    }
-
-    let mut hwaddr = [0u8; 16];
-    for (idx, part) in parts.iter().enumerate() {
-        hwaddr[idx] = u8::from_str_radix(part, 16).map_err(|_| {
-            invalid_value_for(cl, "dhcp-host", value, "invalid MAC address octet")
-        })?;
-    }
-
-    Ok(HwaddrConfig {
-        hwaddr,
-        hwaddr_len: 6,
-        hwaddr_type: 1,
-        wildcard_mask: 0,
-    })
-}
-
-#[cfg(feature = "dhcp")]
 fn parse_client_id(value: &str, cl: &ConfigLine, key: &str) -> Result<Vec<u8>, ConfigError> {
     if value.contains(':') {
         let mut out = Vec::new();
@@ -4533,18 +4744,6 @@ fn parse_lease_time(token: &str) -> Option<u32> {
 #[cfg(feature = "dhcp")]
 fn ipv4_broadcast(start: Ipv4Addr, netmask: Ipv4Addr) -> Ipv4Addr {
     Ipv4Addr::from(u32::from(start) | !u32::from(netmask))
-}
-
-#[cfg(feature = "dhcp")]
-fn looks_like_mac(value: &str) -> bool {
-    value.len() == 17
-        && value.as_bytes().iter().enumerate().all(|(idx, b)| {
-            if idx % 3 == 2 {
-                *b == b':'
-            } else {
-                b.is_ascii_hexdigit()
-            }
-        })
 }
 
 #[cfg(feature = "dhcp")]
@@ -5410,6 +5609,68 @@ mod tests {
         let lines = parse_config_text("umbrella", "test").unwrap();
         apply_config(&mut d, &lines).unwrap();
         assert!(d.option_bool(OPT_UMBRELLA));
+        assert_eq!(d.umbrella_org, 0);
+        assert_eq!(d.umbrella_asset, 0);
+        assert!(!d.option_bool(crate::types::constants::OPT_UMBRELLA_DEVID));
+    }
+
+    #[test]
+    fn apply_umbrella_orgid() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("umbrella=orgid:123", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(OPT_UMBRELLA));
+        assert_eq!(d.umbrella_org, 123);
+    }
+
+    #[test]
+    fn apply_umbrella_assetid() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("umbrella=assetid:456", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.umbrella_asset, 456);
+    }
+
+    #[test]
+    fn apply_umbrella_orgid_and_assetid_combined() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("umbrella=orgid:123,assetid:456", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.umbrella_org, 123);
+        assert_eq!(d.umbrella_asset, 456);
+    }
+
+    #[test]
+    fn apply_umbrella_deviceid_sets_devid_option_and_bytes() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("umbrella=deviceid:0123456789abcdef", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(crate::types::constants::OPT_UMBRELLA_DEVID));
+        assert_eq!(d.umbrella_device, [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
+    }
+
+    #[test]
+    fn apply_umbrella_deviceid_wrong_length_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("umbrella=deviceid:0123", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "umbrella"));
+    }
+
+    #[test]
+    fn apply_umbrella_deviceid_non_hex_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("umbrella=deviceid:zzzzzzzzzzzzzzzz", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "umbrella"));
+    }
+
+    #[test]
+    fn apply_umbrella_unknown_suboption_errors() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("umbrella=bogus:1", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "umbrella"));
     }
 
     #[test]
@@ -5521,25 +5782,180 @@ mod tests {
     /// startup — that is exactly the bug this issue fixes.
     #[test]
     fn apply_documented_unsupported_directives_do_not_abort_startup() {
+        // `conf-script` (option.c:2068) is the one directive in this family
+        // that remains a deliberate no-op: running an external program as
+        // part of config parsing is a capability this port intentionally
+        // does not implement (see tasks.md).
+        let mut d = Daemon::default();
+        let lines = parse_config_text("conf-script=/etc/dnsmasq-script.conf", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+    }
+
+    #[test]
+    fn apply_dhcp_broadcast_bare_and_tagged() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-broadcast\ndhcp-broadcast=tag:foo", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        #[cfg(feature = "dhcp")]
+        {
+            assert_eq!(d.force_broadcast.len(), 2);
+            assert!(d.force_broadcast[0].list.is_empty());
+            assert_eq!(d.force_broadcast[1].list[0].net, "foo");
+        }
+    }
+
+    #[test]
+    fn apply_dhcp_generate_names_and_ignore_names_and_bootp_dynamic() {
         let mut d = Daemon::default();
         let lines = parse_config_text(
-            "dhcp-broadcast\n\
-             dhcp-broadcast=tag:foo\n\
-             dhcp-generate-names\n\
-             dhcp-generate-names=tag:foo\n\
-             dhcp-ignore-names\n\
-             dhcp-ignore-names=tag:foo\n\
-             bootp-dynamic\n\
-             bootp-dynamic=tag:foo\n\
-             dhcp-proxy\n\
-             dhcp-proxy=192.168.0.1\n\
-             dhcp-pxe-vendor=PXEClient\n\
-             pxe-prompt=Boot from network\n\
-             pxe-service=x86PC,Boot,pxelinux\n\
-             conf-script=/etc/dnsmasq-script.conf",
+            "dhcp-generate-names=tag:foo\ndhcp-ignore-names=tag:bar\nbootp-dynamic=tag:baz",
             "test",
         ).unwrap();
         apply_config(&mut d, &lines).unwrap();
+        #[cfg(feature = "dhcp")]
+        {
+            assert_eq!(d.dhcp_gen_names[0].list[0].net, "foo");
+            assert_eq!(d.dhcp_ignore_names[0].list[0].net, "bar");
+            assert_eq!(d.bootp_dynamic[0].list[0].net, "baz");
+        }
+    }
+
+    #[test]
+    fn apply_dhcp_proxy_bare_and_with_addresses() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-proxy=192.168.0.1,192.168.0.2", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        #[cfg(feature = "dhcp")]
+        {
+            assert!(d.dhcp_override);
+            assert_eq!(d.override_relays, vec![
+                "192.168.0.1".parse::<Ipv4Addr>().unwrap(),
+                "192.168.0.2".parse::<Ipv4Addr>().unwrap(),
+            ]);
+        }
+
+        let mut d2 = Daemon::default();
+        let lines2 = parse_config_text("dhcp-proxy", "test").unwrap();
+        apply_config(&mut d2, &lines2).unwrap();
+        #[cfg(feature = "dhcp")]
+        {
+            assert!(d2.dhcp_override);
+            assert!(d2.override_relays.is_empty());
+        }
+    }
+
+    #[test]
+    fn apply_dhcp_pxe_vendor() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-pxe-vendor=PXEClient,Etherboot", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        #[cfg(feature = "dhcp")]
+        {
+            assert_eq!(d.dhcp_pxe_vendors.len(), 2);
+            assert_eq!(d.dhcp_pxe_vendors[0].data, "PXEClient");
+            assert_eq!(d.dhcp_pxe_vendors[1].data, "Etherboot");
+        }
+    }
+
+    #[test]
+    fn apply_pxe_prompt_sets_dhcp_opt_and_enable_pxe() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("pxe-prompt=Boot from network,5", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        #[cfg(feature = "dhcp")]
+        {
+            assert!(d.enable_pxe);
+            assert_eq!(d.dhcp_opts.len(), 1);
+            let opt = &d.dhcp_opts[0];
+            assert_eq!(opt.opt, 10);
+            assert_eq!(opt.flags, crate::types::dhcp::DHOPT_VENDOR | crate::types::dhcp::DHOPT_VENDOR_PXE);
+            let val = opt.val.as_ref().unwrap();
+            assert_eq!(val[0], 5);
+            assert_eq!(&val[1..], b"Boot from network");
+        }
+    }
+
+    #[test]
+    fn apply_pxe_prompt_default_timeout() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("pxe-prompt=Boot from network", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        #[cfg(feature = "dhcp")]
+        {
+            assert_eq!(d.dhcp_opts[0].val.as_ref().unwrap()[0], 255);
+        }
+    }
+
+    #[test]
+    fn apply_pxe_service_local_boot() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("pxe-service=x86PC,Boot from network", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        #[cfg(feature = "dhcp")]
+        {
+            assert!(d.enable_pxe);
+            assert_eq!(d.pxe_services.len(), 1);
+            let svc = &d.pxe_services[0];
+            assert_eq!(svc.csa, 0);
+            assert_eq!(svc.menu, "Boot from network");
+            assert_eq!(svc.boot_type, 0);
+            assert!(svc.basename.is_none());
+        }
+    }
+
+    #[test]
+    fn apply_pxe_service_with_basename_auto_assigns_boot_type() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text(
+            "pxe-service=x86PC,Boot,pxelinux\npxe-service=BC_EFI,Boot,pxelinux.efi",
+            "test",
+        ).unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        #[cfg(feature = "dhcp")]
+        {
+            assert_eq!(d.pxe_services[0].csa, 0);
+            assert_eq!(d.pxe_services[0].basename.as_deref(), Some("pxelinux"));
+            assert_eq!(d.pxe_services[0].boot_type, 32768);
+            assert_eq!(d.pxe_services[1].csa, 9);
+            assert_eq!(d.pxe_services[1].boot_type, 32769);
+        }
+    }
+
+    #[test]
+    fn apply_pxe_service_numeric_csa_and_boot_type() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("pxe-service=0,Boot,0,192.168.0.1", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        #[cfg(feature = "dhcp")]
+        {
+            let svc = &d.pxe_services[0];
+            assert_eq!(svc.csa, 0);
+            assert_eq!(svc.boot_type, 0);
+            assert!(svc.basename.is_none());
+            assert_eq!(svc.server, "192.168.0.1".parse::<Ipv4Addr>().unwrap());
+        }
+    }
+
+    #[test]
+    fn apply_pxe_service_sname_fallback_when_not_an_address() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("pxe-service=x86PC,Boot,pxelinux,bootserver.lan", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        #[cfg(feature = "dhcp")]
+        {
+            let svc = &d.pxe_services[0];
+            assert_eq!(svc.sname.as_deref(), Some("bootserver.lan"));
+            assert_eq!(svc.server, Ipv4Addr::UNSPECIFIED);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn apply_pxe_service_requires_menu_text() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("pxe-service=x86PC", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "pxe-service"));
     }
 
     #[test]
@@ -5867,6 +6283,102 @@ mod tests {
         let lines = parse_config_text("domain=example.com", "test").unwrap();
         apply_config(&mut d, &lines).unwrap();
         assert_eq!(d.domain_suffix, Some("example.com".to_string()));
+        assert!(d.cond_domain.is_empty());
+    }
+
+    #[test]
+    fn apply_domain_hash_sets_resolv_domain_option() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("domain=#", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert!(d.option_bool(crate::types::constants::OPT_RESOLV_DOMAIN));
+        assert_eq!(d.domain_suffix, None);
+    }
+
+    #[test]
+    fn apply_domain_range_form_populates_cond_domain() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("domain=example.com,192.168.0.0,192.168.0.255", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.cond_domain.len(), 1);
+        let cd = &d.cond_domain[0];
+        assert_eq!(cd.domain, "example.com");
+        assert!(!cd.is6);
+        assert_eq!(cd.start, "192.168.0.0".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(cd.end, "192.168.0.255".parse::<Ipv4Addr>().unwrap());
+        // Not populated for `--domain` (only used as a `synth-domain` prefix).
+        assert_eq!(cd.prefix, None);
+        // Distinct from synth_domains.
+        assert!(d.synth_domains.is_empty());
+    }
+
+    #[test]
+    fn apply_domain_single_address_defaults_end_to_start() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("domain=example.com,10.0.0.5", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        let cd = &d.cond_domain[0];
+        assert_eq!(cd.start, "10.0.0.5".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(cd.end, "10.0.0.5".parse::<Ipv4Addr>().unwrap());
+    }
+
+    #[test]
+    fn apply_domain_cidr_form_populates_range() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("domain=example.com,10.0.0.0/24", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        let cd = &d.cond_domain[0];
+        assert_eq!(cd.start, "10.0.0.0".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(cd.end, "10.0.0.255".parse::<Ipv4Addr>().unwrap());
+    }
+
+    #[test]
+    fn apply_domain_cidr_form_with_local_keyword_accepted() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("domain=example.com,10.0.0.0/24,local", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.cond_domain.len(), 1);
+    }
+
+    #[test]
+    fn apply_domain_cidr_form_with_non_local_third_field_is_rejected() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("domain=example.com,10.0.0.0/24,bogus", "test").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "domain"));
+    }
+
+    #[test]
+    fn apply_domain_subnet_from_interface() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("domain=example.com,eth0", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        let cd = &d.cond_domain[0];
+        assert_eq!(cd.interface.as_deref(), Some("eth0"));
+    }
+
+    #[test]
+    fn apply_domain_ipv6_range_form() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("domain=example.com,2001:db8::1,2001:db8::ff", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        let cd = &d.cond_domain[0];
+        assert!(cd.is6);
+        assert_eq!(cd.start6, "2001:db8::1".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(cd.end6, "2001:db8::ff".parse::<Ipv6Addr>().unwrap());
+    }
+
+    #[test]
+    fn apply_domain_repeatable() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text(
+            "domain=a.example.com,10.0.0.0,10.0.0.255\ndomain=b.example.com,10.0.1.0,10.0.1.255",
+            "test",
+        ).unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.cond_domain.len(), 2);
+        assert_eq!(d.cond_domain[0].domain, "a.example.com");
+        assert_eq!(d.cond_domain[1].domain, "b.example.com");
     }
 
     #[test]
@@ -7602,42 +8114,54 @@ mod tests {
         assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "port-limit"));
     }
 
+    // `dhcp-ignore` is upstream's global tag-list gate (`daemon->dhcp_ignore`,
+    // `option.c:4659-4700`'s shared `dhcp_netid_list` case), not a per-host
+    // selector: every comma-separated field becomes a literal tag name
+    // (stripped of a leading `tag:`/`net:` prefix via `is_tag_prefix()`),
+    // never parsed as a MAC address or client-id. That's a distinct upstream
+    // mechanism from `dhcp-host=...,ignore` (`DhcpConfig`'s `CONFIG_DISABLE`
+    // flag on a matched per-host entry).
     #[test]
-    fn apply_dhcp_ignore_mac() {
+    fn apply_dhcp_ignore_bare_tag() {
         let mut d = Daemon::default();
         let lines = parse_config_text("dhcp-ignore=aa:bb:cc:dd:ee:ff", "test").unwrap();
         apply_config(&mut d, &lines).unwrap();
         #[cfg(feature = "dhcp")]
         {
-            assert_eq!(d.dhcp_conf.len(), 1);
-            let cfg = &d.dhcp_conf[0];
-            assert_ne!(cfg.flags & crate::types::dhcp::CONFIG_DISABLE, 0);
-            assert_eq!(cfg.hwaddrs.len(), 1);
-            assert_eq!(&cfg.hwaddrs[0].hwaddr[..6], &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+            assert_eq!(d.dhcp_ignore.len(), 1);
+            assert_eq!(
+                d.dhcp_ignore[0].list.iter().map(|n| n.net.as_str()).collect::<Vec<_>>(),
+                vec!["aa:bb:cc:dd:ee:ff"]
+            );
+            // Not routed through the dhcp-host matcher machinery.
+            assert!(d.dhcp_conf.is_empty());
         }
     }
 
     #[test]
-    fn apply_dhcp_ignore_tag_filter() {
+    fn apply_dhcp_ignore_tag_prefix_stripped() {
         let mut d = Daemon::default();
         let lines = parse_config_text("dhcp-ignore=tag:pxe", "test").unwrap();
         apply_config(&mut d, &lines).unwrap();
         #[cfg(feature = "dhcp")]
         {
-            assert_eq!(d.dhcp_conf.len(), 1);
-            let cfg = &d.dhcp_conf[0];
-            assert_ne!(cfg.flags & CONFIG_DISABLE, 0);
-            assert_eq!(cfg.filter.iter().map(|f| f.net.as_str()).collect::<Vec<_>>(), vec!["pxe"]);
+            assert_eq!(d.dhcp_ignore.len(), 1);
+            assert_eq!(d.dhcp_ignore[0].list[0].net, "pxe");
         }
     }
 
     #[test]
     #[cfg(feature = "dhcp")]
-    fn apply_dhcp_ignore_unsupported_selector_errors() {
+    fn apply_dhcp_ignore_multiple_tags_and_repeated_directive() {
         let mut d = Daemon::default();
-        let lines = parse_config_text("dhcp-ignore=enterprise:1", "test").unwrap();
-        let err = apply_config(&mut d, &lines).unwrap_err();
-        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "dhcp-ignore"));
+        let lines = parse_config_text("dhcp-ignore=tag:a,tag:b\ndhcp-ignore=net:c", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.dhcp_ignore.len(), 2);
+        assert_eq!(
+            d.dhcp_ignore[0].list.iter().map(|n| n.net.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert_eq!(d.dhcp_ignore[1].list[0].net, "c");
     }
 
     #[test]
