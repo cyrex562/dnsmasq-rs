@@ -1,4 +1,4 @@
-#![cfg(feature = "dhcp")]
+#![cfg(all(feature = "dhcp", feature = "script"))]
 
 //! Helper process for DHCP lease-change (and ARP/TFTP/relay-snoop) scripts.
 //!
