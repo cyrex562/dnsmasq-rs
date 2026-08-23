@@ -29,12 +29,13 @@ sudo ./functional/teardown-host.sh
 
 ### Optional: passwordless `ip netns exec`
 
-`functional/run.sh` (added in a later issue) needs one privileged operation per DHCP client run
-— `ip netns exec fn-client-N <command>` — which will prompt for your `sudo` password each time
-unless you install the scoped, opt-in sudoers rule in
-`functional/dnsmasq-rs-functional.sudoers.example`. See that file for install instructions. This
-step is entirely optional; without it, the harness still works, just with a password prompt per
-client invocation.
+`functional/run.sh` needs one privileged operation per DHCP client run — executed through the
+narrow `functional/lib/netns-exec.sh` wrapper, since this host's `sudo` (`sudo-rs`) rejects any
+wildcard in a sudoers command spec, so the `fn-client-*` scoping lives in the wrapper script
+itself rather than the sudoers rule — which will prompt for your `sudo` password each time unless
+you install the scoped, opt-in sudoers rule in `functional/dnsmasq-rs-functional.sudoers.example`.
+See that file for install instructions. This step is entirely optional; without it, the harness
+still works, just with a password prompt per client invocation.
 
 ## Router VM image
 
@@ -53,9 +54,24 @@ service (classic `rc.common`, not `procd` — see the design doc's "Router VM im
 why). Needs `sudo` because `guestfish`'s helper VM needs to read the host's `0600 root:root`
 kernel image; the resulting `functional/.cache/router.img` is chowned back to you afterward.
 
+## Running a scenario
+
+Once both one-time steps above are done:
+
+```bash
+./functional/run.sh basic-lease
+```
+
+This boots the router VM with a per-run scratch disk carrying the scenario's `dnsmasq.conf`,
+waits for `dnsmasq-rs` to report ready, then runs each `client-N.conf`'s DHCP client against it
+and checks the result against that file's `EXPECT_*` values. See
+`functional/scenarios/basic-lease/` for the format, and the design doc's "Scenario format and
+client execution" section for the full field reference. `run.sh` needs no `sudo` of its own
+beyond the `netns-exec.sh` calls covered above.
+
 ## Status
 
 - [x] One-time host network setup (`setup-host.sh` / `teardown-host.sh`) — this file.
 - [x] Router VM image (fetch OpenWrt, cross-compile + inject `dnsmasq-rs`) — issue #135.
-- [ ] Scenario runner + `basic-lease` smoke-test scenario — issue #136.
+- [x] Scenario runner + `basic-lease` smoke-test scenario — issue #136.
 - [ ] Remaining v1 scenarios + ISC `dhclient` client type — issue #137.

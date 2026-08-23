@@ -1428,6 +1428,13 @@ pub fn bind_listeners(daemon: &Daemon) -> Result<Listeners, DnsmasqError> {
             let sock = std::net::UdpSocket::bind(addr)
                 .map_err(|e| DnsmasqError::Bind(addr.to_string(), e.to_string()))?;
             sock.set_nonblocking(true)?;
+            // Upstream sets SO_BROADCAST unconditionally on this socket
+            // (dhcp.c's dhcp_init, `setsockopt(fd, SOL_SOCKET,
+            // SO_BROADCAST, ...)`) — without it, replies to a client that
+            // hasn't got an address yet (sent to 255.255.255.255) fail at
+            // the kernel with ENETUNREACH instead of going out.
+            sock.set_broadcast(true)
+                .map_err(|e| DnsmasqError::Bind(addr.to_string(), e.to_string()))?;
             #[cfg(target_os = "linux")]
             if let Some(device) = runtime.bind_interface.as_deref() {
                 bind_dhcp_socket_to_device(&sock, device)?;
@@ -3659,6 +3666,28 @@ mod tests {
         let daemon = Daemon { port, ..Default::default() };
         let err = bind_listeners(&daemon).unwrap_err();
         assert!(matches!(err, DnsmasqError::Bind(..)), "unexpected error: {err}");
+    }
+
+    /// Without SO_BROADCAST, a reply to a client that has no address yet
+    /// (sent to 255.255.255.255, dhcp.c's `dhcp_reply`) fails at the kernel
+    /// with ENETUNREACH instead of going out — confirmed against a real
+    /// client in the functional harness (issue #136). Upstream sets this
+    /// unconditionally in `dhcp_init()` (dhcp.c:63); this only regresses if
+    /// that parity is lost.
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn bind_listeners_enables_broadcast_on_the_dhcp_socket() {
+        let mut daemon = Daemon { port: 0, ..Default::default() };
+        daemon.dhcp.push(test_dhcp_context());
+        daemon.dhcp_server_port = 1067;
+        daemon.dhcp_client_port = 1068;
+
+        let listeners = bind_listeners(&daemon).unwrap();
+        let dhcp_sock = listeners.dhcp.expect("a dhcp-range should produce a bound socket");
+        assert!(
+            dhcp_sock.broadcast().unwrap(),
+            "the DHCP socket must have SO_BROADCAST set to reply to unconfigured clients"
+        );
     }
 
     #[tokio::test]

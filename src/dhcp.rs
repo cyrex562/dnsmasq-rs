@@ -1230,18 +1230,46 @@ fn loop_relay_reply_dest(pkt: &DhcpPacket, opts: &DhcpLoopOptions) -> SocketAddr
     relay_reply_client_dest(pkt)
 }
 
-/// Send a DHCP reply to an explicit destination, applying any configured delay.
+/// Send a DHCP reply to an explicit destination, applying any configured
+/// delay.
+///
+/// `egress_if_index`, when known, pins the egress interface via
+/// `IP_PKTINFO` for broadcast destinations — see
+/// [`crate::network::send_with_pktinfo`] for why a plain `send_to` fails
+/// there. Non-broadcast destinations (unicast to a relay or a client that
+/// already has an address) are always routable normally and never take
+/// this path.
 pub async fn send_dhcp_reply_to(
     socket: &tokio::net::UdpSocket,
     request: &DhcpPacket,
     dispatched: &DispatchedDhcpReply,
     dest: SocketAddr,
+    egress_if_index: Option<i32>,
 ) -> std::io::Result<usize> {
     if dispatched.delay_secs != 0 {
         tokio::time::sleep(Duration::from_secs(u64::from(dispatched.delay_secs))).await;
     }
 
     let wire = dhcp_reply_to_wire(&dispatched.reply, request);
+
+    #[cfg(all(unix, target_os = "linux"))]
+    if let (SocketAddr::V4(dest4), Some(if_index)) = (dest, egress_if_index) {
+        if if_index != 0 && *dest4.ip() == Ipv4Addr::BROADCAST {
+            use std::os::unix::io::AsRawFd;
+            let fd = socket.as_raw_fd();
+            loop {
+                socket.writable().await?;
+                match socket.try_io(tokio::io::Interest::WRITABLE, || {
+                    crate::network::send_with_pktinfo(fd, &wire, dest4, if_index)
+                }) {
+                    Ok(n) => return Ok(n),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+
     socket.send_to(&wire, dest).await
 }
 
@@ -1251,7 +1279,7 @@ pub async fn send_dhcp_reply(
     request: &DhcpPacket,
     dispatched: &DispatchedDhcpReply,
 ) -> std::io::Result<usize> {
-    send_dhcp_reply_to(socket, request, dispatched, reply_dest(request)).await
+    send_dhcp_reply_to(socket, request, dispatched, reply_dest(request), None).await
 }
 
 /// Receive DHCP packets on `socket`, dispatch them, and send replies until
@@ -1458,7 +1486,10 @@ pub async fn run_dhcp_loop(
                 };
 
                 let dest = loop_reply_dest(&pkt, src, &opts);
-                if let Err(err) = send_dhcp_reply_to(&socket, &pkt, &dispatched, dest).await {
+                let egress_if_index = arrival.as_ref().map(|a| a.if_index);
+                if let Err(err) =
+                    send_dhcp_reply_to(&socket, &pkt, &dispatched, dest, egress_if_index).await
+                {
                     warn!("failed to send DHCP reply to {dest}: {err}");
                 }
             }
@@ -3602,7 +3633,7 @@ mod tests {
         let cfg = default_cfg();
         let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe).expect("discover should produce an offer");
 
-        let sent = match send_dhcp_reply_to(&sender, &pkt, &dispatched, dest).await {
+        let sent = match send_dhcp_reply_to(&sender, &pkt, &dispatched, dest, None).await {
             Ok(sent) => sent,
             Err(err) if err.kind() == ErrorKind::PermissionDenied => return,
             Err(err) => panic!("send_dhcp_reply_to failed: {err}"),
@@ -3642,7 +3673,7 @@ mod tests {
 
         let started = tokio::time::Instant::now();
         let send_task = tokio::spawn(async move {
-            send_dhcp_reply_to(&sender, &pkt, &dispatched, dest).await
+            send_dhcp_reply_to(&sender, &pkt, &dispatched, dest, None).await
         });
 
         let early = tokio::time::timeout(Duration::from_millis(200), async {

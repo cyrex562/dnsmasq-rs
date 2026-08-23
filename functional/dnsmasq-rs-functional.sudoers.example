@@ -1,14 +1,25 @@
 # Optional: install this to let `functional/run.sh` execute DHCP client tools
 # inside the fn-client-* namespaces without a sudo password prompt on every
-# run. Not required — without it, run.sh's `ip netns exec` calls will just
+# run. Not required — without it, run.sh's netns-exec.sh calls will just
 # prompt for your password each time.
 #
 # Install:
 #   1. Replace YOUR_USERNAME below with your actual username (`whoami`).
-#   2. sudo cp functional/dnsmasq-rs-functional.sudoers.example \
+#   2. Replace /home/YOUR_USERNAME/Projects/dnsmasq-rs below with this
+#      repo's actual absolute path.
+#   3. sudo cp functional/dnsmasq-rs-functional.sudoers.example \
 #        /etc/sudoers.d/dnsmasq-rs-functional
-#   3. sudo chmod 0440 /etc/sudoers.d/dnsmasq-rs-functional
-#   4. sudo visudo -c   # verify the file parses before trusting it
+#   4. sudo chmod 0440 /etc/sudoers.d/dnsmasq-rs-functional
+#   5. sudo visudo -c   # verify the file parses before trusting it
 #
-# Scope: only `ip netns exec fn-client-<N> <anything>` — nothing broader.
-YOUR_USERNAME ALL=(root) NOPASSWD: /usr/sbin/ip netns exec fn-client-* *
+# Scope: only functional/lib/netns-exec.sh, a narrow wrapper that itself
+# refuses any namespace name not matching fn-client-* — nothing broader.
+# This grants the wrapper script itself, not `ip netns exec` directly with
+# a wildcard: this host's sudo (sudo-rs, Ubuntu's Rust reimplementation)
+# rejects any wildcard character ("*", "?", "[]") in a command argument
+# outright ("wildcards are not allowed in command arguments"), so the
+# fn-client-* scoping has to live in the wrapper script instead of the
+# sudoers file. A bare command path with no argument list (as below)
+# still matches any arguments, per standard sudoers(5) semantics — that
+# part is not a wildcard and sudo-rs does support it.
+YOUR_USERNAME ALL=(root) NOPASSWD: /home/YOUR_USERNAME/Projects/dnsmasq-rs/functional/lib/netns-exec.sh

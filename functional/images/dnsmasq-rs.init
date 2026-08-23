@@ -58,12 +58,26 @@ start() {
 		return 1
 	}
 
+	# dnsmasq-rs's default lease file (/var/lib/misc/dnsmasq.leases) needs
+	# this directory to exist -- this base OpenWrt image doesn't create it,
+	# so without this every dispatch logs a lease-file write failure.
+	mkdir -p /var/lib/misc
+
 	"$PROG" -k --conf-file=/mnt/scenario/dnsmasq.conf \
 		>/mnt/scenario/dnsmasq-rs.log 2>&1 &
 
+	# `pidof` alone is too early: it finds the process as soon as it's
+	# forked, before the async runtime finishes binding the DHCP/DNS
+	# sockets -- under TCG emulation that gap is long enough for a client
+	# request sent right after `.ready` to arrive before anything is
+	# listening (confirmed: run.sh's client only failed when it ran
+	# immediately after readiness; manual step-by-step testing with
+	# natural delay between steps never hit it). Wait for the actual
+	# startup-complete log line instead.
 	local i=0
 	while [ $i -lt 20 ]; do
-		if pidof dnsmasq-rs >/dev/null 2>&1; then
+		if pidof dnsmasq-rs >/dev/null 2>&1 \
+			&& grep -q "listening for DHCP packets" /mnt/scenario/dnsmasq-rs.log 2>/dev/null; then
 			touch /mnt/scenario/.ready
 			sync
 			return 0
@@ -72,7 +86,7 @@ start() {
 		i=$((i + 1))
 	done
 	sync
-	echo "dnsmasq-rs: process did not appear within 20s" >&2
+	echo "dnsmasq-rs: did not finish starting within 20s" >&2
 	return 1
 }
 
