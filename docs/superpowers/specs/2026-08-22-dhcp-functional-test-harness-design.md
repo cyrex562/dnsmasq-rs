@@ -27,7 +27,9 @@ breaks" treatment `parity/`'s expansion (issue #124) already gave DNS.
   **no 9p support at all** (confirmed by inspecting `modules.builtin` — see "Router VM image"),
   which changed the original config-injection plan; `mtools` (`mformat`/`mcopy`) is installed
   for unprivileged vfat image creation. `expect` is not installed. `busybox` (providing
-  `udhcpc`) is installed; ISC `dhclient` is not (one-time `apt` install).
+  `udhcpc`) is installed — v1's only client tool runs entirely on tooling already present, no
+  host package installs needed (see "Scenario format and client execution" for why a second,
+  ISC-`dhclient`-based tool was dropped from v1's scope).
 - Creating network namespaces, moving interfaces between namespaces, and creating bridges/TAPs
   all require `CAP_NET_ADMIN` (root) on this kernel/config — there is no way to make the *whole*
   harness unprivileged without changing the client-topology decision below.
@@ -159,27 +161,42 @@ virtio-blk disk, not baked into the image) and one `client-N.conf` per client, a
 shell-sourceable `KEY=value` file:
 
 ```
-CLIENT_TOOL=busybox-udhcpc     # busybox-udhcpc | isc-dhclient  (v1 set)
+CLIENT_TOOL=busybox-udhcpc     # busybox-udhcpc (v1 set — see below)
 CLIENT_MAC=52:54:00:12:34:56    # optional; auto-generated per run if omitted
 EXPECT_RESULT=lease             # lease | nak | timeout
+EXPECT_IP=192.168.50.120         # optional exact-match (static reservations)
 EXPECT_IP_RANGE=192.168.50.100-192.168.50.150
 EXPECT_ROUTER=192.168.50.1
 EXPECT_DNS=192.168.50.1
 EXPECT_LEASE_TIME=3600
+EXPECT_DOMAIN=example.test      # optional
+EXPECT_NTP=192.168.50.1          # optional
 ```
 
 For each client file, `run.sh` assigns a pre-provisioned namespace slot and execs the named
-tool inside it (`busybox udhcpc` with a small lease-dump hook script; ISC `dhclient` reading
-back `dhclient.leases`), capturing the resulting facts — assigned IP, router/DNS options, lease
-time, or an explicit NAK/timeout. A comparison step checks those facts against the scenario's
-`EXPECT_*` values and reports pass/fail per assertion, the same "normalize actual vs. expected,
-report every mismatch" shape `parity_probe` already uses for DNS, applied to lease facts
-instead of DNS packets.
+tool inside it (`busybox udhcpc` with a small lease-dump hook script), capturing the resulting
+facts — assigned IP, router/DNS/domain/NTP options, lease time, or an explicit NAK/timeout. A
+comparison step checks those facts against the scenario's `EXPECT_*` values and reports
+pass/fail per assertion, the same "normalize actual vs. expected, report every mismatch" shape
+`parity_probe` already uses for DNS, applied to lease facts instead of DNS packets.
 
-v1 supports exactly two client tools (`busybox-udhcpc`, ISC `dhclient` — genuinely different
-retry/option-request behavior) and runs a scenario's clients **sequentially**, not
-concurrently. Concurrent multi-client scenarios (pool exhaustion) are real future work, not v1,
-because of the extra care needed around ordering and timing.
+**v1 client tools — revised from the original two-tool plan.** The original plan called for a
+second client tool, ISC `dhclient`, running inside the same `fn-client-N` namespaces
+`busybox-udhcpc` uses. Implementing it (Issue #137) surfaced a real design question: `dhclient`
+isn't installed on this class of host, and installing new packages onto the host's own root
+filesystem just to support a test harness runs against how this project wants to treat host
+state. The alternatives considered — a Docker container bind-mounted onto an existing `ip
+netns`-created namespace's `/proc/<pid>/ns/net`, or extracting a static `dhclient` binary from a
+container build — were both more fragile than this design's own stated direction for a second
+client type: a real VM. That became Issue #141 (Alpine base image, Packer/Vagrant-built, a
+one-time build a developer runs once these test machines are mature), tracked separately since
+it's a new subsystem (its own image pipeline, networking, and result-capture convention), not a
+same-day extension of the namespace-based runner. v1 ships with exactly one client tool,
+`busybox-udhcpc`, running in the existing namespaces.
+
+Scenarios still run a scenario's clients **sequentially**, not concurrently — concurrent
+multi-client scenarios (pool exhaustion) are real future work, not v1, because of the extra
+care needed around ordering and timing.
 
 ### Error handling
 

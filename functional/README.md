@@ -64,14 +64,39 @@ Once both one-time steps above are done:
 
 This boots the router VM with a per-run scratch disk carrying the scenario's `dnsmasq.conf`,
 waits for `dnsmasq-rs` to report ready, then runs each `client-N.conf`'s DHCP client against it
-and checks the result against that file's `EXPECT_*` values. See
-`functional/scenarios/basic-lease/` for the format, and the design doc's "Scenario format and
-client execution" section for the full field reference. `run.sh` needs no `sudo` of its own
-beyond the `netns-exec.sh` calls covered above.
+and checks the result against that file's `EXPECT_*` values. See the design doc's "Scenario
+format and client execution" section for the full field reference. `run.sh` needs no `sudo` of
+its own beyond the `netns-exec.sh` calls covered above.
+
+## Scenarios (v1)
+
+| Scenario | What it proves |
+|---|---|
+| `basic-lease` | Plain `dhcp-range`: a client gets a pool address plus router/DNS/lease-time. |
+| `static-reservation` | `dhcp-host=<mac>,<ip>` (a reserved address *outside* the pool range): the matching MAC gets exactly that address, not a pool one. |
+| `client-options` | `dhcp-option` for domain-name and NTP server: the client actually receives them, not just the fixed fact set `basic-lease` covers. |
+| `mac-blocklist-nak` | `dhcp-host=<mac>,ignore`: the matching MAC gets no reply at all. Named to match the design doc's v1 list, but the verified, correct expected outcome is `EXPECT_RESULT=timeout`, not an explicit NAK — `ignore` is a silent drop in both dnsmasq-rs and upstream (see `tasks.md`). Verified this isn't a silent-pass trap: removing the `dhcp-host` line makes the scenario fail as expected (the client gets a real lease instead). |
+
+All four run with `CLIENT_TOOL=busybox-udhcpc` — v1's only client tool (see below).
+
+### Client tools
+
+v1 ships with `busybox-udhcpc` only, running inside the `fn-client-N` namespaces
+`setup-host.sh` creates. A second client tool was originally planned as ISC `dhclient` running
+the same way, but installing a new package onto the host just to support this harness didn't
+sit right once it came time to implement it (issue #137) — namespaces are fine, but new
+test-only software belongs in a container or VM, not the host's own package database. The
+alternatives for running `dhclient` in a container joined to an existing namespace were more
+fragile than just building a real second client VM, which the original design already
+anticipated ("namespace clients now, VM clients later"). That's tracked as its own issue
+(#141 — Alpine base image, Packer/Vagrant-built) rather than folded into `busybox-udhcpc`'s
+existing namespace-based path.
 
 ## Status
 
 - [x] One-time host network setup (`setup-host.sh` / `teardown-host.sh`) — this file.
 - [x] Router VM image (fetch OpenWrt, cross-compile + inject `dnsmasq-rs`) — issue #135.
 - [x] Scenario runner + `basic-lease` smoke-test scenario — issue #136.
-- [ ] Remaining v1 scenarios + ISC `dhclient` client type — issue #137.
+- [x] Remaining v1 scenarios (`static-reservation`, `client-options`, `mac-blocklist-nak`) —
+      issue #137. ISC `dhclient` support was dropped from this issue's scope — see "Client
+      tools" above and issue #141.

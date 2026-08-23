@@ -23,6 +23,8 @@ case "$1" in
 			echo "ACTUAL_ROUTER=${router%% *}"
 			echo "ACTUAL_DNS=${dns%% *}"
 			echo "ACTUAL_LEASE=$lease"
+			echo "ACTUAL_DOMAIN=$domain"
+			echo "ACTUAL_NTP=${ntpsrv%% *}"
 		} > "$RESULT_FILE"
 		;;
 	nak)
