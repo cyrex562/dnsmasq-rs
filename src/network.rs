@@ -941,7 +941,10 @@ pub fn interface_mtu(name: &str) -> Option<i32> {
     for (dst, &src) in ifr.ifr_name.iter_mut().zip(name_bytes.iter()) {
         *dst = src as libc::c_char;
     }
-    let rc = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFMTU, &mut ifr) };
+    // `ioctl`'s request parameter type is platform-specific (`c_ulong` on
+    // glibc, `c_int` on musl) — `SIOCGIFMTU` is typed to match on each, so a
+    // same-target cast to `libc::Ioctl` is the portable way to pass it.
+    let rc = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFMTU as libc::Ioctl, &mut ifr) };
     if rc == -1 {
         return None;
     }
@@ -2483,6 +2486,29 @@ mod tests {
         let iface = Ipv4Addr::new(10, 0, 1, 1);
         assert!(is_same_subnet(Ipv4Addr::new(10, 0, 200, 5), iface, mask));
         assert!(!is_same_subnet(Ipv4Addr::new(10, 1, 0, 1), iface, mask));
+    }
+
+    /// Regression test for a real `SIOCGIFMTU`/`libc::ioctl` type mismatch
+    /// that only surfaced when cross-compiling for musl (`libc::Ioctl` is
+    /// `c_ulong` on glibc but `c_int` on musl, and `SIOCGIFMTU` is typed to
+    /// match on each) — a plain `cargo check`/`cargo test` on this host's
+    /// default glibc target never caught it. This test can't reproduce the
+    /// compile-time bug itself (that only exists in the musl build), but
+    /// exercises the real ioctl call end to end on whichever target it runs
+    /// under, which the function previously had zero coverage for at all.
+    #[cfg(unix)]
+    #[test]
+    fn interface_mtu_loopback_has_a_sane_value() {
+        // Loopback always exists and its MTU is stable across Linux
+        // distributions/kernels (65536), so this is safe to assert exactly
+        // rather than just "is Some".
+        assert_eq!(interface_mtu("lo"), Some(65536));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interface_mtu_nonexistent_interface_returns_none() {
+        assert_eq!(interface_mtu("this-interface-does-not-exist"), None);
     }
 
     #[test]

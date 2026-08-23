@@ -10,3 +10,6 @@ __pycache__/
 
 # Harness per-cycle runtime records
 harness/state/
+
+# Downloaded/built VM images for the functional DHCP test harness
+/functional/.cache/

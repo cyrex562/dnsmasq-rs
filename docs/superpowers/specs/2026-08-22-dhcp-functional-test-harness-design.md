@@ -22,9 +22,12 @@ breaks" treatment `parity/`'s expansion (issue #124) already gave DNS.
   ACL grant) — VMs run under software emulation (TCG) unless that changes. The harness must not
   assume hardware acceleration.
 - `guestfish` and `qemu-nbd` are installed (offline image customization without needing
-  `virt-customize`). QEMU supports `virtio-9p` host-directory passthrough. `expect` is not
-  installed. `busybox` (providing `udhcpc`) is installed; ISC `dhclient` is not (one-time `apt`
-  install).
+  `virt-customize`) — though `guestfish` itself needs `sudo` on this host (see below).
+  The chosen OpenWrt image has `virtio_blk`/`virtio_net` compiled directly into its kernel but
+  **no 9p support at all** (confirmed by inspecting `modules.builtin` — see "Router VM image"),
+  which changed the original config-injection plan; `mtools` (`mformat`/`mcopy`) is installed
+  for unprivileged vfat image creation. `expect` is not installed. `busybox` (providing
+  `udhcpc`) is installed; ISC `dhclient` is not (one-time `apt` install).
 - Creating network namespaces, moving interfaces between namespaces, and creating bridges/TAPs
   all require `CAP_NET_ADMIN` (root) on this kernel/config — there is no way to make the *whole*
   harness unprivileged without changing the client-topology decision below.
@@ -46,12 +49,16 @@ breaks" treatment `parity/`'s expansion (issue #124) already gave DNS.
    KVM) and the one-time host network setup this needs make it too slow/heavy for the
    autonomous port harness's per-issue gate; it lives in `functional/` and is run by hand, the
    same relationship `parity/run-suite.sh` has to `harness/gate.sh --parity`.
-4. **Unprivileged by default; `sudo` isolated to a documented one-time setup step.** A
+4. **Unprivileged by default; `sudo` isolated to documented one-time setup steps.** A
    `sudo ./functional/setup-host.sh` run once (idempotent, safe to re-run) creates the bridge,
-   persistent TAP, and per-client namespaces/veths. Every repeated `./functional/run.sh
-   <scenario>` invocation after that needs no privilege except one narrow, isolatable
-   `ip netns exec` call per client (optionally passwordless via a scoped, opt-in
-   `/etc/sudoers.d/` rule this repo ships but does not install automatically).
+   persistent TAP, and per-client namespaces/veths. A one-time
+   `sudo ./functional/images/build-router-image.sh` similarly needs `sudo` — confirmed while
+   implementing this: `guestfish`'s supermin helper VM needs to read the host's kernel image,
+   which is `0600 root:root` on this system, the same class of constraint as the network setup.
+   Every repeated `./functional/run.sh <scenario>` invocation after both one-time steps needs no
+   privilege except one narrow, isolatable `ip netns exec` call per client (optionally
+   passwordless via a scoped, opt-in `/etc/sudoers.d/` rule this repo ships but does not install
+   automatically).
 
 ## Architecture
 
@@ -93,35 +100,63 @@ invoked automatically by `run.sh` — the shared network state is meant to persi
 
 ### Router VM image (`images/`)
 
-`fetch-openwrt.sh` downloads one pinned OpenWrt x86_64 `generic-ext4-combined` image into
-`functional/.cache/` (gitignored — images don't belong in git, matching the reasoning that kept
-the 44GB `target/` build directory out of Docker context in the parity harness).
-`build-router-image.sh` customizes that base image **once**, offline, via `guestfish` (no boot
-needed):
+`fetch-openwrt.sh` downloads one pinned OpenWrt x86_64 `generic-ext4-combined` image
+(OpenWrt 25.12.5, checksum-verified) into `functional/.cache/` (gitignored — images don't
+belong in git, matching the reasoning that kept the 44GB `target/` build directory out of
+Docker context in the parity harness). `build-router-image.sh` customizes that base image
+**once**, offline, via `guestfish` (no boot needed — but confirmed to require `sudo` on this
+host: `guestfish`'s supermin helper VM needs to read the host kernel image to build its own
+appliance, and this system's kernel images are `0600 root:root`, the same class of constraint
+that makes `setup-host.sh` need `sudo`):
 
-- Installs the cross-compiled `dnsmasq-rs` binary (musl target, matching OpenWrt's libc) at
-  `/usr/sbin/dnsmasq-rs`.
+- Installs the cross-compiled `dnsmasq-rs` binary (`x86_64-unknown-linux-musl` target — a
+  static-pie musl binary carries its own libc, so it doesn't need to match OpenWrt's musl
+  version exactly) at `/usr/sbin/dnsmasq-rs`.
 - Disables OpenWrt's own `dnsmasq` init script so the two don't fight over ports 53/67.
-- Adds a custom init script that mounts a `virtio-9p` share (mount tag `scenario`) at
-  `/mnt/scenario` and execs `dnsmasq-rs --conf-file=/mnt/scenario/dnsmasq.conf`.
-- Ensures the `9p`/`virtio` kernel modules needed for that mount are present.
+- Adds a custom init script (`/etc/init.d/dnsmasq-rs`) that waits for a second virtio-block
+  device to appear, mounts its (vfat) filesystem **read-write** at `/mnt/scenario`, backgrounds
+  `dnsmasq-rs --conf-file=/mnt/scenario/dnsmasq.conf` redirecting its output to
+  `/mnt/scenario/dnsmasq-rs.log`, and once `pidof dnsmasq-rs` confirms it's running, touches
+  `/mnt/scenario/.ready` on that same disk.
 
-One customized image is reused across every scenario. `run.sh` boots QEMU with
-`-virtfs local,path=functional/scenarios/<name>,mount_tag=scenario,security_model=none`
-pointing at that scenario's own directory, so each scenario supplies its own `dnsmasq.conf`
-without any image rebuild — adding a scenario is adding a directory, not a build step, and
-iterating on one reboots the VM rather than re-customizing a disk.
+**Config injection — revised from the original virtio-9p plan.** Inspecting the actual
+downloaded image (`sda2` is the rootfs; confirmed via `guestfish`) showed `virtio_blk`/
+`virtio_net` compiled directly into the kernel (`modules.builtin`), but **no 9p support at
+all** — neither built in nor as a loadable module, and no way to add one offline without a
+full kernel rebuild. `run.sh` instead builds a small per-run scratch disk: an `mtools`-formatted
+vfat image (`mformat`/`mcopy` — unprivileged, no loop-mount needed) containing just the
+scenario's `dnsmasq.conf`, attached as QEMU's second `virtio-blk` drive. One customized router
+image is still reused across every scenario; only the scratch disk (built fresh per run, in
+seconds) carries scenario-specific content, so adding a scenario is still "add a directory,"
+not an image rebuild.
 
-**Readiness detection:** the init script writes a marker file (`/mnt/scenario/.ready`) to the
-9p share once `dnsmasq-rs` is listening. `run.sh` polls for that file's appearance from the
-host side — this works identically regardless of boot speed (TCG vs. hypothetical future KVM),
-and avoids `expect`-scripting the serial console (not installed, and brittle across OpenWrt
-versions).
+**Readiness detection — revised twice from the original `.ready`-marker plan, before landing
+back on a `.ready` marker.** The first revision made the scratch disk config-injection-only and
+tried polling the guest's serial console (`-serial file:<path>`) for `dnsmasq-rs`'s own startup
+log line instead, since a read-only disk gives the guest no way to signal back. That in turn
+was superseded once it became clear the console approach would need a *read-write* channel
+anyway to be robust (a config that hangs rather than errors gives no console line to poll for
+either way). The scratch disk was made read-write and the guest now writes both a `.ready`
+marker and a full `dnsmasq-rs.log` back onto it — `run.sh` polls for `.ready`'s appearance from
+the host via `mtools` (`mdir`), and `dnsmasq-rs.log` is available for post-run debugging without
+needing console access at all.
+
+**Init mechanism — classic `rc.common`, not `procd`.** The init script deliberately does not
+use `USE_PROCD=1`/`procd_open_instance` despite that being OpenWrt's modern convention (and
+what the stock `/etc/init.d/dnsmasq` uses). Empirically, `procd_open_instance` /
+`procd_set_param command ...` / `procd_close_instance` all completed without error but the
+resulting instance never actually started `dnsmasq-rs` — confirmed via `pidof` polling, and by
+proving the identical command works when instead launched as a plain backgrounded shell job
+from the same script. Rather than chase procd's silent failure further, the script uses the
+older `start()`/`stop()` `rc.common` convention, which the dispatcher still fully supports.
+The trade-off is losing procd's auto-respawn-on-crash — acceptable for a test harness, where a
+mid-scenario crash should surface as a test failure rather than be silently respawned away.
 
 ### Scenario format and client execution
 
-Each scenario is a directory with a real `dnsmasq.conf` (injected via the 9p share, not baked
-into the image) and one `client-N.conf` per client, a shell-sourceable `KEY=value` file:
+Each scenario is a directory with a real `dnsmasq.conf` (injected via the per-run scratch
+virtio-blk disk, not baked into the image) and one `client-N.conf` per client, a
+shell-sourceable `KEY=value` file:
 
 ```
 CLIENT_TOOL=busybox-udhcpc     # busybox-udhcpc | isc-dhclient  (v1 set)
