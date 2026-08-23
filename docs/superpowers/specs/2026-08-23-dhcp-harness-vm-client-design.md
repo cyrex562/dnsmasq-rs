@@ -58,7 +58,7 @@ Creating and destroying a TAP needs `CAP_NET_ADMIN` (root), so this needs its ow
 entry point, `functional/lib/tap-ctl.sh` — the same shape as the now-removed `netns-exec.sh`:
 a fixed script path granted with no argument list in the sudoers file (sudo-rs rejects
 wildcards outright, and a bare command path already matches any arguments per standard
-sudoers(5) semantics), with the actual scoping — only TAP names matching `fn-vmclient-*` — done
+sudoers(5) semantics), with the actual scoping — only TAP names matching `fnvm*` — done
 inside the script itself. It supports two operations:
 
 ```
@@ -118,7 +118,7 @@ existing comparison logic (`EXPECT_*` vs. `ACTUAL_*`) completely unchanged — o
 replaced by a VM-based equivalent:
 
 ```
-1. Generate a unique ephemeral TAP name (e.g. fn-vmclient-<random>).
+1. Generate a unique ephemeral TAP name (e.g. fnvm<hex-pid><hex-random>).
 2. sudo tap-ctl.sh create <name>
 3. Build an empty scratch disk (generalizing lib/scratch-disk.sh, which today always copies in
    a dnsmasq.conf — the client doesn't need one).

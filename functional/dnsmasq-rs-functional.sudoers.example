@@ -1,7 +1,7 @@
-# Optional: install this to let `functional/run.sh` execute DHCP client tools
-# inside the fn-client-* namespaces without a sudo password prompt on every
-# run. Not required — without it, run.sh's netns-exec.sh calls will just
-# prompt for your password each time.
+# Optional: install this to let `functional/lib/client.sh` create/destroy
+# the ephemeral TAP devices client VMs attach to the shared bridge with,
+# without a sudo password prompt on every run. Not required — without it,
+# tap-ctl.sh calls will just prompt for your password each time.
 #
 # Install:
 #   1. Replace YOUR_USERNAME below with your actual username (`whoami`).
@@ -12,14 +12,14 @@
 #   4. sudo chmod 0440 /etc/sudoers.d/dnsmasq-rs-functional
 #   5. sudo visudo -c   # verify the file parses before trusting it
 #
-# Scope: only functional/lib/netns-exec.sh, a narrow wrapper that itself
-# refuses any namespace name not matching fn-client-* — nothing broader.
-# This grants the wrapper script itself, not `ip netns exec` directly with
+# Scope: only functional/lib/tap-ctl.sh, a narrow wrapper that itself
+# refuses any TAP name not matching fnvm* — nothing broader. This
+# grants the wrapper script itself, not `ip tuntap`/`ip link` directly with
 # a wildcard: this host's sudo (sudo-rs, Ubuntu's Rust reimplementation)
 # rejects any wildcard character ("*", "?", "[]") in a command argument
 # outright ("wildcards are not allowed in command arguments"), so the
-# fn-client-* scoping has to live in the wrapper script instead of the
-# sudoers file. A bare command path with no argument list (as below)
-# still matches any arguments, per standard sudoers(5) semantics — that
-# part is not a wildcard and sudo-rs does support it.
-YOUR_USERNAME ALL=(root) NOPASSWD: /home/YOUR_USERNAME/Projects/dnsmasq-rs/functional/lib/netns-exec.sh
+# fnvm* scoping has to live in the wrapper script instead of the
+# sudoers file. A bare command path with no argument list (as below) still
+# matches any arguments, per standard sudoers(5) semantics — that part is
+# not a wildcard and sudo-rs does support it.
+YOUR_USERNAME ALL=(root) NOPASSWD: /home/YOUR_USERNAME/Projects/dnsmasq-rs/functional/lib/tap-ctl.sh

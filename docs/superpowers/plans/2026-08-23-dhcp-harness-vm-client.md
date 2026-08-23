@@ -130,7 +130,7 @@ git commit -m "functional: fetch the pinned Alpine client VM base image"
 
 **Interfaces:**
 - Consumes: `$BRIDGE` (must match `functional/lib/common.sh`'s `BRIDGE=dnsmasq-fnbr0` constant — this script does not source `common.sh`, since it runs under `sudo` as a standalone entry point exactly like `netns-exec.sh` does; keep the value in sync manually, same as that file already requires).
-- Produces: `functional/lib/tap-ctl.sh create <name>` and `functional/lib/tap-ctl.sh delete <name>`, where `<name>` must match `fn-vmclient-*` or the script refuses and exits 1. `create` makes the TAP, attaches it to the bridge, and brings it up, owned by the invoking (`SUDO_USER`) user. Task 5's `client.sh` calls this via `sudo`.
+- Produces: `functional/lib/tap-ctl.sh create <name>` and `functional/lib/tap-ctl.sh delete <name>`, where `<name>` must match `fnvm*` or the script refuses and exits 1. `create` makes the TAP, attaches it to the bridge, and brings it up, owned by the invoking (`SUDO_USER`) user. Task 5's `client.sh` calls this via `sudo`.
 
 - [ ] **Step 1: Write `tap-ctl.sh`**
 
@@ -144,7 +144,7 @@ set -euo pipefail
 # functional/dnsmasq-rs-functional.sudoers.example, which grants this exact
 # absolute path with no argument list in the sudoers spec -- this host's
 # sudo (sudo-rs) rejects any wildcard character in a command argument
-# outright, so the fn-vmclient-* scoping below is what actually constrains
+# outright, so the fnvm* scoping below is what actually constrains
 # this, not the sudoers grant syntax. Same pattern netns-exec.sh already
 # uses for namespace names.
 
@@ -155,9 +155,9 @@ op="${1:-}"
 name="${2:-}"
 
 case "$name" in
-  fn-vmclient-*) ;;
+  fnvm*) ;;
   *)
-    echo "tap-ctl.sh: refusing non fn-vmclient-* TAP name: '$name'" >&2
+    echo "tap-ctl.sh: refusing non fnvm* TAP name: '$name'" >&2
     exit 1
     ;;
 esac
@@ -172,7 +172,7 @@ case "$op" in
     ip link delete "$name" 2>/dev/null || true
     ;;
   *)
-    echo "tap-ctl.sh: usage: tap-ctl.sh create|delete <fn-vmclient-name>" >&2
+    echo "tap-ctl.sh: usage: tap-ctl.sh create|delete <fnvm-name>" >&2
     exit 1
     ;;
 esac
@@ -207,12 +207,12 @@ Replace the entire contents of `functional/dnsmasq-rs-functional.sudoers.example
 #   5. sudo visudo -c   # verify the file parses before trusting it
 #
 # Scope: only functional/lib/tap-ctl.sh, a narrow wrapper that itself
-# refuses any TAP name not matching fn-vmclient-* — nothing broader. This
+# refuses any TAP name not matching fnvm* — nothing broader. This
 # grants the wrapper script itself, not `ip tuntap`/`ip link` directly with
 # a wildcard: this host's sudo (sudo-rs, Ubuntu's Rust reimplementation)
 # rejects any wildcard character ("*", "?", "[]") in a command argument
 # outright ("wildcards are not allowed in command arguments"), so the
-# fn-vmclient-* scoping has to live in the wrapper script instead of the
+# fnvm* scoping has to live in the wrapper script instead of the
 # sudoers file. A bare command path with no argument list (as below) still
 # matches any arguments, per standard sudoers(5) semantics — that part is
 # not a wildcard and sudo-rs does support it.
@@ -233,19 +233,19 @@ sudo visudo -c
 Then, without any further sudo prompt, verify directly:
 
 ```bash
-sudo -n /home/YOUR_USERNAME/Projects/dnsmasq-rs/functional/lib/tap-ctl.sh create fn-vmclient-test
-ip link show fn-vmclient-test
-sudo -n /home/YOUR_USERNAME/Projects/dnsmasq-rs/functional/lib/tap-ctl.sh delete fn-vmclient-test
-ip link show fn-vmclient-test
+sudo -n /home/YOUR_USERNAME/Projects/dnsmasq-rs/functional/lib/tap-ctl.sh create fnvmtest1234
+ip link show fnvmtest1234
+sudo -n /home/YOUR_USERNAME/Projects/dnsmasq-rs/functional/lib/tap-ctl.sh delete fnvmtest1234
+ip link show fnvmtest1234
 ```
 
 Expected: `visudo -c` reports the file parsed OK; the first `ip link show` shows the TAP attached to `dnsmasq-fnbr0` and up; the second `ip link show` fails with "does not exist" (deleted). Also verify the safety check independently:
 
 ```bash
-sudo -n /home/YOUR_USERNAME/Projects/dnsmasq-rs/functional/lib/tap-ctl.sh create not-fn-vmclient-prefixed
+sudo -n /home/YOUR_USERNAME/Projects/dnsmasq-rs/functional/lib/tap-ctl.sh create not-fnvm-prefixed
 ```
 
-Expected: `tap-ctl.sh: refusing non fn-vmclient-* TAP name: 'not-fn-vmclient-prefixed'`, exit 1, no TAP created.
+Expected: `tap-ctl.sh: refusing non fnvm*-prefixed TAP name: 'not-fnvm-prefixed'`, exit 1, no TAP created.
 
 - [ ] **Step 5: Commit**
 
@@ -744,7 +744,11 @@ Replace it with:
 run_alpine_vm_client() {
   local mac="$1" result_file="$2"
   local tap_ctl="$LIB_DIR/tap-ctl.sh"
-  local tap_name="fn-vmclient-$$-$RANDOM"
+  # Linux interface names are capped at 15 usable characters (IFNAMSIZ-1):
+  # "fnvm" + 4 hex digits from $$ + 4 hex digits from $RANDOM = 12 chars,
+  # comfortably under the limit and still unique enough for sequential runs.
+  local tap_name
+  tap_name="fnvm$(printf '%04x' $(( $$ % 65536 )))$(printf '%04x' "$RANDOM")"
 
   sudo "$tap_ctl" create "$tap_name"
 
@@ -1069,7 +1073,7 @@ Replace the `### Optional: passwordless \`ip netns exec\`` section with:
 `functional/lib/client.sh` needs one privileged operation per client VM run — creating and
 destroying its ephemeral TAP device, executed through the narrow `functional/lib/tap-ctl.sh`
 wrapper, since this host's `sudo` (`sudo-rs`) rejects any wildcard in a sudoers command spec, so
-the `fn-vmclient-*` scoping lives in the wrapper script itself rather than the sudoers rule —
+the `fnvm*` scoping lives in the wrapper script itself rather than the sudoers rule —
 which will prompt for your `sudo` password each time unless you install the scoped, opt-in
 sudoers rule in `functional/dnsmasq-rs-functional.sudoers.example`. See that file for install
 instructions. This step is entirely optional; without it, the harness still works, just with a
@@ -1190,8 +1194,7 @@ Expected: the first run (blocklist removed) reports `FAIL client-0: expected res
 ./functional/run.sh basic-lease
 ./functional/run.sh basic-lease
 ps aux | grep qemu-system | grep -v grep || echo "no leftover qemu processes"
-ip link show | grep fn-vmclient || echo "no leftover client TAPs"
-ip link show | grep fn-vmclient-h 2>/dev/null; true
+ip link show | grep fnvm || echo "no leftover client TAPs"
 ls /tmp/dnsmasq-rs-functional.* 2>&1 || echo "no leftover work dirs"
 ```
 
