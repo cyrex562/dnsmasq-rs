@@ -1085,6 +1085,79 @@ fn sockaddr_storage_to_socket_addr(
     }
 }
 
+/// `sendmsg(2)` a UDP datagram with an `IP_PKTINFO` control message pinning
+/// the egress interface to `if_index`.
+///
+/// An unbound (wildcard) socket sending to a broadcast address has no way
+/// for the kernel to pick an egress interface on its own, and fails with
+/// `ENETUNREACH` rather than guessing — confirmed against a real client in
+/// the DHCP functional harness (issue #136). Upstream's Linux branch of
+/// `dhcp_reply()` (dhcp.c:427-446) fills in exactly this cmsg (`ipi_ifindex
+/// = rcvd_iface_index`, `ipi_spec_dst` left zero so the kernel picks the
+/// interface's own address as source) for both broadcast and
+/// unicast-to-unconfigured-client replies; this only covers the broadcast
+/// case dnsmasq-rs's reply path can hit today.
+#[cfg(all(unix, target_os = "linux"))]
+pub fn send_with_pktinfo(
+    fd: std::os::unix::io::RawFd,
+    buf: &[u8],
+    dest: std::net::SocketAddrV4,
+    if_index: i32,
+) -> std::io::Result<usize> {
+    use std::mem;
+
+    let mut addr: libc::sockaddr_in = unsafe { mem::zeroed() };
+    addr.sin_family = libc::AF_INET as libc::sa_family_t;
+    addr.sin_port = dest.port().to_be();
+    addr.sin_addr.s_addr = u32::from(*dest.ip()).to_be();
+
+    let iov = libc::iovec {
+        iov_base: buf.as_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+
+    #[repr(C)]
+    struct ControlBuf {
+        hdr: libc::cmsghdr,
+        pktinfo: libc::in_pktinfo,
+    }
+    let mut control: ControlBuf = unsafe { mem::zeroed() };
+    control.hdr.cmsg_level = libc::IPPROTO_IP;
+    control.hdr.cmsg_type = libc::IP_PKTINFO;
+    control.hdr.cmsg_len =
+        unsafe { libc::CMSG_LEN(mem::size_of::<libc::in_pktinfo>() as u32) } as _;
+    control.pktinfo.ipi_ifindex = if_index;
+
+    let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+    msg.msg_name = &mut addr as *mut _ as *mut libc::c_void;
+    msg.msg_namelen = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    msg.msg_iov = &iov as *const libc::iovec as *mut libc::iovec;
+    msg.msg_iovlen = 1;
+    msg.msg_control = &mut control as *mut _ as *mut libc::c_void;
+    msg.msg_controllen = mem::size_of::<ControlBuf>() as _;
+
+    let rc = unsafe { libc::sendmsg(fd, &msg, 0) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(rc as usize)
+}
+
+/// Non-Linux stub: no cmsg-based egress-interface pinning available, so
+/// callers fall back to a plain `send_to`.
+#[cfg(not(all(unix, target_os = "linux")))]
+pub fn send_with_pktinfo(
+    _fd: i32,
+    _buf: &[u8],
+    _dest: std::net::SocketAddrV4,
+    _if_index: i32,
+) -> std::io::Result<usize> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "send_with_pktinfo not supported on this platform",
+    ))
+}
+
 /// Non-Unix stub.
 #[cfg(not(unix))]
 pub fn recv_with_dest(_fd: i32, _buf: &mut [u8]) -> std::io::Result<RecvMeta> {
@@ -3163,6 +3236,50 @@ mod tests {
         unsafe { libc::close(fd) };
         assert!(result.is_ok());
         // We don't assert true/false since kernel support varies.
+    }
+
+    // ── send_with_pktinfo ────────────────────────────────────────────────────
+
+    /// Exercises the actual `sendmsg`/cmsg plumbing end-to-end. Targets the
+    /// receiver's own unicast address rather than a real broadcast: loopback
+    /// typically lacks `IFF_BROADCAST`, so pinning it as the egress
+    /// interface for a genuinely broadcast destination could legitimately
+    /// fail with `ENETUNREACH` in a sandboxed test runner for reasons
+    /// unrelated to the cmsg construction this test is checking.
+    #[cfg(all(unix, target_os = "linux"))]
+    #[tokio::test]
+    async fn send_with_pktinfo_delivers_via_the_pinned_interface() {
+        use std::os::unix::io::AsRawFd;
+
+        let receiver = match tokio::net::UdpSocket::bind("127.0.0.1:0").await {
+            Ok(sock) => sock,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("failed to bind receiver: {e}"),
+        };
+        let sender = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+            Ok(sock) => sock,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("failed to bind sender: {e}"),
+        };
+        let dest = match receiver.local_addr().unwrap() {
+            std::net::SocketAddr::V4(a) => a,
+            std::net::SocketAddr::V6(_) => panic!("expected an IPv4 receiver address"),
+        };
+
+        // Loopback is always index 1 on Linux.
+        let sent = send_with_pktinfo(sender.as_raw_fd(), b"hello", dest, 1)
+            .expect("sendmsg with an IP_PKTINFO cmsg should succeed on loopback");
+        assert_eq!(sent, 5);
+
+        let mut buf = [0u8; 16];
+        let (len, _from) = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            receiver.recv_from(&mut buf),
+        )
+        .await
+        .expect("timed out waiting for the pktinfo-pinned datagram")
+        .unwrap();
+        assert_eq!(&buf[..len], b"hello");
     }
 
     // ── join_dhcp6_multicast ──────────────────────────────────────────────────

@@ -1516,14 +1516,34 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     to a full `address_allocate` scan (rfc2131.c:1340-1341); this port only
     scans, so a client that asks for a specific free address by number
     doesn't get it preferentially.
-  - **`make_fd`/`dhcp_init` socket options are still unported**: no
-    `IP_MTU_DISCOVER`/`IP_PMTUDISC_DONT`, `IP_TOS`, `IP_PKTINFO`,
-    `SO_REUSEPORT`/`SO_REUSEADDR` gating, or PXE-port (4011) bind. DHCP
-    socket setup in `bind_listeners` is still a plain bind + `set_nonblocking`
-    + optional `SO_BINDTODEVICE`. `Daemon::enable_pxe` now exists and is set
-    by `pxe-prompt`/`pxe-service` (Issue #56/T3-daemon-struct), but
-    `daemon->pxefd` and the PXE-port bind/response path it would gate still
-    don't exist in this port at all.
+  - **`make_fd`/`dhcp_init` socket options are partially ported.** `IP_PKTINFO`
+    (receive-side arrival-interface metadata) and, as of the functional DHCP
+    harness (Issue #136), `SO_BROADCAST` plus send-side `IP_PKTINFO`
+    egress-interface pinning (`network::send_with_pktinfo`, used by
+    `send_dhcp_reply_to` when replying to a broadcast destination) are done —
+    the latter was a real bug, not just missing parity: without it, every
+    reply to a client that doesn't have an address yet failed at the kernel
+    with `ENETUNREACH`, caught only because the harness actually exercises a
+    real client over a real network path instead of a loopback unit test.
+    Still missing: `IP_MTU_DISCOVER`/`IP_PMTUDISC_DONT`, `IP_TOS`,
+    `SO_REUSEPORT`/`SO_REUSEADDR` gating, and PXE-port (4011) bind. DHCP
+    socket setup in `bind_listeners` is otherwise a plain bind +
+    `set_nonblocking` + optional `SO_BINDTODEVICE`. `Daemon::enable_pxe` now
+    exists and is set by `pxe-prompt`/`pxe-service` (Issue #56/T3-daemon-struct),
+    but `daemon->pxefd` and the PXE-port bind/response path it would gate
+    still don't exist in this port at all.
+  - **Configured `dhcp-option` for router/dns-server can end up duplicated
+    in the reply alongside the auto-derived default.** Found via the
+    functional harness (Issue #136): a scenario's explicit
+    `dhcp-option=option:router,<addr>` (matching what `link_contexts_for_interface`
+    already derives as the context's own address) produced a reply with the
+    option present twice (`router=192.168.1.1 192.168.1.1` as busybox udhcpc
+    reported it) — worked around at the harness level (the scenario simply
+    doesn't set it, relying on the default), but the underlying merge gap
+    between configured `dhcp-option`s and `rfc2131.rs`'s
+    `!has_opt_raw(opts, OPTION_ROUTER)`/`OPTION_DNSSERVER` default-fill checks
+    (rfc2131.rs:1447-1456) is unresolved — trace where configured extra
+    options get appended relative to that fill-in check.
   - **`host_from_dns` is not ported** — DHCP lease hostname resolution has
     no fallback to a reverse `F_HOSTS` cache lookup.
   - **No SIGHUP re-run of `--read-ethers`.** Upstream re-reads
