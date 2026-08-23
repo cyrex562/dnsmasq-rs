@@ -1,0 +1,55 @@
+#!/sbin/openrc-run
+# One-shot DHCP client for the DHCP functional test harness's VM-based
+# client (see
+# docs/superpowers/specs/2026-08-23-dhcp-harness-vm-client-design.md). Not
+# a long-running service: brings up eth0, runs udhcpc once, writes the
+# result to the scratch disk functional/lib/client.sh attached, then
+# powers off. build-client-image.sh disables this image's own default
+# networking/tiny-cloud services so nothing else touches eth0 or delays
+# boot looking for a cloud-init datasource that doesn't exist here.
+
+description="One-shot DHCP client run for the dnsmasq-rs functional test harness"
+
+find_scratch_disk() {
+	local i=0
+	while [ $i -lt 30 ]; do
+		if [ -b /dev/vdb1 ]; then
+			echo /dev/vdb1
+			return 0
+		elif [ -b /dev/vdb ]; then
+			echo /dev/vdb
+			return 0
+		fi
+		sleep 1
+		i=$((i + 1))
+	done
+	return 1
+}
+
+start() {
+	ebegin "$description"
+
+	local dev
+	dev="$(find_scratch_disk)" || {
+		eend 1 "scratch disk never appeared"
+		poweroff
+		return 1
+	}
+
+	mkdir -p /mnt/scratch
+	mount -t vfat "$dev" /mnt/scratch
+
+	ip link set eth0 up
+
+	RESULT_FILE=/mnt/scratch/result \
+		udhcpc -i eth0 -n -q -f -t 8 -T 3 \
+			-O domain -O ntpsrv \
+			-s /usr/local/sbin/dhcp-test-handler.sh \
+		>/mnt/scratch/udhcpc.log 2>&1
+
+	touch /mnt/scratch/.done
+	sync
+
+	eend 0
+	poweroff
+}

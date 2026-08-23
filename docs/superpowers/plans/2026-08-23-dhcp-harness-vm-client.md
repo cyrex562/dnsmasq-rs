@@ -596,6 +596,10 @@ guestfish -a "$CLIENT_IMG" -m /dev/sda <<GUESTFISH
 upload $ROOT_DIR/functional/images/client-dhcp-test.init /etc/init.d/dhcp-test-client
 chmod 0755 /etc/init.d/dhcp-test-client
 
+# upload doesn't create parent directories, and this minimal Alpine image
+# doesn't ship /usr/local/sbin -- confirmed the hard way ("upload: ...: No
+# such file or directory") on first attempt.
+mkdir-p /usr/local/sbin
 upload $ROOT_DIR/functional/images/client-udhcpc-handler.sh /usr/local/sbin/dhcp-test-handler.sh
 chmod 0755 /usr/local/sbin/dhcp-test-handler.sh
 
