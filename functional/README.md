@@ -36,9 +36,26 @@ unless you install the scoped, opt-in sudoers rule in
 step is entirely optional; without it, the harness still works, just with a password prompt per
 client invocation.
 
+## Router VM image
+
+Once per host (or whenever `dnsmasq-rs` itself changes and you want the image to pick up the
+new binary):
+
+```bash
+sudo ./functional/images/build-router-image.sh
+```
+
+This fetches (and checksum-verifies) a pinned OpenWrt x86_64 image into `functional/.cache/`
+(gitignored) if not already cached, cross-compiles `dnsmasq-rs` for
+`x86_64-unknown-linux-musl`, and customizes a copy of the base image via `guestfish`: installs
+the binary, disables OpenWrt's own `dnsmasq`, and installs a custom `/etc/init.d/dnsmasq-rs`
+service (classic `rc.common`, not `procd` — see the design doc's "Router VM image" section for
+why). Needs `sudo` because `guestfish`'s helper VM needs to read the host's `0600 root:root`
+kernel image; the resulting `functional/.cache/router.img` is chowned back to you afterward.
+
 ## Status
 
 - [x] One-time host network setup (`setup-host.sh` / `teardown-host.sh`) — this file.
-- [ ] Router VM image (fetch OpenWrt, cross-compile + inject `dnsmasq-rs`) — issue #135.
+- [x] Router VM image (fetch OpenWrt, cross-compile + inject `dnsmasq-rs`) — issue #135.
 - [ ] Scenario runner + `basic-lease` smoke-test scenario — issue #136.
 - [ ] Remaining v1 scenarios + ISC `dhclient` client type — issue #137.
