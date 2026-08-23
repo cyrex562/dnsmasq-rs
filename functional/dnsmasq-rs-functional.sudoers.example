@@ -1,0 +1,14 @@
+# Optional: install this to let `functional/run.sh` execute DHCP client tools
+# inside the fn-client-* namespaces without a sudo password prompt on every
+# run. Not required — without it, run.sh's `ip netns exec` calls will just
+# prompt for your password each time.
+#
+# Install:
+#   1. Replace YOUR_USERNAME below with your actual username (`whoami`).
+#   2. sudo cp functional/dnsmasq-rs-functional.sudoers.example \
+#        /etc/sudoers.d/dnsmasq-rs-functional
+#   3. sudo chmod 0440 /etc/sudoers.d/dnsmasq-rs-functional
+#   4. sudo visudo -c   # verify the file parses before trusting it
+#
+# Scope: only `ip netns exec fn-client-<N> <anything>` — nothing broader.
+YOUR_USERNAME ALL=(root) NOPASSWD: /usr/sbin/ip netns exec fn-client-* *
