@@ -26,3 +26,10 @@ require_router_image() {
     exit 1
   fi
 }
+
+require_client_image() {
+  if [[ ! -f "$CACHE_DIR/client.img" ]]; then
+    err "client image not built — run: sudo ./functional/images/build-client-image.sh"
+    exit 1
+  fi
+}

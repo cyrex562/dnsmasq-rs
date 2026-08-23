@@ -63,7 +63,14 @@ rm-f /etc/runlevels/default/tiny-cloud-main
 rm-f /etc/runlevels/default/sshd
 rm-f /etc/runlevels/default/chronyd
 
-ln-sf ../init.d/dhcp-test-client /etc/runlevels/default/dhcp-test-client
+# Two levels of ".." because /etc/runlevels/default/ is two directories
+# below /etc/, not one -- unlike OpenWrt's flat /etc/rc.d/ (one level
+# below /etc/), where the router image's equivalent symlink only needs a
+# single "..". Confirmed the hard way: the first attempt's symlink was
+# valid but pointed at the non-existent /etc/runlevels/init.d/..., so
+# OpenRC's default runlevel had nothing to run even though \`rc default\`
+# itself executes unconditionally from /etc/inittab.
+ln-sf ../../init.d/dhcp-test-client /etc/runlevels/default/dhcp-test-client
 GUESTFISH
 
 # The base image is qcow2; guestfish edits it in place without changing

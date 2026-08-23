@@ -36,6 +36,7 @@ SCENARIO_DIR="$ROOT_DIR/functional/scenarios/$SCENARIO"
 
 require_host_setup
 require_router_image
+require_client_image
 
 WORK_DIR="$(mktemp -d /tmp/dnsmasq-rs-functional.XXXXXX)"
 ROUTER_RUN_IMG="$WORK_DIR/router.img"
@@ -72,10 +73,8 @@ FAIL_COUNT=0
 for conf_file in "$SCENARIO_DIR"/client-*.conf; do
   [[ -e "$conf_file" ]] || continue
   label="$(basename "$conf_file" .conf)"
-  idx="${label#client-}"
-  ns="fn-client-$idx"
-  log "running client $label against namespace $ns"
-  if run_and_check_client "$conf_file" "$ns" "$label"; then
+  log "running client $label"
+  if run_and_check_client "$conf_file" "$label"; then
     PASS_COUNT=$((PASS_COUNT + 1))
   else
     FAIL_COUNT=$((FAIL_COUNT + 1))

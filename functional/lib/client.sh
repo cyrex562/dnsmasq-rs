@@ -23,37 +23,48 @@ ip_in_range() {
   (( ip_i >= lo_i && ip_i <= hi_i ))
 }
 
-# Brings up $ns's eth0 with $mac, runs busybox udhcpc against it, and writes
-# a normalized RESULT=lease|nak|timeout (plus ACTUAL_* facts on lease) to
-# $result_file via lib/udhcpc-handler.sh — see that script for why router/
-# dns/ntp are reduced to their first address and why the file must stay
-# single-word-per-line.
-run_busybox_udhcpc() {
-  local ns="$1" mac="$2" result_file="$3"
-  local netns_exec="$LIB_DIR/netns-exec.sh"
+# Boots a small Alpine VM (functional/.cache/client.img, built by
+# functional/images/build-client-image.sh) attached to the shared bridge
+# via a fresh ephemeral TAP, waits for it to run its one-shot DHCP client
+# and report results, and writes the same RESULT=/ACTUAL_* shape to
+# $result_file that the namespace-based busybox-udhcpc path used to —
+# comparison logic in run_and_check_client never needs to know the
+# difference. See
+# docs/superpowers/specs/2026-08-23-dhcp-harness-vm-client-design.md.
+run_alpine_vm_client() {
+  local mac="$1" result_file="$2"
+  local tap_ctl="$LIB_DIR/tap-ctl.sh"
+  # Linux interface names are capped at 15 usable characters (IFNAMSIZ-1):
+  # "fnvm" + 4 hex digits from $$ + 4 hex digits from $RANDOM = 12 chars,
+  # comfortably under the limit and still unique enough for sequential runs.
+  local tap_name
+  tap_name="fnvm$(printf '%04x' $(( $$ % 65536 )))$(printf '%04x' "$RANDOM")"
 
-  sudo "$netns_exec" "$ns" ip link set eth0 down
-  sudo "$netns_exec" "$ns" ip link set eth0 address "$mac"
-  sudo "$netns_exec" "$ns" ip link set eth0 up
+  sudo "$tap_ctl" create "$tap_name"
 
-  # -t 8 -T 3 gives ~24s of discover retries (the 45s wrapper below leaves
-  # headroom for the request/ack round trip after an offer arrives): the
-  # veth flap above drops carrier on the host-side bridge port too, and
-  # how long it takes to return to forwarding varies with how loaded the
-  # host is running the (unaccelerated, TCG) router VM alongside
-  # everything else — a fixed short guard delay was tried and still
-  # flaked under load. Retrying across a longer window is the standard
-  # way DHCP clients absorb this instead of guessing a fixed delay.
-  #
-  # -O domain -O ntpsrv: busybox only requests a baseline option set by
-  # default: client-options scenarios need these explicitly requested to
-  # get them back at all.
-  timeout 45 sudo "$netns_exec" "$ns" \
-    env RESULT_FILE="$result_file" \
-    busybox udhcpc -i eth0 -n -q -f -t 8 -T 3 \
-      -O domain -O ntpsrv \
-      -s "$LIB_DIR/udhcpc-handler.sh" \
-    >/dev/null 2>&1 || true
+  local work_dir client_img scratch_disk console_log qemu_log
+  work_dir="$(mktemp -d)"
+  client_img="$work_dir/client.img"
+  scratch_disk="$work_dir/scratch.img"
+  console_log="$work_dir/console.log"
+  qemu_log="$work_dir/qemu.log"
+
+  build_empty_scratch_disk "$scratch_disk"
+  cp -f "$CACHE_DIR/client.img" "$client_img"
+
+  local vm_pid
+  vm_pid="$(start_vm "$tap_name" 256 "$client_img" "$scratch_disk" "$console_log" "$qemu_log" "$mac")"
+
+  if wait_for_marker "$scratch_disk" 60 '\.done'; then
+    mtype -i "$scratch_disk" ::result > "$result_file" 2>/dev/null || true
+  else
+    echo "client VM did not finish within 60s" >&2
+    print_vm_diagnostics "$console_log" "$scratch_disk" ""
+  fi
+
+  stop_vm "$vm_pid"
+  sudo "$tap_ctl" delete "$tap_name"
+  rm -rf "$work_dir"
 }
 
 # Runs the client tool named in $1 (a client-N.conf) inside namespace $2,
@@ -61,7 +72,7 @@ run_busybox_udhcpc() {
 # EXPECT_* values. Prints one line per mismatch plus a final PASS/FAIL
 # line; returns 0 only if every assertion held.
 run_and_check_client() {
-  local conf_file="$1" ns="$2" label="$3"
+  local conf_file="$1" label="$2"
   local CLIENT_TOOL="" CLIENT_MAC="" EXPECT_RESULT="" EXPECT_IP="" EXPECT_IP_RANGE=""
   local EXPECT_ROUTER="" EXPECT_DNS="" EXPECT_LEASE_TIME="" EXPECT_DOMAIN="" EXPECT_NTP=""
   # shellcheck source=/dev/null
@@ -82,11 +93,11 @@ run_and_check_client() {
   result_file="$result_dir/result"
 
   case "$CLIENT_TOOL" in
-    busybox-udhcpc)
-      run_busybox_udhcpc "$ns" "$CLIENT_MAC" "$result_file"
+    alpine-vm)
+      run_alpine_vm_client "$CLIENT_MAC" "$result_file"
       ;;
     *)
-      echo "FAIL $label: unsupported CLIENT_TOOL '$CLIENT_TOOL' (v1 supports busybox-udhcpc only — see issue #141 for a VM-based second client type)"
+      echo "FAIL $label: unsupported CLIENT_TOOL '$CLIENT_TOOL' (v1 supports alpine-vm only)"
       rm -rf "$result_dir"
       return 1
       ;;
