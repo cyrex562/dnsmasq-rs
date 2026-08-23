@@ -58,20 +58,25 @@ breaks" treatment `parity/`'s expansion (issue #124) already gave DNS.
    implementing this: `guestfish`'s supermin helper VM needs to read the host's kernel image,
    which is `0600 root:root` on this system, the same class of constraint as the network setup.
    Every repeated `./functional/run.sh <scenario>` invocation after both one-time steps needs no
-   privilege except one narrow, isolatable `ip netns exec` call per client (optionally
-   passwordless via a scoped, opt-in `/etc/sudoers.d/` rule this repo ships but does not install
-   automatically).
+   privilege except one narrow, isolatable ephemeral-TAP create/destroy call per client
+   (optionally passwordless via a scoped, opt-in `/etc/sudoers.d/` rule this repo ships but does
+   not install automatically). Originally this was one `ip netns exec` call per client against a
+   namespace `setup-host.sh` created once; see
+   `docs/superpowers/specs/2026-08-23-dhcp-harness-vm-client-design.md` for why client execution
+   moved from namespaces to per-client VMs (Issue #141).
 
 ## Architecture
 
 ```
 functional/
-  setup-host.sh          # one-time, sudo: bridge + persistent TAP + client netns/veth
+  setup-host.sh          # one-time, sudo: bridge + persistent router TAP
   teardown-host.sh        # reverses setup-host.sh
-  run.sh                  # ./functional/run.sh <scenario>  (no sudo except netns-exec)
+  run.sh                  # ./functional/run.sh <scenario>  (no sudo except tap-ctl.sh)
   images/
     fetch-openwrt.sh      # downloads + pins an OpenWrt x86_64 release into .cache/ (gitignored)
     build-router-image.sh # guestfish offline customization (see below)
+    fetch-alpine.sh       # downloads + pins an Alpine x86_64 cloud image (client VM)
+    build-client-image.sh # guestfish offline customization for the client VM
   scenarios/
     basic-lease/
       dnsmasq.conf
@@ -85,20 +90,24 @@ functional/
     mac-blocklist-nak/
       dnsmasq.conf
       client-1.conf
-  lib/                    # shared shell helpers: wait-for-vm, parse-lease, netns helpers
+  lib/                    # shared shell helpers: VM lifecycle, scratch disks, tap-ctl.sh, client execution
 ```
 
 ### One-time host setup (`setup-host.sh` / `teardown-host.sh`)
 
-Creates (idempotently): a Linux bridge (`dnsmasq-fnbr0`); one persistent TAP device for the
+Creates (idempotently): a Linux bridge (`dnsmasq-fnbr0`) and one persistent TAP device for the
 router VM's single LAN-side interface (where `dnsmasq-rs` listens — the VM has no WAN interface
 at all, since every v1 scenario is purely LAN-side DHCP and there is nothing for a WAN link to
-do), chowned to the invoking user so QEMU can attach without `sudo`; four network namespace +
-veth pairs (`fn-client-0` through `fn-client-3` — enough for v1's sequential, single-client-at-
-a-time scenarios with headroom for near-term additions, cheap to raise later), with each
-bridge-side veth end already attached. `teardown-host.sh` reverses all of it. Neither script is
-invoked automatically by `run.sh` — the shared network state is meant to persist across many
-`run.sh` invocations within a working session, torn down explicitly when the user is done.
+do), chowned to the invoking user so QEMU can attach without `sudo`. `teardown-host.sh` reverses
+both. Neither script is invoked automatically by `run.sh` — the shared network state is meant to
+persist across many `run.sh` invocations within a working session, torn down explicitly when the
+user is done.
+
+Originally this also created four network namespace + veth pairs (`fn-client-0` through
+`fn-client-3`) for client execution. Issue #141 replaced namespace-based clients with per-client
+VMs, each attaching to the bridge via its own ephemeral TAP (created and destroyed per run by
+`functional/lib/tap-ctl.sh`, not by `setup-host.sh`) — see
+`docs/superpowers/specs/2026-08-23-dhcp-harness-vm-client-design.md` for the full design.
 
 ### Router VM image (`images/`)
 
@@ -161,7 +170,7 @@ virtio-blk disk, not baked into the image) and one `client-N.conf` per client, a
 shell-sourceable `KEY=value` file:
 
 ```
-CLIENT_TOOL=busybox-udhcpc     # busybox-udhcpc (v1 set — see below)
+CLIENT_TOOL=alpine-vm           # alpine-vm (v1 set — see below)
 CLIENT_MAC=52:54:00:12:34:56    # optional; auto-generated per run if omitted
 EXPECT_RESULT=lease             # lease | nak | timeout
 EXPECT_IP=192.168.50.120         # optional exact-match (static reservations)
@@ -173,26 +182,26 @@ EXPECT_DOMAIN=example.test      # optional
 EXPECT_NTP=192.168.50.1          # optional
 ```
 
-For each client file, `run.sh` assigns a pre-provisioned namespace slot and execs the named
-tool inside it (`busybox udhcpc` with a small lease-dump hook script), capturing the resulting
-facts — assigned IP, router/DNS/domain/NTP options, lease time, or an explicit NAK/timeout. A
-comparison step checks those facts against the scenario's `EXPECT_*` values and reports
-pass/fail per assertion, the same "normalize actual vs. expected, report every mismatch" shape
-`parity_probe` already uses for DNS, applied to lease facts instead of DNS packets.
+For each client file, `run.sh` boots a small Alpine VM (see
+`docs/superpowers/specs/2026-08-23-dhcp-harness-vm-client-design.md`) that runs `udhcpc` once
+and reports the result back over a scratch disk, capturing the resulting facts — assigned IP,
+router/DNS/domain/NTP options, lease time, or an explicit NAK/timeout. A comparison step checks
+those facts against the scenario's `EXPECT_*` values and reports pass/fail per assertion, the
+same "normalize actual vs. expected, report every mismatch" shape `parity_probe` already uses
+for DNS, applied to lease facts instead of DNS packets.
 
-**v1 client tools — revised from the original two-tool plan.** The original plan called for a
-second client tool, ISC `dhclient`, running inside the same `fn-client-N` namespaces
-`busybox-udhcpc` uses. Implementing it (Issue #137) surfaced a real design question: `dhclient`
-isn't installed on this class of host, and installing new packages onto the host's own root
-filesystem just to support a test harness runs against how this project wants to treat host
-state. The alternatives considered — a Docker container bind-mounted onto an existing `ip
-netns`-created namespace's `/proc/<pid>/ns/net`, or extracting a static `dhclient` binary from a
-container build — were both more fragile than this design's own stated direction for a second
-client type: a real VM. That became Issue #141 (Alpine base image, Packer/Vagrant-built, a
-one-time build a developer runs once these test machines are mature), tracked separately since
-it's a new subsystem (its own image pipeline, networking, and result-capture convention), not a
-same-day extension of the namespace-based runner. v1 ships with exactly one client tool,
-`busybox-udhcpc`, running in the existing namespaces.
+**v1 client tools — revised twice.** The original plan called for two client tools running
+inside per-client Linux network namespaces `setup-host.sh` created once: `busybox-udhcpc` and
+ISC `dhclient`. Implementing `dhclient` (Issue #137) surfaced a real design question: it isn't
+installed on this class of host, and installing new packages onto the host's own root filesystem
+just to support a test harness runs against how this project wants to treat host state. That
+became Issue #141, which went further than just finding a home for `dhclient` — it replaced the
+namespace-based client entirely with a small QEMU VM per client (see
+`docs/superpowers/specs/2026-08-23-dhcp-harness-vm-client-design.md` for why: the Docker-based
+alternatives considered for `dhclient` specifically were more fragile than this design's own
+already-stated direction for a second client type, and a VM sidesteps the host-package-install
+objection for any future client tool, not just `dhclient`). v1 ships with exactly one client
+tool, `alpine-vm`, running in a small Alpine Linux VM rather than a namespace.
 
 Scenarios still run a scenario's clients **sequentially**, not concurrently — concurrent
 multi-client scenarios (pool exhaustion) are real future work, not v1, because of the extra
