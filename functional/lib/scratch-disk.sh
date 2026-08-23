@@ -12,3 +12,11 @@ build_scenario_disk() {
   mformat -i "$out_img" -v SCENARIO ::
   mcopy -i "$out_img" "$scenario_dir/dnsmasq.conf" ::dnsmasq.conf
 }
+
+# A client VM needs no per-scenario config injected — only a blank,
+# formatted disk to write its result back onto.
+build_empty_scratch_disk() {
+  local out_img="$1"
+  dd if=/dev/zero of="$out_img" bs=1M count=8 status=none
+  mformat -i "$out_img" -v SCRATCH ::
+}

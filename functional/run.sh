@@ -8,8 +8,8 @@ set -euo pipefail
 # against it and checks the result against its EXPECT_* values. See
 # docs/superpowers/specs/2026-08-22-dhcp-functional-test-harness-design.md.
 #
-# Needs no sudo of its own except the `ip netns exec` calls inside
-# lib/client.sh (optionally passwordless — see
+# Needs no sudo of its own except the tap-ctl.sh calls inside lib/client.sh
+# (optionally passwordless — see
 # functional/dnsmasq-rs-functional.sudoers.example).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -45,7 +45,7 @@ QEMU_LOG="$WORK_DIR/qemu.log"
 
 VM_PID=""
 cleanup() {
-  stop_router_vm "$VM_PID"
+  stop_vm "$VM_PID"
   rm -rf "$WORK_DIR"
 }
 trap cleanup EXIT
@@ -57,12 +57,12 @@ log "copying router image for this run"
 cp -f "$CACHE_DIR/router.img" "$ROUTER_RUN_IMG"
 
 log "booting router VM"
-VM_PID="$(start_router_vm "$ROUTER_RUN_IMG" "$SCENARIO_DISK" "$CONSOLE_LOG" "$QEMU_LOG")"
+VM_PID="$(start_vm "$TAP" 512 "$ROUTER_RUN_IMG" "$SCENARIO_DISK" "$CONSOLE_LOG" "$QEMU_LOG" "")"
 
 log "waiting for dnsmasq-rs to become ready (timeout 180s)"
-if ! wait_for_vm_ready "$SCENARIO_DISK" 180; then
+if ! wait_for_marker "$SCENARIO_DISK" 180 '\.ready'; then
   err "VM did not become ready within 180s"
-  print_vm_diagnostics "$CONSOLE_LOG" "$SCENARIO_DISK"
+  print_vm_diagnostics "$CONSOLE_LOG" "$SCENARIO_DISK" "dnsmasq-rs.log"
   exit 1
 fi
 log "dnsmasq-rs is ready"
