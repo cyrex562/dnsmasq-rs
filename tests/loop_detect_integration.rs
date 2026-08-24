@@ -21,7 +21,7 @@ use dnsmasq_rs::forward::{run_forward_loop_on, DnsListener, ForwardConfig};
 use dnsmasq_rs::loop_detect::{loop_make_probe, send_probes};
 use dnsmasq_rs::rfc1035::{DnsPacket, DnsQuestion, DnsRr};
 use dnsmasq_rs::types::addr::MySockAddr;
-use dnsmasq_rs::types::server::Server;
+use dnsmasq_rs::types::server::{Server, ServFlags};
 
 fn query_wire(name: &str, qtype: u16, id: u16) -> Vec<u8> {
     DnsPacket {
@@ -38,7 +38,7 @@ fn query_wire(name: &str, qtype: u16, id: u16) -> Vec<u8> {
 fn loop_server(addr: SocketAddr, uid: u32) -> Server {
     let sock = MySockAddr::from(addr);
     Server {
-        flags: 0,
+        flags: ServFlags::empty(),
         domain: String::new(),
         addr: sock.clone(),
         source_addr: sock,

@@ -3728,17 +3728,17 @@ mod tests {
 
     use crate::domain_match::ServerArray;
     use crate::types::addr::MySockAddr;
-    use crate::types::server::{Server, SERV_4ADDR, SERV_6ADDR, SERV_ALL_ZEROS, SERV_LITERAL_ADDRESS};
+    use crate::types::server::{Server, ServFlags};
     use std::net::SocketAddrV4;
 
-    fn literal_server(domain: &str, flags: u16, ip: Option<std::net::IpAddr>) -> Server {
+    fn literal_server(domain: &str, flags: ServFlags, ip: Option<std::net::IpAddr>) -> Server {
         let addr = match ip {
             Some(std::net::IpAddr::V4(a)) => MySockAddr::V4(SocketAddrV4::new(a, 0)),
             Some(std::net::IpAddr::V6(a)) => MySockAddr::V6(std::net::SocketAddrV6::new(a, 0, 0, 0)),
             None => MySockAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
         };
         Server {
-            flags: flags | SERV_LITERAL_ADDRESS,
+            flags: flags | ServFlags::LITERAL_ADDRESS,
             domain: domain.to_string(),
             addr: addr.clone(),
             source_addr: addr,
@@ -3764,7 +3764,7 @@ mod tests {
     #[test]
     fn address_literal_answers_with_configured_ipv4() {
         let servers = vec![literal_server(
-            "example.com", SERV_4ADDR, Some("1.2.3.4".parse().unwrap()),
+            "example.com", ServFlags::ADDR4, Some("1.2.3.4".parse().unwrap()),
         )];
         let arr = ServerArray::build(&[], &servers);
         let cfg = LocalConfig { address_servers: &arr, address_server_list: &servers, ..empty_config() };
@@ -3782,7 +3782,7 @@ mod tests {
 
     #[test]
     fn address_literal_answers_with_configured_ipv6() {
-        let servers = vec![literal_server("example.com", SERV_6ADDR, Some("::1".parse().unwrap()))];
+        let servers = vec![literal_server("example.com", ServFlags::ADDR6, Some("::1".parse().unwrap()))];
         let arr = ServerArray::build(&[], &servers);
         let cfg = LocalConfig { address_servers: &arr, address_server_list: &servers, ..empty_config() };
 
@@ -3797,7 +3797,7 @@ mod tests {
 
     #[test]
     fn address_literal_all_zeros_answers_a_and_aaaa_for_any_query() {
-        let servers = vec![literal_server("example.com", SERV_ALL_ZEROS, None)];
+        let servers = vec![literal_server("example.com", ServFlags::ALL_ZEROS, None)];
         let arr = ServerArray::build(&[], &servers);
         let cfg = LocalConfig { address_servers: &arr, address_server_list: &servers, ..empty_config() };
 
@@ -3817,7 +3817,7 @@ mod tests {
     /// answer").
     #[test]
     fn bare_literal_domain_returns_nxdomain_by_default() {
-        let servers = vec![literal_server("example.com", 0, None)];
+        let servers = vec![literal_server("example.com", ServFlags::empty(), None)];
         let arr = ServerArray::build(&[], &servers);
         let cfg = LocalConfig { address_servers: &arr, address_server_list: &servers, ..empty_config() };
 
@@ -3833,7 +3833,7 @@ mod tests {
     /// blocks *every* query type, unlike an address literal (see below).
     #[test]
     fn bare_literal_domain_blocks_subdomains_and_all_qtypes() {
-        let servers = vec![literal_server("example.com", 0, None)];
+        let servers = vec![literal_server("example.com", ServFlags::empty(), None)];
         let arr = ServerArray::build(&[], &servers);
         let cfg = LocalConfig { address_servers: &arr, address_server_list: &servers, ..empty_config() };
 
@@ -3849,7 +3849,7 @@ mod tests {
     /// the rollback case in `is_local_answer` (domain-match.c:396-401).
     #[test]
     fn bare_literal_domain_returns_noerr_when_name_locally_known() {
-        let servers = vec![literal_server("example.com", 0, None)];
+        let servers = vec![literal_server("example.com", ServFlags::empty(), None)];
         let arr = ServerArray::build(&[], &servers);
         let mx = MxSrvRecord {
             name: "example.com".into(), target: "mail.example.com".into(),
@@ -3880,7 +3880,7 @@ mod tests {
     #[test]
     fn address_literal_lets_other_qtypes_go_upstream() {
         let servers = vec![literal_server(
-            "example.com", SERV_4ADDR, Some("1.2.3.4".parse().unwrap()),
+            "example.com", ServFlags::ADDR4, Some("1.2.3.4".parse().unwrap()),
         )];
         let arr = ServerArray::build(&[], &servers);
         let cfg = LocalConfig { address_servers: &arr, address_server_list: &servers, ..empty_config() };
@@ -3900,7 +3900,7 @@ mod tests {
     fn host_record_overrides_address_literal_for_same_name() {
         use crate::types::dns_records::HostRecord;
         let servers = vec![literal_server(
-            "example.com", SERV_4ADDR, Some("9.9.9.9".parse().unwrap()),
+            "example.com", ServFlags::ADDR4, Some("9.9.9.9".parse().unwrap()),
         )];
         let arr = ServerArray::build(&[], &servers);
         let hr = HostRecord {
@@ -3931,7 +3931,7 @@ mod tests {
         // (name + fixed RR overhead + 4-byte rdata) — comfortably over the
         // default 512-byte PACKETSZ budget for a query with no EDNS0 OPT.
         let servers: Vec<Server> = (0..64u8)
-            .map(|i| literal_server("example.com", SERV_4ADDR, Some(std::net::IpAddr::V4(Ipv4Addr::new(10, 0, 0, i)))))
+            .map(|i| literal_server("example.com", ServFlags::ADDR4, Some(std::net::IpAddr::V4(Ipv4Addr::new(10, 0, 0, i)))))
             .collect();
         let arr = ServerArray::build(&[], &servers);
         let cfg = LocalConfig { address_servers: &arr, address_server_list: &servers, ..empty_config() };
@@ -3952,7 +3952,7 @@ mod tests {
     /// be shadowed by the dot-free-name NXDOMAIN/NOERR fallback.
     #[test]
     fn address_literal_on_single_label_domain_wins_over_nodots_local() {
-        let servers = vec![literal_server("foo", SERV_4ADDR, Some("1.2.3.4".parse().unwrap()))];
+        let servers = vec![literal_server("foo", ServFlags::ADDR4, Some("1.2.3.4".parse().unwrap()))];
         let arr = ServerArray::build(&[], &servers);
         let cfg = LocalConfig {
             address_servers: &arr,

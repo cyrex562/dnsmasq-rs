@@ -4,11 +4,12 @@
 //! resolver periodically sends an identifiable probe query to each general
 //! upstream server. If a probe ever comes back to us as an incoming client
 //! query, that upstream server is forwarding back to us — a loop — and it is
-//! marked [`SERV_LOOP`] so [`ForwardEngine`](crate::forward::ForwardEngine)
+//! marked [`ServFlags::LOOP`](crate::types::server::ServFlags::LOOP) so
+//! [`ForwardEngine`](crate::forward::ForwardEngine)
 //! stops selecting it.
 #![cfg(feature = "loop")]
 
-use crate::types::server::{Server, SERV_FOR_NODOTS, SERV_LOOP};
+use crate::types::server::{Server, ServFlags};
 use std::net::SocketAddr;
 
 // ---------------------------------------------------------------------------
@@ -73,7 +74,8 @@ pub struct ProbeSend {
 ///
 /// A server is eligible when it is a general resolver: no per-domain
 /// restriction (`domain` empty) and not restricted to unqualified names
-/// (`SERV_FOR_NODOTS`). Each eligible server's [`SERV_LOOP`] flag is cleared
+/// (`ServFlags::FOR_NODOTS`). Each eligible server's
+/// [`ServFlags::LOOP`] flag is cleared
 /// before a fresh probe is built for it — exactly as C does — so a server
 /// that stops looping recovers on the next probe round.
 ///
@@ -83,10 +85,10 @@ pub struct ProbeSend {
 pub fn loop_send_probes(servers: &mut [Server]) -> Vec<ProbeSend> {
     let mut out = Vec::new();
     for (idx, serv) in servers.iter_mut().enumerate() {
-        if !serv.domain.is_empty() || serv.flags & SERV_FOR_NODOTS != 0 {
+        if !serv.domain.is_empty() || serv.flags.contains(ServFlags::FOR_NODOTS) {
             continue;
         }
-        serv.flags &= !SERV_LOOP;
+        serv.flags.remove(ServFlags::LOOP);
         let id = rand::random::<u16>();
         out.push(ProbeSend {
             server_idx: idx,
@@ -128,7 +130,7 @@ pub async fn send_probes(servers: &mut [Server]) -> usize {
 ///
 /// `query` is the extracted, dotted qname (as
 /// [`extract_request`](crate::rfc1035::extract_request) returns it) — C's
-/// `daemon->namebuff`. Returns `true` (and sets [`SERV_LOOP`] on the matching
+/// `daemon->namebuff`. Returns `true` (and sets [`ServFlags::LOOP`] on the matching
 /// server) exactly when the query is a probe this resolver could have sent:
 /// right type, right shape (`"<8 hex digits>.test"`), and the embedded uid
 /// belongs to a general server not already marked as looping.
@@ -151,8 +153,8 @@ pub fn detect_loop(query: &str, qtype: u16, servers: &mut [Server]) -> bool {
     let Ok(uid) = u32::from_str_radix(hex, 16) else { return false };
 
     for serv in servers.iter_mut() {
-        if serv.domain.is_empty() && serv.flags & SERV_LOOP == 0 && serv.uid == uid {
-            serv.flags |= SERV_LOOP;
+        if serv.domain.is_empty() && !serv.flags.contains(ServFlags::LOOP) && serv.uid == uid {
+            serv.flags.insert(ServFlags::LOOP);
             return true;
         }
     }
@@ -173,7 +175,7 @@ mod tests {
         MySockAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port))
     }
 
-    fn make_server(domain: &str, flags: u16, uid: u32) -> Server {
+    fn make_server(domain: &str, flags: ServFlags, uid: u32) -> Server {
         let mut s = crate::option::new_server(flags, domain.to_string(), test_addr(53), test_addr(0));
         s.uid = uid;
         s
@@ -214,9 +216,9 @@ mod tests {
     #[test]
     fn loop_send_probes_builds_one_probe_per_general_server() {
         let mut servers = vec![
-            make_server("", 0, 111),
-            make_server("example.com", 0, 222),
-            make_server("", SERV_FOR_NODOTS, 333),
+            make_server("", ServFlags::empty(), 111),
+            make_server("example.com", ServFlags::empty(), 222),
+            make_server("", ServFlags::FOR_NODOTS, 333),
         ];
         let probes = loop_send_probes(&mut servers);
         assert_eq!(probes.len(), 1);
@@ -227,15 +229,15 @@ mod tests {
 
     #[test]
     fn loop_send_probes_clears_stale_serv_loop() {
-        let mut servers = vec![make_server("", SERV_LOOP, 1)];
+        let mut servers = vec![make_server("", ServFlags::LOOP, 1)];
         let probes = loop_send_probes(&mut servers);
         assert_eq!(probes.len(), 1);
-        assert_eq!(servers[0].flags & SERV_LOOP, 0);
+        assert!(!servers[0].flags.contains(ServFlags::LOOP));
     }
 
     #[test]
     fn loop_send_probes_empty_when_no_eligible_servers() {
-        let mut servers = vec![make_server("example.com", 0, 1)];
+        let mut servers = vec![make_server("example.com", ServFlags::empty(), 1)];
         assert!(loop_send_probes(&mut servers).is_empty());
     }
 
@@ -243,33 +245,33 @@ mod tests {
 
     #[test]
     fn detect_loop_marks_the_matching_server() {
-        let mut servers = vec![make_server("", 0, 0x1a2b3c4d)];
+        let mut servers = vec![make_server("", ServFlags::empty(), 0x1a2b3c4d)];
         assert!(detect_loop("1a2b3c4d.test", LOOP_TEST_TYPE, &mut servers));
-        assert_ne!(servers[0].flags & SERV_LOOP, 0);
+        assert!(servers[0].flags.contains(ServFlags::LOOP));
     }
 
     #[test]
     fn detect_loop_wrong_type_does_not_match() {
-        let mut servers = vec![make_server("", 0, 0x1a2b3c4d)];
+        let mut servers = vec![make_server("", ServFlags::empty(), 0x1a2b3c4d)];
         assert!(!detect_loop("1a2b3c4d.test", 1 /* T_A */, &mut servers));
-        assert_eq!(servers[0].flags & SERV_LOOP, 0);
+        assert!(!servers[0].flags.contains(ServFlags::LOOP));
     }
 
     #[test]
     fn detect_loop_wrong_domain_suffix_does_not_match() {
-        let mut servers = vec![make_server("", 0, 0x1a2b3c4d)];
+        let mut servers = vec![make_server("", ServFlags::empty(), 0x1a2b3c4d)];
         assert!(!detect_loop("1a2b3c4d.nope", LOOP_TEST_TYPE, &mut servers));
     }
 
     #[test]
     fn detect_loop_non_hex_uid_does_not_match() {
-        let mut servers = vec![make_server("", 0, 0)];
+        let mut servers = vec![make_server("", ServFlags::empty(), 0)];
         assert!(!detect_loop("zzzzzzzz.test", LOOP_TEST_TYPE, &mut servers));
     }
 
     #[test]
     fn detect_loop_wrong_length_does_not_match() {
-        let mut servers = vec![make_server("", 0, 0x1a2b3c4d)];
+        let mut servers = vec![make_server("", ServFlags::empty(), 0x1a2b3c4d)];
         assert!(!detect_loop("1a2b3c4.test", LOOP_TEST_TYPE, &mut servers));
         assert!(!detect_loop("1a2b3c4dd.test", LOOP_TEST_TYPE, &mut servers));
     }
@@ -278,27 +280,27 @@ mod tests {
     fn detect_loop_ignores_domain_scoped_servers() {
         // A domain-scoped server can never have sent this probe, even if its
         // uid happens to match (it wasn't eligible in loop_send_probes).
-        let mut servers = vec![make_server("example.com", 0, 0x1a2b3c4d)];
+        let mut servers = vec![make_server("example.com", ServFlags::empty(), 0x1a2b3c4d)];
         assert!(!detect_loop("1a2b3c4d.test", LOOP_TEST_TYPE, &mut servers));
     }
 
     #[test]
     fn detect_loop_no_uid_match_returns_false() {
-        let mut servers = vec![make_server("", 0, 0xffffffff)];
+        let mut servers = vec![make_server("", ServFlags::empty(), 0xffffffff)];
         assert!(!detect_loop("1a2b3c4d.test", LOOP_TEST_TYPE, &mut servers));
     }
 
     #[test]
     fn detect_loop_already_looping_server_not_matched_again() {
         let mut servers = vec![
-            make_server("", SERV_LOOP, 0x1a2b3c4d),
-            make_server("", 0, 0x1a2b3c4d),
+            make_server("", ServFlags::LOOP, 0x1a2b3c4d),
+            make_server("", ServFlags::empty(), 0x1a2b3c4d),
         ];
         // The already-flagged server is skipped; the second, identical-uid
         // server (a pathological config, but C's loop has no dedup either)
         // is the one that ends up matched.
         assert!(detect_loop("1a2b3c4d.test", LOOP_TEST_TYPE, &mut servers));
-        assert_ne!(servers[1].flags & SERV_LOOP, 0);
+        assert!(servers[1].flags.contains(ServFlags::LOOP));
     }
 
     #[test]
@@ -313,7 +315,7 @@ mod tests {
     async fn send_probes_delivers_to_a_real_loopback_listener() {
         let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let mut servers = vec![make_server("", 0, 0xcafef00d)];
+        let mut servers = vec![make_server("", ServFlags::empty(), 0xcafef00d)];
         servers[0].addr = test_addr(port);
 
         let sent = send_probes(&mut servers).await;
@@ -331,7 +333,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_probes_skips_domain_scoped_servers() {
-        let mut servers = vec![make_server("example.com", 0, 1)];
+        let mut servers = vec![make_server("example.com", ServFlags::empty(), 1)];
         assert_eq!(send_probes(&mut servers).await, 0);
     }
 }

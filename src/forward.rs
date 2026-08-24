@@ -1344,7 +1344,7 @@ pub struct ForwardEngine {
     /// Live loop-detection state, index-aligned with `config.upstreams`.
     /// Seeded from `config.loop_servers` and mutated in place: cleared and
     /// re-probed by [`crate::loop_detect::send_probes`], flagged
-    /// [`SERV_LOOP`](crate::types::server::SERV_LOOP) by
+    /// [`ServFlags::LOOP`](crate::types::server::ServFlags::LOOP) by
     /// [`crate::loop_detect::detect_loop`] on the incoming-query path.
     #[cfg(feature = "loop")]
     pub loop_servers: Vec<crate::types::server::Server>,
@@ -1375,7 +1375,7 @@ impl ForwardEngine {
     }
 
     /// Whether `idx` (an index into `config.upstreams`) currently carries
-    /// [`SERV_LOOP`](crate::types::server::SERV_LOOP) — set by
+    /// [`ServFlags::LOOP`](crate::types::server::ServFlags::LOOP) — set by
     /// [`crate::loop_detect::detect_loop`] once a probe to that server has
     /// come back to us.  A server without loop-detection state (index out of
     /// range, or the `loop` feature disabled) is never excluded on this
@@ -1384,7 +1384,7 @@ impl ForwardEngine {
     fn is_looping(&self, idx: usize) -> bool {
         self.loop_servers
             .get(idx)
-            .is_some_and(|s| s.flags & crate::types::server::SERV_LOOP != 0)
+            .is_some_and(|s| s.flags.contains(crate::types::server::ServFlags::LOOP))
     }
 
     /// Replace this engine's ARP state with a shared handle — used to make

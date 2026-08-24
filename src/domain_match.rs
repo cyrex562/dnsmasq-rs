@@ -13,23 +13,24 @@ use crate::types::addr::MySockAddr;
 use crate::types::constants::{
     F_CONFIG, F_DNSSECOK, F_DOMAINSRV, F_DS, F_IPV4, F_IPV6, F_NXDOMAIN, F_NOERR, F_SERVER,
 };
-use crate::types::server::{
-    Server, SERV_4ADDR, SERV_6ADDR, SERV_ALL_ZEROS, SERV_FOR_NODOTS, SERV_LITERAL_ADDRESS,
-    SERV_MARK, SERV_USE_RESOLV, SERV_WILDCARD,
-};
+use crate::types::server::{Server, ServFlags};
 use crate::util::{hostname_isequal, hostname_order};
 
 // ── Combined flag masks (from dnsmasq.h) ─────────────────────────────────────
 
 /// Servers that live on the `local_domains` chain (not forwarded upstream).
-const SERV_IS_LOCAL: u16 = SERV_USE_RESOLV | SERV_LITERAL_ADDRESS;
+const SERV_IS_LOCAL: ServFlags = ServFlags::USE_RESOLV.union(ServFlags::LITERAL_ADDRESS);
 
 /// Servers that return a direct IP address.
-const SERV_LOCAL_ADDRESS: u16 = SERV_6ADDR | SERV_4ADDR | SERV_ALL_ZEROS;
+const SERV_LOCAL_ADDRESS: ServFlags =
+    ServFlags::ADDR6.union(ServFlags::ADDR4).union(ServFlags::ALL_ZEROS);
 
 /// The set of flags that distinguish local-answer priority within a domain group.
-const TYPE_FLAGS: u16 =
-    SERV_LITERAL_ADDRESS | SERV_4ADDR | SERV_6ADDR | SERV_ALL_ZEROS | SERV_USE_RESOLV;
+const TYPE_FLAGS: ServFlags = ServFlags::LITERAL_ADDRESS
+    .union(ServFlags::ADDR4)
+    .union(ServFlags::ADDR6)
+    .union(ServFlags::ALL_ZEROS)
+    .union(ServFlags::USE_RESOLV);
 
 // ── ServerEntry ──────────────────────────────────────────────────────────────
 
@@ -41,7 +42,7 @@ pub struct ServerEntry {
     /// `domain.len()` — cached for fast comparisons.
     pub domain_len: usize,
     /// `SERV_*` flags.
-    pub flags: u16,
+    pub flags: ServFlags,
     /// Appearance order in config — used for `--strict-order`.
     pub serial: i32,
     /// Index back into the slice passed to `ServerArray::build`.
@@ -60,7 +61,7 @@ pub struct ServerEntry {
 /// * 0  → exact domain-length + name match
 fn order_entry(qdomain: &str, entry: &ServerEntry) -> i32 {
     // NODOTS servers always sort last; they appear "before" any real query.
-    if entry.flags & SERV_FOR_NODOTS != 0 {
+    if entry.flags.contains(ServFlags::FOR_NODOTS) {
         return -1;
     }
     let dlen = entry.domain_len;
@@ -82,8 +83,8 @@ fn order_entry(qdomain: &str, entry: &ServerEntry) -> i32 {
 /// Mirrors `order_qsort` in `domain-match.c`.
 fn compare_entries(a: &ServerEntry, b: &ServerEntry) -> Ordering {
     // SERV_FOR_NODOTS sorts last.
-    let a_nd = a.flags & SERV_FOR_NODOTS != 0;
-    let b_nd = b.flags & SERV_FOR_NODOTS != 0;
+    let a_nd = a.flags.contains(ServFlags::FOR_NODOTS);
+    let b_nd = b.flags.contains(ServFlags::FOR_NODOTS);
     if a_nd != b_nd {
         return a_nd.cmp(&b_nd); // false < true → nodots goes last ✓
     }
@@ -101,16 +102,16 @@ fn compare_entries(a: &ServerEntry, b: &ServerEntry) -> Ordering {
     }
 
     // Same domain name: non-wildcard before wildcard.
-    let a_w = a.flags & SERV_WILDCARD != 0;
-    let b_w = b.flags & SERV_WILDCARD != 0;
+    let a_w = a.flags.contains(ServFlags::WILDCARD);
+    let b_w = b.flags.contains(ServFlags::WILDCARD);
     if a_w != b_w {
         return a_w.cmp(&b_w); // wildcards last ✓
     }
 
     // Same wildcard status: higher TYPE_FLAGS value sorts first.
     // (SERV_6ADDR=16 > SERV_4ADDR=8 > SERV_ALL_ZEROS=4 > SERV_LITERAL_ADDRESS=2 > SERV_USE_RESOLV=1)
-    let at = a.flags & TYPE_FLAGS;
-    let bt = b.flags & TYPE_FLAGS;
+    let at = a.flags.intersection(TYPE_FLAGS).bits();
+    let bt = b.flags.intersection(TYPE_FLAGS).bits();
     match bt.cmp(&at) {
         Ordering::Equal => {}
         ord => return ord,
@@ -149,10 +150,10 @@ impl ServerArray {
 
         for (i, s) in servers.iter().enumerate() {
             #[cfg(feature = "loop")]
-            if s.flags & crate::types::server::SERV_LOOP != 0 {
+            if s.flags.contains(crate::types::server::ServFlags::LOOP) {
                 continue;
             }
-            if s.flags & SERV_WILDCARD != 0 {
+            if s.flags.contains(ServFlags::WILDCARD) {
                 has_wildcard = true;
             }
             entries.push(ServerEntry {
@@ -167,7 +168,7 @@ impl ServerArray {
         }
 
         for (i, s) in local_domains.iter().enumerate() {
-            if s.flags & SERV_WILDCARD != 0 {
+            if s.flags.contains(ServFlags::WILDCARD) {
                 has_wildcard = true;
             }
             entries.push(ServerEntry {
@@ -204,8 +205,8 @@ impl ServerArray {
     pub fn same_group(&self, a: usize, b: usize) -> bool {
         match (self.entries.get(a), self.entries.get(b)) {
             (Some(ea), Some(eb)) => {
-                if ea.flags & SERV_FOR_NODOTS != 0 {
-                    return eb.flags & SERV_FOR_NODOTS != 0;
+                if ea.flags.contains(ServFlags::FOR_NODOTS) {
+                    return eb.flags.contains(ServFlags::FOR_NODOTS);
                 }
                 order_entry(&ea.domain, eb) == 0
             }
@@ -326,7 +327,7 @@ impl ServerArray {
                         while t < n - 1 && order_entry(qdomain, &self.entries[t + 1]) == 0 {
                             t += 1;
                         }
-                        if self.entries[t].flags & SERV_WILDCARD == 0 {
+                        if !self.entries[t].flags.contains(ServFlags::WILDCARD) {
                             matched = false;
                         }
                     }
@@ -334,7 +335,7 @@ impl ServerArray {
 
                 if matched {
                     if let Some((nl, nh)) = self.filter_servers_impl(t, flags) {
-                        if self.entries[nl].flags & SERV_USE_RESOLV != 0 {
+                        if self.entries[nl].flags.contains(ServFlags::USE_RESOLV) {
                             // This match says "use resolv.conf": continue searching
                             // from the root (empty query) but only for real servers.
                             crop_query = qlen;
@@ -368,7 +369,7 @@ impl ServerArray {
         // Apply only if no match was found (or the best match is the catch-all).
         if nodots && !self.entries.is_empty() {
             let last = &self.entries[n - 1];
-            if last.flags & SERV_FOR_NODOTS != 0
+            if last.flags.contains(ServFlags::FOR_NODOTS)
                 && (!found || self.entries[nlow].domain_len == 0)
             {
                 if let Some((nl, nh)) = self.filter_servers_impl(n - 1, flags) {
@@ -416,7 +417,7 @@ impl ServerArray {
         if flags & F_CONFIG != 0 {
             // Just need any entry that can return an IP address.
             let has_local = (nlow..nhigh)
-                .any(|i| self.entries[i].flags & SERV_LOCAL_ADDRESS != 0);
+                .any(|i| self.entries[i].flags.intersects(SERV_LOCAL_ADDRESS));
             return if has_local { Some((nlow, nhigh)) } else { None };
         }
 
@@ -428,7 +429,7 @@ impl ServerArray {
 
         // IPv6 literal addresses.
         let i6 = (lo..hi)
-            .find(|&i| self.entries[i].flags & SERV_6ADDR == 0)
+            .find(|&i| !self.entries[i].flags.contains(ServFlags::ADDR6))
             .unwrap_or(hi);
         if flags & F_SERVER == 0 && i6 != lo && flags & F_IPV6 != 0 {
             return Some((lo, i6));
@@ -437,7 +438,7 @@ impl ServerArray {
 
         // IPv4 literal addresses.
         let i4 = (lo..hi)
-            .find(|&i| self.entries[i].flags & SERV_4ADDR == 0)
+            .find(|&i| !self.entries[i].flags.contains(ServFlags::ADDR4))
             .unwrap_or(hi);
         if flags & F_SERVER == 0 && i4 != lo && flags & F_IPV4 != 0 {
             return Some((lo, i4));
@@ -446,7 +447,7 @@ impl ServerArray {
 
         // All-zeros (return 0.0.0.0 / ::).
         let iz = (lo..hi)
-            .find(|&i| self.entries[i].flags & SERV_ALL_ZEROS == 0)
+            .find(|&i| !self.entries[i].flags.contains(ServFlags::ALL_ZEROS))
             .unwrap_or(hi);
         if flags & F_SERVER == 0 && iz != lo && flags & (F_IPV4 | F_IPV6) != 0 {
             return Some((lo, iz));
@@ -455,7 +456,7 @@ impl ServerArray {
 
         // NXDOMAIN / NODATA literal (--local=/domain/).
         let il = (lo..hi)
-            .find(|&i| self.entries[i].flags & SERV_LITERAL_ADDRESS == 0)
+            .find(|&i| !self.entries[i].flags.contains(ServFlags::LITERAL_ADDRESS))
             .unwrap_or(hi);
         if flags & (F_DOMAINSRV | F_SERVER) == 0 && il != lo {
             return Some((lo, il));
@@ -464,7 +465,7 @@ impl ServerArray {
 
         // "Use resolv.conf" servers.
         let ir = (lo..hi)
-            .find(|&i| self.entries[i].flags & SERV_USE_RESOLV == 0)
+            .find(|&i| !self.entries[i].flags.contains(ServFlags::USE_RESOLV))
             .unwrap_or(hi);
         if ir != lo {
             return Some((lo, ir));
@@ -476,7 +477,7 @@ impl ServerArray {
             // F_DOMAINSRV: reject catch-all upstream entries (domain_len == 0).
             if flags & F_DOMAINSRV != 0
                 && self.entries[lo].domain_len == 0
-                && self.entries[lo].flags & SERV_FOR_NODOTS == 0
+                && !self.entries[lo].flags.contains(ServFlags::FOR_NODOTS)
             {
                 return None;
             }
@@ -525,16 +526,16 @@ pub fn is_local_answer(arr: &ServerArray, mut first: usize, is_locally_known: im
         Some(e) => e,
         None => return 0,
     };
-    if entry.flags & SERV_LITERAL_ADDRESS == 0 {
+    if !entry.flags.contains(ServFlags::LITERAL_ADDRESS) {
         return 0;
     }
-    if entry.flags & SERV_4ADDR != 0 {
+    if entry.flags.contains(ServFlags::ADDR4) {
         return F_IPV4;
     }
-    if entry.flags & SERV_6ADDR != 0 {
+    if entry.flags.contains(ServFlags::ADDR6) {
         return F_IPV6;
     }
-    if entry.flags & SERV_ALL_ZEROS != 0 {
+    if entry.flags.contains(ServFlags::ALL_ZEROS) {
         return F_IPV4 | F_IPV6;
     }
 
@@ -545,7 +546,7 @@ pub fn is_local_answer(arr: &ServerArray, mut first: usize, is_locally_known: im
         first -= 1;
     }
     let rolled = &arr.entries[first];
-    if rolled.flags & SERV_LOCAL_ADDRESS != 0 || is_locally_known() {
+    if rolled.flags.intersects(SERV_LOCAL_ADDRESS) || is_locally_known() {
         F_NOERR
     } else {
         F_NXDOMAIN
@@ -582,7 +583,7 @@ pub fn make_local_answer(
     if flags & F_IPV4 != 0 {
         for i in first..last {
             let Some(entry) = arr.get(i) else { continue };
-            let addr4 = if entry.flags & SERV_ALL_ZEROS != 0 {
+            let addr4 = if entry.flags.contains(ServFlags::ALL_ZEROS) {
                 Ipv4Addr::UNSPECIFIED
             } else {
                 match servers.get(entry.index).map(|s| s.addr.ip()) {
@@ -603,7 +604,7 @@ pub fn make_local_answer(
     if flags & F_IPV6 != 0 {
         for i in first..last {
             let Some(entry) = arr.get(i) else { continue };
-            let addr6 = if entry.flags & SERV_ALL_ZEROS != 0 {
+            let addr6 = if entry.flags.contains(ServFlags::ALL_ZEROS) {
                 std::net::Ipv6Addr::UNSPECIFIED
             } else {
                 match servers.get(entry.index).map(|s| s.addr.ip()) {
@@ -631,12 +632,12 @@ pub fn make_local_answer(
 ///
 /// Must be called before `add_update_server` to enable free-list reuse.
 /// Mirrors `mark_servers(flag)` in C.
-pub fn mark_servers(servers: &mut Vec<Server>, flag: u16) {
+pub fn mark_servers(servers: &mut Vec<Server>, flag: ServFlags) {
     for s in servers.iter_mut() {
-        if s.flags & flag != 0 {
-            s.flags |= SERV_MARK;
+        if s.flags.intersects(flag) {
+            s.flags.insert(ServFlags::MARK);
         } else {
-            s.flags &= !SERV_MARK;
+            s.flags.remove(ServFlags::MARK);
         }
     }
 }
@@ -644,7 +645,7 @@ pub fn mark_servers(servers: &mut Vec<Server>, flag: u16) {
 /// Remove all upstream servers that still have `SERV_MARK` set (i.e. stale entries).
 /// Mirrors `cleanup_servers` in C.
 pub fn cleanup_servers(servers: &mut Vec<Server>) {
-    servers.retain(|s| s.flags & SERV_MARK == 0);
+    servers.retain(|s| !s.flags.contains(ServFlags::MARK));
 }
 
 /// Add a new server or re-use a marked (stale) entry with the same domain.
@@ -664,16 +665,16 @@ pub fn add_update_server(
     let domain = s.domain.trim_start_matches('.').to_string();
     s.domain = domain.clone();
 
-    let is_local = s.flags & SERV_IS_LOCAL != 0;
+    let is_local = s.flags.intersects(SERV_IS_LOCAL);
 
     if !is_local {
         // Try to reuse a marked entry with the same domain.
         if let Some(pos) = servers
             .iter()
-            .position(|x| x.flags & SERV_MARK != 0 && hostname_isequal(&x.domain, &domain))
+            .position(|x| x.flags.contains(ServFlags::MARK) && hostname_isequal(&x.domain, &domain))
         {
             let mut reused = servers.remove(pos);
-            reused.flags = s.flags & !SERV_MARK;
+            reused.flags = s.flags.difference(ServFlags::MARK);
             reused.addr = s.addr;
             reused.source_addr = s.source_addr;
             reused.interface = s.interface;
@@ -714,14 +715,13 @@ pub fn domain_matches(query_domain: &str, server_domain: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::server::{SERV_4ADDR, SERV_6ADDR, SERV_LITERAL_ADDRESS};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     fn upstream(domain: &str) -> Server {
         let addr = MySockAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 53));
         Server {
-            flags: 0,
+            flags: ServFlags::empty(),
             domain: domain.to_string(),
             addr: addr.clone(),
             source_addr: addr,
@@ -746,19 +746,19 @@ mod tests {
 
     fn local_nxdomain(domain: &str) -> Server {
         let mut s = upstream(domain);
-        s.flags = SERV_LITERAL_ADDRESS;
+        s.flags = ServFlags::LITERAL_ADDRESS;
         s
     }
 
     fn local_ipv4(domain: &str) -> Server {
         let mut s = upstream(domain);
-        s.flags = SERV_LITERAL_ADDRESS | SERV_4ADDR;
+        s.flags = ServFlags::LITERAL_ADDRESS | ServFlags::ADDR4;
         s
     }
 
     fn local_ipv6(domain: &str) -> Server {
         let mut s = upstream(domain);
-        s.flags = SERV_LITERAL_ADDRESS | SERV_6ADDR;
+        s.flags = ServFlags::LITERAL_ADDRESS | ServFlags::ADDR6;
         s
     }
 
@@ -776,7 +776,7 @@ mod tests {
 
     fn local_all_zeros(domain: &str) -> Server {
         let mut s = upstream(domain);
-        s.flags = SERV_LITERAL_ADDRESS | SERV_ALL_ZEROS;
+        s.flags = ServFlags::LITERAL_ADDRESS | ServFlags::ALL_ZEROS;
         s
     }
 
@@ -895,7 +895,7 @@ mod tests {
         let result = arr.lookup("example.com", F_IPV4);
         assert!(result.is_some());
         let (lo, _) = result.unwrap();
-        assert!(arr.entries[lo].flags & SERV_4ADDR != 0);
+        assert!(arr.entries[lo].flags.contains(ServFlags::ADDR4));
     }
 
     #[test]
@@ -905,7 +905,7 @@ mod tests {
         let result = arr.lookup("example.com", F_IPV6);
         assert!(result.is_some());
         let (lo, _) = result.unwrap();
-        assert!(arr.entries[lo].flags & SERV_6ADDR != 0);
+        assert!(arr.entries[lo].flags.contains(ServFlags::ADDR6));
     }
 
     #[test]
@@ -990,14 +990,14 @@ mod tests {
     fn mark_and_cleanup_removes_marked() {
         let mut servers = vec![upstream("a.com"), upstream("b.com")];
         // Mark SERV_4ADDR entries — none match here.
-        mark_servers(&mut servers, SERV_4ADDR);
+        mark_servers(&mut servers, ServFlags::ADDR4);
         // All get SERV_MARK cleared (none had SERV_4ADDR).
         cleanup_servers(&mut servers);
         assert_eq!(servers.len(), 2, "nothing should be removed");
 
         // Now mark everything by setting their flags first.
-        servers[0].flags = SERV_4ADDR;
-        mark_servers(&mut servers, SERV_4ADDR);
+        servers[0].flags = ServFlags::ADDR4;
+        mark_servers(&mut servers, ServFlags::ADDR4);
         cleanup_servers(&mut servers);
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].domain, "b.com");
@@ -1013,14 +1013,14 @@ mod tests {
     #[test]
     fn add_update_server_reuses_marked() {
         let mut servers = vec![upstream("example.com")];
-        servers[0].flags = SERV_MARK;
+        servers[0].flags = ServFlags::MARK;
         let mut replacement = upstream("example.com");
-        replacement.flags = SERV_4ADDR;
+        replacement.flags = ServFlags::ADDR4;
         add_update_server(&mut servers, replacement);
         // Reused: still only one entry, now with SERV_4ADDR.
         assert_eq!(servers.len(), 1);
-        assert!(servers[0].flags & SERV_4ADDR != 0);
-        assert_eq!(servers[0].flags & SERV_MARK, 0);
+        assert!(servers[0].flags.contains(ServFlags::ADDR4));
+        assert!(!servers[0].flags.contains(ServFlags::MARK));
     }
 
     #[test]

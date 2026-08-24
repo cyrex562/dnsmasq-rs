@@ -20,9 +20,7 @@ use crate::types::addr::MySockAddr;
 use crate::types::constants::{OPT_BOGUSPRIV, OPT_FILTER, OPT_LOCALISE};
 use crate::types::daemon::Daemon;
 use crate::types::dns_records::RrList;
-use crate::types::server::{SERV_4ADDR, SERV_6ADDR, SERV_FROM_DBUS, SERV_LITERAL_ADDRESS};
-#[cfg(feature = "loop")]
-use crate::types::server::SERV_LOOP;
+use crate::types::server::ServFlags;
 
 /// The canonical dnsmasq D-Bus interface name and well-known bus name
 /// (`DNSMASQ_SERVICE` / `DNSMASQ_PATH` in `dbus.c`/`config.h`).  `--enable-dbus`
@@ -112,7 +110,7 @@ fn apply_rr_filter(daemon: &mut Daemon, rr: u16, enabled: bool) {
 /// variants below; mirrors the address part of `parse_server`/`parse_server_addr`
 /// for the literal-IP case (hostname resolution via `getaddrinfo` is out of
 /// scope — see `tasks.md`).
-fn parse_dbus_addr(addr_str: &str) -> Result<(MySockAddr, u16), String> {
+fn parse_dbus_addr(addr_str: &str) -> Result<(MySockAddr, ServFlags), String> {
     let (host, port_str) = match addr_str.find('#') {
         Some(i) => (&addr_str[..i], Some(&addr_str[i + 1..])),
         None => (addr_str, None),
@@ -123,7 +121,7 @@ fn parse_dbus_addr(addr_str: &str) -> Result<(MySockAddr, u16), String> {
         Some(p) => p.parse().map_err(|_| format!("Invalid port '{p}'"))?,
         None => 53,
     };
-    let flags = if ip.is_ipv4() { SERV_4ADDR } else { SERV_6ADDR };
+    let flags = if ip.is_ipv4() { ServFlags::ADDR4 } else { ServFlags::ADDR6 };
     let sock = match ip {
         std::net::IpAddr::V4(a) => MySockAddr::V4(std::net::SocketAddrV4::new(a, port)),
         std::net::IpAddr::V6(a) => MySockAddr::V6(std::net::SocketAddrV6::new(a, port, 0, 0)),
@@ -137,7 +135,7 @@ fn dummy_source() -> MySockAddr {
 
 /// Push one server entry per domain (or a single catch-all entry when
 /// `domains` is empty), reusing a stale `SERV_FROM_DBUS` slot where possible.
-fn push_dbus_servers(daemon: &mut Daemon, flags: u16, domains: &[String], addr: &MySockAddr) {
+fn push_dbus_servers(daemon: &mut Daemon, flags: ServFlags, domains: &[String], addr: &MySockAddr) {
     let source = dummy_source();
     if domains.is_empty() {
         add_update_server(&mut daemon.servers, new_server(flags, String::new(), addr.clone(), source));
@@ -154,7 +152,7 @@ fn push_dbus_servers(daemon: &mut Daemon, flags: u16, domains: &[String], addr: 
 /// `parse_server_or_address` in `option.rs`), or `/domain[/domain...]/` (empty
 /// address) meaning "never forward, answer locally".
 pub fn apply_set_domain_servers(daemon: &mut Daemon, entries: &[String]) -> Result<(), String> {
-    mark_servers(&mut daemon.servers, SERV_FROM_DBUS);
+    mark_servers(&mut daemon.servers, ServFlags::FROM_DBUS);
 
     for entry in entries {
         if entry.is_empty() {
@@ -174,10 +172,10 @@ pub fn apply_set_domain_servers(daemon: &mut Daemon, entries: &[String]) -> Resu
         };
 
         if addr_part.is_empty() {
-            push_dbus_servers(daemon, SERV_LITERAL_ADDRESS | SERV_FROM_DBUS, &domains, &dummy_source());
+            push_dbus_servers(daemon, ServFlags::LITERAL_ADDRESS | ServFlags::FROM_DBUS, &domains, &dummy_source());
         } else {
             let (sock, addr_flags) = parse_dbus_addr(addr_part)?;
-            push_dbus_servers(daemon, addr_flags | SERV_FROM_DBUS, &domains, &sock);
+            push_dbus_servers(daemon, addr_flags | ServFlags::FROM_DBUS, &domains, &sock);
         }
     }
 
@@ -188,7 +186,7 @@ pub fn apply_set_domain_servers(daemon: &mut Daemon, entries: &[String]) -> Resu
 /// `SetServersEx` (`dbus.c:272-486`, `strings=0`): each entry is
 /// `[address[#port], domain, domain, ...]`; no domains means a catch-all.
 pub fn apply_set_servers_ex(daemon: &mut Daemon, entries: &[Vec<String>]) -> Result<(), String> {
-    mark_servers(&mut daemon.servers, SERV_FROM_DBUS);
+    mark_servers(&mut daemon.servers, ServFlags::FROM_DBUS);
 
     for entry in entries {
         let addr_str = entry.first().ok_or_else(|| "Expected IP address".to_string())?;
@@ -199,11 +197,11 @@ pub fn apply_set_servers_ex(daemon: &mut Daemon, entries: &[Vec<String>]) -> Res
         // dbus.c:464-468: "0.0.0.0 for server address == NULL, for Dbus" —
         // a literal v4 0.0.0.0 means "answer locally, never forward".
         let literal_flags = if matches!(sock.ip(), std::net::IpAddr::V4(a) if a.is_unspecified()) {
-            SERV_LITERAL_ADDRESS
+            ServFlags::LITERAL_ADDRESS
         } else {
-            0
+            ServFlags::empty()
         };
-        push_dbus_servers(daemon, addr_flags | literal_flags | SERV_FROM_DBUS, &entry[1..], &sock);
+        push_dbus_servers(daemon, addr_flags | literal_flags | ServFlags::FROM_DBUS, &entry[1..], &sock);
     }
 
     cleanup_servers(&mut daemon.servers);
@@ -229,18 +227,18 @@ pub enum ServerArg {
 
 /// `SetServers` (`dbus.c:157-247`): apply a flat address/domain sequence.
 pub fn apply_set_servers(daemon: &mut Daemon, args: &[ServerArg]) -> Result<(), String> {
-    mark_servers(&mut daemon.servers, SERV_FROM_DBUS);
+    mark_servers(&mut daemon.servers, ServFlags::FROM_DBUS);
 
     let mut i = 0;
     while i < args.len() {
         let (sock, addr_flags) = match &args[i] {
             ServerArg::Addr4(a) => {
                 let ip = std::net::Ipv4Addr::from(*a);
-                (MySockAddr::V4(std::net::SocketAddrV4::new(ip, 53)), SERV_4ADDR)
+                (MySockAddr::V4(std::net::SocketAddrV4::new(ip, 53)), ServFlags::ADDR4)
             }
             ServerArg::Addr6(bytes) => {
                 let ip = std::net::Ipv6Addr::from(*bytes);
-                (MySockAddr::V6(std::net::SocketAddrV6::new(ip, 53, 0, 0)), SERV_6ADDR)
+                (MySockAddr::V6(std::net::SocketAddrV6::new(ip, 53, 0, 0)), ServFlags::ADDR6)
             }
             ServerArg::Domain(_) => {
                 return Err("Expected an address before any domain name".to_string());
@@ -254,7 +252,7 @@ pub fn apply_set_servers(daemon: &mut Daemon, args: &[ServerArg]) -> Result<(), 
             i += 1;
         }
 
-        push_dbus_servers(daemon, addr_flags | SERV_FROM_DBUS, &domains, &sock);
+        push_dbus_servers(daemon, addr_flags | ServFlags::FROM_DBUS, &domains, &sock);
     }
 
     cleanup_servers(&mut daemon.servers);
@@ -342,7 +340,7 @@ pub fn server_metrics(daemon: &Daemon) -> Vec<HashMap<String, String>> {
 /// server, kept only to receive/detect forwarding loops).
 #[cfg(feature = "loop")]
 pub fn loop_servers(daemon: &Daemon) -> Vec<String> {
-    daemon.servers.iter().filter(|s| s.flags & SERV_LOOP != 0).map(|s| s.addr.ip().to_string()).collect()
+    daemon.servers.iter().filter(|s| s.flags.contains(ServFlags::LOOP)).map(|s| s.addr.ip().to_string()).collect()
 }
 
 // ─── DHCP lease add/delete (AddDhcpLease / DeleteDhcpLease) ───────────────
@@ -773,7 +771,7 @@ mod tests {
     use crate::types::server::Server;
 
     /// `addr` is `ip[#port]`; defaults to port 53 when no `#port` is given.
-    fn test_server(flags: u16, domain: &str, addr: &str) -> Server {
+    fn test_server(flags: ServFlags, domain: &str, addr: &str) -> Server {
         let (sock, addr_flags) = parse_dbus_addr(addr).unwrap();
         new_server(flags | addr_flags, domain.to_string(), sock, dummy_source())
     }
@@ -864,7 +862,7 @@ mod tests {
         assert_eq!(d.servers.len(), 1);
         assert_eq!(d.servers[0].addr.ip().to_string(), "1.2.3.4");
         assert_eq!(d.servers[0].domain, "");
-        assert!(d.servers[0].flags & SERV_FROM_DBUS != 0);
+        assert!(d.servers[0].flags.contains(ServFlags::FROM_DBUS));
     }
 
     #[test]
@@ -890,7 +888,7 @@ mod tests {
         let mut d = Daemon::default();
         apply_set_domain_servers(&mut d, &["/example.com/".to_string()]).unwrap();
         assert_eq!(d.servers.len(), 1);
-        assert!(d.servers[0].flags & SERV_LITERAL_ADDRESS != 0);
+        assert!(d.servers[0].flags.contains(ServFlags::LITERAL_ADDRESS));
     }
 
     #[test]
@@ -918,7 +916,7 @@ mod tests {
     #[test]
     fn set_domain_servers_preserves_non_dbus_entries() {
         let mut d = Daemon::default();
-        d.servers.push(test_server(0, "", "9.9.9.9#53"));
+        d.servers.push(test_server(ServFlags::empty(), "", "9.9.9.9#53"));
         apply_set_domain_servers(&mut d, &["1.2.3.4".to_string()]).unwrap();
         assert_eq!(d.servers.len(), 2);
         assert!(d.servers.iter().any(|s| s.addr.ip().to_string() == "9.9.9.9"));
@@ -965,7 +963,7 @@ mod tests {
         let mut d = Daemon::default();
         apply_set_servers_ex(&mut d, &[vec!["0.0.0.0".to_string(), "example.com".to_string()]]).unwrap();
         assert_eq!(d.servers.len(), 1);
-        assert!(d.servers[0].flags & SERV_LITERAL_ADDRESS != 0);
+        assert!(d.servers[0].flags.contains(ServFlags::LITERAL_ADDRESS));
     }
 
     // ── apply_set_servers ────────────────────────────────────────────────────
@@ -1043,9 +1041,9 @@ mod tests {
     #[test]
     fn server_metrics_reports_one_row_per_distinct_address() {
         let mut d = Daemon::default();
-        let mut s1 = test_server(0, "a.com", "1.2.3.4#53");
+        let mut s1 = test_server(ServFlags::empty(), "a.com", "1.2.3.4#53");
         s1.queries = 10;
-        let mut s2 = test_server(0, "b.com", "1.2.3.4#53");
+        let mut s2 = test_server(ServFlags::empty(), "b.com", "1.2.3.4#53");
         s2.queries = 5;
         d.servers.push(s1);
         d.servers.push(s2);
@@ -1059,8 +1057,8 @@ mod tests {
     #[test]
     fn server_metrics_distinguishes_different_addresses() {
         let mut d = Daemon::default();
-        d.servers.push(test_server(0, "", "1.1.1.1#53"));
-        d.servers.push(test_server(0, "", "2.2.2.2#53"));
+        d.servers.push(test_server(ServFlags::empty(), "", "1.1.1.1#53"));
+        d.servers.push(test_server(ServFlags::empty(), "", "2.2.2.2#53"));
         assert_eq!(server_metrics(&d).len(), 2);
     }
 
@@ -1070,8 +1068,8 @@ mod tests {
     #[test]
     fn loop_servers_filters_by_serv_loop_flag() {
         let mut d = Daemon::default();
-        d.servers.push(test_server(SERV_LOOP, "", "1.1.1.1#53"));
-        d.servers.push(test_server(0, "", "2.2.2.2#53"));
+        d.servers.push(test_server(ServFlags::LOOP, "", "1.1.1.1#53"));
+        d.servers.push(test_server(ServFlags::empty(), "", "2.2.2.2#53"));
         let servers = loop_servers(&d);
         assert_eq!(servers, vec!["1.1.1.1".to_string()]);
     }

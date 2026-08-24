@@ -6,28 +6,34 @@ use std::time::{Duration, Instant};
 use crate::types::addr::MySockAddr;
 use crate::types::constants::*;
 
-// Server flags (SERV_*)
-pub const SERV_USE_RESOLV:        u16 = 1;
-pub const SERV_LITERAL_ADDRESS:   u16 = 2;
-pub const SERV_ALL_ZEROS:         u16 = 4;
-pub const SERV_4ADDR:             u16 = 8;
-pub const SERV_6ADDR:             u16 = 16;
-pub const SERV_HAS_SOURCE:        u16 = 32;
-pub const SERV_FOR_NODOTS:        u16 = 64;
-pub const SERV_WARNED_RECURSIVE:  u16 = 128;
-pub const SERV_FROM_DBUS:         u16 = 256;
-pub const SERV_MARK:              u16 = 512;
-pub const SERV_WILDCARD:          u16 = 1024;
-pub const SERV_FROM_RESOLV:       u16 = 2048;
-pub const SERV_FROM_FILE:         u16 = 4096;
-pub const SERV_LOOP:              u16 = 8192;
-pub const SERV_DO_DNSSEC:         u16 = 16384;
-pub const SERV_GOT_TCP:           u16 = 32768;
+bitflags::bitflags! {
+    /// Upstream-server flags (`struct server`'s `flags`, upstream `SERV_*`
+    /// constants in `dnsmasq.h`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct ServFlags: u16 {
+        const USE_RESOLV       = 1 << 0;
+        const LITERAL_ADDRESS  = 1 << 1;
+        const ALL_ZEROS        = 1 << 2;
+        const ADDR4            = 1 << 3;
+        const ADDR6            = 1 << 4;
+        const HAS_SOURCE       = 1 << 5;
+        const FOR_NODOTS       = 1 << 6;
+        const WARNED_RECURSIVE = 1 << 7;
+        const FROM_DBUS        = 1 << 8;
+        const MARK             = 1 << 9;
+        const WILDCARD         = 1 << 10;
+        const FROM_RESOLV      = 1 << 11;
+        const FROM_FILE        = 1 << 12;
+        const LOOP             = 1 << 13;
+        const DO_DNSSEC        = 1 << 14;
+        const GOT_TCP          = 1 << 15;
+    }
+}
 
 /// An upstream DNS server entry (`struct server`).
 #[derive(Debug, Clone)]
 pub struct Server {
-    pub flags:       u16,
+    pub flags:       ServFlags,
     pub domain:      String,
     pub addr:        MySockAddr,
     pub source_addr: MySockAddr,
@@ -132,8 +138,8 @@ mod tests {
 
     #[test]
     fn serv_flags_distinct() {
-        assert_ne!(SERV_USE_RESOLV, SERV_LITERAL_ADDRESS);
-        assert_ne!(SERV_4ADDR, SERV_6ADDR);
+        assert_ne!(ServFlags::USE_RESOLV, ServFlags::LITERAL_ADDRESS);
+        assert_ne!(ServFlags::ADDR4, ServFlags::ADDR6);
     }
 
     #[test]

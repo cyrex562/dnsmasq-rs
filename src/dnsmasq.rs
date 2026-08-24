@@ -663,11 +663,11 @@ fn builtin_stat_txt_records() -> Vec<crate::types::dns_records::TxtRecord> {
 /// [`daemon_local_data`] (answers them NXDOMAIN) and [`daemon_forward_config`]
 /// (excludes them from the upstream list).
 fn literal_server_domains(daemon: &Daemon) -> Vec<String> {
-    use crate::types::server::SERV_LITERAL_ADDRESS;
+    use crate::types::server::ServFlags;
     daemon
         .servers
         .iter()
-        .filter(|s| s.flags & SERV_LITERAL_ADDRESS != 0 && !s.domain.is_empty())
+        .filter(|s| s.flags.contains(ServFlags::LITERAL_ADDRESS) && !s.domain.is_empty())
         .map(|s| s.domain.clone())
         .collect()
 }
@@ -679,11 +679,11 @@ fn literal_server_domains(daemon: &Daemon) -> Vec<String> {
 /// `is_local_answer`/`make_local_answer`) and [`daemon_forward_config`]
 /// (excludes them from the upstream list).
 fn literal_servers(daemon: &Daemon) -> Vec<crate::types::server::Server> {
-    use crate::types::server::SERV_LITERAL_ADDRESS;
+    use crate::types::server::ServFlags;
     daemon
         .servers
         .iter()
-        .filter(|s| s.flags & SERV_LITERAL_ADDRESS != 0)
+        .filter(|s| s.flags.contains(ServFlags::LITERAL_ADDRESS))
         .cloned()
         .collect()
 }
@@ -734,7 +734,7 @@ pub fn daemon_forward_config(daemon: &Daemon) -> crate::forward::ForwardConfig {
     let forwardable: Vec<&crate::types::server::Server> = daemon
         .servers
         .iter()
-        .filter(|s| s.flags & crate::types::server::SERV_LITERAL_ADDRESS == 0)
+        .filter(|s| !s.flags.contains(crate::types::server::ServFlags::LITERAL_ADDRESS))
         .collect();
 
     crate::forward::ForwardConfig {
@@ -2487,7 +2487,7 @@ pub async fn clear_cache_and_reload(daemon_handle: &DaemonHandle, cache: &crate:
     if any_resolv_read {
         use crate::domain_match::{add_update_server, cleanup_servers, mark_servers};
         use crate::types::addr::MySockAddr;
-        use crate::types::server::{SERV_4ADDR, SERV_6ADDR, SERV_FROM_RESOLV};
+        use crate::types::server::ServFlags;
 
         let query_port = d.query_port;
         // network.c:1711/1766/1774 — mark every existing resolv-derived server,
@@ -2495,7 +2495,7 @@ pub async fn clear_cache_and_reload(daemon_handle: &DaemonHandle, cache: &crate:
         // "" here) instead of rebuilding it, so its query statistics survive an
         // unchanged address across reload; whatever is still marked afterwards
         // (an address that dropped out of the file) is swept away.
-        mark_servers(&mut d.servers, SERV_FROM_RESOLV);
+        mark_servers(&mut d.servers, ServFlags::FROM_RESOLV);
         for addr in discovered {
             // network.c:1729-1754 — `source_addr` is the wildcard address in the
             // *same* family as the server, bound to `--query-port`; scope is
@@ -2515,7 +2515,7 @@ pub async fn clear_cache_and_reload(daemon_handle: &DaemonHandle, cache: &crate:
                     )),
                 ),
             };
-            let flags = SERV_FROM_RESOLV | if addr.is_ipv6() { SERV_6ADDR } else { SERV_4ADDR };
+            let flags = ServFlags::FROM_RESOLV | if addr.is_ipv6() { ServFlags::ADDR6 } else { ServFlags::ADDR4 };
             add_update_server(
                 &mut d.servers,
                 crate::option::new_server(flags, String::new(), my_addr, source_addr),
@@ -3209,7 +3209,7 @@ mod tests {
 
         let addr = MySockAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53));
         Server {
-            flags: 0,
+            flags: crate::types::server::ServFlags::empty(),
             domain: String::new(),
             source_addr: addr.clone(),
             addr,
@@ -4651,7 +4651,7 @@ mod tests {
     #[tokio::test]
     async fn clear_cache_and_reload_reloads_resolv_file_servers() {
         use crate::types::network::Resolvc;
-        use crate::types::server::SERV_FROM_RESOLV;
+        use crate::types::server::ServFlags;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("resolv.conf");
@@ -4679,7 +4679,7 @@ mod tests {
         let d = handle.read().await;
         assert!(
             d.servers.iter().any(|s| {
-                s.flags & SERV_FROM_RESOLV != 0
+                s.flags.contains(ServFlags::FROM_RESOLV)
                     && SocketAddr::from(s.addr.clone())
                         == SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)), 53)
             }),
@@ -4695,7 +4695,7 @@ mod tests {
     #[tokio::test]
     async fn clear_cache_and_reload_preserves_servers_when_resolv_file_becomes_unreadable() {
         use crate::types::network::Resolvc;
-        use crate::types::server::SERV_FROM_RESOLV;
+        use crate::types::server::ServFlags;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("resolv.conf");
@@ -4722,7 +4722,7 @@ mod tests {
         {
             let d = handle.read().await;
             assert_eq!(
-                d.servers.iter().filter(|s| s.flags & SERV_FROM_RESOLV != 0).count(),
+                d.servers.iter().filter(|s| s.flags.contains(ServFlags::FROM_RESOLV)).count(),
                 1,
                 "the server must be discovered on the first, successful reload",
             );
@@ -4736,7 +4736,7 @@ mod tests {
 
         let d = handle.read().await;
         assert_eq!(
-            d.servers.iter().filter(|s| s.flags & SERV_FROM_RESOLV != 0).count(),
+            d.servers.iter().filter(|s| s.flags.contains(ServFlags::FROM_RESOLV)).count(),
             1,
             "a failed resolv-file read must not empty the existing resolv-derived server list",
         );
@@ -4759,7 +4759,7 @@ mod tests {
     #[tokio::test]
     async fn clear_cache_and_reload_resolv_servers_do_not_accumulate_across_reloads() {
         use crate::types::network::Resolvc;
-        use crate::types::server::SERV_FROM_RESOLV;
+        use crate::types::server::ServFlags;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("resolv.conf");
@@ -4788,7 +4788,7 @@ mod tests {
 
         let d = handle.read().await;
         let resolv_derived =
-            d.servers.iter().filter(|s| s.flags & SERV_FROM_RESOLV != 0).count();
+            d.servers.iter().filter(|s| s.flags.contains(ServFlags::FROM_RESOLV)).count();
         assert_eq!(
             resolv_derived, 1,
             "an unchanged resolv file must not accumulate duplicate server entries",
@@ -4803,7 +4803,7 @@ mod tests {
     #[tokio::test]
     async fn clear_cache_and_reload_preserves_query_stats_for_unchanged_resolv_server() {
         use crate::types::network::Resolvc;
-        use crate::types::server::SERV_FROM_RESOLV;
+        use crate::types::server::ServFlags;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("resolv.conf");
@@ -4832,7 +4832,7 @@ mod tests {
             let server = d
                 .servers
                 .iter_mut()
-                .find(|s| s.flags & SERV_FROM_RESOLV != 0)
+                .find(|s| s.flags.contains(ServFlags::FROM_RESOLV))
                 .expect("resolv-derived server must exist after the first reload");
             server.queries = 42;
         }
@@ -4844,7 +4844,7 @@ mod tests {
         let server = d
             .servers
             .iter()
-            .find(|s| s.flags & SERV_FROM_RESOLV != 0)
+            .find(|s| s.flags.contains(ServFlags::FROM_RESOLV))
             .expect("resolv-derived server must still exist");
         assert_eq!(
             server.queries, 42,
@@ -4859,7 +4859,7 @@ mod tests {
     #[tokio::test]
     async fn clear_cache_and_reload_resolv_ipv6_source_addr_matches_family() {
         use crate::types::network::Resolvc;
-        use crate::types::server::SERV_FROM_RESOLV;
+        use crate::types::server::ServFlags;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("resolv.conf");
@@ -4889,7 +4889,7 @@ mod tests {
         let server = d
             .servers
             .iter()
-            .find(|s| s.flags & SERV_FROM_RESOLV != 0)
+            .find(|s| s.flags.contains(ServFlags::FROM_RESOLV))
             .expect("resolv-derived server must exist");
         assert!(
             matches!(server.source_addr, crate::types::addr::MySockAddr::V6(_)),

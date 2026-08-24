@@ -17,7 +17,7 @@ use crate::types::dns_records::{
     ADDRLIST_LITERAL, IN4, IN6, INP4, INP6,
 };
 use crate::types::network::{Allowlist, DynDir, DynDirFlags, HostsFile, IfaceNameFlags, Iname, Ipsets, MySubnet};
-use crate::types::server::{Server, SERV_4ADDR, SERV_6ADDR, SERV_ALL_ZEROS, SERV_LITERAL_ADDRESS};
+use crate::types::server::{Server, ServFlags};
 use crate::types::daemon::{DhcpBridge, SharedNetwork};
 use crate::domain::CondDomain;
 #[cfg(feature = "dhcp")]
@@ -2220,7 +2220,7 @@ fn parse_server_or_address(
         let dummy_addr = MySockAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0));
         if domains.is_empty() {
             daemon.servers.push(new_server(
-                SERV_LITERAL_ADDRESS,
+                ServFlags::LITERAL_ADDRESS,
                 String::new(),
                 dummy_addr.clone(),
                 dummy_addr,
@@ -2228,7 +2228,7 @@ fn parse_server_or_address(
         } else {
             for domain in domains {
                 daemon.servers.push(new_server(
-                    SERV_LITERAL_ADDRESS,
+                    ServFlags::LITERAL_ADDRESS,
                     domain,
                     dummy_addr.clone(),
                     dummy_addr.clone(),
@@ -2246,7 +2246,7 @@ fn parse_server_or_address(
     // all, since server addresses always need a real, resolvable target.
     if key == "address" && addr_part == "#" {
         let dummy_addr = MySockAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0));
-        let flags = SERV_ALL_ZEROS | SERV_LITERAL_ADDRESS;
+        let flags = ServFlags::ALL_ZEROS | ServFlags::LITERAL_ADDRESS;
         if domains.is_empty() {
             daemon.servers.push(new_server(flags, String::new(), dummy_addr.clone(), dummy_addr));
         } else {
@@ -2282,12 +2282,12 @@ fn parse_server_or_address(
     };
 
     let mut flags = match ip {
-        IpAddr::V4(_) => SERV_4ADDR,
-        IpAddr::V6(_) => SERV_6ADDR,
+        IpAddr::V4(_) => ServFlags::ADDR4,
+        IpAddr::V6(_) => ServFlags::ADDR6,
     };
 
     if key == "address" {
-        flags |= SERV_LITERAL_ADDRESS;
+        flags.insert(ServFlags::LITERAL_ADDRESS);
     }
 
     let dummy_addr = MySockAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0));
@@ -2303,7 +2303,7 @@ fn parse_server_or_address(
     Ok(())
 }
 
-pub(crate) fn new_server(flags: u16, domain: String, addr: MySockAddr, source_addr: MySockAddr) -> Server {
+pub(crate) fn new_server(flags: ServFlags, domain: String, addr: MySockAddr, source_addr: MySockAddr) -> Server {
     Server {
         flags,
         domain,
@@ -2384,7 +2384,7 @@ fn push_domain_servers(
     match server_part {
         None => {
             for d in domains {
-                daemon.servers.push(new_server(SERV_LITERAL_ADDRESS, d.clone(), dummy_addr.clone(), dummy_addr.clone()));
+                daemon.servers.push(new_server(ServFlags::LITERAL_ADDRESS, d.clone(), dummy_addr.clone(), dummy_addr.clone()));
             }
         }
         Some(s) => {
@@ -2394,8 +2394,8 @@ fn push_domain_servers(
                 IpAddr::V6(a) => MySockAddr::V6(SocketAddrV6::new(a, port, 0, 0)),
             };
             let flags = match ip {
-                IpAddr::V4(_) => SERV_4ADDR,
-                IpAddr::V6(_) => SERV_6ADDR,
+                IpAddr::V4(_) => ServFlags::ADDR4,
+                IpAddr::V6(_) => ServFlags::ADDR6,
             };
             for d in domains {
                 daemon.servers.push(new_server(flags, d.clone(), sock.clone(), dummy_addr.clone()));
@@ -5494,8 +5494,8 @@ mod tests {
             std::net::Ipv4Addr::UNSPECIFIED,
             0,
         ));
-        let a = new_server(0, String::new(), dummy.clone(), dummy.clone());
-        let b = new_server(0, String::new(), dummy.clone(), dummy);
+        let a = new_server(ServFlags::empty(), String::new(), dummy.clone(), dummy.clone());
+        let b = new_server(ServFlags::empty(), String::new(), dummy.clone(), dummy);
         assert_ne!(a.uid, b.uid);
     }
 
@@ -5544,8 +5544,8 @@ mod tests {
         assert_eq!(d.servers.len(), 1);
         let s = &d.servers[0];
         assert_eq!(s.domain, "1.168.192.in-addr.arpa");
-        assert_eq!(s.flags & SERV_4ADDR, SERV_4ADDR);
-        assert_eq!(s.flags & SERV_LITERAL_ADDRESS, 0);
+        assert!(s.flags.contains(ServFlags::ADDR4));
+        assert!(!s.flags.contains(ServFlags::LITERAL_ADDRESS));
         match &s.addr {
             MySockAddr::V4(a) => {
                 assert_eq!(*a.ip(), "10.0.0.1".parse::<Ipv4Addr>().unwrap());
@@ -5582,7 +5582,7 @@ mod tests {
         let lines = parse_config_text("rev-server=192.168.1.0/24", "test").unwrap();
         apply_config(&mut d, &lines).unwrap();
         assert_eq!(d.servers.len(), 1);
-        assert_eq!(d.servers[0].flags & SERV_LITERAL_ADDRESS, SERV_LITERAL_ADDRESS);
+        assert!(d.servers[0].flags.contains(ServFlags::LITERAL_ADDRESS));
     }
 
     #[test]
@@ -5592,7 +5592,7 @@ mod tests {
         apply_config(&mut d, &lines).unwrap();
         assert_eq!(d.servers.len(), 1);
         assert!(d.servers[0].domain.ends_with(".ip6.arpa"));
-        assert_eq!(d.servers[0].flags & SERV_6ADDR, SERV_6ADDR);
+        assert!(d.servers[0].flags.contains(ServFlags::ADDR6));
     }
 
     #[test]
@@ -6868,8 +6868,8 @@ mod tests {
         assert_eq!(d.servers.len(), 1);
         let s = &d.servers[0];
         assert_eq!(s.domain, "example.com");
-        assert_eq!(s.flags & SERV_LITERAL_ADDRESS, SERV_LITERAL_ADDRESS);
-        assert_eq!(s.flags & SERV_4ADDR, SERV_4ADDR);
+        assert!(s.flags.contains(ServFlags::LITERAL_ADDRESS));
+        assert!(s.flags.contains(ServFlags::ADDR4));
         assert_eq!(s.addr.ip(), "1.2.3.4".parse::<std::net::IpAddr>().unwrap());
     }
 
@@ -6884,8 +6884,8 @@ mod tests {
         assert_eq!(d.servers.len(), 1);
         let s = &d.servers[0];
         assert_eq!(s.domain, "example.com");
-        assert_eq!(s.flags & SERV_LITERAL_ADDRESS, SERV_LITERAL_ADDRESS);
-        assert_eq!(s.flags & (SERV_4ADDR | SERV_6ADDR), 0);
+        assert!(s.flags.contains(ServFlags::LITERAL_ADDRESS));
+        assert!(!s.flags.intersects(ServFlags::ADDR4 | ServFlags::ADDR6));
     }
 
     /// `address=/domain/#`: the whole address argument is literally `#`,
@@ -6904,8 +6904,8 @@ mod tests {
         assert_eq!(d.servers.len(), 1);
         let s = &d.servers[0];
         assert_eq!(s.domain, "example.com");
-        assert_eq!(s.flags & SERV_LITERAL_ADDRESS, SERV_LITERAL_ADDRESS);
-        assert_eq!(s.flags & SERV_ALL_ZEROS, SERV_ALL_ZEROS);
+        assert!(s.flags.contains(ServFlags::LITERAL_ADDRESS));
+        assert!(s.flags.contains(ServFlags::ALL_ZEROS));
     }
 
     #[test]
@@ -6919,7 +6919,7 @@ mod tests {
         apply_config(&mut d, &lines).unwrap();
         assert_eq!(d.servers.len(), 1);
         assert_eq!(d.servers[0].domain, "");
-        assert_eq!(d.servers[0].flags & SERV_ALL_ZEROS, SERV_ALL_ZEROS);
+        assert!(d.servers[0].flags.contains(ServFlags::ALL_ZEROS));
     }
 
     /// A mixed directive naming a specific domain alongside the `/#/`
@@ -6959,7 +6959,7 @@ mod tests {
         assert_eq!(d.servers.len(), 1);
         let s = &d.servers[0];
         assert_eq!(s.domain, "example.com");
-        assert_eq!(s.flags & SERV_LITERAL_ADDRESS, SERV_LITERAL_ADDRESS);
+        assert!(s.flags.contains(ServFlags::LITERAL_ADDRESS));
     }
 
     #[test]
@@ -6970,7 +6970,7 @@ mod tests {
         assert_eq!(d.servers.len(), 1);
         let s = &d.servers[0];
         assert_eq!(s.domain, "example.com");
-        assert_eq!(s.flags & SERV_LITERAL_ADDRESS, SERV_LITERAL_ADDRESS);
+        assert!(s.flags.contains(ServFlags::LITERAL_ADDRESS));
     }
 
     #[test]

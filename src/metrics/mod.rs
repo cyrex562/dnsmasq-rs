@@ -136,7 +136,7 @@ mod tests {
 
         let mut daemon = Daemon::default();
         let mut server = Server {
-            flags: 0,
+            flags: crate::types::server::ServFlags::empty(),
             domain: String::new(),
             addr: MySockAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 53)),
             source_addr: MySockAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 0)),
