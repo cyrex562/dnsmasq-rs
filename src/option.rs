@@ -16,7 +16,7 @@ use crate::types::dns_records::{
     InterfaceName, MxSrvRecord, Naptr, PtrRecord, RrList, TxtRecord, ADDRLIST_IPV6,
     ADDRLIST_LITERAL, IN4, IN6, INP4, INP6,
 };
-use crate::types::network::{Allowlist, DynDir, HostsFile, Iname, Ipsets, MySubnet, AH_DHCP_HST, AH_DHCP_OPT, AH_HOSTS, INAME_4, INAME_6};
+use crate::types::network::{Allowlist, DynDir, DynDirFlags, HostsFile, Iname, Ipsets, MySubnet, INAME_4, INAME_6};
 use crate::types::server::{Server, SERV_4ADDR, SERV_6ADDR, SERV_ALL_ZEROS, SERV_LITERAL_ADDRESS};
 use crate::types::daemon::{DhcpBridge, SharedNetwork};
 use crate::domain::CondDomain;
@@ -1774,17 +1774,17 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
 
         "hostsdir" | "addn-hosts-dir" | "hosts-dir" => {
             let v = require_value(key)?;
-            daemon.dynamic_dirs.push(make_dynamic_dir(v, AH_HOSTS));
+            daemon.dynamic_dirs.push(make_dynamic_dir(v, DynDirFlags::HOSTS));
         }
 
         "dhcp-hostsdir" => {
             let v = require_value("dhcp-hostsdir")?;
-            daemon.dynamic_dirs.push(make_dynamic_dir(v, AH_DHCP_HST));
+            daemon.dynamic_dirs.push(make_dynamic_dir(v, DynDirFlags::DHCP_HST));
         }
 
         "dhcp-optsdir" => {
             let v = require_value("dhcp-optsdir")?;
-            daemon.dynamic_dirs.push(make_dynamic_dir(v, AH_DHCP_OPT));
+            daemon.dynamic_dirs.push(make_dynamic_dir(v, DynDirFlags::DHCP_OPT));
         }
 
         // ── conf-dir (recursive config loading) ────────────────────────────
@@ -2845,13 +2845,13 @@ fn make_hosts_file(daemon: &mut Daemon, fname: &str) -> HostsFile {
     let index = daemon.host_index as u32;
     daemon.host_index += 1;
     HostsFile {
-        flags: 0,
+        flags: DynDirFlags::empty(),
         fname: fname.to_string(),
         index,
     }
 }
 
-fn make_dynamic_dir(dname: &str, flags: u32) -> DynDir {
+fn make_dynamic_dir(dname: &str, flags: DynDirFlags) -> DynDir {
     DynDir {
         files: Vec::new(),
         flags,
@@ -7276,11 +7276,11 @@ mod tests {
         apply_config(&mut d, &lines).unwrap();
         assert_eq!(d.dynamic_dirs.len(), 3);
         assert_eq!(d.dynamic_dirs[0].dname, "/etc/hosts.d");
-        assert_eq!(d.dynamic_dirs[0].flags, AH_HOSTS);
+        assert_eq!(d.dynamic_dirs[0].flags, DynDirFlags::HOSTS);
         assert_eq!(d.dynamic_dirs[1].dname, "/etc/dhcp-hosts.d");
-        assert_eq!(d.dynamic_dirs[1].flags, AH_DHCP_HST);
+        assert_eq!(d.dynamic_dirs[1].flags, DynDirFlags::DHCP_HST);
         assert_eq!(d.dynamic_dirs[2].dname, "/etc/dhcp-opts.d");
-        assert_eq!(d.dynamic_dirs[2].flags, AH_DHCP_OPT);
+        assert_eq!(d.dynamic_dirs[2].flags, DynDirFlags::DHCP_OPT);
     }
 
     #[test]

@@ -37,7 +37,7 @@
 use crate::cache::DnsCache;
 use crate::types::constants::{OPT_NO_POLL, OPT_NO_RESOLV, UID_NONE};
 use crate::types::daemon::Daemon;
-use crate::types::network::{DynDir, HostsFile, AH_HOSTS, AH_WD_DONE};
+use crate::types::network::{DynDir, DynDirFlags, HostsFile};
 
 /// Which file event triggered a reload.
 #[derive(Debug, Clone, PartialEq)]
@@ -292,7 +292,7 @@ pub fn set_dynamic_inotify(daemon: &mut Daemon, cache: &mut DnsCache) {
             continue;
         }
 
-        if dd.flags & AH_WD_DONE == 0 {
+        if !dd.flags.contains(DynDirFlags::WD_DONE) {
             match add_watch(
                 fd,
                 &dd.dname,
@@ -301,7 +301,7 @@ pub fn set_dynamic_inotify(daemon: &mut Daemon, cache: &mut DnsCache) {
                 Ok(wd) => dd.wd = wd,
                 Err(_) => dd.wd = -1,
             }
-            dd.flags |= AH_WD_DONE;
+            dd.flags.insert(DynDirFlags::WD_DONE);
         }
 
         if dd.wd == -1 {
@@ -317,7 +317,7 @@ pub fn set_dynamic_inotify(daemon: &mut Daemon, cache: &mut DnsCache) {
             }
         };
 
-        if dd.flags & AH_HOSTS == 0 {
+        if !dd.flags.contains(DynDirFlags::HOSTS) {
             continue;
         }
 
@@ -390,7 +390,7 @@ pub fn inotify_check(daemon: &mut Daemon, cache: &mut DnsCache) -> bool {
             }
 
             for dd in daemon.dynamic_dirs.iter_mut() {
-                if dd.wd != wd || dd.flags & AH_HOSTS == 0 {
+                if dd.wd != wd || !dd.flags.contains(DynDirFlags::HOSTS) {
                     continue;
                 }
 
@@ -486,7 +486,7 @@ pub async fn watch_inotify_changes(
 mod tests {
     use super::*;
     use crate::types::constants::F_IPV4;
-    use crate::types::network::{Resolvc, AH_DHCP_HST};
+    use crate::types::network::{Resolvc, DynDirFlags};
     use std::time::Instant;
 
     fn make_raw_event(wd: i32, mask: u32, cookie: u32, name: &str) -> Vec<u8> {
@@ -680,7 +680,7 @@ mod tests {
     // ── set_dynamic_inotify ──────────────────────────────────────────────
 
     fn make_hosts_dyndir(dname: &str) -> DynDir {
-        DynDir { files: vec![], flags: AH_HOSTS, dname: dname.to_string(), wd: -1 }
+        DynDir { files: vec![], flags: DynDirFlags::HOSTS, dname: dname.to_string(), wd: -1 }
     }
 
     /// Closes a raw fd on drop. `inotify_dnsmasq_init` opens a real kernel
@@ -741,7 +741,7 @@ mod tests {
         set_dynamic_inotify(&mut daemon, &mut cache);
 
         assert!(daemon.dynamic_dirs[0].wd >= 0);
-        assert_ne!(daemon.dynamic_dirs[0].flags & AH_WD_DONE, 0);
+        assert!(daemon.dynamic_dirs[0].flags.contains(DynDirFlags::WD_DONE));
         assert_eq!(daemon.dynamic_dirs[0].files.len(), 1);
         assert_ne!(daemon.dynamic_dirs[0].files[0].index, UID_NONE);
 
@@ -775,7 +775,7 @@ mod tests {
         let (mut daemon, _guard) = init_test_daemon_with_fd();
         daemon.dynamic_dirs.push(DynDir {
             files: vec![],
-            flags: AH_DHCP_HST,
+            flags: DynDirFlags::DHCP_HST,
             dname: dir.path().to_str().unwrap().to_string(),
             wd: -1,
         });

@@ -76,17 +76,24 @@ pub struct Resolvc {
     pub file:       Option<String>,
 }
 
-pub const AH_DIR:      u32 = 1;
-pub const AH_INACTIVE: u32 = 2;
-pub const AH_WD_DONE:  u32 = 4;
-pub const AH_HOSTS:    u32 = 8;
-pub const AH_DHCP_HST: u32 = 16;
-pub const AH_DHCP_OPT: u32 = 32;
+bitflags::bitflags! {
+    /// Hosts/options-file and dynamic-directory flags (upstream `AH_*`
+    /// constants in `dnsmasq.h`, used by `struct hostsfile`/`struct dyndir`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct DynDirFlags: u32 {
+        const DIR      = 1 << 0;
+        const INACTIVE = 1 << 1;
+        const WD_DONE  = 1 << 2;
+        const HOSTS    = 1 << 3;
+        const DHCP_HST = 1 << 4;
+        const DHCP_OPT = 1 << 5;
+    }
+}
 
 /// Hosts/options file parameter (`struct hostsfile`).
 #[derive(Debug, Clone)]
 pub struct HostsFile {
-    pub flags: u32,
+    pub flags: DynDirFlags,
     pub fname: String,
     pub index: u32,
 }
@@ -95,7 +102,7 @@ pub struct HostsFile {
 #[derive(Debug, Clone)]
 pub struct DynDir {
     pub files: Vec<HostsFile>,
-    pub flags: u32,
+    pub flags: DynDirFlags,
     pub dname: String,
     #[cfg(feature = "inotify")]
     pub wd:    i32,

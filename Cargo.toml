@@ -45,6 +45,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # Byte buffers
 bytes = "1"
 
+# Typed bitmask flag sets
+bitflags = "2"
+
 # LRU cache
 lru = "0.12"
 

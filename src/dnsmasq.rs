@@ -4588,7 +4588,7 @@ mod tests {
             let mut d = handle.write().await;
             d.set_option(crate::types::constants::OPT_NO_HOSTS); // skip the real /etc/hosts
             d.addn_hosts.push(HostsFile {
-                flags: 0,
+                flags: crate::types::network::DynDirFlags::empty(),
                 fname: path.to_str().unwrap().to_string(),
                 index: 0,
             });
@@ -4616,7 +4616,7 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "inotify")]
     async fn clear_cache_and_reload_rescans_hostsdir_entries() {
-        use crate::types::network::{DynDir, AH_HOSTS, AH_WD_DONE};
+        use crate::types::network::{DynDir, DynDirFlags};
 
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("hosts1"), "192.0.2.50 dynamic.test\n").unwrap();
@@ -4631,7 +4631,7 @@ mod tests {
             // watch itself isn't what's under test here, the re-scan is.
             d.dynamic_dirs.push(DynDir {
                 files: vec![],
-                flags: AH_HOSTS | AH_WD_DONE,
+                flags: DynDirFlags::HOSTS | DynDirFlags::WD_DONE,
                 dname: dir.path().to_str().unwrap().to_string(),
                 wd: 999,
             });
