@@ -145,8 +145,8 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
     // `daemon->log_fac != -1` wins; otherwise `-d` defaults to `LOG_LOCAL0`
     // and everything else defaults to `LOG_DAEMON` inside `log_start`
     // (log.c:64-69).
-    let log_fac = if daemon.log_fac != -1 {
-        Some(daemon.log_fac as u32)
+    let log_fac = if let Some(fac) = daemon.log_fac {
+        Some(fac as u32)
     } else if debug {
         Some(log::LOG_LOCAL0)
     } else {

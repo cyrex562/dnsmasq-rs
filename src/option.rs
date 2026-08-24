@@ -1182,7 +1182,7 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
                 daemon.log_file = Some(v.to_string());
             } else {
                 match crate::log::facility_by_name(v) {
-                    Some(fac) => daemon.log_fac = fac as i32,
+                    Some(fac) => daemon.log_fac = Some(fac as i32),
                     None => return Err(invalid(v, "bad log facility")),
                 }
             }
@@ -8382,7 +8382,7 @@ mod tests {
     fn log_facility_name_sets_log_fac_not_log_file() {
         let resolved =
             resolve_config(&parse_config_text("log-facility=local0", "test.conf").unwrap()).unwrap();
-        assert_eq!(resolved.daemon.log_fac, crate::log::LOG_LOCAL0 as i32);
+        assert_eq!(resolved.daemon.log_fac, Some(crate::log::LOG_LOCAL0 as i32));
         assert_eq!(resolved.daemon.log_file, None);
     }
 
@@ -8390,7 +8390,7 @@ mod tests {
     fn log_facility_daemon_name_maps_to_log_daemon() {
         let resolved =
             resolve_config(&parse_config_text("log-facility=daemon", "test.conf").unwrap()).unwrap();
-        assert_eq!(resolved.daemon.log_fac, crate::log::LOG_DAEMON as i32);
+        assert_eq!(resolved.daemon.log_fac, Some(crate::log::LOG_DAEMON as i32));
         assert_eq!(resolved.daemon.log_file, None);
     }
 
@@ -8403,7 +8403,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved.daemon.log_file.as_deref(), Some("/tmp/dnsmasq.log"));
-        assert_eq!(resolved.daemon.log_fac, -1);
+        assert_eq!(resolved.daemon.log_fac, None);
     }
 
     #[test]

@@ -213,7 +213,7 @@ fn split_dir_file(path: &str) -> (String, String) {
 /// `init_daemon_with` already handles `ipset_init` failures.
 pub fn inotify_dnsmasq_init(daemon: &mut Daemon) -> std::io::Result<()> {
     let fd = open_inotify()?;
-    daemon.inotify_fd = fd;
+    daemon.inotify_fd = Some(fd);
 
     if daemon.port == 0 || daemon.option_bool(OPT_NO_RESOLV) {
         return Ok(());
@@ -276,7 +276,7 @@ fn dyndir_find_or_add(dd: &mut DynDir, file: &str) -> usize {
 /// see the module doc for why.
 pub fn set_dynamic_inotify(daemon: &mut Daemon, cache: &mut DnsCache) {
     let ttl = daemon.local_ttl;
-    let fd = daemon.inotify_fd;
+    let fd = daemon.inotify_fd.unwrap_or(-1);
     let now = std::time::Instant::now();
 
     for dd in daemon.dynamic_dirs.iter_mut() {
@@ -345,10 +345,9 @@ pub fn set_dynamic_inotify(daemon: &mut Daemon, cache: &mut DnsCache) {
 /// changed (upstream's `hit`), leaving the decision of whether to force a
 /// resolv reload to the caller.
 pub fn inotify_check(daemon: &mut Daemon, cache: &mut DnsCache) -> bool {
-    let fd = daemon.inotify_fd;
-    if fd < 0 {
+    let Some(fd) = daemon.inotify_fd else {
         return false;
-    }
+    };
 
     let mut hit = false;
     let mut buf = [0u8; 4096];
@@ -454,10 +453,9 @@ pub async fn watch_inotify_changes(
 ) -> std::io::Result<()> {
     use std::os::fd::{FromRawFd, OwnedFd};
 
-    let fd = daemon_handle.read().await.inotify_fd;
-    if fd < 0 {
+    let Some(fd) = daemon_handle.read().await.inotify_fd else {
         return Ok(());
-    }
+    };
 
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
     let async_fd = tokio::io::unix::AsyncFd::new(owned)?;
@@ -629,9 +627,9 @@ mod tests {
         daemon.resolv_files.push(make_resolvc(path.to_str().unwrap()));
 
         inotify_dnsmasq_init(&mut daemon).unwrap();
-        let _guard = FdGuard(daemon.inotify_fd);
+        let _guard = FdGuard(daemon.inotify_fd.unwrap_or(-1));
 
-        assert!(daemon.inotify_fd >= 0);
+        assert!(daemon.inotify_fd.is_some());
         assert!(daemon.resolv_files[0].wd >= 0);
         assert_eq!(daemon.resolv_files[0].file.as_deref(), Some("resolv.conf"));
     }
@@ -644,7 +642,7 @@ mod tests {
             .push(make_resolvc("/nonexistent-inotify-test-dir-xyz/resolv.conf"));
 
         assert!(inotify_dnsmasq_init(&mut daemon).is_err());
-        let _guard = FdGuard(daemon.inotify_fd);
+        let _guard = FdGuard(daemon.inotify_fd.unwrap_or(-1));
         assert_eq!(daemon.resolv_files[0].wd, -1);
     }
 
@@ -656,9 +654,9 @@ mod tests {
             .push(make_resolvc("/nonexistent-inotify-test-dir-xyz/resolv.conf"));
 
         inotify_dnsmasq_init(&mut daemon).unwrap();
-        let _guard = FdGuard(daemon.inotify_fd);
+        let _guard = FdGuard(daemon.inotify_fd.unwrap_or(-1));
 
-        assert!(daemon.inotify_fd >= 0);
+        assert!(daemon.inotify_fd.is_some());
         assert_eq!(daemon.resolv_files[0].wd, -1);
     }
 
@@ -671,9 +669,9 @@ mod tests {
             .push(make_resolvc("/nonexistent-inotify-test-dir-xyz/resolv.conf"));
 
         inotify_dnsmasq_init(&mut daemon).unwrap();
-        let _guard = FdGuard(daemon.inotify_fd);
+        let _guard = FdGuard(daemon.inotify_fd.unwrap_or(-1));
 
-        assert!(daemon.inotify_fd >= 0);
+        assert!(daemon.inotify_fd.is_some());
         assert_eq!(daemon.resolv_files[0].wd, -1);
     }
 
@@ -707,7 +705,7 @@ mod tests {
     fn init_test_daemon_with_fd() -> (Daemon, FdGuard) {
         let mut daemon = Daemon { port: 0, ..Daemon::default() };
         inotify_dnsmasq_init(&mut daemon).unwrap();
-        let guard = FdGuard(daemon.inotify_fd);
+        let guard = FdGuard(daemon.inotify_fd.unwrap_or(-1));
         (daemon, guard)
     }
 
@@ -871,7 +869,7 @@ mod tests {
         let mut daemon = Daemon { port: 53, ..Daemon::default() };
         daemon.resolv_files.push(make_resolvc(path.to_str().unwrap()));
         inotify_dnsmasq_init(&mut daemon).unwrap();
-        let _guard = FdGuard(daemon.inotify_fd);
+        let _guard = FdGuard(daemon.inotify_fd.unwrap_or(-1));
         let mut cache = DnsCache::new(1000);
 
         std::fs::write(&path, "nameserver 8.8.8.8\n").unwrap();

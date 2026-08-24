@@ -140,7 +140,10 @@ pub struct Daemon {
     pub edns_pktsz:    u16,
 
     // ── Logging ───────────────────────────────────────────────────────────────
-    pub log_fac:       i32,
+    /// Syslog facility (`--log-facility`). `None` means "use the platform
+    /// default" (`LOG_DAEMON`, or `LOG_LOCAL0` under `--log-async`) rather
+    /// than upstream's `-1` sentinel.
+    pub log_fac:       Option<i32>,
     pub log_file:      Option<String>,
     pub max_logs:      i32,
     pub log_malloc:    i32,
@@ -174,17 +177,20 @@ pub struct Daemon {
     pub dhcp_hosts_file: Vec<HostsFile>,
     pub dhcp_opts_file:  Vec<HostsFile>,
     pub dynamic_dirs:    Vec<DynDir>,
-    /// Raw inotify fd opened by `inotify::inotify_dnsmasq_init`; `-1` if
+    /// Raw inotify fd opened by `inotify::inotify_dnsmasq_init`; `None` if
     /// unopened (init not yet run, or `inotify_init1` failed).
     #[cfg(feature = "inotify")]
-    pub inotify_fd:      i32,
+    pub inotify_fd:      Option<i32>,
     pub soa_sn:          u32,
     pub soa_refresh:     u32,
     pub soa_retry:       u32,
     pub soa_expiry:      u32,
     pub osport:          i32,
     pub host_index:      i32,
-    pub pipe_to_parent:  i32,
+    /// Pipe fd to the pre-fork parent process (privilege-drop helper);
+    /// `None` outside that mode. Not yet consumed anywhere in this port
+    /// (see `arp.rs`'s comment on the upstream `!= -1` check).
+    pub pipe_to_parent:  Option<i32>,
     pub max_procs:       i32,
     pub randport_limit:  i32,
     /// Incremented each time a config reload (SIGHUP) is processed.
@@ -443,7 +449,7 @@ impl Default for Daemon {
             fast_retry_time: 0,
             fast_retry_timeout: 0,
             edns_pktsz: EDNS_PKTSZ,
-            log_fac: -1,
+            log_fac: None,
             log_file: None,
             max_logs: 5,
             log_malloc: 0,
@@ -472,14 +478,14 @@ impl Default for Daemon {
             dhcp_opts_file: vec![],
             dynamic_dirs: vec![],
             #[cfg(feature = "inotify")]
-            inotify_fd: -1,
+            inotify_fd: None,
             soa_sn: 0,
             soa_refresh: 1200,
             soa_retry: 180,
             soa_expiry: 1209600,
             osport: 0,
             host_index: 0,
-            pipe_to_parent: -1,
+            pipe_to_parent: None,
             max_procs: 0,
             // `option.c:5986` — one source port per transaction per server, and
             // `--port-limit` refuses anything below 1.  A zero here would make
