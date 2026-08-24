@@ -2690,12 +2690,12 @@ fn parse_bridge_interface(daemon: &mut Daemon, v: &str, cl: &ConfigLine) -> Resu
     let key = "bridge-interface";
     let mut parts = v.splitn(2, ',');
     let iface = parts.next().unwrap_or("").trim();
-    let rest = parts.next();
-
-    if iface.is_empty() || iface.len() > BRIDGE_IF_NAMESIZE - 1 || rest.is_none() {
+    let Some(rest) = parts.next() else {
+        return Err(invalid_value_for(cl, key, v, "bad bridge-interface"));
+    };
+    if iface.is_empty() || iface.len() > BRIDGE_IF_NAMESIZE - 1 {
         return Err(invalid_value_for(cl, key, v, "bad bridge-interface"));
     }
-    let rest = rest.unwrap();
 
     let idx = match daemon.bridges.iter().position(|b| b.iface == iface) {
         Some(i) => i,

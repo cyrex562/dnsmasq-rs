@@ -509,7 +509,8 @@ pub fn answer_auth(
                 // `zone` is always populated by this point: either from the
                 // reverse-lookup branch above (when `found` was already
                 // true), or from the zone-selection loop just above.
-                let zone_domain = zone.as_ref().unwrap().domain.clone();
+                let zone_ref = zone.as_ref().expect("zone populated by this point");
+                let zone_domain = zone_ref.domain.clone();
 
                 // MX
                 for rec in config.mxnames.iter() {
@@ -586,7 +587,7 @@ pub fn answer_auth(
                             let want = if is6 { RrType::AAAA } else { RrType::A };
                             if want as u16 != qtype_num { continue; }
                             if al.flags & ADDRLIST_REVONLY != 0 { continue; }
-                            if !(local_query || filter_zone(zone.as_ref().unwrap(), &al.addr)) { continue; }
+                            if !(local_query || filter_zone(zone_ref, &al.addr)) { continue; }
                             if let Some(rr) = make_addr_rr(&name, qtype_num, &al.addr, config.auth_ttl) {
                                 answers.push(rr);
                             }
@@ -638,7 +639,7 @@ pub fn answer_auth(
                                 nxdomain = false;
                                 if cr.flags & flag != 0 {
                                     let Some(addr) = &cr.addr else { continue };
-                                    if local_query || filter_zone(zone.as_ref().unwrap(), addr) {
+                                    if local_query || filter_zone(zone_ref, addr) {
                                         if let Some(rr) = make_addr_rr(&stripped, qtype_num, addr, config.auth_ttl) {
                                             answers.push(rr);
                                         }
@@ -657,7 +658,7 @@ pub fn answer_auth(
                     nxdomain = false;
                     if cr.flags & flag != 0 {
                         let Some(addr) = &cr.addr else { continue };
-                        if local_query || filter_zone(zone.as_ref().unwrap(), addr) {
+                        if local_query || filter_zone(zone_ref, addr) {
                             if let Some(rr) = make_addr_rr(&name, qtype_num, addr, config.auth_ttl) {
                                 answers.push(rr);
                             }

@@ -1328,13 +1328,11 @@ pub fn log_query(
     if opts.extralog {
         let proto = if opts.log_proto { if id < 0 { "TCP " } else { "UDP " } } else { "" };
         let display_id = id.unsigned_abs();
-        if flags & F_NOEXTRA != 0 || source_addr.is_none() {
-            Some(format!("{proto}{display_id} {source} {name}{gap}{verb} {dest}{extra}"))
-        } else {
-            let (ip, port) = source_addr.expect("checked above");
-            Some(format!(
+        match source_addr.filter(|_| flags & F_NOEXTRA == 0) {
+            None => Some(format!("{proto}{display_id} {source} {name}{gap}{verb} {dest}{extra}")),
+            Some((ip, port)) => Some(format!(
                 "{proto}{display_id} {ip}/{port} {source} {name}{gap}{verb} {dest}{extra}"
-            ))
+            )),
         }
     } else {
         Some(format!("{source} {name}{gap}{verb} {dest}{extra}"))

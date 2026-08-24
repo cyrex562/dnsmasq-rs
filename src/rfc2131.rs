@@ -1193,9 +1193,9 @@ pub fn do_opt(
     if let Some(buf) = p {
         if len == 0 { return 0; }
 
-        if opt.flags.contains(DhOptFlags::ADDR) && local.is_some() {
+        if let Some(l) = local.filter(|_| opt.flags.contains(DhOptFlags::ADDR)) {
             // Replace every 4-byte zero address with the local address.
-            let local_b = local.unwrap().octets();
+            let local_b = l.octets();
             for (chunk, out) in raw.chunks(4).zip(buf.chunks_mut(4)) {
                 let src = if chunk == [0, 0, 0, 0] { &local_b } else { chunk };
                 let n = src.len().min(out.len());
@@ -1222,10 +1222,10 @@ pub fn match_vendor_opts(vc_data: Option<&[u8]>, opts: &mut Vec<crate::types::dh
     use crate::types::dhcp::DhOptFlags;
     for opt in opts.iter_mut() {
         opt.flags.remove(DhOptFlags::VENDOR_MATCH);
-        if vc_data.is_none() || !opt.flags.contains(DhOptFlags::VENDOR) {
+        if !opt.flags.contains(DhOptFlags::VENDOR) {
             continue;
         }
-        let haystack = vc_data.unwrap();
+        let Some(haystack) = vc_data else { continue };
         let needle = match &opt.vendor_class {
             Some(vc) => vc.as_slice(),
             None     => &[][..],

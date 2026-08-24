@@ -514,14 +514,12 @@ pub fn validate_rrset(
         if labels > name_labels { continue; }
 
         // If no key is provided, signal that we need one.
-        if dnskey_rdata.is_none() {
+        let Some(key) = dnskey_rdata else {
             let signer = parse_wire_name(&rdata[18..])
                 .map(|(n, _)| n)
                 .unwrap_or_default();
             return RrsetValidation::NeedKey { signer, key_tag };
-        }
-
-        let key = dnskey_rdata.unwrap();
+        };
         // Skip (don't fail outright) unsupported algorithms, mirroring
         // upstream's `hash_find(algo_digest_name(algo))` skip at
         // dnssec.c:522-523: try the next RRSIG/key combination instead of

@@ -1901,27 +1901,27 @@ pub fn send_from(
     // Build the destination sockaddr.
     let (to_storage, to_len) = sockaddr_from_socket_addr(to);
 
-    if nowild || source_addr.is_none() {
-        // Simple sendto — no cmsg needed.
-        let rc = unsafe {
-            libc::sendto(
-                fd,
-                packet.as_ptr() as *const libc::c_void,
-                packet.len(),
-                0,
-                &to_storage as *const libc::sockaddr_storage as *const libc::sockaddr,
-                to_len as libc::socklen_t,
-            )
-        };
-        return if rc < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(rc as usize)
-        };
-    }
-
-    // We need to specify the source address via cmsg.
-    let source = source_addr.unwrap();
+    let source = match source_addr {
+        Some(s) if !nowild => s,
+        _ => {
+            // Simple sendto — no cmsg needed.
+            let rc = unsafe {
+                libc::sendto(
+                    fd,
+                    packet.as_ptr() as *const libc::c_void,
+                    packet.len(),
+                    0,
+                    &to_storage as *const libc::sockaddr_storage as *const libc::sockaddr,
+                    to_len as libc::socklen_t,
+                )
+            };
+            return if rc < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(rc as usize)
+            };
+        }
+    };
 
     // Allocate a large-enough control buffer.
     let mut ctrl_buf = [0u8; 256];
