@@ -74,7 +74,7 @@ pub fn slaac_address(prefix: Ipv6Addr, prefix_len: u8, mac: &[u8; 6]) -> Ipv6Add
 // ─────────────────────────────────────────────────────────────────────────────
 
 use crate::types::dhcp::{
-    ContextFlags, LEASE_HAVE_HWADDR, LEASE_TA, LEASE_NA,
+    ContextFlags, LeaseFlags,
     DhcpContext, DhcpLease, SlaacAddress,
 };
 
@@ -148,8 +148,8 @@ pub fn slaac_add_addrs(
     contexts: &[DhcpContext],
     mut ra_start_unsolicited: impl FnMut(&DhcpContext),
 ) -> bool {
-    if lease.flags & LEASE_HAVE_HWADDR == 0
-        || lease.flags & (LEASE_TA | LEASE_NA) != 0
+    if !lease.flags.contains(LeaseFlags::HAVE_HWADDR)
+        || lease.flags.intersects(LeaseFlags::TA | LeaseFlags::NA)
         || lease.last_interface == 0
         || lease.hostname.is_none()
     {
@@ -501,7 +501,7 @@ mod tests {
             hostname: hostname.map(|s| s.to_string()),
             fqdn: None,
             old_hostname: None,
-            flags: LEASE_HAVE_HWADDR,
+            flags: LeaseFlags::HAVE_HWADDR,
             expires: None,
             hwaddr: hw,
             hwaddr_len: 6,
@@ -602,7 +602,7 @@ mod tests {
     fn slaac_add_addrs_skips_no_hwaddr_flag() {
         let ctx = make_ra_ctx("2001:db8::".parse().unwrap(), 1);
         let mut lease = make_lease(MAC, 1, Some("host"));
-        lease.flags = 0; // no LEASE_HAVE_HWADDR
+        lease.flags = LeaseFlags::empty(); // no LEASE_HAVE_HWADDR
         let dirty = slaac_add_addrs(&mut lease, SystemTime::now(), false, std::slice::from_ref(&ctx), |_| {});
         assert!(!dirty);
         assert!(lease.slaac_address.is_empty());
@@ -612,7 +612,7 @@ mod tests {
     fn slaac_add_addrs_skips_ta_na() {
         let ctx = make_ra_ctx("2001:db8::".parse().unwrap(), 1);
         let mut lease = make_lease(MAC, 1, Some("host"));
-        lease.flags |= LEASE_NA;
+        lease.flags.insert(LeaseFlags::NA);
         let dirty = slaac_add_addrs(&mut lease, SystemTime::now(), false, std::slice::from_ref(&ctx), |_| {});
         assert!(!dirty);
         assert!(lease.slaac_address.is_empty());

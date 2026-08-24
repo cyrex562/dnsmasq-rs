@@ -23,7 +23,7 @@ use nix::unistd::{fork, pipe, setgid, setgroups, setuid, ForkResult, Gid, Pid, U
 use crate::dhcp_protocol::DHCP_CHADDR_MAX;
 use crate::types::dhcp::{
     ACTION_ADD, ACTION_ARP, ACTION_ARP_DEL, ACTION_DEL, ACTION_OLD, ACTION_OLD_HOSTNAME,
-    ACTION_RELAY_SNOOP, ACTION_TFTP, DhcpLease, LEASE_NA, LEASE_TA,
+    ACTION_RELAY_SNOOP, ACTION_TFTP, DhcpLease, LeaseFlags,
 };
 use crate::util::legal_hostname;
 
@@ -265,7 +265,7 @@ impl ScriptData {
 
         ScriptData {
             action,
-            flags: lease.flags,
+            flags: lease.flags.bits(),
             hwaddr_type: lease.hwaddr_type as u16,
             hwaddr: lease.hwaddr[..lease.hwaddr_len.min(DHCP_CHADDR_MAX)].to_vec(),
             addr: lease.addr,
@@ -567,7 +567,7 @@ fn is6(data: &ScriptData) -> bool {
     match data.action {
         ACTION_TFTP | ACTION_ARP | ACTION_ARP_DEL => data.flags != libc::AF_INET as u32,
         ACTION_RELAY_SNOOP => true,
-        _ => data.flags & (LEASE_TA | LEASE_NA) != 0,
+        _ => data.flags & (LeaseFlags::TA | LeaseFlags::NA).bits() != 0,
     }
 }
 
@@ -798,7 +798,7 @@ mod tests {
             hostname: Some("myhost".to_string()),
             fqdn: None,
             old_hostname: None,
-            flags: 0,
+            flags: LeaseFlags::empty(),
             expires: Some(SystemTime::now() + Duration::from_secs(3600)),
             hwaddr,
             hwaddr_len: 6,

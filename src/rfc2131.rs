@@ -1962,7 +1962,7 @@ mod tests {
             hostname: None,
             fqdn: None,
             old_hostname: None,
-            flags: 0,
+            flags: crate::types::dhcp::LeaseFlags::empty(),
             expires: None,
             hwaddr: [0u8; DHCP_CHADDR_MAX],
             hwaddr_len: 6,

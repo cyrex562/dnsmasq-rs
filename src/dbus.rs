@@ -409,7 +409,7 @@ pub mod dhcp_leases {
             hostname: hostname_str,
             fqdn: None,
             old_hostname: None,
-            flags: 0,
+            flags: crate::types::dhcp::LeaseFlags::empty(),
             expires,
             hwaddr: hwaddr_fixed,
             hwaddr_len: hw.len(),

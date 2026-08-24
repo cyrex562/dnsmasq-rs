@@ -86,15 +86,22 @@ bitflags::bitflags! {
 }
 
 // LEASE_* flags
-pub const LEASE_NEW:          u32 = 1;
-pub const LEASE_CHANGED:      u32 = 2;
-pub const LEASE_AUX_CHANGED:  u32 = 4;
-pub const LEASE_AUTH_NAME:    u32 = 8;
-pub const LEASE_USED:         u32 = 16;
-pub const LEASE_NA:           u32 = 32;
-pub const LEASE_TA:           u32 = 64;
-pub const LEASE_HAVE_HWADDR:  u32 = 128;
-pub const LEASE_EXP_CHANGED:  u32 = 256;
+bitflags::bitflags! {
+    /// `struct dhcp_lease`'s `flags` (upstream `LEASE_*` constants in
+    /// `dnsmasq.h`) — per-lease state and lease-script/renewal bookkeeping.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct LeaseFlags: u32 {
+        const NEW          = 1 << 0;
+        const CHANGED      = 1 << 1;
+        const AUX_CHANGED  = 1 << 2;
+        const AUTH_NAME    = 1 << 3;
+        const USED         = 1 << 4;
+        const NA           = 1 << 5;
+        const TA           = 1 << 6;
+        const HAVE_HWADDR  = 1 << 7;
+        const EXP_CHANGED  = 1 << 8;
+    }
+}
 
 // Action codes for the helper process RPC
 pub const ACTION_DEL:          u32 = 1;
@@ -119,7 +126,7 @@ pub struct DhcpLease {
     pub hostname:   Option<String>,
     pub fqdn:       Option<String>,
     pub old_hostname: Option<String>,
-    pub flags:      u32,
+    pub flags:      LeaseFlags,
     pub expires:    Option<SystemTime>,
     pub hwaddr:     [u8; DHCP_CHADDR_MAX],
     pub hwaddr_len: usize,

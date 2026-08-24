@@ -19,7 +19,7 @@ use crate::dhcp6_protocol::{
 use crate::lease::LeaseDb;
 use crate::metrics::{inc_metric, Metric};
 use crate::types::daemon::Daemon;
-use crate::types::dhcp::{DhcpConfig, DhcpContext, DhcpNetid, LEASE_NA};
+use crate::types::dhcp::{DhcpConfig, DhcpContext, DhcpNetid, LeaseFlags};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DHCPv6 packet representation
@@ -254,7 +254,7 @@ fn persist_lease(
     } else {
         Some(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(now_secs.saturating_add(valid as u64)))
     };
-    lease_db.bind_v6(addr, clid, iaid, LEASE_NA, expires);
+    lease_db.bind_v6(addr, clid, iaid, LeaseFlags::NA, expires);
     (preferred, valid, t1, t2)
 }
 
@@ -2056,14 +2056,14 @@ mod tests {
 
     #[test]
     fn dispatch_dhcp6_request_address_leased_to_other_client_is_unspec_fail() {
-        use crate::types::dhcp::{ContextFlags, LEASE_NA};
+        use crate::types::dhcp::{ContextFlags, LeaseFlags};
         let ctx = make_v6_ctx(
             "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(),
             64, ContextFlags::DHCP,
         );
         let taken: Ipv6Addr = "2001:db8::5".parse().unwrap();
         let mut db = LeaseDb::new();
-        db.bind_v6(taken, &[0xFF, 0xFF], 999, LEASE_NA, None);
+        db.bind_v6(taken, &[0xFF, 0xFF], 999, LeaseFlags::NA, None);
 
         let mut data = solicit_pkt(1);
         data[0] = Dhcp6MsgType::Request as u8;
@@ -2138,7 +2138,7 @@ mod tests {
 
     #[test]
     fn dispatch_dhcp6_renew_extends_existing_lease() {
-        use crate::types::dhcp::{ContextFlags, LEASE_NA};
+        use crate::types::dhcp::{ContextFlags, LeaseFlags};
         let mut ctx = make_v6_ctx(
             "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(),
             64, ContextFlags::DHCP,
@@ -2147,7 +2147,7 @@ mod tests {
         let addr: Ipv6Addr = "2001:db8::5".parse().unwrap();
         let clid = vec![0xAA, 0xBB, 0xCC, 0xDD];
         let mut db = LeaseDb::new();
-        db.bind_v6(addr, &clid, 2, LEASE_NA, None);
+        db.bind_v6(addr, &clid, 2, LeaseFlags::NA, None);
 
         let data = renew_pkt(Dhcp6MsgType::Renew, [0, 0, 0, 2], addr);
         let pkt = parse_dhcp6_packet(&data).unwrap();
@@ -2257,11 +2257,11 @@ mod tests {
 
     #[test]
     fn dispatch_dhcp6_release_removes_lease_and_frees_address() {
-        use crate::types::dhcp::LEASE_NA;
+        use crate::types::dhcp::LeaseFlags;
         let addr: Ipv6Addr = "2001:db8::5".parse().unwrap();
         let clid = vec![0xAA, 0xBB, 0xCC, 0xDD];
         let mut db = LeaseDb::new();
-        db.bind_v6(addr, &clid, 2, LEASE_NA, None);
+        db.bind_v6(addr, &clid, 2, LeaseFlags::NA, None);
 
         let mut data = renew_pkt(Dhcp6MsgType::Release, [0, 0, 0, 2], addr);
         data[0] = Dhcp6MsgType::Release as u8;
@@ -2292,11 +2292,11 @@ mod tests {
 
     #[test]
     fn dispatch_dhcp6_decline_removes_lease() {
-        use crate::types::dhcp::LEASE_NA;
+        use crate::types::dhcp::LeaseFlags;
         let addr: Ipv6Addr = "2001:db8::5".parse().unwrap();
         let clid = vec![0xAA, 0xBB, 0xCC, 0xDD];
         let mut db = LeaseDb::new();
-        db.bind_v6(addr, &clid, 2, LEASE_NA, None);
+        db.bind_v6(addr, &clid, 2, LeaseFlags::NA, None);
 
         let mut data = renew_pkt(Dhcp6MsgType::Decline, [0, 0, 0, 2], addr);
         data[0] = Dhcp6MsgType::Decline as u8;

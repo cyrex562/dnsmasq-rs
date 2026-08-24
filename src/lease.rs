@@ -13,7 +13,7 @@ use crate::dhcp_protocol::DHCP_CHADDR_MAX;
 #[cfg(feature = "dhcp")]
 use crate::helper::{run_script_child, ScriptData};
 #[cfg(feature = "dhcp")]
-use crate::types::dhcp::{DhcpLease, ACTION_ADD, ACTION_DEL, ACTION_OLD};
+use crate::types::dhcp::{DhcpLease, LeaseFlags, ACTION_ADD, ACTION_DEL, ACTION_OLD};
 
 /// Errors that can occur during lease deserialisation.
 #[cfg(feature = "dhcp")]
@@ -201,7 +201,7 @@ impl LeaseDb {
                 hostname,
                 fqdn: None,
                 old_hostname: None,
-                flags: 0,
+                flags: LeaseFlags::empty(),
                 expires,
                 hwaddr,
                 hwaddr_len,
@@ -230,7 +230,7 @@ impl LeaseDb {
 
     /// Allocate a new IPv4 lease. Returns `None` if `max_leases` would be exceeded.
     pub fn allocate_v4(&mut self, addr: Ipv4Addr) -> Option<&mut DhcpLease> {
-        use crate::types::dhcp::LEASE_NEW;
+        use crate::types::dhcp::LeaseFlags;
 
         if self.leases.len() >= self.max_leases {
             return None;
@@ -241,7 +241,7 @@ impl LeaseDb {
             hostname: None,
             fqdn: None,
             old_hostname: None,
-            flags: LEASE_NEW,
+            flags: LeaseFlags::NEW,
             expires: None,
             hwaddr: [0u8; DHCP_CHADDR_MAX],
             hwaddr_len: 0,
@@ -274,7 +274,7 @@ impl LeaseDb {
     /// Set the expiry time for a lease. `0xFFFFFFFF` means infinite (no expiry).
     /// Otherwise the lease expires at `now + duration_secs`.
     pub fn set_expires(&mut self, addr: Ipv4Addr, duration_secs: u32) {
-        use crate::types::dhcp::{LEASE_AUX_CHANGED, LEASE_EXP_CHANGED};
+        use crate::types::dhcp::LeaseFlags;
 
         if let Some(lease) = self.leases.values_mut().find(|l| l.addr == addr) {
             let new_expires = if duration_secs == 0xFFFF_FFFF {
@@ -285,7 +285,7 @@ impl LeaseDb {
 
             if lease.expires != new_expires {
                 lease.expires = new_expires;
-                lease.flags |= LEASE_AUX_CHANGED | LEASE_EXP_CHANGED;
+                lease.flags.insert(LeaseFlags::AUX_CHANGED | LeaseFlags::EXP_CHANGED);
                 self.file_dirty = true;
             }
         }
@@ -312,10 +312,6 @@ impl LeaseDb {
         clid: Option<&[u8]>,
         force: bool,
     ) -> bool {
-        use crate::types::dhcp::{LEASE_CHANGED, LEASE_AUX_CHANGED};
-        #[cfg(feature = "dhcp6")]
-        use crate::types::dhcp::LEASE_HAVE_HWADDR;
-
         // We need to find the lease, potentially remove/re-key it if clid changes.
         let key = {
             let lease = match self.leases.values().find(|l| l.addr == addr) {
@@ -332,7 +328,7 @@ impl LeaseDb {
 
         #[cfg(feature = "dhcp6")]
         {
-            lease.flags |= LEASE_HAVE_HWADDR;
+            lease.flags.insert(LeaseFlags::HAVE_HWADDR);
         }
 
         let mut change = force;
@@ -348,7 +344,7 @@ impl LeaseDb {
             lease.hwaddr[..hw_len].copy_from_slice(&hwaddr[..hw_len]);
             lease.hwaddr_len = hw_len;
             lease.hwaddr_type = hw_type;
-            lease.flags |= LEASE_CHANGED;
+            lease.flags.insert(LeaseFlags::CHANGED);
             self.file_dirty = true;
         }
 
@@ -362,7 +358,7 @@ impl LeaseDb {
                 // Need to re-key: remove with old key, update clid, insert with new key
                 let mut lease = self.leases.remove(&key).unwrap();
                 lease.clid = Some(clid.to_vec());
-                lease.flags |= LEASE_AUX_CHANGED;
+                lease.flags.insert(LeaseFlags::AUX_CHANGED);
                 self.file_dirty = true;
                 let new_key = lease_key(&lease);
                 self.leases.insert(new_key, lease);
@@ -376,7 +372,7 @@ impl LeaseDb {
     /// is set. If another lease already has this name, the name is removed from
     /// that lease first.
     pub fn set_hostname(&mut self, addr: Ipv4Addr, name: Option<&str>, auth: bool) {
-        use crate::types::dhcp::{LEASE_AUTH_NAME, LEASE_CHANGED};
+        use crate::types::dhcp::LeaseFlags;
 
         // If a name is being set, check for duplicates and remove from other leases.
         if let Some(new_name) = name {
@@ -397,7 +393,7 @@ impl LeaseDb {
             for dup_addr in duplicates {
                 if let Some(dup) = self.leases.values_mut().find(|l| l.addr == dup_addr) {
                     dup.old_hostname = dup.hostname.take();
-                    dup.flags |= LEASE_CHANGED;
+                    dup.flags.insert(LeaseFlags::CHANGED);
                 }
             }
         }
@@ -413,15 +409,15 @@ impl LeaseDb {
             if name_changed {
                 lease.old_hostname = lease.hostname.take();
                 lease.hostname = name.map(|n| n.to_string());
-                lease.flags |= LEASE_CHANGED;
+                lease.flags.insert(LeaseFlags::CHANGED);
                 self.file_dirty = true;
                 self.dns_dirty = true;
             }
 
             if auth {
-                lease.flags |= LEASE_AUTH_NAME;
+                lease.flags.insert(LeaseFlags::AUTH_NAME);
             } else {
-                lease.flags &= !LEASE_AUTH_NAME;
+                lease.flags.remove(LeaseFlags::AUTH_NAME);
             }
         }
     }
@@ -435,13 +431,13 @@ impl LeaseDb {
 
     /// Set the DHCP relay agent information on a lease.
     pub fn set_agent_id(&mut self, addr: Ipv4Addr, agent_id: Option<&[u8]>) {
-        use crate::types::dhcp::LEASE_AUX_CHANGED;
+        use crate::types::dhcp::LeaseFlags;
 
         if let Some(lease) = self.leases.values_mut().find(|l| l.addr == addr) {
             let new_val = agent_id.map(|a| a.to_vec());
             if lease.agent_id != new_val {
                 lease.agent_id = new_val;
-                lease.flags |= LEASE_AUX_CHANGED;
+                lease.flags.insert(LeaseFlags::AUX_CHANGED);
                 self.file_dirty = true;
             }
         }
@@ -449,13 +445,13 @@ impl LeaseDb {
 
     /// Set the vendor class information on a lease.
     pub fn set_vendorclass(&mut self, addr: Ipv4Addr, vendorclass: Option<&[u8]>) {
-        use crate::types::dhcp::LEASE_AUX_CHANGED;
+        use crate::types::dhcp::LeaseFlags;
 
         if let Some(lease) = self.leases.values_mut().find(|l| l.addr == addr) {
             let new_val = vendorclass.map(|v| v.to_vec());
             if lease.vendorclass != new_val {
                 lease.vendorclass = new_val;
-                lease.flags |= LEASE_AUX_CHANGED;
+                lease.flags.insert(LeaseFlags::AUX_CHANGED);
                 self.file_dirty = true;
             }
         }
@@ -478,10 +474,10 @@ impl LeaseDb {
 
     /// Mark every lease as `LEASE_CHANGED` so that helper scripts are re-run.
     pub fn rerun_scripts(&mut self) {
-        use crate::types::dhcp::LEASE_CHANGED;
+        use crate::types::dhcp::LeaseFlags;
 
         for lease in self.leases.values_mut() {
-            lease.flags |= LEASE_CHANGED;
+            lease.flags.insert(LeaseFlags::CHANGED);
         }
         self.file_dirty = true;
     }
@@ -524,7 +520,7 @@ impl LeaseDb {
     /// `--script-on-renewal` promise, and — since the clear is gated inside
     /// the same `if` — those flags are never cleared either.
     pub fn run_lease_scripts(&mut self, command: Option<&str>, leasefile_ro: bool, script_on_renewal: bool) {
-        use crate::types::dhcp::{LEASE_AUX_CHANGED, LEASE_CHANGED, LEASE_EXP_CHANGED, LEASE_NEW};
+        use crate::types::dhcp::LeaseFlags;
 
         // `run_script_child` runs the script synchronously and in-process —
         // this port has no live caller of `helper::create_helper`'s
@@ -558,12 +554,12 @@ impl LeaseDb {
         }
 
         for lease in self.leases.values_mut() {
-            if lease.flags & (LEASE_NEW | LEASE_CHANGED) != 0
-                || (lease.flags & LEASE_AUX_CHANGED != 0 && leasefile_ro)
-                || (lease.flags & LEASE_EXP_CHANGED != 0 && script_on_renewal)
+            if lease.flags.intersects(LeaseFlags::NEW | LeaseFlags::CHANGED)
+                || (lease.flags.contains(LeaseFlags::AUX_CHANGED) && leasefile_ro)
+                || (lease.flags.contains(LeaseFlags::EXP_CHANGED) && script_on_renewal)
             {
                 if let Some(command) = command {
-                    let (action, action_str) = if lease.flags & LEASE_NEW != 0 {
+                    let (action, action_str) = if lease.flags.contains(LeaseFlags::NEW) {
                         (ACTION_ADD, "add")
                     } else {
                         (ACTION_OLD, "old")
@@ -571,7 +567,7 @@ impl LeaseDb {
                     let ev = build_script_event(lease, action, None);
                     run_script_child(command, action_str, &ev, LOG_DHCP);
                 }
-                lease.flags &= !(LEASE_NEW | LEASE_CHANGED | LEASE_AUX_CHANGED | LEASE_EXP_CHANGED);
+                lease.flags.remove(LeaseFlags::NEW | LeaseFlags::CHANGED | LeaseFlags::AUX_CHANGED | LeaseFlags::EXP_CHANGED);
             }
         }
     }
@@ -742,9 +738,9 @@ impl LeaseDb {
         iaid: u32,
         addr: &std::net::Ipv6Addr,
     ) -> Option<&DhcpLease> {
-        use crate::types::dhcp::{LEASE_TA, LEASE_NA};
+        use crate::types::dhcp::LeaseFlags;
         self.leases.values().find(|l| {
-            (l.flags & (LEASE_TA | LEASE_NA) != 0)
+            (l.flags.intersects(LeaseFlags::TA | LeaseFlags::NA))
                 && l.iaid == iaid
                 && l.addr6 == *addr
                 && l.clid.as_deref() == Some(clid)
@@ -758,9 +754,9 @@ impl LeaseDb {
     /// requiring the client to have echoed it back in the request.
     #[cfg(feature = "dhcp6")]
     pub fn find_v6_by_client_iaid(&self, clid: &[u8], iaid: u32) -> Option<&DhcpLease> {
-        use crate::types::dhcp::{LEASE_TA, LEASE_NA};
+        use crate::types::dhcp::LeaseFlags;
         self.leases.values().find(|l| {
-            (l.flags & (LEASE_TA | LEASE_NA) != 0)
+            (l.flags.intersects(LeaseFlags::TA | LeaseFlags::NA))
                 && l.iaid == iaid
                 && l.clid.as_deref() == Some(clid)
         })
@@ -771,9 +767,9 @@ impl LeaseDb {
     /// Port of `lease6_find_by_plain_addr()` from lease.c:776-790.
     #[cfg(feature = "dhcp6")]
     pub fn find_v6_by_addr(&self, addr: &std::net::Ipv6Addr) -> Option<&DhcpLease> {
-        use crate::types::dhcp::{LEASE_TA, LEASE_NA};
+        use crate::types::dhcp::LeaseFlags;
         self.leases.values().find(|l| {
-            (l.flags & (LEASE_TA | LEASE_NA) != 0) && l.addr6 == *addr
+            (l.flags.intersects(LeaseFlags::TA | LeaseFlags::NA)) && l.addr6 == *addr
         })
     }
 
@@ -784,9 +780,9 @@ impl LeaseDb {
     pub fn allocate_v6(
         &mut self,
         addr: std::net::Ipv6Addr,
-        lease_type: u32,
+        lease_type: LeaseFlags,
     ) -> Option<&mut DhcpLease> {
-        use crate::types::dhcp::LEASE_NEW;
+        use crate::types::dhcp::LeaseFlags;
 
         if self.leases.len() >= self.max_leases {
             return None;
@@ -797,7 +793,7 @@ impl LeaseDb {
             hostname: None,
             fqdn: None,
             old_hostname: None,
-            flags: LEASE_NEW | lease_type,
+            flags: LeaseFlags::NEW | lease_type,
             expires: None,
             hwaddr: [0u8; DHCP_CHADDR_MAX],
             hwaddr_len: 0,
@@ -828,10 +824,10 @@ impl LeaseDb {
     /// Port of `lease6_reset()` from lease.c:721-727.
     #[cfg(feature = "dhcp6")]
     pub fn reset_v6_used(&mut self) {
-        use crate::types::dhcp::{LEASE_TA, LEASE_NA, LEASE_USED};
+        use crate::types::dhcp::LeaseFlags;
         for lease in self.leases.values_mut() {
-            if lease.flags & (LEASE_TA | LEASE_NA) != 0 {
-                lease.flags &= !LEASE_USED;
+            if lease.flags.intersects(LeaseFlags::TA | LeaseFlags::NA) {
+                lease.flags.remove(LeaseFlags::USED);
             }
         }
     }
@@ -856,13 +852,13 @@ impl LeaseDb {
         addr: std::net::Ipv6Addr,
         clid: &[u8],
         iaid: u32,
-        lease_type: u32,
+        lease_type: LeaseFlags,
         expires: Option<SystemTime>,
     ) -> Option<&mut DhcpLease> {
-        use crate::types::dhcp::{LEASE_NEW, LEASE_TA, LEASE_NA};
+        use crate::types::dhcp::LeaseFlags;
 
         let existing_key = self.leases.iter().find_map(|(k, l)| {
-            ((l.flags & (LEASE_TA | LEASE_NA)) != 0 && l.addr6 == addr).then_some(*k)
+            (l.flags.intersects(LeaseFlags::TA | LeaseFlags::NA) && l.addr6 == addr).then_some(*k)
         });
 
         let mut lease = if let Some(k) = existing_key {
@@ -876,7 +872,7 @@ impl LeaseDb {
                 hostname: None,
                 fqdn: None,
                 old_hostname: None,
-                flags: LEASE_NEW | lease_type,
+                flags: LeaseFlags::NEW | lease_type,
                 expires: None,
                 hwaddr: [0u8; DHCP_CHADDR_MAX],
                 hwaddr_len: 0,
@@ -919,9 +915,9 @@ impl LeaseDb {
         iaid: u32,
         addr: &std::net::Ipv6Addr,
     ) -> bool {
-        use crate::types::dhcp::{LEASE_TA, LEASE_NA};
+        use crate::types::dhcp::LeaseFlags;
         let key = self.leases.iter().find_map(|(k, l)| {
-            ((l.flags & (LEASE_TA | LEASE_NA)) != 0
+            (l.flags.intersects(LeaseFlags::TA | LeaseFlags::NA)
                 && l.iaid == iaid
                 && l.addr6 == *addr
                 && l.clid.as_deref() == Some(clid))
@@ -995,7 +991,7 @@ mod tests {
             hostname: Some("host1".into()),
             fqdn: None,
             old_hostname: None,
-            flags: 0,
+            flags: LeaseFlags::empty(),
             expires: expires_secs.map(|s| UNIX_EPOCH + Duration::from_secs(s)),
             hwaddr,
             hwaddr_len: 6,
@@ -1161,7 +1157,7 @@ mod tests {
         assert!(lease.is_some());
         let lease = lease.unwrap();
         assert_eq!(lease.addr, addr);
-        assert_eq!(lease.flags, crate::types::dhcp::LEASE_NEW);
+        assert_eq!(lease.flags, crate::types::dhcp::LeaseFlags::NEW);
     }
 
     #[test]
@@ -1222,14 +1218,14 @@ mod tests {
 
     #[test]
     fn set_expires_sets_flags() {
-        use crate::types::dhcp::{LEASE_AUX_CHANGED, LEASE_EXP_CHANGED};
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         let addr = Ipv4Addr::new(10, 0, 0, 1);
         db.insert(make_lease(addr, [0x01, 0, 0, 0, 0, 0], Some(100)));
         db.set_expires(addr, 7200);
         let lease = db.find_by_addr(addr).unwrap();
-        assert_ne!(lease.flags & LEASE_AUX_CHANGED, 0);
-        assert_ne!(lease.flags & LEASE_EXP_CHANGED, 0);
+        assert!(lease.flags.contains(LeaseFlags::AUX_CHANGED));
+        assert!(lease.flags.contains(LeaseFlags::EXP_CHANGED));
         assert!(db.file_dirty);
     }
 
@@ -1244,7 +1240,7 @@ mod tests {
 
     #[test]
     fn set_hwaddr_updates_hardware_address() {
-        use crate::types::dhcp::LEASE_CHANGED;
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         let addr = Ipv4Addr::new(10, 0, 0, 1);
         db.insert(make_lease(addr, [0x01, 0x02, 0x03, 0x04, 0x05, 0x06], None));
@@ -1254,7 +1250,7 @@ mod tests {
 
         let lease = db.find_by_addr(addr).unwrap();
         assert_eq!(&lease.hwaddr[..6], &new_hw);
-        assert_ne!(lease.flags & LEASE_CHANGED, 0);
+        assert!(lease.flags.contains(LeaseFlags::CHANGED));
         assert!(db.file_dirty);
     }
 
@@ -1273,7 +1269,7 @@ mod tests {
 
     #[test]
     fn set_hwaddr_with_clid_rekeys() {
-        use crate::types::dhcp::LEASE_AUX_CHANGED;
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         let addr = Ipv4Addr::new(10, 0, 0, 1);
         db.insert(make_lease(addr, [0x01, 0, 0, 0, 0, 0], None));
@@ -1283,20 +1279,20 @@ mod tests {
 
         let lease = db.find_by_addr(addr).unwrap();
         assert_eq!(lease.clid, Some(clid));
-        assert_ne!(lease.flags & LEASE_AUX_CHANGED, 0);
+        assert!(lease.flags.contains(LeaseFlags::AUX_CHANGED));
     }
 
     #[cfg(feature = "dhcp6")]
     #[test]
     fn set_hwaddr_sets_lease_have_hwaddr_flag() {
-        use crate::types::dhcp::LEASE_HAVE_HWADDR;
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         let addr = Ipv4Addr::new(10, 0, 0, 1);
         db.insert(make_lease(addr, [0x01, 0x02, 0x03, 0x04, 0x05, 0x06], None));
-        assert_eq!(db.find_by_addr(addr).unwrap().flags & LEASE_HAVE_HWADDR, 0);
+        assert!(!db.find_by_addr(addr).unwrap().flags.contains(LeaseFlags::HAVE_HWADDR));
 
         db.set_hwaddr(addr, &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], 1, None, false);
-        assert_ne!(db.find_by_addr(addr).unwrap().flags & LEASE_HAVE_HWADDR, 0);
+        assert!(db.find_by_addr(addr).unwrap().flags.contains(LeaseFlags::HAVE_HWADDR));
     }
 
     #[test]
@@ -1358,7 +1354,7 @@ mod tests {
 
     #[test]
     fn set_hwaddr_changes_hw_type() {
-        use crate::types::dhcp::LEASE_CHANGED;
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         let addr = Ipv4Addr::new(10, 0, 0, 1);
         let hw = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
@@ -1368,14 +1364,14 @@ mod tests {
         db.set_hwaddr(addr, &hw, 6, None, false);
         let lease = db.find_by_addr(addr).unwrap();
         assert_eq!(lease.hwaddr_type, 6);
-        assert_ne!(lease.flags & LEASE_CHANGED, 0);
+        assert!(lease.flags.contains(LeaseFlags::CHANGED));
     }
 
     // ── set_hostname tests ──
 
     #[test]
     fn set_hostname_basic() {
-        use crate::types::dhcp::LEASE_CHANGED;
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         let addr = Ipv4Addr::new(10, 0, 0, 1);
         db.insert(make_lease(addr, [0x01, 0, 0, 0, 0, 0], None));
@@ -1383,30 +1379,30 @@ mod tests {
         db.set_hostname(addr, Some("myhost"), false);
         let lease = db.find_by_addr(addr).unwrap();
         assert_eq!(lease.hostname.as_deref(), Some("myhost"));
-        assert_ne!(lease.flags & LEASE_CHANGED, 0);
+        assert!(lease.flags.contains(LeaseFlags::CHANGED));
         assert!(db.dns_dirty);
     }
 
     #[test]
     fn set_hostname_auth_flag() {
-        use crate::types::dhcp::LEASE_AUTH_NAME;
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         let addr = Ipv4Addr::new(10, 0, 0, 1);
         db.insert(make_lease(addr, [0x01, 0, 0, 0, 0, 0], None));
 
         db.set_hostname(addr, Some("authhost"), true);
         let lease = db.find_by_addr(addr).unwrap();
-        assert_ne!(lease.flags & LEASE_AUTH_NAME, 0);
+        assert!(lease.flags.contains(LeaseFlags::AUTH_NAME));
 
         // Remove auth
         db.set_hostname(addr, Some("authhost"), false);
         let lease = db.find_by_addr(addr).unwrap();
-        assert_eq!(lease.flags & LEASE_AUTH_NAME, 0);
+        assert!(!lease.flags.contains(LeaseFlags::AUTH_NAME));
     }
 
     #[test]
     fn set_hostname_removes_duplicate_from_other_lease() {
-        use crate::types::dhcp::LEASE_CHANGED;
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         let addr1 = Ipv4Addr::new(10, 0, 0, 1);
         let addr2 = Ipv4Addr::new(10, 0, 0, 2);
@@ -1425,7 +1421,7 @@ mod tests {
         let l1 = db.find_by_addr(addr1).unwrap();
         assert!(l1.hostname.is_none());
         assert_eq!(l1.old_hostname.as_deref(), Some("shared-name"));
-        assert_ne!(l1.flags & LEASE_CHANGED, 0);
+        assert!(l1.flags.contains(LeaseFlags::CHANGED));
 
         let l2 = db.find_by_addr(addr2).unwrap();
         assert_eq!(l2.hostname.as_deref(), Some("shared-name"));
@@ -1500,7 +1496,7 @@ mod tests {
 
     #[test]
     fn set_agent_id_basic() {
-        use crate::types::dhcp::LEASE_AUX_CHANGED;
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         let addr = Ipv4Addr::new(10, 0, 0, 1);
         db.insert(make_lease(addr, [0x01, 0, 0, 0, 0, 0], None));
@@ -1510,7 +1506,7 @@ mod tests {
 
         let lease = db.find_by_addr(addr).unwrap();
         assert_eq!(lease.agent_id, Some(agent));
-        assert_ne!(lease.flags & LEASE_AUX_CHANGED, 0);
+        assert!(lease.flags.contains(LeaseFlags::AUX_CHANGED));
         assert!(db.file_dirty);
     }
 
@@ -1544,7 +1540,7 @@ mod tests {
 
     #[test]
     fn set_vendorclass_basic() {
-        use crate::types::dhcp::LEASE_AUX_CHANGED;
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         let addr = Ipv4Addr::new(10, 0, 0, 1);
         db.insert(make_lease(addr, [0x01, 0, 0, 0, 0, 0], None));
@@ -1554,7 +1550,7 @@ mod tests {
 
         let lease = db.find_by_addr(addr).unwrap();
         assert_eq!(lease.vendorclass, Some(vc));
-        assert_ne!(lease.flags & LEASE_AUX_CHANGED, 0);
+        assert!(lease.flags.contains(LeaseFlags::AUX_CHANGED));
     }
 
     #[test]
@@ -1629,7 +1625,7 @@ mod tests {
 
     #[test]
     fn rerun_scripts_marks_all_changed() {
-        use crate::types::dhcp::LEASE_CHANGED;
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         db.insert(make_lease(Ipv4Addr::new(10, 0, 0, 1), [0x01, 0, 0, 0, 0, 0], None));
         db.insert(make_lease(Ipv4Addr::new(10, 0, 0, 2), [0x02, 0, 0, 0, 0, 0], None));
@@ -1637,7 +1633,7 @@ mod tests {
         db.rerun_scripts();
 
         for lease in db.iter() {
-            assert_ne!(lease.flags & LEASE_CHANGED, 0);
+            assert!(lease.flags.contains(LeaseFlags::CHANGED));
         }
         assert!(db.file_dirty);
     }
@@ -1725,7 +1721,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_lease_scripts_clears_new_and_changed_flags() {
-        use crate::types::dhcp::{LEASE_CHANGED, LEASE_NEW};
+        use crate::types::dhcp::LeaseFlags;
         let dir = tempfile::tempdir().unwrap();
         let (script_path, marker) = write_marker_script(dir.path());
         let addr = Ipv4Addr::new(10, 0, 0, 5);
@@ -1738,7 +1734,7 @@ mod tests {
         });
 
         let lease = db.find_by_addr(addr).unwrap();
-        assert_eq!(lease.flags & (LEASE_NEW | LEASE_CHANGED), 0);
+        assert!(!lease.flags.intersects(LeaseFlags::NEW | LeaseFlags::CHANGED));
     }
 
     #[cfg(unix)]
@@ -1856,7 +1852,7 @@ mod tests {
 
     #[test]
     fn run_lease_scripts_clears_lease_flags_without_command_configured() {
-        use crate::types::dhcp::{LEASE_CHANGED, LEASE_NEW};
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         let addr = Ipv4Addr::new(10, 0, 0, 5);
         db.allocate_v4(addr);
@@ -1864,7 +1860,7 @@ mod tests {
         db.run_lease_scripts(None, false, false);
 
         let lease = db.find_by_addr(addr).unwrap();
-        assert_eq!(lease.flags & (LEASE_NEW | LEASE_CHANGED), 0);
+        assert!(!lease.flags.intersects(LeaseFlags::NEW | LeaseFlags::CHANGED));
     }
 
     /// Upstream's trigger condition (lease.c:1286-1288) fires on a pure
@@ -1875,7 +1871,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_lease_scripts_fires_on_pure_renewal_only_when_enabled() {
-        use crate::types::dhcp::{LEASE_AUX_CHANGED, LEASE_EXP_CHANGED};
+        use crate::types::dhcp::LeaseFlags;
 
         let dir = tempfile::tempdir().unwrap();
         let (script_path, marker) = write_marker_script(dir.path());
@@ -1895,7 +1891,7 @@ mod tests {
         db.set_expires(addr, 3600);
         {
             let lease = db.find_by_addr(addr).unwrap();
-            assert_ne!(lease.flags & (LEASE_AUX_CHANGED | LEASE_EXP_CHANGED), 0);
+            assert!(lease.flags.intersects(LeaseFlags::AUX_CHANGED | LeaseFlags::EXP_CHANGED));
         }
         db.run_lease_scripts(Some(command), false, false);
         assert!(
@@ -1904,8 +1900,8 @@ mod tests {
         );
         {
             let lease = db.find_by_addr(addr).unwrap();
-            assert_ne!(
-                lease.flags & (LEASE_AUX_CHANGED | LEASE_EXP_CHANGED), 0,
+            assert!(
+                lease.flags.intersects(LeaseFlags::AUX_CHANGED | LeaseFlags::EXP_CHANGED),
                 "renewal flags must stay set until a run that's actually allowed to fire clears them"
             );
         }
@@ -1918,7 +1914,7 @@ mod tests {
         let first_line = contents.lines().next().unwrap();
         assert_eq!(first_line, format!("old {addr} host1"));
         let lease = db.find_by_addr(addr).unwrap();
-        assert_eq!(lease.flags & (LEASE_AUX_CHANGED | LEASE_EXP_CHANGED), 0);
+        assert!(!lease.flags.intersects(LeaseFlags::AUX_CHANGED | LeaseFlags::EXP_CHANGED));
     }
 
     // ── write_to_file / load_from_file tests ──
@@ -2129,7 +2125,7 @@ mod tests {
 
     #[test]
     fn allocate_then_configure_lease() {
-        use crate::types::dhcp::{LEASE_NEW, LEASE_CHANGED, LEASE_AUX_CHANGED};
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         let addr = Ipv4Addr::new(192, 168, 1, 100);
 
@@ -2148,7 +2144,7 @@ mod tests {
         assert_eq!(lease.last_interface, 3);
         assert!(lease.agent_id.is_some());
         assert_eq!(lease.vendorclass.as_deref(), Some(b"MSFT 5.0".as_ref()));
-        assert_ne!(lease.flags & LEASE_NEW, 0);
+        assert!(lease.flags.contains(LeaseFlags::NEW));
     }
 
     #[test]
@@ -2210,10 +2206,10 @@ mod tests {
     #[cfg(feature = "dhcp6")]
     #[test]
     fn allocate_v6_basic() {
-        use crate::types::dhcp::LEASE_NA;
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         let addr: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
-        let lease = db.allocate_v6(addr, LEASE_NA);
+        let lease = db.allocate_v6(addr, LeaseFlags::NA);
         assert!(lease.is_some());
         assert_eq!(db.count(), 1);
     }
@@ -2221,10 +2217,10 @@ mod tests {
     #[cfg(feature = "dhcp6")]
     #[test]
     fn find_v6_by_addr_found() {
-        use crate::types::dhcp::LEASE_NA;
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         let addr: std::net::Ipv6Addr = "2001:db8::42".parse().unwrap();
-        db.allocate_v6(addr, LEASE_NA);
+        db.allocate_v6(addr, LeaseFlags::NA);
         assert!(db.find_v6_by_addr(&addr).is_some());
     }
 
@@ -2239,12 +2235,12 @@ mod tests {
     #[cfg(feature = "dhcp6")]
     #[test]
     fn find_v6_by_clid_iaid() {
-        use crate::types::dhcp::LEASE_NA;
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         let addr: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
         let clid = vec![0x00, 0x01, 0xAA, 0xBB];
         {
-            let lease = db.allocate_v6(addr, LEASE_NA).unwrap();
+            let lease = db.allocate_v6(addr, LeaseFlags::NA).unwrap();
             lease.clid = Some(clid.clone());
             lease.iaid = 42;
         }
@@ -2255,28 +2251,28 @@ mod tests {
     #[cfg(feature = "dhcp6")]
     #[test]
     fn reset_v6_used_clears_flag() {
-        use crate::types::dhcp::{LEASE_NA, LEASE_USED};
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         let addr: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
         {
-            let lease = db.allocate_v6(addr, LEASE_NA).unwrap();
-            lease.flags |= LEASE_USED;
+            let lease = db.allocate_v6(addr, LeaseFlags::NA).unwrap();
+            lease.flags.insert(LeaseFlags::USED);
         }
         db.reset_v6_used();
         let lease = db.find_v6_by_addr(&addr).unwrap();
-        assert_eq!(lease.flags & LEASE_USED, 0);
+        assert!(!lease.flags.contains(LeaseFlags::USED));
     }
 
     #[cfg(feature = "dhcp6")]
     #[test]
     fn allocate_v6_respects_max() {
-        use crate::types::dhcp::LEASE_NA;
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         db.max_leases = 1;
         let a1: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
         let a2: std::net::Ipv6Addr = "2001:db8::2".parse().unwrap();
-        assert!(db.allocate_v6(a1, LEASE_NA).is_some());
-        assert!(db.allocate_v6(a2, LEASE_NA).is_none());
+        assert!(db.allocate_v6(a1, LeaseFlags::NA).is_some());
+        assert!(db.allocate_v6(a2, LeaseFlags::NA).is_none());
     }
 
     // ── bind_v6 ──────────────────────────────────────────────────────────────
@@ -2284,11 +2280,11 @@ mod tests {
     #[cfg(feature = "dhcp6")]
     #[test]
     fn bind_v6_creates_new_lease_with_clid_and_iaid() {
-        use crate::types::dhcp::LEASE_NA;
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         let addr: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
         let clid = vec![0xAA, 0xBB];
-        let lease = db.bind_v6(addr, &clid, 7, LEASE_NA, None).unwrap();
+        let lease = db.bind_v6(addr, &clid, 7, LeaseFlags::NA, None).unwrap();
         assert_eq!(lease.addr6, addr);
         assert_eq!(lease.clid, Some(clid.clone()));
         assert_eq!(lease.iaid, 7);
@@ -2302,14 +2298,14 @@ mod tests {
         // Regression: binding a second client's address used to collide on the
         // same all-zero lookup key as the first (both keyed off an empty
         // clid/hwaddr at insert time), silently evicting the first lease.
-        use crate::types::dhcp::LEASE_NA;
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         let a1: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
         let a2: std::net::Ipv6Addr = "2001:db8::2".parse().unwrap();
         let c1 = vec![0x01];
         let c2 = vec![0x02];
-        db.bind_v6(a1, &c1, 1, LEASE_NA, None);
-        db.bind_v6(a2, &c2, 2, LEASE_NA, None);
+        db.bind_v6(a1, &c1, 1, LeaseFlags::NA, None);
+        db.bind_v6(a2, &c2, 2, LeaseFlags::NA, None);
         assert!(db.find_v6_by_clid_iaid(&c1, 1, &a1).is_some());
         assert!(db.find_v6_by_clid_iaid(&c2, 2, &a2).is_some());
         assert_eq!(db.count(), 2);
@@ -2318,14 +2314,14 @@ mod tests {
     #[cfg(feature = "dhcp6")]
     #[test]
     fn bind_v6_updates_existing_lease_in_place() {
-        use crate::types::dhcp::LEASE_NA;
+        use crate::types::dhcp::LeaseFlags;
         use std::time::{Duration, SystemTime};
         let mut db = LeaseDb::new();
         let addr: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
         let clid = vec![0xAA];
-        db.bind_v6(addr, &clid, 1, LEASE_NA, None);
+        db.bind_v6(addr, &clid, 1, LeaseFlags::NA, None);
         let later = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
-        db.bind_v6(addr, &clid, 1, LEASE_NA, Some(later));
+        db.bind_v6(addr, &clid, 1, LeaseFlags::NA, Some(later));
         assert_eq!(db.count(), 1);
         let lease = db.find_v6_by_addr(&addr).unwrap();
         assert_eq!(lease.expires, Some(later));
@@ -2334,13 +2330,13 @@ mod tests {
     #[cfg(feature = "dhcp6")]
     #[test]
     fn bind_v6_respects_max_leases_for_new_addr() {
-        use crate::types::dhcp::LEASE_NA;
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         db.max_leases = 1;
         let a1: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
         let a2: std::net::Ipv6Addr = "2001:db8::2".parse().unwrap();
-        assert!(db.bind_v6(a1, &[0x01], 1, LEASE_NA, None).is_some());
-        assert!(db.bind_v6(a2, &[0x02], 2, LEASE_NA, None).is_none());
+        assert!(db.bind_v6(a1, &[0x01], 1, LeaseFlags::NA, None).is_some());
+        assert!(db.bind_v6(a2, &[0x02], 2, LeaseFlags::NA, None).is_none());
     }
 
     // ── remove_v6_by_clid_iaid_addr ─────────────────────────────────────────
@@ -2348,11 +2344,11 @@ mod tests {
     #[cfg(feature = "dhcp6")]
     #[test]
     fn remove_v6_by_clid_iaid_addr_removes_match() {
-        use crate::types::dhcp::LEASE_NA;
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         let addr: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
         let clid = vec![0xAA];
-        db.bind_v6(addr, &clid, 1, LEASE_NA, None);
+        db.bind_v6(addr, &clid, 1, LeaseFlags::NA, None);
         assert!(db.remove_v6_by_clid_iaid_addr(&clid, 1, &addr));
         assert!(db.find_v6_by_addr(&addr).is_none());
     }
@@ -2370,11 +2366,11 @@ mod tests {
     #[cfg(feature = "dhcp6")]
     #[test]
     fn find_v6_by_client_iaid_finds_regardless_of_address() {
-        use crate::types::dhcp::LEASE_NA;
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         let addr: std::net::Ipv6Addr = "2001:db8::99".parse().unwrap();
         let clid = vec![0xAA];
-        db.bind_v6(addr, &clid, 5, LEASE_NA, None);
+        db.bind_v6(addr, &clid, 5, LeaseFlags::NA, None);
         let found = db.find_v6_by_client_iaid(&clid, 5).unwrap();
         assert_eq!(found.addr6, addr);
     }
@@ -2382,11 +2378,11 @@ mod tests {
     #[cfg(feature = "dhcp6")]
     #[test]
     fn find_v6_by_client_iaid_wrong_iaid_not_found() {
-        use crate::types::dhcp::LEASE_NA;
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         let addr: std::net::Ipv6Addr = "2001:db8::99".parse().unwrap();
         let clid = vec![0xAA];
-        db.bind_v6(addr, &clid, 5, LEASE_NA, None);
+        db.bind_v6(addr, &clid, 5, LeaseFlags::NA, None);
         assert!(db.find_v6_by_client_iaid(&clid, 6).is_none());
     }
 
@@ -2424,13 +2420,13 @@ mod tests {
     #[cfg(feature = "dhcp6")]
     #[test]
     fn refresh_slaac_populates_matching_lease_and_marks_no_dirty_on_first_add() {
-        use crate::types::dhcp::LEASE_HAVE_HWADDR;
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         let addr = Ipv4Addr::new(10, 0, 0, 1);
         db.insert(make_lease(addr, [0x00, 0x60, 0x97, 0x00, 0x28, 0x4C], None));
         {
             let lease = db.leases.values_mut().next().unwrap();
-            lease.flags |= LEASE_HAVE_HWADDR;
+            lease.flags.insert(LeaseFlags::HAVE_HWADDR);
             lease.hostname = Some("host".to_string());
             lease.last_interface = 1;
         }
@@ -2448,13 +2444,13 @@ mod tests {
     #[cfg(feature = "dhcp6")]
     #[test]
     fn refresh_slaac_force_marks_dns_dirty() {
-        use crate::types::dhcp::LEASE_HAVE_HWADDR;
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         let addr = Ipv4Addr::new(10, 0, 0, 1);
         db.insert(make_lease(addr, [0x00, 0x60, 0x97, 0x00, 0x28, 0x4C], None));
         {
             let lease = db.leases.values_mut().next().unwrap();
-            lease.flags |= LEASE_HAVE_HWADDR;
+            lease.flags.insert(LeaseFlags::HAVE_HWADDR);
             lease.hostname = Some("host".to_string());
             lease.last_interface = 1;
         }
@@ -2469,14 +2465,14 @@ mod tests {
     #[cfg(feature = "dhcp6")]
     #[test]
     fn tick_slaac_sends_due_probe_and_confirm_ping_clears_it() {
-        use crate::types::dhcp::LEASE_HAVE_HWADDR;
+        use crate::types::dhcp::LeaseFlags;
         let mut db = LeaseDb::new();
         let addr = Ipv4Addr::new(10, 0, 0, 1);
         db.insert(make_lease(addr, [0x00, 0x60, 0x97, 0x00, 0x28, 0x4C], None));
         let now = SystemTime::now();
         {
             let lease = db.leases.values_mut().next().unwrap();
-            lease.flags |= LEASE_HAVE_HWADDR;
+            lease.flags.insert(LeaseFlags::HAVE_HWADDR);
             lease.hostname = Some("host".to_string());
             lease.last_interface = 1;
         }
