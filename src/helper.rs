@@ -147,39 +147,35 @@ impl ScriptData {
         if bytes.len() < Self::HEADER_LEN {
             return Err(HelperError::Truncated);
         }
-        let mut p = 0usize;
-        let mut take = |n: usize| {
-            let s = &bytes[p..p + n];
-            p += n;
-            s
-        };
+        let mut c = crate::byte_cursor::ByteCursor::new(bytes);
+        const LEN_CHECKED: &str = "length checked against HEADER_LEN above";
 
-        let version = take(1)[0];
+        let version = c.read_u8().expect(LEN_CHECKED);
         if version != Self::WIRE_VERSION {
             return Err(HelperError::UnsupportedVersion(version));
         }
-        let action = u32::from_be_bytes(take(4).try_into().unwrap());
-        let flags = u32::from_be_bytes(take(4).try_into().unwrap());
-        let hwaddr_type = u16::from_be_bytes(take(2).try_into().unwrap());
-        let hwaddr_len = take(1)[0] as usize;
-        let hwaddr_raw = take(DHCP_CHADDR_MAX).to_vec();
+        let action = c.read_u32_be().expect(LEN_CHECKED);
+        let flags = c.read_u32_be().expect(LEN_CHECKED);
+        let hwaddr_type = c.read_u16_be().expect(LEN_CHECKED);
+        let hwaddr_len = c.read_u8().expect(LEN_CHECKED) as usize;
+        let hwaddr_raw = c.read_slice(DHCP_CHADDR_MAX).expect(LEN_CHECKED).to_vec();
         let hwaddr = hwaddr_raw[..hwaddr_len.min(DHCP_CHADDR_MAX)].to_vec();
-        let clid_len = u16::from_be_bytes(take(2).try_into().unwrap());
-        let hostname_len = u16::from_be_bytes(take(2).try_into().unwrap());
-        let ed_len = u32::from_be_bytes(take(4).try_into().unwrap());
-        let addr = Ipv4Addr::from(<[u8; 4]>::try_from(take(4)).unwrap());
-        let giaddr = Ipv4Addr::from(<[u8; 4]>::try_from(take(4)).unwrap());
-        let addr6 = Ipv6Addr::from(<[u8; 16]>::try_from(take(16)).unwrap());
-        let remaining_time = u32::from_be_bytes(take(4).try_into().unwrap());
-        let expires = i64::from_be_bytes(take(8).try_into().unwrap());
-        let iaid = u32::from_be_bytes(take(4).try_into().unwrap());
-        let vendorclass_count = i32::from_be_bytes(take(4).try_into().unwrap());
-        let file_len = u64::from_be_bytes(take(8).try_into().unwrap());
-        let interface_raw = take(IF_NAMESIZE);
+        let clid_len = c.read_u16_be().expect(LEN_CHECKED);
+        let hostname_len = c.read_u16_be().expect(LEN_CHECKED);
+        let ed_len = c.read_u32_be().expect(LEN_CHECKED);
+        let addr = Ipv4Addr::from(<[u8; 4]>::try_from(c.read_slice(4).expect(LEN_CHECKED)).unwrap());
+        let giaddr = Ipv4Addr::from(<[u8; 4]>::try_from(c.read_slice(4).expect(LEN_CHECKED)).unwrap());
+        let addr6 = Ipv6Addr::from(<[u8; 16]>::try_from(c.read_slice(16).expect(LEN_CHECKED)).unwrap());
+        let remaining_time = c.read_u32_be().expect(LEN_CHECKED);
+        let expires = i64::from_be_bytes(c.read_slice(8).expect(LEN_CHECKED).try_into().unwrap());
+        let iaid = c.read_u32_be().expect(LEN_CHECKED);
+        let vendorclass_count = i32::from_be_bytes(c.read_slice(4).expect(LEN_CHECKED).try_into().unwrap());
+        let file_len = u64::from_be_bytes(c.read_slice(8).expect(LEN_CHECKED).try_into().unwrap());
+        let interface_raw = c.read_slice(IF_NAMESIZE).expect(LEN_CHECKED);
         let interface_end = interface_raw.iter().position(|&b| b == 0).unwrap_or(interface_raw.len());
         let interface = String::from_utf8_lossy(&interface_raw[..interface_end]).into_owned();
 
-        debug_assert_eq!(p, Self::HEADER_LEN);
+        debug_assert_eq!(c.position(), Self::HEADER_LEN);
 
         let blob_len = clid_len as usize + hostname_len as usize + ed_len as usize;
 
