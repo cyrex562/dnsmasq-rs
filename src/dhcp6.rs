@@ -710,8 +710,8 @@ pub fn address6_available(contexts: &[crate::types::dhcp::DhcpContext], addr: &I
     for ctx in contexts {
         #[cfg(feature = "dhcp6")]
         {
-            use crate::types::dhcp::{CONTEXT_STATIC, CONTEXT_RA_STATELESS};
-            if ctx.flags & (CONTEXT_STATIC | CONTEXT_RA_STATELESS) != 0 {
+            use crate::types::dhcp::ContextFlags;
+            if ctx.flags.intersects(ContextFlags::STATIC | ContextFlags::RA_STATELESS) {
                 continue;
             }
             if !is_same_net6(&ctx.start6, addr, ctx.prefix) {
@@ -835,12 +835,12 @@ pub fn address6_allocate(
     netids: &[DhcpNetid],
     in_use: &mut dyn FnMut(&Ipv6Addr) -> bool,
 ) -> Option<Ipv6Addr> {
-    use crate::types::dhcp::{CONTEXT_DEPRECATE, CONTEXT_RA_STATELESS, CONTEXT_STATIC, CONTEXT_USED};
+    use crate::types::dhcp::ContextFlags;
 
     let hash = sdbm_hash64(clid, iaid);
 
     for ctx in contexts {
-        if ctx.flags & (CONTEXT_DEPRECATE | CONTEXT_STATIC | CONTEXT_RA_STATELESS | CONTEXT_USED) != 0 {
+        if ctx.flags.intersects(ContextFlags::DEPRECATE | ContextFlags::STATIC | ContextFlags::RA_STATELESS | ContextFlags::USED) {
             continue;
         }
         if !ctx.filter.is_empty() && !crate::dhcp_common::match_netid(&ctx.filter, netids) {
@@ -936,7 +936,7 @@ pub fn complete_context6(
     live: &LiveAddr6,
     contexts: &[crate::types::dhcp::DhcpContext],
 ) -> Vec<crate::types::dhcp::DhcpContext> {
-    use crate::types::dhcp::{CONTEXT_CONSTRUCTED, CONTEXT_DEPRECATE, CONTEXT_DHCP, CONTEXT_OLD, CONTEXT_TEMPLATE};
+    use crate::types::dhcp::ContextFlags;
 
     if matches!(
         classify_addr6(&live.addr),
@@ -947,10 +947,10 @@ pub fn complete_context6(
 
     let mut current: Vec<crate::types::dhcp::DhcpContext> = Vec::new();
     for ctx in contexts {
-        if ctx.flags & CONTEXT_DHCP == 0 {
+        if !ctx.flags.contains(ContextFlags::DHCP) {
             continue;
         }
-        if ctx.flags & (CONTEXT_TEMPLATE | CONTEXT_OLD) != 0 {
+        if ctx.flags.intersects(ContextFlags::TEMPLATE | ContextFlags::OLD) {
             continue;
         }
         if live.prefix > ctx.prefix {
@@ -963,13 +963,13 @@ pub fn complete_context6(
         }
 
         // "use interface values only for constructed contexts"
-        let (mut preferred, valid) = if ctx.flags & CONTEXT_CONSTRUCTED == 0 {
+        let (mut preferred, valid) = if !ctx.flags.contains(ContextFlags::CONSTRUCTED) {
             (0xffff_ffffu32, 0xffff_ffffu32)
         } else {
             let p = if live.deprecated { 0 } else { live.preferred };
             (p, live.valid)
         };
-        if ctx.flags & CONTEXT_DEPRECATE != 0 {
+        if ctx.flags.contains(ContextFlags::DEPRECATE) {
             preferred = 0;
         }
 
@@ -1002,7 +1002,7 @@ pub fn dhcp_construct_contexts(
     contexts: &mut [crate::types::dhcp::DhcpContext],
     live_addrs: &[LiveAddr6],
 ) {
-    use crate::types::dhcp::{CONTEXT_CONSTRUCTED, CONTEXT_TEMPLATE};
+    use crate::types::dhcp::ContextFlags;
 
     for live in live_addrs {
         if matches!(
@@ -1012,7 +1012,7 @@ pub fn dhcp_construct_contexts(
             continue;
         }
         for ctx in contexts.iter_mut() {
-            if ctx.flags & (CONTEXT_TEMPLATE | CONTEXT_CONSTRUCTED) != 0 {
+            if ctx.flags.intersects(ContextFlags::TEMPLATE | ContextFlags::CONSTRUCTED) {
                 continue;
             }
             if live.prefix <= ctx.prefix
@@ -1318,6 +1318,7 @@ pub fn get_client_mac(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::dhcp::ContextFlags;
 
     fn solicit_pkt(xid: u32) -> Vec<u8> {
         let mut v = Vec::new();
@@ -1478,7 +1479,7 @@ mod tests {
     // ── address6_available / address6_valid ───────────────────────────────────
 
     #[cfg(feature = "dhcp6")]
-    fn make_v6_ctx(start6: Ipv6Addr, end6: Ipv6Addr, prefix: i32, flags: u32) -> crate::types::dhcp::DhcpContext {
+    fn make_v6_ctx(start6: Ipv6Addr, end6: Ipv6Addr, prefix: i32, flags: crate::types::dhcp::ContextFlags) -> crate::types::dhcp::DhcpContext {
         use std::net::Ipv4Addr;
         crate::types::dhcp::DhcpContext {
             start: Ipv4Addr::UNSPECIFIED,
@@ -1512,7 +1513,7 @@ mod tests {
         let ctx = make_v6_ctx(
             "2001:db8::100".parse().unwrap(),
             "2001:db8::200".parse().unwrap(),
-            64, 0,
+            64, ContextFlags::empty(),
         );
         assert!(address6_available(&[ctx], &"2001:db8::150".parse().unwrap()));
     }
@@ -1523,7 +1524,7 @@ mod tests {
         let ctx = make_v6_ctx(
             "2001:db8::100".parse().unwrap(),
             "2001:db8::200".parse().unwrap(),
-            64, 0,
+            64, ContextFlags::empty(),
         );
         assert!(!address6_available(&[ctx], &"2001:db8::50".parse().unwrap()));
     }
@@ -1531,11 +1532,11 @@ mod tests {
     #[cfg(feature = "dhcp6")]
     #[test]
     fn address6_available_skips_static() {
-        use crate::types::dhcp::CONTEXT_STATIC;
+        use crate::types::dhcp::ContextFlags;
         let ctx = make_v6_ctx(
             "2001:db8::100".parse().unwrap(),
             "2001:db8::200".parse().unwrap(),
-            64, CONTEXT_STATIC,
+            64, ContextFlags::STATIC,
         );
         assert!(!address6_available(&[ctx], &"2001:db8::150".parse().unwrap()));
     }
@@ -1546,7 +1547,7 @@ mod tests {
         let ctx = make_v6_ctx(
             "2001:db8::100".parse().unwrap(),
             "2001:db8::200".parse().unwrap(),
-            64, 0,
+            64, ContextFlags::empty(),
         );
         assert!(address6_valid(&[ctx], &"2001:db8::999".parse().unwrap()));
     }
@@ -1557,7 +1558,7 @@ mod tests {
         let ctx = make_v6_ctx(
             "2001:db8:1::100".parse().unwrap(),
             "2001:db8:1::200".parse().unwrap(),
-            48, 0,
+            48, ContextFlags::empty(),
         );
         assert!(!address6_valid(&[ctx], &"2001:db8:2::1".parse().unwrap()));
     }
@@ -1621,7 +1622,7 @@ mod tests {
         let ctx = make_v6_ctx(
             "2001:db8::1".parse().unwrap(),
             "2001:db8::10".parse().unwrap(),
-            64, 0,
+            64, ContextFlags::empty(),
         );
         let mut in_use = |_: &Ipv6Addr| false;
         let addr = address6_allocate(&[ctx], &[0x01, 0x02], 1, &[], &mut in_use);
@@ -1634,7 +1635,7 @@ mod tests {
     fn address6_allocate_skips_collision_and_finds_next() {
         let start: Ipv6Addr = "2001:db8::1".parse().unwrap();
         let end: Ipv6Addr = "2001:db8::10".parse().unwrap();
-        let ctx = make_v6_ctx(start, end, 64, 0);
+        let ctx = make_v6_ctx(start, end, 64, ContextFlags::empty());
         let clid = [0x01, 0x02];
         let iaid = 1u32;
 
@@ -1649,11 +1650,11 @@ mod tests {
 
     #[test]
     fn address6_allocate_skips_static_context() {
-        use crate::types::dhcp::CONTEXT_STATIC;
+        use crate::types::dhcp::ContextFlags;
         let ctx = make_v6_ctx(
             "2001:db8::1".parse().unwrap(),
             "2001:db8::10".parse().unwrap(),
-            64, CONTEXT_STATIC,
+            64, ContextFlags::STATIC,
         );
         let mut in_use = |_: &Ipv6Addr| false;
         assert!(address6_allocate(&[ctx], &[0x01], 1, &[], &mut in_use).is_none());
@@ -1664,7 +1665,7 @@ mod tests {
         let ctx = make_v6_ctx(
             "2001:db8::1".parse().unwrap(),
             "2001:db8::1".parse().unwrap(),
-            128, 0,
+            128, ContextFlags::empty(),
         );
         let mut in_use = |_: &Ipv6Addr| true;
         assert!(address6_allocate(&[ctx], &[0x01], 1, &[], &mut in_use).is_none());
@@ -1675,7 +1676,7 @@ mod tests {
         let mut ctx = make_v6_ctx(
             "2001:db8::1".parse().unwrap(),
             "2001:db8::1".parse().unwrap(),
-            128, 0,
+            128, ContextFlags::empty(),
         );
         ctx.local6 = "2001:db8::1".parse().unwrap();
         let mut in_use = |_: &Ipv6Addr| false;
@@ -1714,11 +1715,11 @@ mod tests {
 
     #[test]
     fn complete_context6_matches_and_fills_fields() {
-        use crate::types::dhcp::CONTEXT_DHCP;
+        use crate::types::dhcp::ContextFlags;
         let ctx = make_v6_ctx(
             "2001:db8:1::".parse().unwrap(),
             "2001:db8:1::ffff".parse().unwrap(),
-            64, CONTEXT_DHCP,
+            64, ContextFlags::DHCP,
         );
         let live = LiveAddr6 {
             addr: "2001:db8:1::1".parse().unwrap(),
@@ -1739,11 +1740,11 @@ mod tests {
 
     #[test]
     fn complete_context6_constructed_uses_interface_lifetimes() {
-        use crate::types::dhcp::{CONTEXT_CONSTRUCTED, CONTEXT_DHCP};
+        use crate::types::dhcp::ContextFlags;
         let ctx = make_v6_ctx(
             "2001:db8:1::".parse().unwrap(),
             "2001:db8:1::ffff".parse().unwrap(),
-            64, CONTEXT_DHCP | CONTEXT_CONSTRUCTED,
+            64, ContextFlags::DHCP | ContextFlags::CONSTRUCTED,
         );
         let live = LiveAddr6 {
             addr: "2001:db8:1::1".parse().unwrap(),
@@ -1760,11 +1761,11 @@ mod tests {
 
     #[test]
     fn complete_context6_skips_link_local() {
-        use crate::types::dhcp::CONTEXT_DHCP;
+        use crate::types::dhcp::ContextFlags;
         let ctx = make_v6_ctx(
             "fe80::".parse().unwrap(),
             "fe80::ffff".parse().unwrap(),
-            64, CONTEXT_DHCP,
+            64, ContextFlags::DHCP,
         );
         let live = LiveAddr6 {
             addr: "fe80::1".parse().unwrap(),
@@ -1775,14 +1776,14 @@ mod tests {
 
     #[test]
     fn complete_context6_orders_by_preferred_descending() {
-        use crate::types::dhcp::{CONTEXT_CONSTRUCTED, CONTEXT_DHCP};
+        use crate::types::dhcp::ContextFlags;
         let ctx_a = make_v6_ctx(
             "2001:db8:1::".parse().unwrap(), "2001:db8:1::ffff".parse().unwrap(),
-            64, CONTEXT_DHCP | CONTEXT_CONSTRUCTED,
+            64, ContextFlags::DHCP | ContextFlags::CONSTRUCTED,
         );
         let ctx_b = make_v6_ctx(
             "2001:db8:1::".parse().unwrap(), "2001:db8:1::ffff".parse().unwrap(),
-            64, CONTEXT_DHCP | CONTEXT_CONSTRUCTED,
+            64, ContextFlags::DHCP | ContextFlags::CONSTRUCTED,
         );
         let live = LiveAddr6 {
             addr: "2001:db8:1::1".parse().unwrap(),
@@ -1799,10 +1800,10 @@ mod tests {
 
     #[test]
     fn dhcp_construct_contexts_fills_if_index_and_local6() {
-        use crate::types::dhcp::CONTEXT_DHCP;
+        use crate::types::dhcp::ContextFlags;
         let ctx = make_v6_ctx(
             "2001:db8::".parse().unwrap(), "2001:db8::ffff".parse().unwrap(),
-            64, CONTEXT_DHCP,
+            64, ContextFlags::DHCP,
         );
         let mut contexts = vec![ctx];
         let live = LiveAddr6 {
@@ -1816,10 +1817,10 @@ mod tests {
 
     #[test]
     fn dhcp_construct_contexts_skips_template_contexts() {
-        use crate::types::dhcp::{CONTEXT_DHCP, CONTEXT_TEMPLATE};
+        use crate::types::dhcp::ContextFlags;
         let ctx = make_v6_ctx(
             "2001:db8::".parse().unwrap(), "2001:db8::ffff".parse().unwrap(),
-            64, CONTEXT_DHCP | CONTEXT_TEMPLATE,
+            64, ContextFlags::DHCP | ContextFlags::TEMPLATE,
         );
         let mut contexts = vec![ctx];
         let live = LiveAddr6 {
@@ -1832,10 +1833,10 @@ mod tests {
 
     #[test]
     fn dhcp_construct_contexts_skips_link_local_live_addr() {
-        use crate::types::dhcp::CONTEXT_DHCP;
+        use crate::types::dhcp::ContextFlags;
         let ctx = make_v6_ctx(
             "2001:db8::".parse().unwrap(), "2001:db8::ffff".parse().unwrap(),
-            64, CONTEXT_DHCP,
+            64, ContextFlags::DHCP,
         );
         let mut contexts = vec![ctx];
         let live = LiveAddr6 {
@@ -1919,10 +1920,10 @@ mod tests {
 
     #[test]
     fn dispatch_dhcp6_solicit_returns_advertise_with_allocated_address() {
-        use crate::types::dhcp::CONTEXT_DHCP;
+        use crate::types::dhcp::ContextFlags;
         let ctx = make_v6_ctx(
             "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(),
-            64, CONTEXT_DHCP,
+            64, ContextFlags::DHCP,
         );
         let data = solicit_with_ia(0x1234, [0, 0, 0, 1]);
         let pkt = parse_dhcp6_packet(&data).unwrap();
@@ -1949,10 +1950,10 @@ mod tests {
 
     #[test]
     fn dispatch_dhcp6_solicit_lifetimes_come_from_context_lease_time_not_hardcoded() {
-        use crate::types::dhcp::CONTEXT_DHCP;
+        use crate::types::dhcp::ContextFlags;
         let mut ctx = make_v6_ctx(
             "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(),
-            64, CONTEXT_DHCP,
+            64, ContextFlags::DHCP,
         );
         ctx.lease_time = 100;
         let data = solicit_with_ia(0x1234, [0, 0, 0, 1]);
@@ -1973,10 +1974,10 @@ mod tests {
 
     #[test]
     fn dispatch_dhcp6_solicit_rapid_commit_persists_and_replies() {
-        use crate::types::dhcp::CONTEXT_DHCP;
+        use crate::types::dhcp::ContextFlags;
         let ctx = make_v6_ctx(
             "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(),
-            64, CONTEXT_DHCP,
+            64, ContextFlags::DHCP,
         );
         let mut data = solicit_with_ia(0x42, [0, 0, 0, 9]);
         data.extend_from_slice(&OPTION6_RAPID_COMMIT.to_be_bytes());
@@ -2007,10 +2008,10 @@ mod tests {
 
     #[test]
     fn dispatch_dhcp6_request_returns_reply_with_allocated_address_and_persists() {
-        use crate::types::dhcp::CONTEXT_DHCP;
+        use crate::types::dhcp::ContextFlags;
         let ctx = make_v6_ctx(
             "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(),
-            64, CONTEXT_DHCP,
+            64, ContextFlags::DHCP,
         );
         let mut data = solicit_with_ia(0x99, [0, 0, 0, 2]);
         data[0] = Dhcp6MsgType::Request as u8;
@@ -2027,10 +2028,10 @@ mod tests {
 
     #[test]
     fn dispatch_dhcp6_request_empty_ia_redirects_like_rapid_commit_solicit() {
-        use crate::types::dhcp::CONTEXT_DHCP;
+        use crate::types::dhcp::ContextFlags;
         let ctx = make_v6_ctx(
             "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(),
-            64, CONTEXT_DHCP,
+            64, ContextFlags::DHCP,
         );
         // Request whose IA_NA has IAID+T1+T2 but no IAADDR sub-option.
         let mut data = vec![Dhcp6MsgType::Request as u8, 0, 0, 1];
@@ -2055,10 +2056,10 @@ mod tests {
 
     #[test]
     fn dispatch_dhcp6_request_address_leased_to_other_client_is_unspec_fail() {
-        use crate::types::dhcp::{CONTEXT_DHCP, LEASE_NA};
+        use crate::types::dhcp::{ContextFlags, LEASE_NA};
         let ctx = make_v6_ctx(
             "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(),
-            64, CONTEXT_DHCP,
+            64, ContextFlags::DHCP,
         );
         let taken: Ipv6Addr = "2001:db8::5".parse().unwrap();
         let mut db = LeaseDb::new();
@@ -2137,10 +2138,10 @@ mod tests {
 
     #[test]
     fn dispatch_dhcp6_renew_extends_existing_lease() {
-        use crate::types::dhcp::{CONTEXT_DHCP, LEASE_NA};
+        use crate::types::dhcp::{ContextFlags, LEASE_NA};
         let mut ctx = make_v6_ctx(
             "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(),
-            64, CONTEXT_DHCP,
+            64, ContextFlags::DHCP,
         );
         ctx.lease_time = 200;
         let addr: Ipv6Addr = "2001:db8::5".parse().unwrap();
@@ -2191,10 +2192,10 @@ mod tests {
 
     #[test]
     fn dispatch_dhcp6_rebind_no_lease_authoritative_creates_lease() {
-        use crate::types::dhcp::CONTEXT_DHCP;
+        use crate::types::dhcp::ContextFlags;
         let ctx = make_v6_ctx(
             "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(),
-            64, CONTEXT_DHCP,
+            64, ContextFlags::DHCP,
         );
         let addr: Ipv6Addr = "2001:db8::5".parse().unwrap();
         let data = renew_pkt(Dhcp6MsgType::Rebind, [0, 0, 0, 2], addr);
@@ -2221,10 +2222,10 @@ mod tests {
 
     #[test]
     fn dispatch_dhcp6_confirm_valid_address_is_success() {
-        use crate::types::dhcp::CONTEXT_DHCP;
+        use crate::types::dhcp::ContextFlags;
         let ctx = make_v6_ctx(
             "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(),
-            64, CONTEXT_DHCP,
+            64, ContextFlags::DHCP,
         );
         let addr: Ipv6Addr = "2001:db8::5".parse().unwrap();
         let mut data = renew_pkt(Dhcp6MsgType::Confirm, [0, 0, 0, 2], addr);
@@ -2353,7 +2354,7 @@ mod tests {
 
         let ctx = make_v6_ctx(
             "2001:db8::1".parse().unwrap(), "2001:db8::ff".parse().unwrap(),
-            64, crate::types::dhcp::CONTEXT_DHCP,
+            64, ContextFlags::DHCP,
         );
         let duid = vec![0x00, 0x03, 0x00, 0x01, 1, 2, 3, 4, 5, 6];
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -2389,7 +2390,7 @@ mod tests {
         // Single-address pool: only one address to ever hand out.
         let ctx = make_v6_ctx(
             "2001:db8::1".parse().unwrap(), "2001:db8::1".parse().unwrap(),
-            128, crate::types::dhcp::CONTEXT_DHCP,
+            128, ContextFlags::DHCP,
         );
         let duid = vec![0x00, 0x03, 0x00, 0x01, 1, 2, 3, 4, 5, 6];
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

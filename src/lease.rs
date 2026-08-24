@@ -2394,12 +2394,12 @@ mod tests {
 
     #[cfg(feature = "dhcp6")]
     fn make_ra_ctx(start6: std::net::Ipv6Addr, if_index: i32) -> crate::types::dhcp::DhcpContext {
-        use crate::types::dhcp::{CONTEXT_RA_NAME, DhcpNetid};
+        use crate::types::dhcp::{ContextFlags, DhcpNetid};
         crate::types::dhcp::DhcpContext {
             start: Ipv4Addr::UNSPECIFIED,
             end: Ipv4Addr::UNSPECIFIED,
             router: Ipv4Addr::UNSPECIFIED,
-            flags: CONTEXT_RA_NAME,
+            flags: ContextFlags::RA_NAME,
             netmask: Ipv4Addr::UNSPECIFIED,
             broadcast: Ipv4Addr::UNSPECIFIED,
             local: Ipv4Addr::UNSPECIFIED,

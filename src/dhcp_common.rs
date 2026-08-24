@@ -590,7 +590,7 @@ pub fn log_context(family: std::net::IpAddr, ctx: &crate::types::dhcp::DhcpConte
 
     // ", prefix deprecated" and ", lease time X" are mutually exclusive
     // (upstream writes one or the other into the same buffer).
-    let namebuff = if is_v6 && (ctx.flags & CONTEXT_DEPRECATE) != 0 {
+    let namebuff = if is_v6 && ctx.flags.contains(ContextFlags::DEPRECATE) {
         ", prefix deprecated".to_string()
     } else {
         format!(", lease time {}", prettyprint_time(ctx.lease_time))
@@ -598,16 +598,16 @@ pub fn log_context(family: std::net::IpAddr, ctx: &crate::types::dhcp::DhcpConte
 
     let mut messages = Vec::new();
 
-    if (ctx.flags & CONTEXT_OLD) == 0 && ((ctx.flags & CONTEXT_DHCP) != 0 || !is_v6) {
+    if !ctx.flags.contains(ContextFlags::OLD) && (ctx.flags.contains(ContextFlags::DHCP) || !is_v6) {
         if is_v6 {
             #[cfg(feature = "dhcp6")]
             {
                 let dhcp_buff3 = ctx.end6.to_string();
-                let msg = if (ctx.flags & CONTEXT_RA_STATELESS) != 0 {
+                let msg = if ctx.flags.contains(ContextFlags::RA_STATELESS) {
                     format!("{family_str} stateless on {}", subnet6_str(ctx.start6))
-                } else if (ctx.flags & CONTEXT_STATIC) != 0 {
+                } else if ctx.flags.contains(ContextFlags::STATIC) {
                     format!("{family_str}, static leases only on {dhcp_buff3}{namebuff}")
-                } else if (ctx.flags & CONTEXT_PROXY) != 0 {
+                } else if ctx.flags.contains(ContextFlags::PROXY) {
                     format!("{family_str}, proxy on subnet {dhcp_buff3}")
                 } else {
                     format!("{family_str}, IP range {} -- {dhcp_buff3}{namebuff}", ctx.start6)
@@ -616,9 +616,9 @@ pub fn log_context(family: std::net::IpAddr, ctx: &crate::types::dhcp::DhcpConte
             }
         } else {
             let dhcp_buff3 = ctx.end.to_string();
-            let msg = if (ctx.flags & CONTEXT_STATIC) != 0 {
+            let msg = if ctx.flags.contains(ContextFlags::STATIC) {
                 format!("{family_str}, static leases only on {dhcp_buff3}{namebuff}")
-            } else if (ctx.flags & CONTEXT_PROXY) != 0 {
+            } else if ctx.flags.contains(ContextFlags::PROXY) {
                 format!("{family_str}, proxy on subnet {dhcp_buff3}")
             } else {
                 format!("{family_str}, IP range {} -- {dhcp_buff3}{namebuff}", ctx.start)
@@ -631,11 +631,11 @@ pub fn log_context(family: std::net::IpAddr, ctx: &crate::types::dhcp::DhcpConte
     if is_v6 {
         let addrbuff = subnet6_str(ctx.start6);
 
-        if (ctx.flags & CONTEXT_RA_NAME) != 0 && (ctx.flags & CONTEXT_OLD) == 0 {
+        if ctx.flags.contains(ContextFlags::RA_NAME) && !ctx.flags.contains(ContextFlags::OLD) {
             messages.push(format!("DHCPv4-derived IPv6 names on {addrbuff}"));
         }
 
-        if (ctx.flags & CONTEXT_RA) != 0 || (opt_ra && (ctx.flags & CONTEXT_DHCP) != 0) {
+        if ctx.flags.contains(ContextFlags::RA) || (opt_ra && ctx.flags.contains(ContextFlags::DHCP)) {
             messages.push(format!("router advertisement on {addrbuff}"));
         }
     }
@@ -2120,7 +2120,7 @@ mod tests {
 
     #[cfg(feature = "dhcp")]
     fn base_ctx() -> crate::types::dhcp::DhcpContext {
-        use crate::types::dhcp::{DhcpContext, DhcpNetid};
+        use crate::types::dhcp::{ContextFlags, DhcpContext, DhcpNetid};
         use std::net::{Ipv4Addr, Ipv6Addr};
 
         DhcpContext {
@@ -2132,7 +2132,7 @@ mod tests {
             router: Ipv4Addr::new(192, 168, 1, 1),
             start: Ipv4Addr::new(192, 168, 1, 100),
             end: Ipv4Addr::new(192, 168, 1, 200),
-            flags: 0,
+            flags: ContextFlags::empty(),
             netid: DhcpNetid { net: "net".into() },
             filter: vec![],
             #[cfg(feature = "dhcp6")]
@@ -2173,11 +2173,11 @@ mod tests {
     #[test]
     #[cfg(feature = "dhcp")]
     fn log_context_ipv4_static_uses_end_addr_not_start() {
-        use crate::types::dhcp::CONTEXT_STATIC;
+        use crate::types::dhcp::ContextFlags;
         use std::net::{IpAddr, Ipv4Addr};
 
         let mut ctx = base_ctx();
-        ctx.flags = CONTEXT_STATIC;
+        ctx.flags = ContextFlags::STATIC;
         let msgs = log_context(IpAddr::V4(Ipv4Addr::UNSPECIFIED), &ctx, false);
         assert_eq!(msgs, vec!["DHCP, static leases only on 192.168.1.200, lease time 1h".to_string()]);
     }
@@ -2185,11 +2185,11 @@ mod tests {
     #[test]
     #[cfg(feature = "dhcp")]
     fn log_context_ipv4_proxy_has_no_lease_time() {
-        use crate::types::dhcp::CONTEXT_PROXY;
+        use crate::types::dhcp::ContextFlags;
         use std::net::{IpAddr, Ipv4Addr};
 
         let mut ctx = base_ctx();
-        ctx.flags = CONTEXT_PROXY;
+        ctx.flags = ContextFlags::PROXY;
         let msgs = log_context(IpAddr::V4(Ipv4Addr::UNSPECIFIED), &ctx, false);
         assert_eq!(msgs, vec!["DHCP, proxy on subnet 192.168.1.200".to_string()]);
     }
@@ -2197,11 +2197,11 @@ mod tests {
     #[test]
     #[cfg(feature = "dhcp")]
     fn log_context_skips_old_context() {
-        use crate::types::dhcp::CONTEXT_OLD;
+        use crate::types::dhcp::ContextFlags;
         use std::net::{IpAddr, Ipv4Addr};
 
         let mut ctx = base_ctx();
-        ctx.flags = CONTEXT_OLD;
+        ctx.flags = ContextFlags::OLD;
         let msgs = log_context(IpAddr::V4(Ipv4Addr::UNSPECIFIED), &ctx, false);
         assert!(msgs.is_empty(), "CONTEXT_OLD contexts should produce no messages");
     }
@@ -2209,11 +2209,11 @@ mod tests {
     #[test]
     #[cfg(all(feature = "dhcp", feature = "dhcp6"))]
     fn log_context_ipv6_plain_range() {
-        use crate::types::dhcp::CONTEXT_DHCP;
+        use crate::types::dhcp::ContextFlags;
         use std::net::{IpAddr, Ipv6Addr};
 
         let mut ctx = base_ctx();
-        ctx.flags = CONTEXT_DHCP;
+        ctx.flags = ContextFlags::DHCP;
         ctx.lease_time = 7200;
         let msgs = log_context(IpAddr::V6(Ipv6Addr::UNSPECIFIED), &ctx, false);
         assert_eq!(msgs, vec!["DHCPv6, IP range fd00::100 -- fd00::200, lease time 2h".to_string()]);
@@ -2222,11 +2222,11 @@ mod tests {
     #[test]
     #[cfg(all(feature = "dhcp", feature = "dhcp6"))]
     fn log_context_ipv6_deprecated_excludes_lease_time() {
-        use crate::types::dhcp::{CONTEXT_DEPRECATE, CONTEXT_DHCP};
+        use crate::types::dhcp::ContextFlags;
         use std::net::{IpAddr, Ipv6Addr};
 
         let mut ctx = base_ctx();
-        ctx.flags = CONTEXT_DHCP | CONTEXT_DEPRECATE;
+        ctx.flags = ContextFlags::DHCP | ContextFlags::DEPRECATE;
         let msgs = log_context(IpAddr::V6(Ipv6Addr::UNSPECIFIED), &ctx, false);
         assert_eq!(msgs, vec!["DHCPv6, IP range fd00::100 -- fd00::200, prefix deprecated".to_string()]);
     }
@@ -2234,16 +2234,16 @@ mod tests {
     #[test]
     #[cfg(all(feature = "dhcp", feature = "dhcp6"))]
     fn log_context_ipv6_static_and_proxy() {
-        use crate::types::dhcp::{CONTEXT_DHCP, CONTEXT_PROXY, CONTEXT_STATIC};
+        use crate::types::dhcp::ContextFlags;
         use std::net::{IpAddr, Ipv6Addr};
 
         let mut static_ctx = base_ctx();
-        static_ctx.flags = CONTEXT_DHCP | CONTEXT_STATIC;
+        static_ctx.flags = ContextFlags::DHCP | ContextFlags::STATIC;
         let msgs = log_context(IpAddr::V6(Ipv6Addr::UNSPECIFIED), &static_ctx, false);
         assert_eq!(msgs, vec!["DHCPv6, static leases only on fd00::200, lease time 1h".to_string()]);
 
         let mut proxy_ctx = base_ctx();
-        proxy_ctx.flags = CONTEXT_DHCP | CONTEXT_PROXY;
+        proxy_ctx.flags = ContextFlags::DHCP | ContextFlags::PROXY;
         let msgs = log_context(IpAddr::V6(Ipv6Addr::UNSPECIFIED), &proxy_ctx, false);
         assert_eq!(msgs, vec!["DHCPv6, proxy on subnet fd00::200".to_string()]);
     }
@@ -2251,11 +2251,11 @@ mod tests {
     #[test]
     #[cfg(all(feature = "dhcp", feature = "dhcp6"))]
     fn log_context_ipv6_ra_stateless_uses_subnet() {
-        use crate::types::dhcp::{CONTEXT_DHCP, CONTEXT_RA_STATELESS};
+        use crate::types::dhcp::ContextFlags;
         use std::net::{IpAddr, Ipv6Addr};
 
         let mut ctx = base_ctx();
-        ctx.flags = CONTEXT_DHCP | CONTEXT_RA_STATELESS;
+        ctx.flags = ContextFlags::DHCP | ContextFlags::RA_STATELESS;
         let msgs = log_context(IpAddr::V6(Ipv6Addr::UNSPECIFIED), &ctx, false);
         assert_eq!(msgs, vec!["DHCPv6 stateless on fd00::".to_string()]);
     }
@@ -2263,11 +2263,11 @@ mod tests {
     #[test]
     #[cfg(all(feature = "dhcp", feature = "dhcp6"))]
     fn log_context_ra_name_and_ra_lines() {
-        use crate::types::dhcp::{CONTEXT_RA, CONTEXT_RA_NAME};
+        use crate::types::dhcp::ContextFlags;
         use std::net::{IpAddr, Ipv6Addr};
 
         let mut ctx = base_ctx();
-        ctx.flags = CONTEXT_RA_NAME | CONTEXT_RA;
+        ctx.flags = ContextFlags::RA_NAME | ContextFlags::RA;
         let msgs = log_context(IpAddr::V6(Ipv6Addr::UNSPECIFIED), &ctx, false);
         assert_eq!(
             msgs,
@@ -2281,11 +2281,11 @@ mod tests {
     #[test]
     #[cfg(all(feature = "dhcp", feature = "dhcp6"))]
     fn log_context_opt_ra_triggers_ra_line_for_dhcp_context() {
-        use crate::types::dhcp::CONTEXT_DHCP;
+        use crate::types::dhcp::ContextFlags;
         use std::net::{IpAddr, Ipv6Addr};
 
         let mut ctx = base_ctx();
-        ctx.flags = CONTEXT_DHCP;
+        ctx.flags = ContextFlags::DHCP;
         let msgs = log_context(IpAddr::V6(Ipv6Addr::UNSPECIFIED), &ctx, true);
         assert!(msgs.iter().any(|m| m == "router advertisement on fd00::"),
             "opt_ra + CONTEXT_DHCP on v6 should emit a router-advertisement line, got {msgs:?}");

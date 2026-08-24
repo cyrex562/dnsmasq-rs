@@ -74,7 +74,7 @@ pub fn slaac_address(prefix: Ipv6Addr, prefix_len: u8, mac: &[u8; 6]) -> Ipv6Add
 // ─────────────────────────────────────────────────────────────────────────────
 
 use crate::types::dhcp::{
-    CONTEXT_RA_NAME, CONTEXT_OLD, LEASE_HAVE_HWADDR, LEASE_TA, LEASE_NA,
+    ContextFlags, LEASE_HAVE_HWADDR, LEASE_TA, LEASE_NA,
     DhcpContext, DhcpLease, SlaacAddress,
 };
 
@@ -160,7 +160,7 @@ pub fn slaac_add_addrs(
     let mut dns_dirty = false;
 
     for ctx in contexts {
-        if ctx.flags & CONTEXT_RA_NAME == 0 || ctx.flags & CONTEXT_OLD != 0 {
+        if !ctx.flags.contains(ContextFlags::RA_NAME) || ctx.flags.contains(ContextFlags::OLD) {
             continue;
         }
         if lease.last_interface != ctx.if_index {
@@ -257,7 +257,7 @@ pub fn periodic_slaac<'a>(
 ) -> Option<std::time::SystemTime> {
     let configured = contexts
         .iter()
-        .any(|c| c.flags & CONTEXT_RA_NAME != 0 && c.flags & CONTEXT_OLD == 0);
+        .any(|c| c.flags.contains(ContextFlags::RA_NAME) && !c.flags.contains(ContextFlags::OLD));
     if !configured {
         return None;
     }
@@ -471,7 +471,7 @@ mod tests {
             start: Ipv4Addr::UNSPECIFIED,
             end: Ipv4Addr::UNSPECIFIED,
             router: Ipv4Addr::UNSPECIFIED,
-            flags: CONTEXT_RA_NAME,
+            flags: ContextFlags::RA_NAME,
             netmask: Ipv4Addr::UNSPECIFIED,
             broadcast: Ipv4Addr::UNSPECIFIED,
             local: Ipv4Addr::UNSPECIFIED,
@@ -621,7 +621,7 @@ mod tests {
     #[test]
     fn slaac_add_addrs_skips_old_context() {
         let mut ctx = make_ra_ctx("2001:db8::".parse().unwrap(), 1);
-        ctx.flags |= CONTEXT_OLD;
+        ctx.flags.insert(ContextFlags::OLD);
         let mut lease = make_lease(MAC, 1, Some("host"));
         let dirty = slaac_add_addrs(&mut lease, SystemTime::now(), false, std::slice::from_ref(&ctx), |_| {});
         assert!(!dirty);

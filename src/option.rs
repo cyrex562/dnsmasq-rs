@@ -22,12 +22,12 @@ use crate::types::daemon::{DhcpBridge, SharedNetwork};
 use crate::domain::CondDomain;
 #[cfg(feature = "dhcp")]
 use crate::types::dhcp::{
-    ConfigFlags, CONTEXT_DHCP, DhOptFlags,
+    ConfigFlags, ContextFlags, DhOptFlags,
     DhcpBoot, DhcpConfig, DhcpContext, DhcpMacRule, DhcpNetid, DhcpNetidList, DhcpOpt, DhcpPxeVendor,
     DhcpRelay, DhcpRelayIdRule, DhcpReplyDelay, DhcpUserClassRule, DhcpVendorRule, HwaddrConfig, PxeService,
 };
 #[cfg(feature = "dhcp6")]
-use crate::types::dhcp::{RaInterface, CONTEXT_RA};
+use crate::types::dhcp::RaInterface;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -621,7 +621,7 @@ fn apply_doing_ra_default(daemon: &mut Daemon) {
     }
     daemon.doing_ra = daemon.option_bool(OPT_RA);
     for context in &daemon.dhcp6 {
-        if context.flags & CONTEXT_RA != 0 {
+        if context.flags.contains(ContextFlags::RA) {
             daemon.doing_ra = true;
         }
     }
@@ -3913,7 +3913,7 @@ fn parse_dhcp_range(value: &str, cl: &ConfigLine) -> Result<DhcpContext, ConfigE
         router: Ipv4Addr::UNSPECIFIED,
         start,
         end,
-        flags: CONTEXT_DHCP,
+        flags: ContextFlags::DHCP,
         netid,
         filter,
         #[cfg(feature = "dhcp6")]
@@ -6000,10 +6000,10 @@ mod tests {
     #[test]
     #[cfg(feature = "dhcp6")]
     fn apply_enable_ra_with_dhcp6_context_sets_doing_ra() {
-        use crate::types::dhcp::CONTEXT_DHCP;
+        use crate::types::dhcp::ContextFlags;
         let mut d = Daemon::default();
         let lines = parse_config_text("enable-ra", "test").unwrap();
-        d.dhcp6.push(dhcp6_ctx_for_test(CONTEXT_DHCP));
+        d.dhcp6.push(dhcp6_ctx_for_test(ContextFlags::DHCP));
         apply_config(&mut d, &lines).unwrap();
         assert!(d.doing_ra);
     }
@@ -6011,9 +6011,9 @@ mod tests {
     #[test]
     #[cfg(feature = "dhcp6")]
     fn context_ra_flag_sets_doing_ra_without_enable_ra() {
-        use crate::types::dhcp::CONTEXT_RA;
+        use crate::types::dhcp::ContextFlags;
         let mut d = Daemon::default();
-        d.dhcp6.push(dhcp6_ctx_for_test(CONTEXT_RA));
+        d.dhcp6.push(dhcp6_ctx_for_test(ContextFlags::RA));
         apply_config(&mut d, &[]).unwrap();
         assert!(d.doing_ra);
     }
@@ -6032,7 +6032,7 @@ mod tests {
     }
 
     #[cfg(feature = "dhcp6")]
-    fn dhcp6_ctx_for_test(flags: u32) -> DhcpContext {
+    fn dhcp6_ctx_for_test(flags: ContextFlags) -> DhcpContext {
         DhcpContext {
             lease_time: 3600,
             addr_epoch: 0,

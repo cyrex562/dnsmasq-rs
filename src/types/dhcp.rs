@@ -57,26 +57,33 @@ bitflags::bitflags! {
 }
 
 // CONTEXT_* flags
-pub const CONTEXT_STATIC:        u32 = 1 << 0;
-pub const CONTEXT_NETMASK:       u32 = 1 << 1;
-pub const CONTEXT_BRDCAST:       u32 = 1 << 2;
-pub const CONTEXT_PROXY:         u32 = 1 << 3;
-pub const CONTEXT_RA_ROUTER:     u32 = 1 << 4;
-pub const CONTEXT_RA_DONE:       u32 = 1 << 5;
-pub const CONTEXT_RA_NAME:       u32 = 1 << 6;
-pub const CONTEXT_RA_STATELESS:  u32 = 1 << 7;
-pub const CONTEXT_DHCP:          u32 = 1 << 8;
-pub const CONTEXT_DEPRECATE:     u32 = 1 << 9;
-pub const CONTEXT_TEMPLATE:      u32 = 1 << 10;
-pub const CONTEXT_CONSTRUCTED:   u32 = 1 << 11;
-pub const CONTEXT_GC:            u32 = 1 << 12;
-pub const CONTEXT_RA:            u32 = 1 << 13;
-pub const CONTEXT_CONF_USED:     u32 = 1 << 14;
-pub const CONTEXT_USED:          u32 = 1 << 15;
-pub const CONTEXT_OLD:           u32 = 1 << 16;
-pub const CONTEXT_V6:            u32 = 1 << 17;
-pub const CONTEXT_RA_OFF_LINK:   u32 = 1 << 18;
-pub const CONTEXT_SETLEASE:      u32 = 1 << 19;
+bitflags::bitflags! {
+    /// `struct dhcp_context`'s `flags` (upstream `CONTEXT_*` constants in
+    /// `dnsmasq.h`) — per-subnet/interface DHCPv4/v6/RA context state.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct ContextFlags: u32 {
+        const STATIC        = 1 << 0;
+        const NETMASK       = 1 << 1;
+        const BRDCAST       = 1 << 2;
+        const PROXY         = 1 << 3;
+        const RA_ROUTER     = 1 << 4;
+        const RA_DONE       = 1 << 5;
+        const RA_NAME       = 1 << 6;
+        const RA_STATELESS  = 1 << 7;
+        const DHCP          = 1 << 8;
+        const DEPRECATE     = 1 << 9;
+        const TEMPLATE      = 1 << 10;
+        const CONSTRUCTED   = 1 << 11;
+        const GC            = 1 << 12;
+        const RA            = 1 << 13;
+        const CONF_USED     = 1 << 14;
+        const USED          = 1 << 15;
+        const OLD           = 1 << 16;
+        const V6            = 1 << 17;
+        const RA_OFF_LINK   = 1 << 18;
+        const SETLEASE      = 1 << 19;
+    }
+}
 
 // LEASE_* flags
 pub const LEASE_NEW:          u32 = 1;
@@ -155,7 +162,7 @@ pub struct DhcpContext {
     pub router:     Ipv4Addr,
     pub start:      Ipv4Addr,
     pub end:        Ipv4Addr,
-    pub flags:      u32,
+    pub flags:      ContextFlags,
     pub netid:      DhcpNetid,
     pub filter:     Vec<DhcpNetid>,
 
@@ -357,8 +364,8 @@ mod tests {
 
     #[test]
     fn context_flags_non_overlapping() {
-        assert_ne!(CONTEXT_STATIC, CONTEXT_NETMASK);
-        assert_ne!(CONTEXT_DHCP, CONTEXT_V6);
+        assert_ne!(ContextFlags::STATIC, ContextFlags::NETMASK);
+        assert_ne!(ContextFlags::DHCP, ContextFlags::V6);
     }
 
     #[test]

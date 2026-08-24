@@ -1751,7 +1751,7 @@ pub fn icmp_checksum(data: &[u8]) -> u16 {
 // Address pool helpers (ported from dhcp.c:687-763)
 // ─────────────────────────────────────────────────────────────────────────────
 
-use crate::types::dhcp::{DhcpContext, DhcpConfig, CONTEXT_STATIC, CONTEXT_PROXY, CONTEXT_NETMASK, CONTEXT_BRDCAST, ConfigFlags};
+use crate::types::dhcp::{DhcpContext, DhcpConfig, ContextFlags, ConfigFlags};
 
 /// Check if `addr` is available in one of the DHCP contexts.
 ///
@@ -1769,7 +1769,7 @@ pub fn address_available(contexts: &[DhcpContext], addr: Ipv4Addr) -> bool {
     }
 
     for ctx in contexts {
-        if ctx.flags & (CONTEXT_STATIC | CONTEXT_PROXY) != 0 {
+        if ctx.flags.intersects(ContextFlags::STATIC | ContextFlags::PROXY) {
             continue;
         }
         let start = u32::from(ctx.start);
@@ -1790,7 +1790,7 @@ pub fn narrow_context<'a>(contexts: &'a [DhcpContext], addr: Ipv4Addr) -> Option
     // Try pool range first.
     if address_available(contexts, addr) {
         for ctx in contexts {
-            if ctx.flags & (CONTEXT_STATIC | CONTEXT_PROXY) != 0 {
+            if ctx.flags.intersects(ContextFlags::STATIC | ContextFlags::PROXY) {
                 continue;
             }
             let a = u32::from(addr);
@@ -1802,7 +1802,7 @@ pub fn narrow_context<'a>(contexts: &'a [DhcpContext], addr: Ipv4Addr) -> Option
 
     // Try static context on same subnet.
     for ctx in contexts {
-        if ctx.flags & CONTEXT_STATIC != 0
+        if ctx.flags.contains(ContextFlags::STATIC)
             && ctx.netmask != Ipv4Addr::UNSPECIFIED
             && is_same_net(addr, ctx.start, ctx.netmask)
         {
@@ -1812,7 +1812,7 @@ pub fn narrow_context<'a>(contexts: &'a [DhcpContext], addr: Ipv4Addr) -> Option
 
     // Any context on same subnet (non-proxy).
     for ctx in contexts {
-        if ctx.flags & CONTEXT_PROXY != 0 {
+        if ctx.flags.contains(ContextFlags::PROXY) {
             continue;
         }
         if ctx.netmask != Ipv4Addr::UNSPECIFIED && is_same_net(addr, ctx.start, ctx.netmask) {
@@ -1868,7 +1868,7 @@ pub struct ArrivalInterface {
 /// indices for the rest of that packet's dispatch.
 pub fn link_contexts_for_interface(contexts: &mut [DhcpContext], iface: &ArrivalInterface) -> Vec<usize> {
     for ctx in contexts.iter_mut() {
-        if ctx.flags & CONTEXT_NETMASK == 0
+        if !ctx.flags.contains(ContextFlags::NETMASK)
             && (is_same_net(iface.local, ctx.start, iface.netmask)
                 || is_same_net(iface.local, ctx.end, iface.netmask))
         {
@@ -1887,7 +1887,7 @@ pub fn link_contexts_for_interface(contexts: &mut [DhcpContext], iface: &Arrival
 
         ctx.router = iface.local;
         ctx.local = iface.local;
-        if ctx.flags & CONTEXT_BRDCAST == 0 {
+        if !ctx.flags.contains(ContextFlags::BRDCAST) {
             ctx.broadcast = if is_same_net(iface.broadcast, ctx.start, ctx.netmask) {
                 iface.broadcast
             } else {
@@ -2133,7 +2133,7 @@ pub fn address_allocate(
 
     for pass in 0..=1 {
         for c in contexts {
-            if c.flags & (CONTEXT_STATIC | CONTEXT_PROXY) != 0 {
+            if c.flags.intersects(ContextFlags::STATIC | ContextFlags::PROXY) {
                 continue;
             }
             if !context_filter_matches(&c.filter, netids, pass == 1) {
@@ -2188,7 +2188,7 @@ fn synthetic_pool_context(start: Ipv4Addr, end: Ipv4Addr) -> DhcpContext {
         router: Ipv4Addr::UNSPECIFIED,
         start,
         end,
-        flags: 0,
+        flags: ContextFlags::empty(),
         netid: crate::types::dhcp::DhcpNetid { net: String::new() },
         filter: vec![],
         #[cfg(feature = "dhcp6")]
@@ -3349,7 +3349,7 @@ mod tests {
 
     #[test]
     fn discover_injects_requested_configured_options() {
-        use crate::types::dhcp::{DhcpContext, DhcpNetid, DhcpOpt, CONTEXT_DHCP};
+        use crate::types::dhcp::{ContextFlags, DhcpContext, DhcpNetid, DhcpOpt};
 
         let mut pkt = base_packet();
         pkt.options = vec![
@@ -3368,7 +3368,7 @@ mod tests {
             router: Ipv4Addr::new(10, 0, 0, 1),
             start: Ipv4Addr::new(10, 0, 0, 100),
             end: Ipv4Addr::new(10, 0, 0, 200),
-            flags: CONTEXT_DHCP,
+            flags: ContextFlags::DHCP,
             netid: DhcpNetid { net: String::new() },
             filter: vec![],
             #[cfg(feature = "dhcp6")]
@@ -3410,7 +3410,7 @@ mod tests {
 
     #[test]
     fn discover_host_set_tag_selects_tagged_option() {
-        use crate::types::dhcp::{DhcpConfig, DhcpContext, DhcpNetid, DhcpOpt, HwaddrConfig, CONTEXT_DHCP, ConfigFlags};
+        use crate::types::dhcp::{DhcpConfig, DhcpContext, DhcpNetid, DhcpOpt, HwaddrConfig, ContextFlags, ConfigFlags};
 
         let mut pkt = base_packet();
         pkt.options = vec![
@@ -3433,7 +3433,7 @@ mod tests {
             router: Ipv4Addr::new(10, 0, 0, 1),
             start: Ipv4Addr::new(10, 0, 0, 100),
             end: Ipv4Addr::new(10, 0, 0, 200),
-            flags: CONTEXT_DHCP,
+            flags: ContextFlags::DHCP,
             netid: DhcpNetid { net: String::new() },
             filter: vec![],
             #[cfg(feature = "dhcp6")]
@@ -3732,8 +3732,8 @@ mod tests {
         // on, so a correctly-wired loop must offer from it instead.
         let cfg = DhcpServerConfig {
             contexts: vec![
-                make_ctx(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 200), Ipv4Addr::UNSPECIFIED, 0),
-                make_ctx(Ipv4Addr::new(127, 0, 0, 50), Ipv4Addr::new(127, 0, 0, 60), Ipv4Addr::UNSPECIFIED, 0),
+                make_ctx(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 200), Ipv4Addr::UNSPECIFIED, ContextFlags::empty()),
+                make_ctx(Ipv4Addr::new(127, 0, 0, 50), Ipv4Addr::new(127, 0, 0, 60), Ipv4Addr::UNSPECIFIED, ContextFlags::empty()),
             ],
             ..default_cfg()
         };
@@ -4120,7 +4120,7 @@ mod tests {
 
     // ── address_available ────────────────────────────────────────────────────
 
-    fn make_ctx(start: Ipv4Addr, end: Ipv4Addr, router: Ipv4Addr, flags: u32) -> DhcpContext {
+    fn make_ctx(start: Ipv4Addr, end: Ipv4Addr, router: Ipv4Addr, flags: ContextFlags) -> DhcpContext {
         DhcpContext {
             start,
             end,
@@ -4164,7 +4164,7 @@ mod tests {
             "10.0.0.100".parse().unwrap(),
             "10.0.0.200".parse().unwrap(),
             "10.0.0.1".parse().unwrap(),
-            0,
+            ContextFlags::empty(),
         );
         assert!(address_available(&[ctx], "10.0.0.150".parse().unwrap()));
     }
@@ -4175,7 +4175,7 @@ mod tests {
             "10.0.0.100".parse().unwrap(),
             "10.0.0.200".parse().unwrap(),
             "10.0.0.1".parse().unwrap(),
-            0,
+            ContextFlags::empty(),
         );
         assert!(!address_available(&[ctx], "10.0.0.50".parse().unwrap()));
     }
@@ -4186,7 +4186,7 @@ mod tests {
             "10.0.0.1".parse().unwrap(),
             "10.0.0.254".parse().unwrap(),
             "10.0.0.1".parse().unwrap(),
-            0,
+            ContextFlags::empty(),
         );
         assert!(!address_available(&[ctx], "10.0.0.1".parse().unwrap()));
     }
@@ -4197,7 +4197,7 @@ mod tests {
             "10.0.0.100".parse().unwrap(),
             "10.0.0.200".parse().unwrap(),
             "10.0.0.1".parse().unwrap(),
-            CONTEXT_STATIC,
+            ContextFlags::STATIC,
         );
         assert!(!address_available(&[ctx], "10.0.0.150".parse().unwrap()));
     }
@@ -4215,7 +4215,7 @@ mod tests {
             "10.0.0.100".parse().unwrap(),
             "10.0.0.200".parse().unwrap(),
             "10.0.0.1".parse().unwrap(),
-            0,
+            ContextFlags::empty(),
         )];
         let result = narrow_context(&contexts, "10.0.0.150".parse().unwrap());
         assert!(result.is_some());
@@ -4227,7 +4227,7 @@ mod tests {
             "10.0.0.0".parse().unwrap(),
             "10.0.0.0".parse().unwrap(),
             "10.0.0.1".parse().unwrap(),
-            CONTEXT_STATIC,
+            ContextFlags::STATIC,
         )];
         // addr on same subnet but not in pool (static context)
         let result = narrow_context(&contexts, "10.0.0.50".parse().unwrap());
@@ -4240,7 +4240,7 @@ mod tests {
             "10.0.0.100".parse().unwrap(),
             "10.0.0.200".parse().unwrap(),
             "10.0.0.1".parse().unwrap(),
-            0,
+            ContextFlags::empty(),
         )];
         let result = narrow_context(&contexts, "192.168.1.1".parse().unwrap());
         assert!(result.is_none());
@@ -4255,7 +4255,7 @@ mod tests {
             "10.0.0.100".parse().unwrap(),
             "10.0.0.200".parse().unwrap(),
             Ipv4Addr::UNSPECIFIED,
-            0,
+            ContextFlags::empty(),
         )];
         let iface = ArrivalInterface {
             local: Ipv4Addr::new(10, 0, 0, 1),
@@ -4276,7 +4276,7 @@ mod tests {
             "192.168.1.100".parse().unwrap(),
             "192.168.1.200".parse().unwrap(),
             Ipv4Addr::UNSPECIFIED,
-            0,
+            ContextFlags::empty(),
         )];
         let iface = ArrivalInterface {
             local: Ipv4Addr::new(10, 0, 0, 1),
@@ -4296,7 +4296,7 @@ mod tests {
             "10.0.0.100".parse().unwrap(),
             "10.0.0.200".parse().unwrap(),
             Ipv4Addr::UNSPECIFIED,
-            0, // no CONTEXT_NETMASK — netmask below is a placeholder to fill in
+            ContextFlags::empty(), // no CONTEXT_NETMASK — netmask below is a placeholder to fill in
         );
         ctx.netmask = Ipv4Addr::UNSPECIFIED;
         let mut contexts = [ctx];
@@ -4319,7 +4319,7 @@ mod tests {
             "10.0.0.100".parse().unwrap(),
             "10.0.0.200".parse().unwrap(),
             Ipv4Addr::UNSPECIFIED,
-            CONTEXT_NETMASK,
+            ContextFlags::NETMASK,
         );
         ctx.netmask = Ipv4Addr::new(255, 255, 0, 0);
         let mut contexts = [ctx];
@@ -4339,7 +4339,7 @@ mod tests {
             "10.0.0.100".parse().unwrap(),
             "10.0.0.200".parse().unwrap(),
             Ipv4Addr::UNSPECIFIED,
-            CONTEXT_BRDCAST,
+            ContextFlags::BRDCAST,
         );
         ctx.broadcast = Ipv4Addr::new(10, 0, 0, 254); // deliberately non-standard
         let mut contexts = [ctx];
@@ -4393,13 +4393,13 @@ mod tests {
             Ipv4Addr::new(10, 0, 0, 100),
             Ipv4Addr::new(10, 0, 0, 200),
             Ipv4Addr::UNSPECIFIED,
-            0,
+            ContextFlags::empty(),
         );
         let subnet_b = make_ctx(
             Ipv4Addr::new(192, 168, 1, 100),
             Ipv4Addr::new(192, 168, 1, 200),
             Ipv4Addr::UNSPECIFIED,
-            0,
+            ContextFlags::empty(),
         );
         DhcpServerConfig {
             contexts: vec![subnet_a, subnet_b],
@@ -4562,7 +4562,7 @@ mod tests {
         // DHCPv6 stateful leases are), so slaac_add_addrs's guards can
         // actually pass for it — unlike leases in the DHCPv6 loop's own
         // LeaseDb, which are always LEASE_NA-flagged and so never qualify.
-        use crate::types::dhcp::{DhcpContext, DhcpNetid, CONTEXT_RA_NAME};
+        use crate::types::dhcp::{ContextFlags, DhcpContext, DhcpNetid};
         use std::net::Ipv6Addr;
 
         let mut cfg = default_cfg();
@@ -4595,7 +4595,7 @@ mod tests {
             router: Ipv4Addr::UNSPECIFIED,
             start: Ipv4Addr::UNSPECIFIED,
             end: Ipv4Addr::UNSPECIFIED,
-            flags: CONTEXT_RA_NAME,
+            flags: ContextFlags::RA_NAME,
             netid: DhcpNetid { net: String::new() },
             filter: vec![],
             start6: "2001:db8::".parse().unwrap(),
@@ -4813,7 +4813,7 @@ mod tests {
             "10.0.0.100".parse().unwrap(),
             "10.0.0.102".parse().unwrap(),
             Ipv4Addr::UNSPECIFIED,
-            0,
+            ContextFlags::empty(),
         );
         let lease_db = LeaseDb::new();
         let mut ping_cache = PingCache::new();
@@ -4834,7 +4834,7 @@ mod tests {
             "10.0.0.100".parse().unwrap(),
             "10.0.0.101".parse().unwrap(),
             Ipv4Addr::UNSPECIFIED,
-            0,
+            ContextFlags::empty(),
         );
         let lease_db = LeaseDb::new();
         let mut ping_cache = PingCache::new();
@@ -4856,7 +4856,7 @@ mod tests {
             "10.0.0.100".parse().unwrap(),
             "10.0.0.102".parse().unwrap(),
             Ipv4Addr::UNSPECIFIED,
-            0,
+            ContextFlags::empty(),
         );
         let mut lease_db = LeaseDb::new();
         lease_db.allocate_v4(Ipv4Addr::new(10, 0, 0, 101));
@@ -4891,7 +4891,7 @@ mod tests {
             "10.0.0.100".parse().unwrap(),
             "10.0.0.101".parse().unwrap(),
             Ipv4Addr::new(10, 0, 0, 101),
-            0,
+            ContextFlags::empty(),
         );
         let lease_db = LeaseDb::new();
         let mut ping_cache = PingCache::new();
@@ -5334,7 +5334,7 @@ mod tests {
     fn bootp_request_gated_by_bootp_dynamic_tag() {
         let pkt = bootp_packet();
         let mut cfg = default_cfg();
-        cfg.contexts = vec![make_ctx(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 200), Ipv4Addr::UNSPECIFIED, 0)];
+        cfg.contexts = vec![make_ctx(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 200), Ipv4Addr::UNSPECIFIED, ContextFlags::empty())];
 
         // Without a --bootp-dynamic rule, dynamic BOOTP allocation is refused.
         assert!(dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new()).is_none());
@@ -5356,7 +5356,7 @@ mod tests {
     fn bootp_dynamic_gate_also_applies_when_reusing_an_existing_lease() {
         let pkt = bootp_packet();
         let mut cfg = default_cfg();
-        cfg.contexts = vec![make_ctx(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 200), Ipv4Addr::UNSPECIFIED, 0)];
+        cfg.contexts = vec![make_ctx(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 200), Ipv4Addr::UNSPECIFIED, ContextFlags::empty())];
         cfg.bootp_dynamic = vec![vec![]]; // matches everyone: allocation is allowed
         let mut lease_db = LeaseDb::new();
 
@@ -5417,7 +5417,7 @@ mod tests {
         let mut cfg = default_cfg();
         cfg.leasequery_enabled = true;
         cfg.leasequery_source = Ipv4Addr::new(192, 0, 2, 1);
-        cfg.contexts = vec![make_ctx(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 200), Ipv4Addr::UNSPECIFIED, 0)];
+        cfg.contexts = vec![make_ctx(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 200), Ipv4Addr::UNSPECIFIED, ContextFlags::empty())];
 
         let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe)
             .expect("leasequery should always reply once enabled+unicast");
@@ -5441,7 +5441,7 @@ mod tests {
         let mut cfg = default_cfg();
         cfg.leasequery_enabled = true;
         cfg.leasequery_source = Ipv4Addr::new(192, 0, 2, 1);
-        cfg.contexts = vec![make_ctx(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 200), Ipv4Addr::UNSPECIFIED, 0)];
+        cfg.contexts = vec![make_ctx(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 200), Ipv4Addr::UNSPECIFIED, ContextFlags::empty())];
 
         let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe)
             .expect("leasequery should always reply once enabled+unicast");
@@ -5461,7 +5461,7 @@ mod tests {
         let mut cfg = default_cfg();
         cfg.leasequery_enabled = true;
         cfg.leasequery_source = Ipv4Addr::new(192, 0, 2, 1);
-        cfg.contexts = vec![make_ctx(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 200), Ipv4Addr::UNSPECIFIED, 0)];
+        cfg.contexts = vec![make_ctx(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 200), Ipv4Addr::UNSPECIFIED, ContextFlags::empty())];
 
         let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db, &mut PingCache::new(), &NullProbe)
             .expect("leasequery for an active lease should reply");
@@ -5487,7 +5487,7 @@ mod tests {
         let mut cfg = default_cfg();
         cfg.leasequery_enabled = true;
         cfg.leasequery_source = Ipv4Addr::new(192, 0, 2, 1);
-        cfg.contexts = vec![make_ctx(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 200), Ipv4Addr::UNSPECIFIED, 0)];
+        cfg.contexts = vec![make_ctx(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 200), Ipv4Addr::UNSPECIFIED, ContextFlags::empty())];
 
         let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut lease_db, &mut PingCache::new(), &NullProbe)
             .expect("leasequery for an active lease should reply");
@@ -5518,7 +5518,7 @@ mod tests {
         let mut cfg = default_cfg();
         cfg.leasequery_enabled = true;
         cfg.leasequery_source = Ipv4Addr::new(192, 0, 2, 1);
-        cfg.contexts = vec![make_ctx(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 200), Ipv4Addr::UNSPECIFIED, 0)];
+        cfg.contexts = vec![make_ctx(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 200), Ipv4Addr::UNSPECIFIED, ContextFlags::empty())];
         cfg.dhcp_opts = vec![crate::types::dhcp::DhcpOpt {
             opt: i32::from(CUSTOM_OPT),
             flags: crate::types::dhcp::DhOptFlags::TAGOK | crate::types::dhcp::DhOptFlags::FORCE,
@@ -5563,7 +5563,7 @@ mod tests {
         ];
         let mut cfg = default_cfg();
         cfg.rapid_commit = true;
-        cfg.contexts = vec![make_ctx(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 200), Ipv4Addr::UNSPECIFIED, 0)];
+        cfg.contexts = vec![make_ctx(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 200), Ipv4Addr::UNSPECIFIED, ContextFlags::empty())];
         cfg.reply_delays = vec![crate::types::dhcp::DhcpReplyDelay { delay_secs: 3, filter: vec![] }];
 
         let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe)

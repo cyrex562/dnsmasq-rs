@@ -89,10 +89,10 @@ pub fn init_daemon_with(mut daemon: Daemon) -> DaemonHandle {
             if !daemon.dhcp6.is_empty() {
                 daemon.doing_ra = opt_ra;
                 for ctx in &daemon.dhcp6 {
-                    if ctx.flags & crate::types::dhcp::CONTEXT_DHCP != 0 {
+                    if ctx.flags.contains(crate::types::dhcp::ContextFlags::DHCP) {
                         daemon.doing_dhcp6 = true;
                     }
-                    if ctx.flags & crate::types::dhcp::CONTEXT_RA != 0 {
+                    if ctx.flags.contains(crate::types::dhcp::ContextFlags::RA) {
                         daemon.doing_ra = true;
                     }
                 }
@@ -2046,7 +2046,7 @@ pub async fn run_main_loop_with(
     // function already applies to a failed DHCPv6 socket bind above.
     #[cfg(feature = "dhcp6")]
     let (radv_task, radv_shutdown_tx) = if let Some(cfg) = radv_config {
-        let want_echo_reply = cfg.contexts.iter().any(|c| c.flags & crate::types::dhcp::CONTEXT_RA_NAME != 0);
+        let want_echo_reply = cfg.contexts.iter().any(|c| c.flags.contains(crate::types::dhcp::ContextFlags::RA_NAME));
         let socket = match RadvSocket::new(want_echo_reply) {
             Ok(s) => s,
             Err(e) => {
@@ -3234,7 +3234,7 @@ mod tests {
 
     #[cfg(feature = "dhcp")]
     fn test_dhcp_context() -> crate::types::dhcp::DhcpContext {
-        use crate::types::dhcp::{DhcpContext, DhcpNetid, CONTEXT_DHCP};
+        use crate::types::dhcp::{ContextFlags, DhcpContext, DhcpNetid};
 
         DhcpContext {
             lease_time: 3600,
@@ -3245,7 +3245,7 @@ mod tests {
             router: Ipv4Addr::new(10, 0, 0, 1),
             start: Ipv4Addr::new(10, 0, 0, 100),
             end: Ipv4Addr::new(10, 0, 0, 150),
-            flags: CONTEXT_DHCP,
+            flags: ContextFlags::DHCP,
             netid: DhcpNetid { net: "default".into() },
             filter: vec![],
             #[cfg(feature = "dhcp6")]
@@ -3371,11 +3371,11 @@ mod tests {
     #[test]
     #[cfg(feature = "dhcp6")]
     fn init_daemon_with_sets_doing_ra_from_context_ra_flag() {
-        use crate::types::dhcp::CONTEXT_RA;
+        use crate::types::dhcp::ContextFlags;
 
         let mut daemon = Daemon::default();
         daemon.dhcp6.push(crate::types::dhcp::DhcpContext {
-            flags: CONTEXT_RA,
+            flags: ContextFlags::RA,
             ..test_dhcp_context()
         });
 
@@ -3793,7 +3793,7 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "dhcp6")]
     async fn run_main_loop_with_dhcp6_context_binds_port_547_and_persists_duid() {
-        use crate::types::dhcp::{DhcpContext, DhcpNetid, CONTEXT_DHCP};
+        use crate::types::dhcp::{ContextFlags, DhcpContext, DhcpNetid};
 
         let listeners = bind_listeners(&Daemon { port: 0, ..Default::default() }).unwrap();
         let dns_port = listeners
@@ -3806,7 +3806,7 @@ mod tests {
             start: Ipv4Addr::UNSPECIFIED,
             end: Ipv4Addr::UNSPECIFIED,
             router: Ipv4Addr::UNSPECIFIED,
-            flags: CONTEXT_DHCP,
+            flags: ContextFlags::DHCP,
             netmask: Ipv4Addr::UNSPECIFIED,
             broadcast: Ipv4Addr::UNSPECIFIED,
             local: Ipv4Addr::UNSPECIFIED,
@@ -4038,7 +4038,7 @@ mod tests {
     #[cfg(feature = "dhcp")]
     #[test]
     fn daemon_dhcp_runtime_uses_first_range_and_rules() {
-        use crate::types::dhcp::{DhcpContext, DhcpNetid, DhcpReplyDelay, CONTEXT_DHCP};
+        use crate::types::dhcp::{ContextFlags, DhcpContext, DhcpNetid, DhcpReplyDelay};
 
         let mut daemon = Daemon::default();
         daemon.dhcp.push(DhcpContext {
@@ -4050,7 +4050,7 @@ mod tests {
             router: Ipv4Addr::new(10, 0, 0, 1),
             start: Ipv4Addr::new(10, 0, 0, 100),
             end: Ipv4Addr::new(10, 0, 0, 150),
-            flags: CONTEXT_DHCP,
+            flags: ContextFlags::DHCP,
             netid: DhcpNetid { net: "default".into() },
             filter: vec![],
             #[cfg(feature = "dhcp6")]
@@ -4097,7 +4097,7 @@ mod tests {
     #[cfg(feature = "dhcp")]
     #[test]
     fn daemon_dhcp_runtime_uses_listen_address_interface_and_alt_client_port() {
-        use crate::types::dhcp::{DhcpContext, DhcpNetid, CONTEXT_DHCP};
+        use crate::types::dhcp::{ContextFlags, DhcpContext, DhcpNetid};
         use crate::types::network::{Iname, IfaceNameFlags};
 
         let mut daemon = Daemon::default();
@@ -4120,7 +4120,7 @@ mod tests {
             router: Ipv4Addr::new(127, 0, 0, 1),
             start: Ipv4Addr::new(127, 0, 0, 10),
             end: Ipv4Addr::new(127, 0, 0, 20),
-            flags: CONTEXT_DHCP,
+            flags: ContextFlags::DHCP,
             netid: DhcpNetid { net: "default".into() },
             filter: vec![],
             #[cfg(feature = "dhcp6")]
@@ -4165,7 +4165,7 @@ mod tests {
     #[test]
     fn daemon_dhcp_runtime_binds_relay_iface_index_to_matching_local_addr() {
         use crate::types::addr::AllAddr;
-        use crate::types::dhcp::{DhcpContext, DhcpNetid, DhcpRelay, CONTEXT_DHCP};
+        use crate::types::dhcp::{ContextFlags, DhcpContext, DhcpNetid, DhcpRelay};
         use crate::types::network::{Iname, IfaceNameFlags};
 
         let mut daemon = Daemon::default();
@@ -4184,7 +4184,7 @@ mod tests {
             router: Ipv4Addr::new(127, 0, 0, 1),
             start: Ipv4Addr::new(127, 0, 0, 10),
             end: Ipv4Addr::new(127, 0, 0, 20),
-            flags: CONTEXT_DHCP,
+            flags: ContextFlags::DHCP,
             netid: DhcpNetid { net: "default".into() },
             filter: vec![],
             #[cfg(feature = "dhcp6")]
@@ -4250,12 +4250,12 @@ mod tests {
 
     #[cfg(feature = "dhcp6")]
     fn dhcp6_ctx(start6: std::net::Ipv6Addr, end6: std::net::Ipv6Addr, prefix: i32) -> crate::types::dhcp::DhcpContext {
-        use crate::types::dhcp::{CONTEXT_DHCP, DhcpNetid};
+        use crate::types::dhcp::{ContextFlags, DhcpNetid};
         crate::types::dhcp::DhcpContext {
             start: Ipv4Addr::UNSPECIFIED,
             end: Ipv4Addr::UNSPECIFIED,
             router: Ipv4Addr::UNSPECIFIED,
-            flags: CONTEXT_DHCP,
+            flags: ContextFlags::DHCP,
             netmask: Ipv4Addr::UNSPECIFIED,
             broadcast: Ipv4Addr::UNSPECIFIED,
             local: Ipv4Addr::UNSPECIFIED,
@@ -5312,7 +5312,7 @@ mod tests {
             netmask: Ipv4Addr::UNSPECIFIED, broadcast: Ipv4Addr::UNSPECIFIED,
             local: Ipv4Addr::UNSPECIFIED, router: Ipv4Addr::UNSPECIFIED,
             start: Ipv4Addr::UNSPECIFIED, end: Ipv4Addr::UNSPECIFIED,
-            flags: crate::types::dhcp::CONTEXT_RA | crate::types::dhcp::CONTEXT_CONSTRUCTED,
+            flags: crate::types::dhcp::ContextFlags::RA | crate::types::dhcp::ContextFlags::CONSTRUCTED,
             netid: crate::types::dhcp::DhcpNetid { net: String::new() },
             filter: vec![],
             start6: global.addr, end6: global.addr, local6: Ipv6Addr::UNSPECIFIED,

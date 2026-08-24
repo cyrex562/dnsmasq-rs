@@ -13,11 +13,7 @@ use std::net::Ipv6Addr;
 #[cfg(feature = "dhcp6")]
 use crate::radv_protocol::{ICMP6_OPT_PREFIX, ICMP6_OPT_RDNSS, ICMP6_OPT_MTU, ICMP6_OPT_ADV_INTERVAL};
 #[cfg(feature = "dhcp6")]
-use crate::types::dhcp::{
-    DhcpContext, RaInterface, CONTEXT_TEMPLATE, CONTEXT_OLD, CONTEXT_RA, CONTEXT_DHCP,
-    CONTEXT_RA_STATELESS, CONTEXT_RA_ROUTER, CONTEXT_SETLEASE, CONTEXT_DEPRECATE,
-    CONTEXT_CONSTRUCTED, CONTEXT_RA_DONE, CONTEXT_RA_OFF_LINK,
-};
+use crate::types::dhcp::{DhcpContext, RaInterface, ContextFlags};
 #[cfg(feature = "dhcp6")]
 use crate::types::daemon::DhcpBridge;
 #[cfg(feature = "dhcp6")]
@@ -449,7 +445,7 @@ pub fn new_timeout_context(context: &mut DhcpContext, adv_interval: u32, now: u6
 #[cfg(feature = "dhcp6")]
 pub fn ra_start_unsolicited_all(contexts: &mut [DhcpContext], now: u64, mut rand16: impl FnMut() -> u16) {
     for context in contexts.iter_mut() {
-        if context.flags & CONTEXT_TEMPLATE != 0 {
+        if context.flags.contains(ContextFlags::TEMPLATE) {
             continue;
         }
         context.ra_time = now + (rand16() as u64) / 13000; // range 0 - 5
@@ -569,7 +565,7 @@ pub fn add_prefix_for_addr(
     let mut time: u32 = u32::MAX;
 
     for context in contexts.iter_mut() {
-        if context.flags & (CONTEXT_TEMPLATE | CONTEXT_OLD) != 0 {
+        if context.flags.intersects(ContextFlags::TEMPLATE | ContextFlags::OLD) {
             continue;
         }
         if addr.prefix > context.prefix {
@@ -583,11 +579,11 @@ pub fn add_prefix_for_addr(
 
         context.saved_valid = addr.valid;
 
-        if context.flags & CONTEXT_RA != 0 {
+        if context.flags.contains(ContextFlags::RA) {
             do_slaac = true;
-            if context.flags & CONTEXT_DHCP != 0 {
+            if context.flags.contains(ContextFlags::DHCP) {
                 param.other = true;
-                if context.flags & CONTEXT_RA_STATELESS == 0 {
+                if !context.flags.contains(ContextFlags::RA_STATELESS) {
                     param.managed = true;
                 }
             }
@@ -599,13 +595,13 @@ pub fn add_prefix_for_addr(
             param.other = true;
         }
 
-        if context.flags & CONTEXT_RA_ROUTER != 0 {
+        if context.flags.contains(ContextFlags::RA_ROUTER) {
             adv_router = true;
             param.adv_router = true;
             real_prefix = context.prefix as u8;
         }
 
-        if context.flags & CONTEXT_SETLEASE != 0 && time > context.lease_time {
+        if context.flags.contains(ContextFlags::SETLEASE) && time > context.lease_time {
             time = context.lease_time;
             let floor = 3 * param.adv_interval;
             if time < floor {
@@ -613,20 +609,20 @@ pub fn add_prefix_for_addr(
             }
         }
 
-        if context.flags & CONTEXT_DEPRECATE != 0 {
+        if context.flags.contains(ContextFlags::DEPRECATE) {
             deprecate = true;
         }
-        if context.flags & CONTEXT_CONSTRUCTED != 0 {
+        if context.flags.contains(ContextFlags::CONSTRUCTED) {
             constructed = true;
         }
 
-        if context.flags & CONTEXT_RA_DONE == 0 {
+        if !context.flags.contains(ContextFlags::RA_DONE) {
             if !param.first {
                 context.ra_time = 0;
             }
-            context.flags |= CONTEXT_RA_DONE;
+            context.flags.insert(ContextFlags::RA_DONE);
             real_prefix = context.prefix as u8;
-            off_link = context.flags & CONTEXT_RA_OFF_LINK != 0;
+            off_link = context.flags.contains(ContextFlags::RA_OFF_LINK);
         }
 
         param.first = false;
@@ -721,7 +717,7 @@ pub fn build_ra_for_interface(
     };
 
     for c in contexts.iter_mut() {
-        c.flags &= !CONTEXT_RA_DONE;
+        c.flags.remove(ContextFlags::RA_DONE);
     }
 
     let mut prefixes = Vec::new();
@@ -753,18 +749,18 @@ pub fn build_ra_for_interface(
     let mut old_prefix = false;
     let mut kept = Vec::with_capacity(contexts.len());
     for context in contexts.drain(..) {
-        if context.if_index as u32 == params.if_index && context.flags & CONTEXT_OLD != 0 {
+        if context.if_index as u32 == params.if_index && context.flags.contains(ContextFlags::OLD) {
             let old = (params.now.saturating_sub(context.address_lost_time)) as u32;
             if old > context.saved_valid {
                 // Advertised enough; drop it.
                 continue;
             }
             old_prefix = true;
-            let do_slaac = context.flags & CONTEXT_RA != 0;
+            let do_slaac = context.flags.contains(ContextFlags::RA);
             if do_slaac {
-                if context.flags & CONTEXT_DHCP != 0 {
+                if context.flags.contains(ContextFlags::DHCP) {
                     param.other = true;
-                    if context.flags & CONTEXT_RA_STATELESS == 0 {
+                    if !context.flags.contains(ContextFlags::RA_STATELESS) {
                         param.managed = true;
                     }
                 }
@@ -772,7 +768,7 @@ pub fn build_ra_for_interface(
                 param.managed = true;
                 param.other = true;
             }
-            let off_link = context.flags & CONTEXT_RA_OFF_LINK != 0;
+            let off_link = context.flags.contains(ContextFlags::RA_OFF_LINK);
             let local = zero_host_part(context.start6, context.prefix as u8);
             prefixes.push(RaPrefix {
                 prefix: local,
@@ -1013,7 +1009,7 @@ pub fn periodic_ra(
 
         let mut target: Option<RaSendTarget> = None;
 
-        if contexts[idx].flags & CONTEXT_OLD != 0 && contexts[idx].if_index != 0 {
+        if contexts[idx].flags.contains(ContextFlags::OLD) && contexts[idx].if_index != 0 {
             let if_index = contexts[idx].if_index as u32;
             if let Some(name) = resolve_stale_name(if_index) {
                 let adv_interval = calc_interval(find_iface_param(ra_interfaces, &name));
@@ -1082,7 +1078,7 @@ pub fn periodic_ra(
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
-    use crate::types::dhcp::{DhcpNetid, CONTEXT_DHCP, CONTEXT_RA};
+    use crate::types::dhcp::{ContextFlags, DhcpNetid};
 
     fn sample_ra() -> RouterAdvertisement {
         RouterAdvertisement {
@@ -1481,7 +1477,7 @@ mod tests {
             // default a plain static range gets (see the
             // `add_prefix_for_addr_no_matching_context_returns_none` test
             // below for that other case).
-            flags: CONTEXT_DHCP | CONTEXT_RA | CONTEXT_CONSTRUCTED,
+            flags: ContextFlags::DHCP | ContextFlags::RA | ContextFlags::CONSTRUCTED,
             netid: DhcpNetid { net: String::new() },
             filter: vec![],
             start6: "2001:db8::".parse().unwrap(),
@@ -1507,7 +1503,7 @@ mod tests {
     #[test]
     fn ra_start_unsolicited_all_skips_template_contexts() {
         let mut ctx = base_ctx();
-        ctx.flags |= CONTEXT_TEMPLATE;
+        ctx.flags.insert(ContextFlags::TEMPLATE);
         let mut ctxs = vec![ctx];
         ra_start_unsolicited_all(&mut ctxs, 1000, || 0);
         assert_eq!(ctxs[0].ra_time, 0);
@@ -1566,7 +1562,7 @@ mod tests {
         assert!(!p.router);
         // zeroed host part
         assert_eq!(p.prefix, "2001:db8::".parse::<Ipv6Addr>().unwrap());
-        assert!(ctxs[0].flags & CONTEXT_RA_DONE != 0);
+        assert!(ctxs[0].flags.contains(ContextFlags::RA_DONE));
         assert_eq!(ctxs[0].saved_valid, 2000);
         assert!(param.found_context);
     }
@@ -1599,7 +1595,7 @@ mod tests {
     #[test]
     fn add_prefix_for_addr_non_ra_context_needs_opt_ra() {
         let mut ctx = base_ctx();
-        ctx.flags = CONTEXT_DHCP; // no CONTEXT_RA
+        ctx.flags = ContextFlags::DHCP; // no CONTEXT_RA
         let mut ctxs = vec![ctx];
         let addr = live_addr(5, "2001:db8::1234", 64, 1000, 2000);
 
@@ -1678,7 +1674,7 @@ mod tests {
     #[test]
     fn build_ra_for_interface_old_context_advertised_deprecated() {
         let mut ctx = base_ctx();
-        ctx.flags |= CONTEXT_OLD;
+        ctx.flags.insert(ContextFlags::OLD);
         ctx.if_index = 5;
         ctx.saved_valid = 500;
         ctx.address_lost_time = 900; // 100s ago at now=1000
@@ -1696,7 +1692,7 @@ mod tests {
     #[test]
     fn build_ra_for_interface_old_context_expires_and_is_removed() {
         let mut ctx = base_ctx();
-        ctx.flags |= CONTEXT_OLD;
+        ctx.flags.insert(ContextFlags::OLD);
         ctx.if_index = 5;
         ctx.saved_valid = 50;
         ctx.address_lost_time = 900; // 100s ago at now=1000, past saved_valid
@@ -1833,7 +1829,7 @@ mod tests {
     #[test]
     fn periodic_ra_iface_check_blocks_old_context() {
         let mut ctx = base_ctx();
-        ctx.flags |= CONTEXT_OLD;
+        ctx.flags.insert(ContextFlags::OLD);
         ctx.if_index = 7;
         ctx.ra_time = 900;
         let mut ctxs = vec![ctx];
@@ -1864,7 +1860,7 @@ mod tests {
     #[test]
     fn periodic_ra_old_context_uses_stale_resolver() {
         let mut ctx = base_ctx();
-        ctx.flags |= CONTEXT_OLD;
+        ctx.flags.insert(ContextFlags::OLD);
         ctx.if_index = 7;
         ctx.ra_time = 900;
         let mut ctxs = vec![ctx];
@@ -1877,7 +1873,7 @@ mod tests {
     #[test]
     fn periodic_ra_old_context_unresolvable_gives_up() {
         let mut ctx = base_ctx();
-        ctx.flags |= CONTEXT_OLD;
+        ctx.flags.insert(ContextFlags::OLD);
         ctx.if_index = 7;
         ctx.ra_time = 900;
         let mut ctxs = vec![ctx];
