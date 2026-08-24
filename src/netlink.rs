@@ -68,11 +68,20 @@ const NLM_F_ACK:     u16 = 4;
 pub const STATE_NEWADDR:  u32 = 1 << 0;
 pub const STATE_NEWROUTE: u32 = 1 << 1;
 
-/// Interface address flags (mirrors C `IFACE_*` constants).
-pub const IFACE_TENTATIVE:  u32 = 1;
-pub const IFACE_DEPRECATED: u32 = 2;
-pub const IFACE_PERMANENT:  u32 = 4;
-pub const IFACE_USED:       u32 = 8;
+bitflags::bitflags! {
+    /// Interface address flags (mirrors C `IFACE_*` constants) — DAD/
+    /// deprecation/permanence state for one address, as derived from a
+    /// netlink `RTM_NEWADDR` message's `ifa_flags`. Distinct from
+    /// `types::network::IfaceNameFlags`, which restricts an
+    /// `--interface`-style deny-list entry to a name and/or address family.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct IfaceAddrFlags: u32 {
+        const TENTATIVE  = 1 << 0;
+        const DEPRECATED = 1 << 1;
+        const PERMANENT  = 1 << 2;
+        const USED       = 1 << 3;
+    }
+}
 
 // ── Netlink message header layout ────────────────────────────────────────────
 /// Size of `struct nlmsghdr` (16 bytes).
@@ -180,7 +189,7 @@ pub enum IfaceRecord {
         prefix_len: u8,
         scope:      u8,
         if_index:   u32,
-        flags:      u32,
+        flags:      IfaceAddrFlags,
         preferred:  u32,
         valid:      u32,
     },
@@ -279,10 +288,10 @@ pub fn parse_newaddr_record(msg: &[u8]) -> Option<IfaceRecord> {
                 }
             });
             let addr = Ipv6Addr::from(addr_bytes?);
-            let mut flags = 0u32;
-            if ifa_flags & IFA_F_TENTATIVE  != 0 { flags |= IFACE_TENTATIVE; }
-            if ifa_flags & IFA_F_DEPRECATED != 0 { flags |= IFACE_DEPRECATED; }
-            if ifa_flags & IFA_F_TEMPORARY  == 0 { flags |= IFACE_PERMANENT; }
+            let mut flags = IfaceAddrFlags::empty();
+            if ifa_flags & IFA_F_TENTATIVE  != 0 { flags.insert(IfaceAddrFlags::TENTATIVE); }
+            if ifa_flags & IFA_F_DEPRECATED != 0 { flags.insert(IfaceAddrFlags::DEPRECATED); }
+            if ifa_flags & IFA_F_TEMPORARY  == 0 { flags.insert(IfaceAddrFlags::PERMANENT); }
             Some(IfaceRecord::V6 { addr, prefix_len, scope, if_index, flags, preferred, valid })
         }
         _ => None,
@@ -1082,7 +1091,7 @@ mod tests {
                 assert_eq!(addr, ip);
                 assert_eq!(prefix_len, 64);
                 assert_eq!(if_index, 3);
-                assert_eq!(flags & IFACE_PERMANENT, 0); // temporary → not permanent
+                assert!(!flags.contains(IfaceAddrFlags::PERMANENT)); // temporary → not permanent
             }
             other => panic!("expected V6, got {:?}", other),
         }
@@ -1101,7 +1110,7 @@ mod tests {
         let rec = parse_newaddr_record(&msg).unwrap();
         match rec {
             IfaceRecord::V6 { flags, .. } => {
-                assert_ne!(flags & IFACE_PERMANENT, 0);
+                assert!(flags.contains(IfaceAddrFlags::PERMANENT));
             }
             other => panic!("expected V6, got {:?}", other),
         }

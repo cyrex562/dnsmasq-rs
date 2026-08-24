@@ -219,8 +219,8 @@ pub fn enumerate_interfaces_netlink() -> std::io::Result<Vec<IfaceInfo>> {
                     netmask: Some(IpAddr::V6(netmask)),
                     flags: 0,
                     label: None,
-                    dad: flags & netlink::IFACE_TENTATIVE != 0,
-                    deprecated: flags & netlink::IFACE_DEPRECATED != 0,
+                    dad: flags.contains(netlink::IfaceAddrFlags::TENTATIVE),
+                    deprecated: flags.contains(netlink::IfaceAddrFlags::DEPRECATED),
                 });
             }
             _ => {}
