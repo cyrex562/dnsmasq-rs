@@ -52,19 +52,12 @@ pub fn parse_dhcp6_packet(pkt: &[u8]) -> Result<Dhcp6Packet, Dhcp6Error> {
     let txn_id = [pkt[1], pkt[2], pkt[3]];
 
     let mut options = Vec::new();
-    let mut pos = 4usize;
-    while pos < pkt.len() {
-        if pos + 4 > pkt.len() {
-            return Err(Dhcp6Error::MalformedOption);
-        }
-        let code = u16::from_be_bytes([pkt[pos], pkt[pos + 1]]);
-        let len  = u16::from_be_bytes([pkt[pos + 2], pkt[pos + 3]]) as usize;
-        pos += 4;
-        if pos + len > pkt.len() {
-            return Err(Dhcp6Error::MalformedOption);
-        }
-        options.push(Dhcp6Option { code, data: pkt[pos..pos + len].to_vec() });
-        pos += len;
+    let mut c = crate::byte_cursor::ByteCursor::at(pkt, 4);
+    while !c.is_empty() {
+        let code = c.read_u16_be().ok_or(Dhcp6Error::MalformedOption)?;
+        let len  = c.read_u16_be().ok_or(Dhcp6Error::MalformedOption)? as usize;
+        let data = c.read_slice(len).ok_or(Dhcp6Error::MalformedOption)?;
+        options.push(Dhcp6Option { code, data: data.to_vec() });
     }
 
     Ok(Dhcp6Packet { msg_type, txn_id, options })
@@ -224,9 +217,9 @@ pub fn handle_request6(
 #[cfg(feature = "dhcp6")]
 pub fn opt6_find(mut opts: &[u8], search: u16, minsize: usize) -> Option<&[u8]> {
     loop {
-        if opts.len() < 4 { return None; }
-        let code = u16::from_be_bytes([opts[0], opts[1]]);
-        let len  = u16::from_be_bytes([opts[2], opts[3]]) as usize;
+        let mut c = crate::byte_cursor::ByteCursor::new(opts);
+        let code = c.read_u16_be()?;
+        let len  = c.read_u16_be()? as usize;
         if 4 + len > opts.len() { return None; }
         if code == search && len >= minsize {
             return Some(&opts[..4 + len]);
@@ -243,8 +236,9 @@ pub fn opt6_find(mut opts: &[u8], search: u16, minsize: usize) -> Option<&[u8]> 
 /// Mirrors `opt6_next()` in `rfc3315.c`.
 #[cfg(feature = "dhcp6")]
 pub fn opt6_next(opts: &[u8]) -> Option<&[u8]> {
-    if opts.len() < 4 { return None; }
-    let len = u16::from_be_bytes([opts[2], opts[3]]) as usize;
+    let mut c = crate::byte_cursor::ByteCursor::new(opts);
+    c.advance(2)?; // skip the code field
+    let len = c.read_u16_be()? as usize;
     let next = 4 + len;
     if next >= opts.len() { return None; }
     Some(&opts[next..])
