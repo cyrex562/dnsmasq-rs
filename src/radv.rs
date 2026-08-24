@@ -21,7 +21,7 @@ use crate::types::dhcp::{
 #[cfg(feature = "dhcp6")]
 use crate::types::daemon::DhcpBridge;
 #[cfg(feature = "dhcp6")]
-use crate::types::network::{Iname, INAME_6};
+use crate::types::network::{Iname, IfaceNameFlags};
 #[cfg(feature = "dhcp6")]
 use crate::dhcp6::{LiveAddr6, is_same_net6};
 #[cfg(feature = "dhcp6")]
@@ -890,7 +890,7 @@ pub const ICMP6_ECHO_REPLY: u8 = 129;
 #[cfg(feature = "dhcp6")]
 pub fn blocked_by_dhcp_except(iface_name: &str, dhcp_except: &[Iname]) -> bool {
     dhcp_except.iter().any(|e| {
-        e.flags & INAME_6 != 0
+        e.flags.contains(IfaceNameFlags::V6)
             && e.name.as_deref().is_some_and(|n| wildcard_match(n, iface_name))
     })
 }
@@ -1740,14 +1740,14 @@ mod tests {
 
     #[test]
     fn blocked_by_dhcp_except_matches_v6_flagged_name() {
-        let except = vec![Iname { name: Some("eth0".to_string()), addr: None, flags: INAME_6 }];
+        let except = vec![Iname { name: Some("eth0".to_string()), addr: None, flags: IfaceNameFlags::V6 }];
         assert!(blocked_by_dhcp_except("eth0", &except));
         assert!(!blocked_by_dhcp_except("eth1", &except));
     }
 
     #[test]
     fn blocked_by_dhcp_except_ignores_v4_only_flag() {
-        let except = vec![Iname { name: Some("eth0".to_string()), addr: None, flags: crate::types::network::INAME_4 }];
+        let except = vec![Iname { name: Some("eth0".to_string()), addr: None, flags: crate::types::network::IfaceNameFlags::V4 }];
         assert!(!blocked_by_dhcp_except("eth0", &except));
     }
 
@@ -1812,7 +1812,7 @@ mod tests {
         ctx.ra_time = 900;
         let mut ctxs = vec![ctx];
         let ifaces = vec![live_iface(5, "eth0", "2001:db8::1", 64)];
-        let except = vec![Iname { name: Some("eth0".to_string()), addr: None, flags: INAME_6 }];
+        let except = vec![Iname { name: Some("eth0".to_string()), addr: None, flags: IfaceNameFlags::V6 }];
         let (targets, _next) = periodic_ra(1000, &mut ctxs, &ifaces, &[], &except, || 0, |_| None, |_| true);
         assert!(targets.is_empty());
         assert_eq!(ctxs[0].ra_time, 0);

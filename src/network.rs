@@ -1,5 +1,5 @@
 use std::net::{Ipv4Addr, Ipv6Addr, IpAddr};
-use crate::types::network::{INAME_4, INAME_6};
+use crate::types::network::IfaceNameFlags;
 
 /// `IFF_LOOPBACK` — the one interface flag this module needs from `SIOCGIFFLAGS`.
 pub const IFACE_LOOPBACK: u32 = 0x8;
@@ -1842,7 +1842,7 @@ pub struct IfaceAllowedConfig {
     /// Interface name / pattern denylist, paired with the `INAME_4`/`INAME_6`
     /// family bits it applies to (mirrors `struct iname.flags` in
     /// `dnsmasq.h`). TFTP is disabled on any name match regardless of family.
-    pub dhcp_except:   Vec<(String, u32)>,
+    pub dhcp_except:   Vec<(String, IfaceNameFlags)>,
     /// If non-empty, only these interfaces get TFTP service.
     pub tftp_ifaces:   Vec<String>,
     /// `--auth-server=<domain>[,interface|ip-address...]` (`daemon->authinterface`).
@@ -1861,8 +1861,8 @@ pub struct AuthInterface {
     /// as a family restriction (unspecified address) alongside `name`.
     pub addr:  Option<IpAddr>,
     /// `INAME_4`/`INAME_6`: restricts a name-based entry to one family.
-    /// `0` (upstream's `sa_family == 0`) means "either family".
-    pub flags: u32,
+    /// Empty (upstream's `sa_family == 0`) means "either family".
+    pub flags: IfaceNameFlags,
 }
 
 /// Decide whether `(name, addr)` is served as an auth-DNS interface.
@@ -1874,12 +1874,12 @@ pub struct AuthInterface {
 pub fn auth_interface_match(name: &str, addr: IpAddr, entries: &[AuthInterface]) -> bool {
     for entry in entries {
         if let Some(ename) = &entry.name {
-            let family_ok = if entry.flags & (INAME_4 | INAME_6) == 0 {
+            let family_ok = if !entry.flags.intersects(IfaceNameFlags::V4 | IfaceNameFlags::V6) {
                 true
             } else {
                 match addr {
-                    IpAddr::V4(_) => entry.flags & INAME_4 != 0,
-                    IpAddr::V6(_) => entry.flags & INAME_6 != 0,
+                    IpAddr::V4(_) => entry.flags.contains(IfaceNameFlags::V4),
+                    IpAddr::V6(_) => entry.flags.contains(IfaceNameFlags::V6),
                 }
             };
             if ename == name && family_ok {
@@ -1969,7 +1969,7 @@ pub fn iface_allowed_v4(
         for (pat, flags) in &config.dhcp_except {
             if iface_name_matches(name, pat) {
                 tftp_denied = true;
-                if flags & INAME_4 != 0 {
+                if flags.contains(IfaceNameFlags::V4) {
                     dhcp4_ok = false;
                 }
             }
@@ -2047,7 +2047,7 @@ pub fn iface_allowed_v6(
         for (pat, flags) in &config.dhcp_except {
             if iface_name_matches(name, pat) {
                 tftp_denied = true;
-                if flags & INAME_6 != 0 {
+                if flags.contains(IfaceNameFlags::V6) {
                     dhcp6_ok = false;
                 }
             }
@@ -3609,7 +3609,7 @@ mod tests {
     #[test]
     fn iface_allowed_v4_dhcp_except_disables_dhcp() {
         let cfg = IfaceAllowedConfig {
-            dhcp_except: vec![("eth0".to_string(), INAME_4 | INAME_6)],
+            dhcp_except: vec![("eth0".to_string(), IfaceNameFlags::V4 | IfaceNameFlags::V6)],
             ..Default::default()
         };
         let rec = iface_allowed_v4(
@@ -3627,7 +3627,7 @@ mod tests {
     fn iface_allowed_v4_no_dhcpv6_interface_leaves_v4_enabled() {
         // `no-dhcpv6-interface=eth0` stores only INAME_6 — v4 must stay on.
         let cfg = IfaceAllowedConfig {
-            dhcp_except: vec![("eth0".to_string(), INAME_6)],
+            dhcp_except: vec![("eth0".to_string(), IfaceNameFlags::V6)],
             ..Default::default()
         };
         let rec = iface_allowed_v4(
@@ -3644,7 +3644,7 @@ mod tests {
     fn iface_allowed_v6_no_dhcpv4_interface_leaves_v6_enabled() {
         // `no-dhcpv4-interface=eth0` stores only INAME_4 — v6 must stay on.
         let cfg = IfaceAllowedConfig {
-            dhcp_except: vec![("eth0".to_string(), INAME_4)],
+            dhcp_except: vec![("eth0".to_string(), IfaceNameFlags::V4)],
             ..Default::default()
         };
         let rec = iface_allowed_v6(
@@ -3660,7 +3660,7 @@ mod tests {
     #[test]
     fn iface_allowed_v6_no_dhcpv6_interface_disables_v6() {
         let cfg = IfaceAllowedConfig {
-            dhcp_except: vec![("eth0".to_string(), INAME_6)],
+            dhcp_except: vec![("eth0".to_string(), IfaceNameFlags::V6)],
             ..Default::default()
         };
         let rec = iface_allowed_v6(
@@ -3719,7 +3719,7 @@ mod tests {
 
     #[test]
     fn auth_interface_match_by_name_any_family() {
-        let entries = vec![AuthInterface { name: Some("eth0".to_string()), addr: None, flags: 0 }];
+        let entries = vec![AuthInterface { name: Some("eth0".to_string()), addr: None, flags: IfaceNameFlags::empty() }];
         assert!(auth_interface_match("eth0", IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), &entries));
         assert!(auth_interface_match("eth0", "2001:db8::1".parse().unwrap(), &entries));
         assert!(!auth_interface_match("eth1", IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), &entries));
@@ -3727,7 +3727,7 @@ mod tests {
 
     #[test]
     fn auth_interface_match_by_name_family_restricted() {
-        let entries = vec![AuthInterface { name: Some("eth0".to_string()), addr: None, flags: INAME_4 }];
+        let entries = vec![AuthInterface { name: Some("eth0".to_string()), addr: None, flags: IfaceNameFlags::V4 }];
         assert!(auth_interface_match("eth0", IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), &entries));
         assert!(!auth_interface_match("eth0", "2001:db8::1".parse().unwrap(), &entries));
     }
@@ -3735,7 +3735,7 @@ mod tests {
     #[test]
     fn auth_interface_match_by_address() {
         let addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-        let entries = vec![AuthInterface { name: None, addr: Some(addr), flags: 0 }];
+        let entries = vec![AuthInterface { name: None, addr: Some(addr), flags: IfaceNameFlags::empty() }];
         assert!(auth_interface_match("eth0", addr, &entries));
         assert!(!auth_interface_match("eth0", IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), &entries));
     }
@@ -3754,7 +3754,7 @@ mod tests {
             ..Default::default()
         };
         let allowed_cfg = IfaceAllowedConfig {
-            auth_interfaces: vec![AuthInterface { name: Some("eth0".to_string()), addr: None, flags: 0 }],
+            auth_interfaces: vec![AuthInterface { name: Some("eth0".to_string()), addr: None, flags: IfaceNameFlags::empty() }],
             ..Default::default()
         };
         let rec = iface_allowed_v4(
@@ -3773,7 +3773,7 @@ mod tests {
     fn iface_allowed_v4_auth_server_by_address() {
         let addr = Ipv4Addr::new(192, 168, 1, 1);
         let allowed_cfg = IfaceAllowedConfig {
-            auth_interfaces: vec![AuthInterface { name: None, addr: Some(IpAddr::V4(addr)), flags: 0 }],
+            auth_interfaces: vec![AuthInterface { name: None, addr: Some(IpAddr::V4(addr)), flags: IfaceNameFlags::empty() }],
             ..Default::default()
         };
         let rec = iface_allowed_v4(
@@ -3801,7 +3801,7 @@ mod tests {
     fn iface_allowed_v6_auth_server_disables_dhcp6_and_tftp() {
         let addr: Ipv6Addr = "2001:db8::1".parse().unwrap();
         let allowed_cfg = IfaceAllowedConfig {
-            auth_interfaces: vec![AuthInterface { name: Some("eth0".to_string()), addr: None, flags: 0 }],
+            auth_interfaces: vec![AuthInterface { name: Some("eth0".to_string()), addr: None, flags: IfaceNameFlags::empty() }],
             ..Default::default()
         };
         let rec = iface_allowed_v6(

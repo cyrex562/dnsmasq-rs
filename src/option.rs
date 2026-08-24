@@ -16,7 +16,7 @@ use crate::types::dns_records::{
     InterfaceName, MxSrvRecord, Naptr, PtrRecord, RrList, TxtRecord, ADDRLIST_IPV6,
     ADDRLIST_LITERAL, IN4, IN6, INP4, INP6,
 };
-use crate::types::network::{Allowlist, DynDir, DynDirFlags, HostsFile, Iname, Ipsets, MySubnet, INAME_4, INAME_6};
+use crate::types::network::{Allowlist, DynDir, DynDirFlags, HostsFile, IfaceNameFlags, Iname, Ipsets, MySubnet};
 use crate::types::server::{Server, SERV_4ADDR, SERV_6ADDR, SERV_ALL_ZEROS, SERV_LITERAL_ADDRESS};
 use crate::types::daemon::{DhcpBridge, SharedNetwork};
 use crate::domain::CondDomain;
@@ -759,7 +759,7 @@ fn apply_local_service_defaults(daemon: &mut Daemon) {
         daemon.if_names.push(Iname {
             name: None,
             addr: None,
-            flags: 0,
+            flags: IfaceNameFlags::empty(),
         });
         daemon.set_option(OPT_NOWILD);
     }
@@ -1309,19 +1309,19 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             daemon.if_addrs.push(Iname {
                 name: None,
                 addr: Some(sock),
-                flags: 0,
+                flags: IfaceNameFlags::empty(),
             });
         }
 
         // ── interface / except-interface ───────────────────────────────────
         "interface" => {
             let v = require_value("interface")?;
-            daemon.if_names.push(Iname { name: Some(v.to_string()), addr: None, flags: 0 });
+            daemon.if_names.push(Iname { name: Some(v.to_string()), addr: None, flags: IfaceNameFlags::empty() });
         }
 
         "except-interface" => {
             let v = require_value("except-interface")?;
-            daemon.if_except.push(Iname { name: Some(v.to_string()), addr: None, flags: 0 });
+            daemon.if_except.push(Iname { name: Some(v.to_string()), addr: None, flags: IfaceNameFlags::empty() });
         }
 
         // ── server ─────────────────────────────────────────────────────────
@@ -1642,7 +1642,7 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
 
         "no-dhcp-interface" => {
             let v = require_value("no-dhcp-interface")?;
-            daemon.dhcp_except.push(Iname { name: Some(v.to_string()), addr: None, flags: 0 });
+            daemon.dhcp_except.push(Iname { name: Some(v.to_string()), addr: None, flags: IfaceNameFlags::empty() });
         }
 
         // `--no-dhcpv4-interface` / `--no-dhcpv6-interface` (option.c:2898,
@@ -1651,12 +1651,12 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
         // (`option.c:2905-2914`).
         "no-dhcpv4-interface" => {
             let v = require_value("no-dhcpv4-interface")?;
-            daemon.dhcp_except.push(Iname { name: Some(v.to_string()), addr: None, flags: INAME_4 });
+            daemon.dhcp_except.push(Iname { name: Some(v.to_string()), addr: None, flags: IfaceNameFlags::V4 });
         }
 
         "no-dhcpv6-interface" => {
             let v = require_value("no-dhcpv6-interface")?;
-            daemon.dhcp_except.push(Iname { name: Some(v.to_string()), addr: None, flags: INAME_6 });
+            daemon.dhcp_except.push(Iname { name: Some(v.to_string()), addr: None, flags: IfaceNameFlags::V6 });
         }
 
         // `--dhcp-duid` (option.c:4857): `enterprise-number,hex-id`.
@@ -2870,7 +2870,7 @@ fn parse_tftp_interfaces(value: &str, cl: &ConfigLine) -> Result<Vec<Iname>, Con
         interfaces.push(Iname {
             name: Some(part.to_string()),
             addr: None,
-            flags: INAME_4 | INAME_6,
+            flags: IfaceNameFlags::V4 | IfaceNameFlags::V6,
         });
     }
     Ok(interfaces)
@@ -2988,7 +2988,7 @@ fn parse_auth_peers(value: &str, cl: &ConfigLine) -> Result<Vec<Iname>, ConfigEr
         out.push(Iname {
             name: None,
             addr: Some(addr),
-            flags: 0,
+            flags: IfaceNameFlags::empty(),
         });
     }
 
@@ -3030,19 +3030,19 @@ fn parse_auth_server_interface(token: &str, cl: &ConfigLine) -> Result<Iname, Co
         return Ok(Iname {
             name: None,
             addr: Some(addr),
-            flags: 0,
+            flags: IfaceNameFlags::empty(),
         });
     }
 
     let (name, family) = parse_interface_family(token, "auth-server", cl)?;
-    let mut flags = 0;
+    let mut flags = IfaceNameFlags::empty();
     let addr = match family {
         Some(4) => {
-            flags |= INAME_4;
+            flags.insert(IfaceNameFlags::V4);
             Some(MySockAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
         }
         Some(6) => {
-            flags |= INAME_6;
+            flags.insert(IfaceNameFlags::V6);
             Some(MySockAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)))
         }
         Some(_) => unreachable!(),
@@ -6069,9 +6069,9 @@ mod tests {
         apply_config(&mut d, &lines).unwrap();
         assert_eq!(d.dhcp_except.len(), 2);
         assert_eq!(d.dhcp_except[0].name.as_deref(), Some("eth0"));
-        assert_eq!(d.dhcp_except[0].flags, INAME_4);
+        assert_eq!(d.dhcp_except[0].flags, IfaceNameFlags::V4);
         assert_eq!(d.dhcp_except[1].name.as_deref(), Some("eth1"));
-        assert_eq!(d.dhcp_except[1].flags, INAME_6);
+        assert_eq!(d.dhcp_except[1].flags, IfaceNameFlags::V6);
     }
 
     // connmark-allowlist{,-enable} mirror upstream's `#ifndef HAVE_CONNTRACK`
@@ -6436,9 +6436,9 @@ mod tests {
         assert!(d.option_bool(OPT_TFTP));
         assert_eq!(d.tftp_interfaces.len(), 2);
         assert_eq!(d.tftp_interfaces[0].name, Some("eth0".to_string()));
-        assert_eq!(d.tftp_interfaces[0].flags, INAME_4 | INAME_6);
+        assert_eq!(d.tftp_interfaces[0].flags, IfaceNameFlags::V4 | IfaceNameFlags::V6);
         assert_eq!(d.tftp_interfaces[1].name, Some("br-lan".to_string()));
-        assert_eq!(d.tftp_interfaces[1].flags, INAME_4 | INAME_6);
+        assert_eq!(d.tftp_interfaces[1].flags, IfaceNameFlags::V4 | IfaceNameFlags::V6);
     }
 
     #[test]
@@ -7341,7 +7341,7 @@ mod tests {
         assert_eq!(d.auth_interfaces.len(), 2);
 
         assert_eq!(d.auth_interfaces[0].name, Some("eth0".to_string()));
-        assert_eq!(d.auth_interfaces[0].flags, INAME_4);
+        assert_eq!(d.auth_interfaces[0].flags, IfaceNameFlags::V4);
         assert!(d.auth_interfaces[0].addr.as_ref().unwrap().is_v4());
 
         assert_eq!(d.auth_interfaces[1].name, None);
@@ -7416,7 +7416,7 @@ mod tests {
         assert_eq!(d.auth_peers.len(), 2);
         assert_eq!(d.auth_peers[0].addr.as_ref().unwrap().ip(), IpAddr::V4("192.0.2.53".parse().unwrap()));
         assert_eq!(d.auth_peers[1].addr.as_ref().unwrap().ip(), IpAddr::V6("2001:db8::53".parse().unwrap()));
-        assert!(d.auth_peers.iter().all(|peer| peer.name.is_none() && peer.flags == 0));
+        assert!(d.auth_peers.iter().all(|peer| peer.name.is_none() && peer.flags == IfaceNameFlags::empty()));
     }
 
     #[test]

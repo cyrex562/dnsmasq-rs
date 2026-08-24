@@ -5,13 +5,18 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use crate::types::addr::MySockAddr;
 
-pub const IFACE_TENTATIVE:  u32 = 1;
-pub const IFACE_DEPRECATED: u32 = 2;
-pub const IFACE_PERMANENT:  u32 = 4;
-
-pub const INAME_USED: u32 = 1;
-pub const INAME_4:    u32 = 2;
-pub const INAME_6:    u32 = 4;
+bitflags::bitflags! {
+    /// `struct iname`'s deny-list/family-restriction flags (upstream
+    /// `INAME_*` constants in `dnsmasq.h`), used by `Iname`/`AuthInterface`
+    /// entries built from `--interface`, `--except-interface`,
+    /// `--no-dhcp-interface`, `--auth-server`, and `--enable-tftp`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct IfaceNameFlags: u32 {
+        const USED = 1 << 0;
+        const V4   = 1 << 1;
+        const V6   = 1 << 2;
+    }
+}
 
 /// A network interface record (`struct irec`).
 #[derive(Debug, Clone)]
@@ -51,7 +56,7 @@ pub struct Listener {
 pub struct Iname {
     pub name:  Option<String>,
     pub addr:  Option<MySockAddr>,
-    pub flags: u32,
+    pub flags: IfaceNameFlags,
 }
 
 /// Subnet parameter from the command line (`struct mysubnet`).
@@ -128,14 +133,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn iface_flags_distinct() {
-        assert_ne!(IFACE_TENTATIVE, IFACE_DEPRECATED);
-        assert_ne!(IFACE_DEPRECATED, IFACE_PERMANENT);
-    }
-
-    #[test]
     fn iname_default() {
-        let i = Iname { name: None, addr: None, flags: INAME_USED };
-        assert_eq!(i.flags, INAME_USED);
+        let i = Iname { name: None, addr: None, flags: IfaceNameFlags::USED };
+        assert_eq!(i.flags, IfaceNameFlags::USED);
     }
 }

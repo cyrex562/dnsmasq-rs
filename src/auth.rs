@@ -22,7 +22,7 @@ use crate::types::dns_records::{
     Addrlist, AuthZone, Cname, InterfaceName, MxSrvRecord, Naptr, TxtRecord, ADDRLIST_IPV6,
     ADDRLIST_REVONLY,
 };
-use crate::types::network::Iname;
+use crate::types::network::{Iname, IfaceNameFlags};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Public types
@@ -1234,7 +1234,7 @@ mod tests {
     #[test]
     fn axfr_allowed_for_listed_auth_peer() {
         let mut fx = Fixture::new();
-        fx.auth_peers.push(Iname { name: None, addr: Some(MySockAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 1), 0))), flags: 0 });
+        fx.auth_peers.push(Iname { name: None, addr: Some(MySockAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 1), 0))), flags: IfaceNameFlags::empty() });
         fx.int_names.push(int_names_with_addr("example.com", "www", Ipv4Addr::new(9, 9, 9, 9)));
         let q = make_query("example.com", RrType::AXFR);
         let mut config = fx.config();
@@ -1263,7 +1263,7 @@ mod tests {
         fx.auth_peers.push(Iname {
             name: None,
             addr: Some(MySockAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0))),
-            flags: 0,
+            flags: IfaceNameFlags::empty(),
         });
         let q = make_query("example.com", RrType::AXFR);
         let mut config = fx.config();

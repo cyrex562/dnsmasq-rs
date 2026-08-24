@@ -4098,18 +4098,18 @@ mod tests {
     #[test]
     fn daemon_dhcp_runtime_uses_listen_address_interface_and_alt_client_port() {
         use crate::types::dhcp::{DhcpContext, DhcpNetid, CONTEXT_DHCP};
-        use crate::types::network::Iname;
+        use crate::types::network::{Iname, IfaceNameFlags};
 
         let mut daemon = Daemon::default();
         daemon.if_addrs.push(Iname {
             name: None,
             addr: Some(MySockAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 0))),
-            flags: 0,
+            flags: IfaceNameFlags::empty(),
         });
         daemon.if_names.push(Iname {
             name: Some("eth-test".into()),
             addr: None,
-            flags: 0,
+            flags: IfaceNameFlags::empty(),
         });
         daemon.dhcp.push(DhcpContext {
             lease_time: 3600,
@@ -4166,15 +4166,15 @@ mod tests {
     fn daemon_dhcp_runtime_binds_relay_iface_index_to_matching_local_addr() {
         use crate::types::addr::AllAddr;
         use crate::types::dhcp::{DhcpContext, DhcpNetid, DhcpRelay, CONTEXT_DHCP};
-        use crate::types::network::Iname;
+        use crate::types::network::{Iname, IfaceNameFlags};
 
         let mut daemon = Daemon::default();
         daemon.if_addrs.push(Iname {
             name: None,
             addr: Some(MySockAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))),
-            flags: 0,
+            flags: IfaceNameFlags::empty(),
         });
-        daemon.if_names.push(Iname { name: Some("lo".into()), addr: None, flags: 0 });
+        daemon.if_names.push(Iname { name: Some("lo".into()), addr: None, flags: IfaceNameFlags::empty() });
         daemon.dhcp.push(DhcpContext {
             lease_time: 3600,
             addr_epoch: 0,
