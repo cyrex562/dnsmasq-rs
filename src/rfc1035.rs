@@ -59,8 +59,8 @@ const PACKETSZ: usize = 512;
 /// [`DnsError::NameTooLong`] if the wire-format name exceeds 255 bytes, and
 /// [`DnsError::UnexpectedEof`] / [`DnsError::PacketTooShort`] on truncation.
 pub fn extract_name(pkt: &[u8], offset: &mut usize) -> Result<String, DnsError> {
+    let mut c = crate::byte_cursor::ByteCursor::at(pkt, *offset);
     let mut labels: Vec<String> = Vec::new();
-    let mut pos = *offset;
     // Byte-position to restore `*offset` to once we have followed ≥1 pointer.
     let mut end_offset: Option<usize> = None;
     let mut hops: usize = 0;
@@ -69,58 +69,45 @@ pub fn extract_name(pkt: &[u8], offset: &mut usize) -> Result<String, DnsError> 
     let mut wire_len: usize = 1;
 
     loop {
-        if pos >= pkt.len() {
-            return Err(DnsError::UnexpectedEof);
-        }
-        let b = pkt[pos] as usize;
+        let b = c.read_u8().ok_or(DnsError::UnexpectedEof)? as usize;
 
         if b == 0 {
-            // Root label — end of name.
-            if end_offset.is_none() {
-                *offset = pos + 1;
-            } else {
-                *offset = end_offset.unwrap();
-            }
-            break;
+            // Root label — end of name. Only the *first* pointer followed (if
+            // any) sets the caller's new offset; otherwise it's the position
+            // right after this root byte.
+            *offset = end_offset.unwrap_or_else(|| c.position());
+            return Ok(labels.join("."));
         }
 
         if (b & 0xC0) == 0xC0 {
             // Pointer compression: lower 14 bits are the target offset.
-            if pos + 1 >= pkt.len() {
-                return Err(DnsError::PacketTooShort);
-            }
-            // Only the *first* pointer sets the caller's new offset.
+            let lo = c.read_u8().ok_or(DnsError::PacketTooShort)? as usize;
             if end_offset.is_none() {
-                end_offset = Some(pos + 2);
+                end_offset = Some(c.position());
             }
             hops += 1;
             if hops > 255 {
                 return Err(DnsError::CompressionLoop);
             }
-            let ptr = ((b & 0x3F) << 8) | (pkt[pos + 1] as usize);
-            if ptr >= pkt.len() {
+            let ptr = ((b & 0x3F) << 8) | lo;
+            if ptr >= c.buf().len() {
                 return Err(DnsError::InvalidName(
                     "compression pointer out of bounds".into(),
                 ));
             }
-            pos = ptr;
+            c.set_position(ptr);
         } else if (b & 0xC0) == 0x00 {
             // Normal label: b is the label length.
             let label_len = b;
-            pos += 1;
-            if pos + label_len > pkt.len() {
-                return Err(DnsError::UnexpectedEof);
-            }
+            let label_bytes = c.read_slice(label_len).ok_or(DnsError::UnexpectedEof)?;
             // +1 for the length octet itself.
             wire_len += label_len + 1;
             if wire_len > 255 {
                 return Err(DnsError::NameTooLong);
             }
-            let label_bytes = &pkt[pos..pos + label_len];
             let label = std::str::from_utf8(label_bytes)
                 .map_err(|_| DnsError::InvalidName("non-UTF8 label bytes".into()))?;
             labels.push(label.to_owned());
-            pos += label_len;
         } else {
             return Err(DnsError::InvalidName(format!(
                 "unknown label type 0x{:02x}",
@@ -128,8 +115,6 @@ pub fn extract_name(pkt: &[u8], offset: &mut usize) -> Result<String, DnsError> 
             )));
         }
     }
-
-    Ok(labels.join("."))
 }
 
 /// Encode a domain name as DNS wire-format labels (no compression).
@@ -154,21 +139,16 @@ pub fn write_name(buf: &mut BytesMut, name: &str) {
 ///
 /// Stops at the root label or at the first pointer (which is always 2 bytes).
 pub fn skip_name(pkt: &[u8], offset: &mut usize) -> Result<(), DnsError> {
-    let mut pos = *offset;
+    let mut c = crate::byte_cursor::ByteCursor::at(pkt, *offset);
     loop {
-        if pos >= pkt.len() {
-            return Err(DnsError::UnexpectedEof);
-        }
-        let b = pkt[pos] as usize;
+        let b = c.read_u8().ok_or(DnsError::UnexpectedEof)? as usize;
         if b == 0 {
-            *offset = pos + 1;
+            *offset = c.position();
             return Ok(());
         }
         if (b & 0xC0) == 0xC0 {
-            if pos + 1 >= pkt.len() {
-                return Err(DnsError::PacketTooShort);
-            }
-            *offset = pos + 2;
+            c.read_u8().ok_or(DnsError::PacketTooShort)?;
+            *offset = c.position();
             return Ok(());
         }
         if (b & 0xC0) != 0x00 {
@@ -177,7 +157,7 @@ pub fn skip_name(pkt: &[u8], offset: &mut usize) -> Result<(), DnsError> {
                 b
             )));
         }
-        pos += 1 + b;
+        c.advance(b).ok_or(DnsError::UnexpectedEof)?;
     }
 }
 
@@ -205,12 +185,10 @@ impl DnsQuestion {
 /// Parse a single DNS question from `pkt` starting at `*offset`.
 pub fn parse_question(pkt: &[u8], offset: &mut usize) -> Result<DnsQuestion, DnsError> {
     let name = extract_name(pkt, offset)?;
-    if *offset + 4 > pkt.len() {
-        return Err(DnsError::PacketTooShort);
-    }
-    let qtype = u16::from_be_bytes([pkt[*offset], pkt[*offset + 1]]);
-    let qclass = u16::from_be_bytes([pkt[*offset + 2], pkt[*offset + 3]]);
-    *offset += 4;
+    let mut c = crate::byte_cursor::ByteCursor::at(pkt, *offset);
+    let qtype = c.read_u16_be().ok_or(DnsError::PacketTooShort)?;
+    let qclass = c.read_u16_be().ok_or(DnsError::PacketTooShort)?;
+    *offset = c.position();
     Ok(DnsQuestion { name, qtype, qclass })
 }
 
@@ -249,25 +227,14 @@ impl DnsRr {
 pub fn parse_rr(pkt: &[u8], offset: &mut usize) -> Result<DnsRr, DnsError> {
     let name = extract_name(pkt, offset)?;
     // Fixed part: TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2) = 10 bytes.
-    if *offset + 10 > pkt.len() {
-        return Err(DnsError::PacketTooShort);
-    }
-    let rtype = u16::from_be_bytes([pkt[*offset], pkt[*offset + 1]]);
-    let class = u16::from_be_bytes([pkt[*offset + 2], pkt[*offset + 3]]);
-    let ttl = u32::from_be_bytes([
-        pkt[*offset + 4],
-        pkt[*offset + 5],
-        pkt[*offset + 6],
-        pkt[*offset + 7],
-    ]);
-    let rdlen = u16::from_be_bytes([pkt[*offset + 8], pkt[*offset + 9]]) as usize;
-    *offset += 10;
-    if *offset + rdlen > pkt.len() {
-        return Err(DnsError::UnexpectedEof);
-    }
-    let rdata_start = *offset;
-    let raw_rdata = pkt[*offset..*offset + rdlen].to_vec();
-    *offset += rdlen;
+    let mut c = crate::byte_cursor::ByteCursor::at(pkt, *offset);
+    let rtype = c.read_u16_be().ok_or(DnsError::PacketTooShort)?;
+    let class = c.read_u16_be().ok_or(DnsError::PacketTooShort)?;
+    let ttl = c.read_u32_be().ok_or(DnsError::PacketTooShort)?;
+    let rdlen = c.read_u16_be().ok_or(DnsError::PacketTooShort)? as usize;
+    let rdata_start = c.position();
+    let raw_rdata = c.read_slice(rdlen).ok_or(DnsError::UnexpectedEof)?.to_vec();
+    *offset = c.position();
 
     // For record types whose rdata contains domain names that may use DNS
     // pointer compression, decompress them here so stored rdata is always
