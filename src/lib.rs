@@ -17,6 +17,7 @@ pub mod radv_protocol;
 pub mod metrics;
 pub mod types;
 
+pub mod byte_cursor;
 pub mod rfc1035;
 pub mod edns0;
 pub mod rrfilter;
