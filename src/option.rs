@@ -22,7 +22,7 @@ use crate::types::daemon::{DhcpBridge, SharedNetwork};
 use crate::domain::CondDomain;
 #[cfg(feature = "dhcp")]
 use crate::types::dhcp::{
-    CONFIG_ADDR, CONFIG_CLID, CONFIG_DISABLE, CONFIG_NAME, CONTEXT_DHCP, DhOptFlags,
+    ConfigFlags, CONTEXT_DHCP, DhOptFlags,
     DhcpBoot, DhcpConfig, DhcpContext, DhcpMacRule, DhcpNetid, DhcpNetidList, DhcpOpt, DhcpPxeVendor,
     DhcpRelay, DhcpRelayIdRule, DhcpReplyDelay, DhcpUserClassRule, DhcpVendorRule, HwaddrConfig, PxeService,
 };
@@ -3949,7 +3949,7 @@ fn parse_dhcp_host(value: &str, cl: &ConfigLine) -> Result<DhcpConfig, ConfigErr
     }
 
     let mut config = DhcpConfig {
-        flags: 0,
+        flags: ConfigFlags::empty(),
         clid: None,
         hostname: None,
         domain: None,
@@ -3989,28 +3989,28 @@ fn parse_dhcp_host(value: &str, cl: &ConfigLine) -> Result<DhcpConfig, ConfigErr
 
         if let Some(rest) = part.strip_prefix("id:") {
             if rest == "*" {
-                config.flags |= crate::types::dhcp::CONFIG_NOCLID;
+                config.flags.insert(ConfigFlags::NOCLID);
             } else {
                 config.clid = Some(parse_client_id(rest, cl, "dhcp-host")?);
-                config.flags |= CONFIG_CLID;
+                config.flags.insert(ConfigFlags::CLID);
             }
             continue;
         }
 
         if let Ok(ip) = part.parse::<Ipv4Addr>() {
             config.addr = ip;
-            config.flags |= CONFIG_ADDR;
+            config.flags.insert(ConfigFlags::ADDR);
             continue;
         }
 
         if let Some(lease_time) = parse_dhcp_host_time(part) {
             config.lease_time = lease_time;
-            config.flags |= crate::types::dhcp::CONFIG_TIME;
+            config.flags.insert(ConfigFlags::TIME);
             continue;
         }
 
         if part.eq_ignore_ascii_case("ignore") {
-            config.flags |= CONFIG_DISABLE;
+            config.flags.insert(ConfigFlags::DISABLE);
             continue;
         }
 
@@ -4032,13 +4032,11 @@ fn parse_dhcp_host(value: &str, cl: &ConfigLine) -> Result<DhcpConfig, ConfigErr
         }
         config.domain = hostname.split_once('.').map(|(_, domain)| domain.to_string());
         config.hostname = Some(hostname);
-        config.flags |= CONFIG_NAME;
+        config.flags.insert(ConfigFlags::NAME);
     }
 
     if config.hwaddrs.is_empty()
-        && (config.flags & CONFIG_CLID) == 0
-        && (config.flags & crate::types::dhcp::CONFIG_NOCLID) == 0
-        && (config.flags & CONFIG_NAME) == 0
+        && !config.flags.intersects(ConfigFlags::CLID | ConfigFlags::NOCLID | ConfigFlags::NAME)
     {
         return Err(invalid_value_for(
             cl,
@@ -7738,7 +7736,7 @@ mod tests {
         #[cfg(feature = "dhcp")]
         {
             let cfg = &d.dhcp_conf[0];
-            assert_ne!(cfg.flags & crate::types::dhcp::CONFIG_NOCLID, 0);
+            assert!(cfg.flags.contains(crate::types::dhcp::ConfigFlags::NOCLID));
             assert_eq!(cfg.hwaddrs.len(), 1);
         }
     }
@@ -7752,8 +7750,8 @@ mod tests {
         {
             let cfg = &d.dhcp_conf[0];
             assert_eq!(cfg.netid.iter().map(|n| n.net.as_str()).collect::<Vec<_>>(), vec!["lab"]);
-            assert_ne!(cfg.flags & crate::types::dhcp::CONFIG_DISABLE, 0);
-            assert_ne!(cfg.flags & crate::types::dhcp::CONFIG_TIME, 0);
+            assert!(cfg.flags.contains(crate::types::dhcp::ConfigFlags::DISABLE));
+            assert!(cfg.flags.contains(crate::types::dhcp::ConfigFlags::TIME));
             assert_eq!(cfg.lease_time, 45 * 60);
         }
     }
@@ -7779,7 +7777,7 @@ mod tests {
         {
             let cfg = &d.dhcp_conf[0];
             assert_eq!(cfg.lease_time, u32::MAX);
-            assert_ne!(cfg.flags & crate::types::dhcp::CONFIG_TIME, 0);
+            assert!(cfg.flags.contains(crate::types::dhcp::ConfigFlags::TIME));
         }
     }
 

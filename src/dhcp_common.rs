@@ -714,22 +714,22 @@ pub fn dhcp_update_configs(
     cache:   &mut crate::cache::DnsCache,
     now:     std::time::Instant,
 ) {
-    use crate::types::dhcp::{CONFIG_ADDR, CONFIG_ADDR_HOSTS, CONFIG_NAME};
+    use crate::types::dhcp::ConfigFlags;
     use crate::types::constants::{F_HOSTS, F_IPV4};
 
     // Reset any previously auto-assigned addresses.
     for c in configs.iter_mut() {
-        if (c.flags & CONFIG_ADDR_HOSTS) != 0 {
-            c.flags &= !(CONFIG_ADDR | CONFIG_ADDR_HOSTS);
+        if c.flags.contains(ConfigFlags::ADDR_HOSTS) {
+            c.flags.remove(ConfigFlags::ADDR | ConfigFlags::ADDR_HOSTS);
         }
     }
 
     // For each config that has a name but no address, try the cache.
     for i in 0..configs.len() {
-        if (configs[i].flags & CONFIG_ADDR) != 0 {
+        if configs[i].flags.contains(ConfigFlags::ADDR) {
             continue; // already has an explicit address
         }
-        if (configs[i].flags & CONFIG_NAME) == 0 {
+        if !configs[i].flags.contains(ConfigFlags::NAME) {
             continue; // no hostname to look up
         }
         let hostname = match &configs[i].hostname {
@@ -744,10 +744,10 @@ pub fn dhcp_update_configs(
             let conflict = configs
                 .iter()
                 .enumerate()
-                .any(|(j, c)| j != i && (c.flags & CONFIG_ADDR) != 0 && c.addr == ip);
+                .any(|(j, c)| j != i && c.flags.contains(ConfigFlags::ADDR) && c.addr == ip);
             if !conflict {
                 configs[i].addr   = ip;
-                configs[i].flags |= CONFIG_ADDR | CONFIG_ADDR_HOSTS;
+                configs[i].flags.insert(ConfigFlags::ADDR | ConfigFlags::ADDR_HOSTS);
             }
         }
     }
@@ -1289,7 +1289,7 @@ pub fn find_config<'a>(
     hostname: Option<&str>,
     tags: &[crate::types::dhcp::DhcpNetid],
 ) -> Option<&'a crate::types::dhcp::DhcpConfig> {
-    use crate::types::dhcp::{CONFIG_CLID, CONFIG_NAME};
+    use crate::types::dhcp::ConfigFlags;
 
     let matches_filter = |config: &crate::types::dhcp::DhcpConfig| {
         config.filter.is_empty() || match_netid_wild(&config.filter, tags)
@@ -1301,7 +1301,7 @@ pub fn find_config<'a>(
             if !matches_filter(config) {
                 continue;
             }
-            if config.flags & CONFIG_CLID != 0 {
+            if config.flags.contains(ConfigFlags::CLID) {
                 if let Some(ref cfg_clid) = config.clid {
                     if cfg_clid == clid {
                         return Some(config);
@@ -1337,7 +1337,7 @@ pub fn find_config<'a>(
             if !matches_filter(config) {
                 continue;
             }
-            if config.flags & CONFIG_NAME != 0 {
+            if config.flags.contains(ConfigFlags::NAME) {
                 if let Some(ref cfg_name) = config.hostname {
                     if cfg_name.eq_ignore_ascii_case(hostname) {
                         return Some(config);
@@ -1544,7 +1544,7 @@ mod tests {
         use std::time::Instant;
         use crate::cache::DnsCache;
         use crate::cache::{parse_hosts_line};
-        use crate::types::dhcp::{DhcpConfig, CONFIG_NAME, CONFIG_ADDR, CONFIG_ADDR_HOSTS};
+        use crate::types::dhcp::{DhcpConfig, ConfigFlags};
         use crate::types::constants::UID_NONE;
 
         let mut cache = DnsCache::new(100);
@@ -1552,7 +1552,7 @@ mod tests {
         parse_hosts_line("10.0.0.42  myserver.local", 60, UID_NONE, now, &mut cache);
 
         let config = DhcpConfig {
-            flags: CONFIG_NAME,
+            flags: ConfigFlags::NAME,
             clid: None,
             hostname: Some("myserver.local".into()),
             domain: None,
@@ -1568,8 +1568,8 @@ mod tests {
         let mut configs = vec![config];
         dhcp_update_configs(&mut configs, &mut cache, now);
 
-        assert!((configs[0].flags & CONFIG_ADDR) != 0, "CONFIG_ADDR should be set");
-        assert!((configs[0].flags & CONFIG_ADDR_HOSTS) != 0);
+        assert!(configs[0].flags.contains(ConfigFlags::ADDR), "CONFIG_ADDR should be set");
+        assert!(configs[0].flags.contains(ConfigFlags::ADDR_HOSTS));
         assert_eq!(configs[0].addr, "10.0.0.42".parse::<std::net::Ipv4Addr>().unwrap());
     }
 
@@ -1578,7 +1578,7 @@ mod tests {
         use std::time::Instant;
         use crate::cache::DnsCache;
         use crate::cache::parse_hosts_line;
-        use crate::types::dhcp::{DhcpConfig, CONFIG_NAME, CONFIG_ADDR};
+        use crate::types::dhcp::{DhcpConfig, ConfigFlags};
         use crate::types::constants::UID_NONE;
 
         let mut cache = DnsCache::new(100);
@@ -1587,7 +1587,7 @@ mod tests {
 
         let explicit_ip: std::net::Ipv4Addr = "192.168.1.50".parse().unwrap();
         let config = DhcpConfig {
-            flags: CONFIG_NAME | CONFIG_ADDR,
+            flags: ConfigFlags::NAME | ConfigFlags::ADDR,
             clid: None,
             hostname: Some("already.local".into()),
             domain: None,
@@ -1876,14 +1876,14 @@ mod tests {
     // ── config_has_mac ───────────────────────────────────────────────────────
 
     fn make_config_with_mac(mac: &[u8], hw_type: i32) -> crate::types::dhcp::DhcpConfig {
-        use crate::types::dhcp::{DhcpConfig, HwaddrConfig};
+        use crate::types::dhcp::{ConfigFlags, DhcpConfig, HwaddrConfig};
         use crate::dhcp_protocol::DHCP_CHADDR_MAX;
         use std::net::Ipv4Addr;
         let mut hwaddr = [0u8; DHCP_CHADDR_MAX];
         let len = mac.len().min(DHCP_CHADDR_MAX);
         hwaddr[..len].copy_from_slice(&mac[..len]);
         DhcpConfig {
-            flags: 0,
+            flags: ConfigFlags::empty(),
             clid: None,
             hostname: None,
             domain: None,
@@ -1938,9 +1938,9 @@ mod tests {
 
     #[test]
     fn find_config_by_clid() {
-        use crate::types::dhcp::CONFIG_CLID;
+        use crate::types::dhcp::ConfigFlags;
         let mut cfg = make_config_with_mac(&[0; 6], 1);
-        cfg.flags = CONFIG_CLID;
+        cfg.flags = ConfigFlags::CLID;
         cfg.clid = Some(vec![0x01, 0x02, 0x03]);
         let configs = [cfg];
         assert!(find_config(&configs, Some(&[0x01, 0x02, 0x03]), None, 0, None, &[]).is_some());
@@ -1954,9 +1954,9 @@ mod tests {
 
     #[test]
     fn find_config_by_hostname() {
-        use crate::types::dhcp::CONFIG_NAME;
+        use crate::types::dhcp::ConfigFlags;
         let mut cfg = make_config_with_mac(&[0; 6], 1);
-        cfg.flags = CONFIG_NAME;
+        cfg.flags = ConfigFlags::NAME;
         cfg.hostname = Some("myhost".to_string());
         let configs = [cfg];
         assert!(find_config(&configs, None, None, 0, Some("myhost"), &[]).is_some());
@@ -1964,9 +1964,9 @@ mod tests {
 
     #[test]
     fn find_config_hostname_case_insensitive() {
-        use crate::types::dhcp::CONFIG_NAME;
+        use crate::types::dhcp::ConfigFlags;
         let mut cfg = make_config_with_mac(&[0; 6], 1);
-        cfg.flags = CONFIG_NAME;
+        cfg.flags = ConfigFlags::NAME;
         cfg.hostname = Some("MyHost".to_string());
         let configs = [cfg];
         assert!(find_config(&configs, None, None, 0, Some("myhost"), &[]).is_some());
@@ -1980,9 +1980,9 @@ mod tests {
 
     #[test]
     fn find_config_clid_dhcpcd_workaround() {
-        use crate::types::dhcp::CONFIG_CLID;
+        use crate::types::dhcp::ConfigFlags;
         let mut cfg = make_config_with_mac(&[0; 6], 1);
-        cfg.flags = CONFIG_CLID;
+        cfg.flags = ConfigFlags::CLID;
         cfg.clid = Some(vec![0x01, 0x02]);
         let configs = [cfg];
         assert!(find_config(&configs, Some(&[0x00, 0x01, 0x02]), None, 0, None, &[]).is_some());
@@ -1990,10 +1990,10 @@ mod tests {
 
     #[test]
     fn find_config_respects_tag_filters() {
-        use crate::types::dhcp::{DhcpNetid, CONFIG_NAME};
+        use crate::types::dhcp::{DhcpNetid, ConfigFlags};
 
         let mut cfg = make_config_with_mac(&[0; 6], 1);
-        cfg.flags = CONFIG_NAME;
+        cfg.flags = ConfigFlags::NAME;
         cfg.hostname = Some("myhost".to_string());
         cfg.filter = vec![DhcpNetid { net: "pxe".into() }, DhcpNetid { net: "lab".into() }];
         let configs = [cfg];

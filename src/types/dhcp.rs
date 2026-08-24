@@ -8,18 +8,27 @@ use crate::dhcp_protocol::DHCP_CHADDR_MAX;
 use crate::types::addr::AllAddr;
 
 // CONFIG_* flags for dhcp_config
-pub const CONFIG_DISABLE:       u32 = 1;
-pub const CONFIG_CLID:          u32 = 2;
-pub const CONFIG_TIME:          u32 = 8;
-pub const CONFIG_NAME:          u32 = 16;
-pub const CONFIG_ADDR:          u32 = 32;
-pub const CONFIG_NOCLID:        u32 = 128;
-pub const CONFIG_FROM_ETHERS:   u32 = 256;
-pub const CONFIG_ADDR_HOSTS:    u32 = 512;
-pub const CONFIG_DECLINED:      u32 = 1024;
-pub const CONFIG_BANK:          u32 = 2048;
-pub const CONFIG_ADDR6:         u32 = 4096;
-pub const CONFIG_ADDR6_HOSTS:   u32 = 16384;
+bitflags::bitflags! {
+    /// `struct dhcp_config`'s `flags` (upstream `CONFIG_*` constants in
+    /// `dnsmasq.h`) — per-host `dhcp-host` reservation behavior bits. Bit
+    /// positions 4, 64, and 8192 have no corresponding upstream `CONFIG_*`
+    /// name and are intentionally absent here, matching `dnsmasq.h` exactly.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct ConfigFlags: u32 {
+        const DISABLE     = 1 << 0;
+        const CLID        = 1 << 1;
+        const TIME        = 1 << 3;
+        const NAME        = 1 << 4;
+        const ADDR        = 1 << 5;
+        const NOCLID      = 1 << 7;
+        const FROM_ETHERS = 1 << 8;
+        const ADDR_HOSTS  = 1 << 9;
+        const DECLINED    = 1 << 10;
+        const BANK        = 1 << 11;
+        const ADDR6       = 1 << 12;
+        const ADDR6_HOSTS = 1 << 14;
+    }
+}
 
 // DHOPT_* flags for dhcp_opt
 bitflags::bitflags! {
@@ -186,7 +195,7 @@ pub struct DhcpContext {
 /// Static DHCP host configuration entry.
 #[derive(Debug, Clone)]
 pub struct DhcpConfig {
-    pub flags:      u32,
+    pub flags:      ConfigFlags,
     pub clid:       Option<Vec<u8>>,
     pub hostname:   Option<String>,
     pub domain:     Option<String>,

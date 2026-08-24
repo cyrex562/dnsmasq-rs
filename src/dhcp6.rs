@@ -752,9 +752,9 @@ pub fn config_find_by_address6(
     addr: &Ipv6Addr,
 ) -> bool {
     use crate::types::addr::AllAddr;
-    use crate::types::dhcp::CONFIG_ADDR6;
+    use crate::types::dhcp::ConfigFlags;
     for config in configs {
-        if config.flags & CONFIG_ADDR6 == 0 {
+        if !config.flags.contains(ConfigFlags::ADDR6) {
             continue;
         }
         for a6 in &config.addr6 {

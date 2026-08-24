@@ -745,7 +745,7 @@ pub fn dispatch_dhcp_with_meta(
     let hw_len = usize::from(pkt.hlen).min(DHCP_CHADDR_MAX);
     let tags = derived_tags(pkt, cfg, hostname);
     let tag_disable = cfg.configs.iter().any(|c| {
-        (c.flags & crate::types::dhcp::CONFIG_DISABLE) != 0
+        c.flags.contains(crate::types::dhcp::ConfigFlags::DISABLE)
             && !c.filter.is_empty()
             && match_netid_wild(&c.filter, &tags)
     });
@@ -766,11 +766,11 @@ pub fn dispatch_dhcp_with_meta(
         hostname,
         &tags,
     );
-    if config.is_some_and(|c| (c.flags & crate::types::dhcp::CONFIG_DISABLE) != 0) {
+    if config.is_some_and(|c| c.flags.contains(crate::types::dhcp::ConfigFlags::DISABLE)) {
         return None;
     }
     let static_addr = config
-        .filter(|c| (c.flags & crate::types::dhcp::CONFIG_ADDR) != 0)
+        .filter(|c| c.flags.contains(crate::types::dhcp::ConfigFlags::ADDR))
         .map(|c| c.addr);
     // "Have maybe already found the lease by MAC or clid" (rfc2131.c:255) —
     // shared by the BOOTP and DHCPLEASEQUERY paths below. `lease_key()`
@@ -975,7 +975,7 @@ fn dispatch_bootp(
     clid: Option<&[u8]>,
     hostname: Option<&str>,
 ) -> Option<DispatchedDhcpReply> {
-    use crate::types::dhcp::{DhcpNetid, CONFIG_DISABLE, CONFIG_TIME};
+    use crate::types::dhcp::{DhcpNetid, ConfigFlags};
 
     // "must have a MAC addr for bootp" (rfc2131.c:571-572).
     if pkt.htype == 0 || pkt.hlen == 0 {
@@ -993,7 +993,7 @@ fn dispatch_bootp(
 
     // dhcp-ignore, re-checked with the "bootp" tag folded in (rfc2131.c:607-609).
     if cfg.configs.iter().any(|c| {
-        (c.flags & CONFIG_DISABLE) != 0 && !c.filter.is_empty() && match_netid_wild(&c.filter, &bootp_tags)
+        c.flags.contains(ConfigFlags::DISABLE) && !c.filter.is_empty() && match_netid_wild(&c.filter, &bootp_tags)
     }) {
         return None;
     }
@@ -1048,7 +1048,7 @@ fn dispatch_bootp(
 
     let lease_time = if nailed {
         config
-            .filter(|c| c.flags & CONFIG_TIME != 0)
+            .filter(|c| c.flags.contains(ConfigFlags::TIME))
             .map_or(0xFFFF_FFFF, |c| c.lease_time)
     } else {
         0xFFFF_FFFF
@@ -1138,7 +1138,7 @@ fn dispatch_leasequery(
         let full_lease_time = calc_time(
             context.map_or(3600, |c| c.lease_time),
             lease_config
-                .filter(|c| c.flags & crate::types::dhcp::CONFIG_TIME != 0)
+                .filter(|c| c.flags.contains(crate::types::dhcp::ConfigFlags::TIME))
                 .map(|c| c.lease_time),
             None,
         );
@@ -1751,7 +1751,7 @@ pub fn icmp_checksum(data: &[u8]) -> u16 {
 // Address pool helpers (ported from dhcp.c:687-763)
 // ─────────────────────────────────────────────────────────────────────────────
 
-use crate::types::dhcp::{DhcpContext, DhcpConfig, CONTEXT_STATIC, CONTEXT_PROXY, CONTEXT_NETMASK, CONTEXT_BRDCAST, CONFIG_ADDR};
+use crate::types::dhcp::{DhcpContext, DhcpConfig, CONTEXT_STATIC, CONTEXT_PROXY, CONTEXT_NETMASK, CONTEXT_BRDCAST, ConfigFlags};
 
 /// Check if `addr` is available in one of the DHCP contexts.
 ///
@@ -1829,7 +1829,7 @@ pub fn narrow_context<'a>(contexts: &'a [DhcpContext], addr: Ipv4Addr) -> Option
 pub fn config_find_by_address(configs: &[DhcpConfig], addr: Ipv4Addr) -> Option<&DhcpConfig> {
     configs
         .iter()
-        .find(|c| c.flags & CONFIG_ADDR != 0 && c.addr == addr)
+        .find(|c| c.flags.contains(ConfigFlags::ADDR) && c.addr == addr)
 }
 
 /// The local address/netmask/broadcast of the interface a DHCP request
@@ -2262,7 +2262,7 @@ pub(crate) fn parse_icmp_echo_reply(data: &[u8], expected_id: u16) -> bool {
 // --read-ethers (ported from dhcp.c:924-1083)
 // ─────────────────────────────────────────────────────────────────────────────
 
-use crate::types::dhcp::{HwaddrConfig, CONFIG_FROM_ETHERS, CONFIG_NAME, CONFIG_NOCLID};
+use crate::types::dhcp::HwaddrConfig;
 
 /// Default location of the ethers file (`ETHERSFILE` in config.h).
 pub const ETHERS_FILE: &str = "/etc/ethers";
@@ -2339,20 +2339,20 @@ fn parse_ethers_text(text: &str) -> Vec<EthersRecord> {
 /// creating a new one, and a record whose hwaddr exactly matches an existing
 /// hwaddr-only `dhcp-host` entry attaches to that entry (dhcp.c:1023-1043).
 fn apply_ethers_records(dhcp_conf: &mut Vec<DhcpConfig>, records: Vec<EthersRecord>) -> usize {
-    dhcp_conf.retain(|c| c.flags & CONFIG_FROM_ETHERS == 0);
+    dhcp_conf.retain(|c| !c.flags.contains(ConfigFlags::FROM_ETHERS));
 
     let mut count = 0;
     for rec in records {
         let existing_idx = dhcp_conf.iter().position(|c| match &rec.key {
-            EthersKey::Addr(addr) => (c.flags & CONFIG_ADDR) != 0 && c.addr == *addr,
+            EthersKey::Addr(addr) => c.flags.contains(ConfigFlags::ADDR) && c.addr == *addr,
             EthersKey::Name(name) => {
-                (c.flags & CONFIG_NAME) != 0
+                c.flags.contains(ConfigFlags::NAME)
                     && c.hostname.as_deref().is_some_and(|h| crate::util::hostname_isequal(h, name))
             }
         });
 
         if let Some(idx) = existing_idx {
-            if dhcp_conf[idx].flags & CONFIG_FROM_ETHERS != 0 {
+            if dhcp_conf[idx].flags.contains(ConfigFlags::FROM_ETHERS) {
                 warn!("ignoring duplicate name or IP address in {ETHERS_FILE}");
                 continue;
             }
@@ -2370,7 +2370,7 @@ fn apply_ethers_records(dhcp_conf: &mut Vec<DhcpConfig>, records: Vec<EthersReco
             idx
         } else {
             dhcp_conf.push(DhcpConfig {
-                flags: CONFIG_FROM_ETHERS,
+                flags: ConfigFlags::FROM_ETHERS,
                 clid: None,
                 hostname: None,
                 domain: None,
@@ -2389,15 +2389,15 @@ fn apply_ethers_records(dhcp_conf: &mut Vec<DhcpConfig>, records: Vec<EthersReco
         let config = &mut dhcp_conf[target_idx];
         match &rec.key {
             EthersKey::Addr(addr) => {
-                config.flags |= CONFIG_ADDR;
+                config.flags.insert(ConfigFlags::ADDR);
                 config.addr = *addr;
             }
             EthersKey::Name(name) => {
-                config.flags |= CONFIG_NAME;
+                config.flags.insert(ConfigFlags::NAME);
                 config.hostname = Some(name.clone());
             }
         }
-        config.flags |= CONFIG_NOCLID;
+        config.flags.insert(ConfigFlags::NOCLID);
 
         let mut hwaddr_full = [0u8; DHCP_CHADDR_MAX];
         hwaddr_full[..6].copy_from_slice(&rec.hwaddr);
@@ -2606,12 +2606,12 @@ mod tests {
 
     #[test]
     fn discover_matching_dhcp_ignore_produces_no_reply() {
-        use crate::types::dhcp::{DhcpConfig, HwaddrConfig, CONFIG_DISABLE};
+        use crate::types::dhcp::{DhcpConfig, HwaddrConfig, ConfigFlags};
 
         let mut hw = [0u8; DHCP_CHADDR_MAX];
         hw[..6].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
         let ignore = DhcpConfig {
-            flags: CONFIG_DISABLE,
+            flags: ConfigFlags::DISABLE,
             clid: None,
             hostname: None,
             domain: None,
@@ -2688,12 +2688,12 @@ mod tests {
 
     #[test]
     fn discover_matching_static_config_offers_static_address() {
-        use crate::types::dhcp::{DhcpConfig, HwaddrConfig, CONFIG_ADDR};
+        use crate::types::dhcp::{DhcpConfig, HwaddrConfig, ConfigFlags};
 
         let mut hw = [0u8; DHCP_CHADDR_MAX];
         hw[..6].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
         let static_cfg = DhcpConfig {
-            flags: CONFIG_ADDR,
+            flags: ConfigFlags::ADDR,
             clid: None,
             hostname: None,
             domain: None,
@@ -2723,10 +2723,10 @@ mod tests {
 
     #[test]
     fn discover_matching_vendor_tag_ignore_produces_no_reply() {
-        use crate::types::dhcp::{DhcpConfig, DhcpNetid, DhcpVendorRule, CONFIG_DISABLE};
+        use crate::types::dhcp::{DhcpConfig, DhcpNetid, DhcpVendorRule, ConfigFlags};
 
         let ignore = DhcpConfig {
-            flags: CONFIG_DISABLE,
+            flags: ConfigFlags::DISABLE,
             clid: None,
             hostname: None,
             domain: None,
@@ -2757,10 +2757,10 @@ mod tests {
 
     #[test]
     fn discover_matching_userclass_tag_ignore_produces_no_reply() {
-        use crate::types::dhcp::{DhcpConfig, DhcpNetid, DhcpUserClassRule, CONFIG_DISABLE};
+        use crate::types::dhcp::{DhcpConfig, DhcpNetid, DhcpUserClassRule, ConfigFlags};
 
         let ignore = DhcpConfig {
-            flags: CONFIG_DISABLE,
+            flags: ConfigFlags::DISABLE,
             clid: None,
             hostname: None,
             domain: None,
@@ -2791,10 +2791,10 @@ mod tests {
 
     #[test]
     fn discover_matching_broken_userclass_tag_ignore_produces_no_reply() {
-        use crate::types::dhcp::{DhcpConfig, DhcpNetid, DhcpUserClassRule, CONFIG_DISABLE};
+        use crate::types::dhcp::{DhcpConfig, DhcpNetid, DhcpUserClassRule, ConfigFlags};
 
         let ignore = DhcpConfig {
-            flags: CONFIG_DISABLE,
+            flags: ConfigFlags::DISABLE,
             clid: None,
             hostname: None,
             domain: None,
@@ -2825,10 +2825,10 @@ mod tests {
 
     #[test]
     fn discover_matching_mac_tag_ignore_produces_no_reply() {
-        use crate::types::dhcp::{DhcpConfig, DhcpMacRule, DhcpNetid, CONFIG_DISABLE};
+        use crate::types::dhcp::{DhcpConfig, DhcpMacRule, DhcpNetid, ConfigFlags};
 
         let ignore = DhcpConfig {
-            flags: CONFIG_DISABLE,
+            flags: ConfigFlags::DISABLE,
             clid: None,
             hostname: None,
             domain: None,
@@ -2858,10 +2858,10 @@ mod tests {
 
     #[test]
     fn discover_matching_circuitid_tag_ignore_produces_no_reply() {
-        use crate::types::dhcp::{DhcpConfig, DhcpNetid, DhcpRelayIdRule, CONFIG_DISABLE};
+        use crate::types::dhcp::{DhcpConfig, DhcpNetid, DhcpRelayIdRule, ConfigFlags};
 
         let ignore = DhcpConfig {
-            flags: CONFIG_DISABLE,
+            flags: ConfigFlags::DISABLE,
             clid: None,
             hostname: None,
             domain: None,
@@ -2894,10 +2894,10 @@ mod tests {
 
     #[test]
     fn discover_matching_hex_circuitid_tag_ignore_produces_no_reply() {
-        use crate::types::dhcp::{DhcpConfig, DhcpNetid, DhcpRelayIdRule, CONFIG_DISABLE};
+        use crate::types::dhcp::{DhcpConfig, DhcpNetid, DhcpRelayIdRule, ConfigFlags};
 
         let ignore = DhcpConfig {
-            flags: CONFIG_DISABLE,
+            flags: ConfigFlags::DISABLE,
             clid: None,
             hostname: None,
             domain: None,
@@ -2930,10 +2930,10 @@ mod tests {
 
     #[test]
     fn discover_matching_remoteid_tag_ignore_produces_no_reply() {
-        use crate::types::dhcp::{DhcpConfig, DhcpNetid, DhcpRelayIdRule, CONFIG_DISABLE};
+        use crate::types::dhcp::{DhcpConfig, DhcpNetid, DhcpRelayIdRule, ConfigFlags};
 
         let ignore = DhcpConfig {
-            flags: CONFIG_DISABLE,
+            flags: ConfigFlags::DISABLE,
             clid: None,
             hostname: None,
             domain: None,
@@ -2966,10 +2966,10 @@ mod tests {
 
     #[test]
     fn discover_matching_subscrid_tag_ignore_produces_no_reply() {
-        use crate::types::dhcp::{DhcpConfig, DhcpNetid, DhcpRelayIdRule, CONFIG_DISABLE};
+        use crate::types::dhcp::{DhcpConfig, DhcpNetid, DhcpRelayIdRule, ConfigFlags};
 
         let ignore = DhcpConfig {
-            flags: CONFIG_DISABLE,
+            flags: ConfigFlags::DISABLE,
             clid: None,
             hostname: None,
             domain: None,
@@ -3178,12 +3178,12 @@ mod tests {
 
     #[test]
     fn request_for_address_reserved_to_another_client_is_nak_d() {
-        use crate::types::dhcp::{DhcpConfig, HwaddrConfig, CONFIG_ADDR};
+        use crate::types::dhcp::{DhcpConfig, HwaddrConfig, ConfigFlags};
 
         let mut reserved_hw = [0u8; DHCP_CHADDR_MAX];
         reserved_hw[..6].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
         let reserved_cfg = DhcpConfig {
-            flags: CONFIG_ADDR,
+            flags: ConfigFlags::ADDR,
             clid: None,
             hostname: None,
             domain: None,
@@ -3220,12 +3220,12 @@ mod tests {
 
     #[test]
     fn request_for_own_reserved_address_is_acked() {
-        use crate::types::dhcp::{DhcpConfig, HwaddrConfig, CONFIG_ADDR};
+        use crate::types::dhcp::{DhcpConfig, HwaddrConfig, ConfigFlags};
 
         let mut hw = [0u8; DHCP_CHADDR_MAX];
         hw[..6].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
         let owner_cfg = DhcpConfig {
-            flags: CONFIG_ADDR,
+            flags: ConfigFlags::ADDR,
             clid: None,
             hostname: None,
             domain: None,
@@ -3410,7 +3410,7 @@ mod tests {
 
     #[test]
     fn discover_host_set_tag_selects_tagged_option() {
-        use crate::types::dhcp::{DhcpConfig, DhcpContext, DhcpNetid, DhcpOpt, HwaddrConfig, CONTEXT_DHCP, CONFIG_NAME};
+        use crate::types::dhcp::{DhcpConfig, DhcpContext, DhcpNetid, DhcpOpt, HwaddrConfig, CONTEXT_DHCP, ConfigFlags};
 
         let mut pkt = base_packet();
         pkt.options = vec![
@@ -3460,7 +3460,7 @@ mod tests {
             address_lost_time: 0,
         });
         cfg.configs.push(DhcpConfig {
-            flags: CONFIG_NAME,
+            flags: ConfigFlags::NAME,
             clid: None,
             hostname: Some("host1".into()),
             domain: None,
@@ -4621,7 +4621,7 @@ mod tests {
     #[test]
     fn config_find_by_address_found() {
         let cfg = DhcpConfig {
-            flags: CONFIG_ADDR,
+            flags: ConfigFlags::ADDR,
             addr: "10.0.0.50".parse().unwrap(),
             clid: None,
             hostname: None,
@@ -4640,7 +4640,7 @@ mod tests {
     #[test]
     fn config_find_by_address_not_found() {
         let cfg = DhcpConfig {
-            flags: CONFIG_ADDR,
+            flags: ConfigFlags::ADDR,
             addr: "10.0.0.50".parse().unwrap(),
             clid: None,
             hostname: None,
@@ -4861,7 +4861,7 @@ mod tests {
         let mut lease_db = LeaseDb::new();
         lease_db.allocate_v4(Ipv4Addr::new(10, 0, 0, 101));
         let reserved = DhcpConfig {
-            flags: CONFIG_ADDR,
+            flags: ConfigFlags::ADDR,
             clid: None,
             hostname: None,
             domain: None,
@@ -5062,9 +5062,9 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(dhcp_conf.len(), 1);
         let cfg = &dhcp_conf[0];
-        assert_ne!(cfg.flags & CONFIG_FROM_ETHERS, 0);
-        assert_ne!(cfg.flags & crate::types::dhcp::CONFIG_ADDR, 0);
-        assert_ne!(cfg.flags & CONFIG_NOCLID, 0);
+        assert!(cfg.flags.contains(ConfigFlags::FROM_ETHERS));
+        assert!(cfg.flags.contains(crate::types::dhcp::ConfigFlags::ADDR));
+        assert!(cfg.flags.contains(ConfigFlags::NOCLID));
         assert_eq!(cfg.addr, Ipv4Addr::new(10, 0, 0, 5));
         assert_eq!(cfg.hwaddrs.len(), 1);
         assert_eq!(&cfg.hwaddrs[0].hwaddr[..6], &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
@@ -5078,12 +5078,12 @@ mod tests {
         apply_ethers_records(&mut dhcp_conf, records);
         assert_eq!(dhcp_conf.len(), 1);
         assert_eq!(dhcp_conf[0].hostname.as_deref(), Some("myhost"));
-        assert_ne!(dhcp_conf[0].flags & CONFIG_NAME, 0);
+        assert!(dhcp_conf[0].flags.contains(ConfigFlags::NAME));
     }
 
     fn empty_static_config() -> DhcpConfig {
         DhcpConfig {
-            flags: 0,
+            flags: ConfigFlags::empty(),
             clid: None,
             hostname: None,
             domain: None,
@@ -5101,7 +5101,7 @@ mod tests {
     #[test]
     fn apply_ethers_records_merges_into_existing_dhcp_host_by_address() {
         let mut dhcp_conf = vec![DhcpConfig {
-            flags: crate::types::dhcp::CONFIG_ADDR,
+            flags: crate::types::dhcp::ConfigFlags::ADDR,
             addr: Ipv4Addr::new(10, 0, 0, 5),
             ..empty_static_config()
         }];
@@ -5110,7 +5110,7 @@ mod tests {
         assert_eq!(count, 1);
         // Merged into the existing entry, not appended as a second one.
         assert_eq!(dhcp_conf.len(), 1);
-        assert_eq!(dhcp_conf[0].flags & CONFIG_FROM_ETHERS, 0, "reused entry keeps its non-ethers origin");
+        assert!(!dhcp_conf[0].flags.contains(ConfigFlags::FROM_ETHERS), "reused entry keeps its non-ethers origin");
         assert_eq!(dhcp_conf[0].hwaddrs.len(), 1);
     }
 
@@ -5122,7 +5122,7 @@ mod tests {
             m
         };
         let mut dhcp_conf = vec![DhcpConfig {
-            flags: 0, // no addr/name yet — just a bare hwaddr reservation
+            flags: ConfigFlags::empty(), // no addr/name yet — just a bare hwaddr reservation
             hwaddrs: vec![HwaddrConfig { hwaddr: mac, hwaddr_len: 6, hwaddr_type: 1, wildcard_mask: 0 }],
             ..empty_static_config()
         }];
@@ -5166,10 +5166,10 @@ mod tests {
         let mut dhcp_conf = Vec::new();
         let count = dhcp_read_ethers(&mut dhcp_conf, path.to_str().unwrap()).expect("file should be read");
         assert_eq!(count, 2);
-        assert!(dhcp_conf.iter().any(|c| c.flags & CONFIG_FROM_ETHERS != 0
-            && c.flags & crate::types::dhcp::CONFIG_ADDR != 0
+        assert!(dhcp_conf.iter().any(|c| c.flags.contains(ConfigFlags::FROM_ETHERS)
+            && c.flags.contains(crate::types::dhcp::ConfigFlags::ADDR)
             && c.addr == Ipv4Addr::new(10, 0, 0, 5)));
-        assert!(dhcp_conf.iter().any(|c| c.flags & CONFIG_FROM_ETHERS != 0
+        assert!(dhcp_conf.iter().any(|c| c.flags.contains(ConfigFlags::FROM_ETHERS)
             && c.hostname.as_deref() == Some("myhost")));
     }
 
@@ -5194,12 +5194,12 @@ mod tests {
         // 53 byte falls through C's `switch` with no matching `case` and
         // gets no reply at all — it must not be treated as BOOTP, even when
         // a nailed dhcp-host would otherwise make BOOTP dispatch succeed.
-        use crate::types::dhcp::{DhcpConfig, HwaddrConfig, CONFIG_ADDR};
+        use crate::types::dhcp::{DhcpConfig, HwaddrConfig, ConfigFlags};
 
         let mut pkt = bootp_packet(); // htype/hlen/chaddr are valid
         pkt.options = vec![OPTION_MESSAGE_TYPE, 1, 99, OPTION_END];
         let nailed_cfg = DhcpConfig {
-            flags: CONFIG_ADDR,
+            flags: ConfigFlags::ADDR,
             clid: None,
             hostname: None,
             domain: None,
@@ -5242,11 +5242,11 @@ mod tests {
 
     #[test]
     fn bootp_request_with_nailed_host_gets_reply_with_no_message_type() {
-        use crate::types::dhcp::{DhcpConfig, HwaddrConfig, CONFIG_ADDR};
+        use crate::types::dhcp::{DhcpConfig, HwaddrConfig, ConfigFlags};
 
         let pkt = bootp_packet(); // base_packet()'s chaddr is all-zero, hlen 6
         let nailed_cfg = DhcpConfig {
-            flags: CONFIG_ADDR,
+            flags: ConfigFlags::ADDR,
             clid: None,
             hostname: None,
             domain: None,
@@ -5291,11 +5291,11 @@ mod tests {
         // — do_options() only ever emits T1/T2 when the lease time isn't
         // that "infinite" sentinel (rfc2131.c:2745-2746), so a BOOTP reply
         // must never carry them.
-        use crate::types::dhcp::{DhcpConfig, HwaddrConfig, CONFIG_ADDR};
+        use crate::types::dhcp::{DhcpConfig, HwaddrConfig, ConfigFlags};
 
         let pkt = bootp_packet();
         let nailed_cfg = DhcpConfig {
-            flags: CONFIG_ADDR,
+            flags: ConfigFlags::ADDR,
             clid: None,
             hostname: None,
             domain: None,
