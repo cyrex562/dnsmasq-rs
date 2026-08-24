@@ -61,13 +61,12 @@ pub enum TftpParseError {
 
 /// Read a null-terminated string from `buf` starting at `pos`.
 /// Returns `(string, next_pos)`.
-fn read_cstring(buf: &[u8], pos: usize) -> Result<(String, usize), TftpParseError> {
-    let end = buf[pos..]
-        .iter()
-        .position(|&b| b == 0)
-        .ok_or(TftpParseError::MissingNull)?;
-    let s = String::from_utf8_lossy(&buf[pos..pos + end]).into_owned();
-    Ok((s, pos + end + 1))
+fn read_cstring(c: &mut crate::byte_cursor::ByteCursor) -> Result<String, TftpParseError> {
+    let end = c.find(0).ok_or(TftpParseError::MissingNull)?;
+    let bytes = c.read_slice(end).expect("find() guarantees `end` bytes remain before the null");
+    let s = String::from_utf8_lossy(bytes).into_owned();
+    c.advance(1).expect("find() located a null byte at this position");
+    Ok(s)
 }
 
 // ---------------------------------------------------------------------------
@@ -80,20 +79,20 @@ pub fn parse_rrq(pkt: &[u8]) -> Result<(String, String, Vec<(String, String)>), 
     if pkt.len() < 4 {
         return Err(TftpParseError::TooShort);
     }
-    let opcode = u16::from_be_bytes([pkt[0], pkt[1]]);
+    let mut c = crate::byte_cursor::ByteCursor::new(pkt);
+    let opcode = c.read_u16_be().expect("length checked above");
     if opcode != TftpOpcode::Rrq as u16 && opcode != TftpOpcode::Wrq as u16 {
         return Err(TftpParseError::InvalidOpcode(opcode));
     }
 
-    let (filename, pos) = read_cstring(pkt, 2)?;
-    let (mode, mut pos) = read_cstring(pkt, pos)?;
+    let filename = read_cstring(&mut c)?;
+    let mode = read_cstring(&mut c)?;
 
     let mut options = Vec::new();
-    while pos < pkt.len() {
-        let (key, next) = read_cstring(pkt, pos)?;
-        let (val, next2) = read_cstring(pkt, next)?;
+    while !c.is_empty() {
+        let key = read_cstring(&mut c)?;
+        let val = read_cstring(&mut c)?;
         options.push((key, val));
-        pos = next2;
     }
 
     Ok((filename, mode, options))
