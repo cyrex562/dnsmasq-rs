@@ -230,17 +230,15 @@ pub fn parse_ra(data: &[u8]) -> Result<RouterAdvertisement, RadvError> {
     let mut mtu             = None;
     let mut source_lla      = None;
 
-    let mut pos = 16usize;
-    while pos < data.len() {
-        if pos + 2 > data.len() {
+    let mut c = crate::byte_cursor::ByteCursor::at(data, 16);
+    while !c.is_empty() {
+        let opt_type = c.read_u8().ok_or(RadvError::TooShort)?;
+        let opt_len_field = c.read_u8().ok_or(RadvError::TooShort)?;
+        let opt_len = opt_len_field as usize * 8; // length in bytes, including the 2-byte header just read
+        if opt_len == 0 {
             return Err(RadvError::TooShort);
         }
-        let opt_type = data[pos];
-        let opt_len  = data[pos + 1] as usize * 8; // length in bytes
-        if opt_len == 0 || pos + opt_len > data.len() {
-            return Err(RadvError::TooShort);
-        }
-        let opt_data = &data[pos + 2..pos + opt_len];
+        let opt_data = c.read_slice(opt_len - 2).ok_or(RadvError::TooShort)?;
 
         match opt_type {
             t if t == ICMP6_OPT_PREFIX => {
@@ -271,11 +269,9 @@ pub fn parse_ra(data: &[u8]) -> Result<RouterAdvertisement, RadvError> {
                     return Err(RadvError::TooShort);
                 }
                 rdnss_lifetime = u32::from_be_bytes([opt_data[2], opt_data[3], opt_data[4], opt_data[5]]);
-                let mut i = 6usize; // skip reserved(2) + lifetime(4)
-                while i + 16 <= opt_data.len() {
-                    let addr_bytes: [u8; 16] = opt_data[i..i + 16].try_into().unwrap();
-                    dns_servers.push(Ipv6Addr::from(addr_bytes));
-                    i += 16;
+                let mut oc = crate::byte_cursor::ByteCursor::at(opt_data, 6); // skip reserved(2) + lifetime(4)
+                while let Some(addr_bytes) = oc.read_slice(16) {
+                    dns_servers.push(Ipv6Addr::from(<[u8; 16]>::try_from(addr_bytes).unwrap()));
                 }
             }
             t if t == ICMP6_OPT_ADV_INTERVAL => {
@@ -293,8 +289,6 @@ pub fn parse_ra(data: &[u8]) -> Result<RouterAdvertisement, RadvError> {
             }
             _ => {} // ignore unknown options
         }
-
-        pos += opt_len;
     }
 
     Ok(RouterAdvertisement {
