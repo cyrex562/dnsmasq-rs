@@ -22,22 +22,30 @@ pub const CONFIG_ADDR6:         u32 = 4096;
 pub const CONFIG_ADDR6_HOSTS:   u32 = 16384;
 
 // DHOPT_* flags for dhcp_opt
-pub const DHOPT_ADDR:            u32 = 1;
-pub const DHOPT_STRING:          u32 = 2;
-pub const DHOPT_ENCAPSULATE:     u32 = 4;
-pub const DHOPT_ENCAP_MATCH:     u32 = 8;
-pub const DHOPT_FORCE:           u32 = 16;
-pub const DHOPT_BANK:            u32 = 32;
-pub const DHOPT_ENCAP_DONE:      u32 = 64;
-pub const DHOPT_MATCH:           u32 = 128;
-pub const DHOPT_VENDOR:          u32 = 256;
-pub const DHOPT_HEX:             u32 = 512;
-pub const DHOPT_VENDOR_MATCH:    u32 = 1024;
-pub const DHOPT_RFC3925:         u32 = 2048;
-pub const DHOPT_TAGOK:           u32 = 4096;
-pub const DHOPT_ADDR6:           u32 = 8192;
-pub const DHOPT_VENDOR_PXE:      u32 = 16384;
-pub const DHOPT_PXE_OPT:         u32 = 32768;
+bitflags::bitflags! {
+    /// `struct dhcp_opt`'s `flags` (upstream `DHOPT_*` constants in
+    /// `dnsmasq.h`) — per-option-record behavior bits for `dhcp-option`/
+    /// `dhcp-match`/vendor-class encapsulation handling.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct DhOptFlags: u32 {
+        const ADDR         = 1 << 0;
+        const STRING       = 1 << 1;
+        const ENCAPSULATE  = 1 << 2;
+        const ENCAP_MATCH  = 1 << 3;
+        const FORCE        = 1 << 4;
+        const BANK         = 1 << 5;
+        const ENCAP_DONE   = 1 << 6;
+        const MATCH        = 1 << 7;
+        const VENDOR       = 1 << 8;
+        const HEX          = 1 << 9;
+        const VENDOR_MATCH = 1 << 10;
+        const RFC3925      = 1 << 11;
+        const TAGOK        = 1 << 12;
+        const ADDR6        = 1 << 13;
+        const VENDOR_PXE   = 1 << 14;
+        const PXE_OPT      = 1 << 15;
+    }
+}
 
 // CONTEXT_* flags
 pub const CONTEXT_STATIC:        u32 = 1 << 0;
@@ -205,7 +213,7 @@ pub struct HwaddrConfig {
 #[derive(Debug, Clone)]
 pub struct DhcpOpt {
     pub opt:   i32,
-    pub flags: u32,
+    pub flags: DhOptFlags,
     pub val:   Option<Vec<u8>>,
     pub netid: Vec<DhcpNetid>,
     pub encap: i32,

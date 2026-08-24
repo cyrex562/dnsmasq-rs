@@ -6,7 +6,7 @@ use crate::dhcp_protocol::{OPTION_END, OPTION_MESSAGE_TYPE, OPTION_PAD, OPTION_V
 #[cfg(feature = "dhcp")]
 use crate::dhcp_protocol::DhcpMsgType;
 #[cfg(feature = "dhcp")]
-use crate::types::dhcp::{DhcpNetid, DhcpOpt};
+use crate::types::dhcp::{DhOptFlags, DhcpNetid, DhcpOpt};
 
 /// Find a DHCP option by code in a packet's options field.
 /// Returns a slice of the option data (not including code/len bytes).
@@ -1078,8 +1078,8 @@ pub fn run_tag_if(tags: Vec<DhcpNetid>, rules: &[TagIf]) -> Vec<DhcpNetid> {
 /// Mirrors `pxe_ok()` in `dhcp-common.c`.
 #[cfg(feature = "dhcp")]
 pub fn pxe_ok(opt: &DhcpOpt, pxemode: u8) -> bool {
-    use crate::types::dhcp::DHOPT_PXE_OPT;
-    if opt.flags & DHOPT_PXE_OPT != 0 {
+    use crate::types::dhcp::DhOptFlags;
+    if opt.flags.contains(DhOptFlags::PXE_OPT) {
         pxemode != 0
     } else {
         pxemode != 2
@@ -1103,19 +1103,21 @@ pub fn option_filter(
     pxemode:      u8,
     tag_rules:    &[TagIf],
 ) -> Vec<DhcpNetid> {
-    use crate::types::dhcp::{DHOPT_ENCAPSULATE, DHOPT_RFC3925, DHOPT_TAGOK, DHOPT_VENDOR};
+    use crate::types::dhcp::DhOptFlags;
+    const ENCAP_MASK: DhOptFlags =
+        DhOptFlags::ENCAPSULATE.union(DhOptFlags::VENDOR).union(DhOptFlags::RFC3925);
 
     let tagif = run_tag_if(tags, tag_rules);
 
     // Phase 1: mark options valid for tagif (without context tags).
     for opt in opts.iter_mut() {
-        opt.flags &= !DHOPT_TAGOK;
-        if opt.flags & (DHOPT_ENCAPSULATE | DHOPT_VENDOR | DHOPT_RFC3925) != 0 {
+        opt.flags.remove(DhOptFlags::TAGOK);
+        if opt.flags.intersects(ENCAP_MASK) {
             continue;
         }
         let netid_matches = !opt.netid.is_empty() && match_netid_wild(&opt.netid, &tagif);
         if netid_matches && pxe_ok(opt, pxemode) {
-            opt.flags |= DHOPT_TAGOK;
+            opt.flags.insert(DhOptFlags::TAGOK);
         }
     }
 
@@ -1126,45 +1128,45 @@ pub fn option_filter(
 
         // Reset options that previously matched but now fail with context tags.
         for opt in opts.iter_mut() {
-            if opt.flags & (DHOPT_ENCAPSULATE | DHOPT_VENDOR | DHOPT_RFC3925) != 0 { continue; }
-            if opt.flags & DHOPT_TAGOK == 0 { continue; }
+            if opt.flags.intersects(ENCAP_MASK) { continue; }
+            if !opt.flags.contains(DhOptFlags::TAGOK) { continue; }
             let still_ok = opt.netid.is_empty() || match_netid_wild(&opt.netid, &tagif_ctx);
-            if !still_ok { opt.flags &= !DHOPT_TAGOK; }
+            if !still_ok { opt.flags.remove(DhOptFlags::TAGOK); }
         }
 
         // Mark options that only match with the context tags.
         let opt_codes: Vec<i32> = opts.iter()
-            .filter(|o| o.flags & DHOPT_TAGOK != 0)
+            .filter(|o| o.flags.contains(DhOptFlags::TAGOK))
             .map(|o| o.opt)
             .collect();
         for opt in opts.iter_mut() {
-            if opt.flags & (DHOPT_ENCAPSULATE | DHOPT_VENDOR | DHOPT_RFC3925 | DHOPT_TAGOK) != 0 { continue; }
+            if opt.flags.intersects(ENCAP_MASK | DhOptFlags::TAGOK) { continue; }
             let matches = !opt.netid.is_empty() && match_netid_wild(&opt.netid, &tagif_ctx);
             if matches && pxe_ok(opt, pxemode) && !opt_codes.contains(&opt.opt) {
-                opt.flags |= DHOPT_TAGOK;
+                opt.flags.insert(DhOptFlags::TAGOK);
             }
         }
     }
 
     // Phase 3: mark untagged options not overridden by a tagged one.
     let tagged_codes: Vec<i32> = opts.iter()
-        .filter(|o| o.flags & DHOPT_TAGOK != 0 && !o.netid.is_empty())
+        .filter(|o| o.flags.contains(DhOptFlags::TAGOK) && !o.netid.is_empty())
         .map(|o| o.opt)
         .collect();
     for opt in opts.iter_mut() {
-        if opt.flags & (DHOPT_ENCAPSULATE | DHOPT_VENDOR | DHOPT_RFC3925 | DHOPT_TAGOK) != 0 { continue; }
+        if opt.flags.intersects(ENCAP_MASK | DhOptFlags::TAGOK) { continue; }
         if !opt.netid.is_empty() { continue; } // has a tag, skip
         if pxe_ok(opt, pxemode) && !tagged_codes.contains(&opt.opt) {
-            opt.flags |= DHOPT_TAGOK;
+            opt.flags.insert(DhOptFlags::TAGOK);
         }
     }
 
     // Phase 4: de-duplicate — later entries for the same opt code lose TAGOK.
     let mut seen: std::collections::HashSet<i32> = std::collections::HashSet::new();
     for opt in opts.iter_mut() {
-        if opt.flags & DHOPT_TAGOK != 0 {
+        if opt.flags.contains(DhOptFlags::TAGOK) {
             if !seen.insert(opt.opt) {
-                opt.flags &= !DHOPT_TAGOK;
+                opt.flags.remove(DhOptFlags::TAGOK);
             }
         }
     }
@@ -1223,7 +1225,7 @@ pub fn log_tags(netids: &[DhcpNetid]) -> Option<String> {
 /// Mirrors `match_bytes()` in `dhcp-common.c`.
 #[cfg(feature = "dhcp")]
 pub fn match_bytes(opt: &DhcpOpt, data: &[u8]) -> bool {
-    use crate::types::dhcp::{DHOPT_HEX, DHOPT_STRING};
+    use crate::types::dhcp::DhOptFlags;
     use crate::util::memcmp_masked;
 
     let val = match &opt.val {
@@ -1233,7 +1235,7 @@ pub fn match_bytes(opt: &DhcpOpt, data: &[u8]) -> bool {
     if val.is_empty() { return true; }
     if val.len() > data.len() { return false; }
 
-    if opt.flags & DHOPT_HEX != 0 {
+    if opt.flags.contains(DhOptFlags::HEX) {
         // Wildcard/masked comparison using the first u32 of val as a mask.
         // In C the mask is stored in opt->u.wildcard_mask; here we treat
         // the first 4 bytes of val as both value and derive a mask of all-ones.
@@ -1242,7 +1244,7 @@ pub fn match_bytes(opt: &DhcpOpt, data: &[u8]) -> bool {
     }
 
     // Substring scan.
-    let step = if opt.flags & DHOPT_STRING != 0 { 1 } else { val.len() };
+    let step = if opt.flags.contains(DhOptFlags::STRING) { 1 } else { val.len() };
     let mut i = 0;
     while i + val.len() <= data.len() {
         if data[i..i + val.len()] == val[..] {
@@ -1423,7 +1425,7 @@ mod tests {
     fn build_and_find_roundtrip() {
         let opt = DhcpOpt {
             opt: 12,
-            flags: 0,
+            flags: DhOptFlags::empty(),
             val: Some(b"router".to_vec()),
             netid: vec![],
             encap: 0,
@@ -1772,30 +1774,30 @@ mod tests {
 
     // ── pxe_ok ────────────────────────────────────────────────────────────────
 
-    use crate::types::dhcp::DHOPT_PXE_OPT;
+    use crate::types::dhcp::DhOptFlags;
 
-    fn make_opt(flags: u32) -> DhcpOpt {
+    fn make_opt(flags: crate::types::dhcp::DhOptFlags) -> DhcpOpt {
         DhcpOpt { opt: 1, flags, val: None, netid: vec![], encap: 0, vendor_class: None }
     }
 
     #[test]
     fn pxe_ok_non_pxe_opt_mode0() {
-        assert!(pxe_ok(&make_opt(0), 0)); // normal opt, mode 0 → include
+        assert!(pxe_ok(&make_opt(DhOptFlags::empty()), 0)); // normal opt, mode 0 → include
     }
 
     #[test]
     fn pxe_ok_non_pxe_opt_mode2() {
-        assert!(!pxe_ok(&make_opt(0), 2)); // normal opt, mode 2 (pxe-only) → exclude
+        assert!(!pxe_ok(&make_opt(DhOptFlags::empty()), 2)); // normal opt, mode 2 (pxe-only) → exclude
     }
 
     #[test]
     fn pxe_ok_pxe_opt_mode0() {
-        assert!(!pxe_ok(&make_opt(DHOPT_PXE_OPT), 0)); // pxe opt, mode 0 → exclude
+        assert!(!pxe_ok(&make_opt(DhOptFlags::PXE_OPT), 0)); // pxe opt, mode 0 → exclude
     }
 
     #[test]
     fn pxe_ok_pxe_opt_mode1() {
-        assert!(pxe_ok(&make_opt(DHOPT_PXE_OPT), 1)); // pxe opt, mode 1 → include
+        assert!(pxe_ok(&make_opt(DhOptFlags::PXE_OPT), 1)); // pxe opt, mode 1 → include
     }
 
     // ── strip_hostname ────────────────────────────────────────────────────────
@@ -1840,7 +1842,7 @@ mod tests {
 
     // ── match_bytes ───────────────────────────────────────────────────────────
 
-    fn opt_with_val(val: &[u8], flags: u32) -> DhcpOpt {
+    fn opt_with_val(val: &[u8], flags: DhOptFlags) -> DhcpOpt {
         DhcpOpt { opt: 43, flags, val: Some(val.to_vec()), netid: vec![], encap: 0, vendor_class: None }
     }
 
@@ -1849,25 +1851,25 @@ mod tests {
         // In non-string mode, scan advances by val.len() (aligned positions).
         // val="test" (len=4): positions checked are 0,4,8...
         // data "testXXXXmore": "test" at position 0 → found.
-        let opt = opt_with_val(b"test", 0);
+        let opt = opt_with_val(b"test", DhOptFlags::empty());
         assert!(match_bytes(&opt, b"testXXXXmore"));
     }
 
     #[test]
     fn match_bytes_not_found() {
-        let opt = opt_with_val(b"nope", 0);
+        let opt = opt_with_val(b"nope", DhOptFlags::empty());
         assert!(!match_bytes(&opt, b"hello test world"));
     }
 
     #[test]
     fn match_bytes_empty_val_matches_any() {
-        let opt = opt_with_val(b"", 0);
+        let opt = opt_with_val(b"", DhOptFlags::empty());
         assert!(match_bytes(&opt, b"anything"));
     }
 
     #[test]
     fn match_bytes_val_longer_than_data_fails() {
-        let opt = opt_with_val(b"toolong", 0);
+        let opt = opt_with_val(b"toolong", DhOptFlags::empty());
         assert!(!match_bytes(&opt, b"sh"));
     }
 

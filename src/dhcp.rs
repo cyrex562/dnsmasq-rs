@@ -3396,7 +3396,7 @@ mod tests {
         });
         cfg.dhcp_opts.push(DhcpOpt {
             opt: crate::dhcp_protocol::OPTION_DOMAINNAME as i32,
-            flags: crate::types::dhcp::DHOPT_STRING,
+            flags: crate::types::dhcp::DhOptFlags::STRING,
             val: Some(b"lab.example".to_vec()),
             netid: vec![],
             encap: 0,
@@ -3480,7 +3480,7 @@ mod tests {
         });
         cfg.dhcp_opts.push(DhcpOpt {
             opt: crate::dhcp_protocol::OPTION_DOMAINNAME as i32,
-            flags: crate::types::dhcp::DHOPT_STRING,
+            flags: crate::types::dhcp::DhOptFlags::STRING,
             val: Some(b"default.example".to_vec()),
             netid: vec![],
             encap: 0,
@@ -3488,7 +3488,7 @@ mod tests {
         });
         cfg.dhcp_opts.push(DhcpOpt {
             opt: crate::dhcp_protocol::OPTION_DOMAINNAME as i32,
-            flags: crate::types::dhcp::DHOPT_STRING,
+            flags: crate::types::dhcp::DhOptFlags::STRING,
             val: Some(b"lab.example".to_vec()),
             netid: vec![DhcpNetid { net: "lab".into() }],
             encap: 0,
@@ -3520,7 +3520,7 @@ mod tests {
         // dhcp-match=set:pxe,60,PXEClient
         cfg.match_rules.push(DhcpOpt {
             opt: crate::dhcp_protocol::OPTION_VENDOR_ID as i32,
-            flags: crate::types::dhcp::DHOPT_STRING | crate::types::dhcp::DHOPT_MATCH,
+            flags: crate::types::dhcp::DhOptFlags::STRING | crate::types::dhcp::DhOptFlags::MATCH,
             val: Some(b"PXEClient".to_vec()),
             netid: vec![DhcpNetid { net: "pxe".into() }],
             encap: 0,
@@ -3534,7 +3534,7 @@ mod tests {
         // dhcp-option=tag:pxeboot,15,"boot.example"
         cfg.dhcp_opts.push(DhcpOpt {
             opt: crate::dhcp_protocol::OPTION_DOMAINNAME as i32,
-            flags: crate::types::dhcp::DHOPT_STRING,
+            flags: crate::types::dhcp::DhOptFlags::STRING,
             val: Some(b"boot.example".to_vec()),
             netid: vec![DhcpNetid { net: "pxeboot".into() }],
             encap: 0,
@@ -5521,7 +5521,7 @@ mod tests {
         cfg.contexts = vec![make_ctx(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 200), Ipv4Addr::UNSPECIFIED, 0)];
         cfg.dhcp_opts = vec![crate::types::dhcp::DhcpOpt {
             opt: i32::from(CUSTOM_OPT),
-            flags: crate::types::dhcp::DHOPT_TAGOK | crate::types::dhcp::DHOPT_FORCE,
+            flags: crate::types::dhcp::DhOptFlags::TAGOK | crate::types::dhcp::DhOptFlags::FORCE,
             val: Some(vec![7]),
             netid: vec![],
             encap: 0,

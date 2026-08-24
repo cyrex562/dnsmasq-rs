@@ -9,7 +9,7 @@ use dnsmasq_rs::dhcp_protocol::{
 #[cfg(feature = "dhcp")]
 use dnsmasq_rs::rfc2131::{handle_discover, handle_request, option_msg_type};
 #[cfg(feature = "dhcp")]
-use dnsmasq_rs::types::dhcp::DhcpOpt;
+use dnsmasq_rs::types::dhcp::{DhOptFlags, DhcpOpt};
 #[cfg(feature = "dhcp")]
 use proptest::prelude::*;
 #[cfg(feature = "dhcp")]
@@ -70,7 +70,7 @@ proptest! {
     ) {
         let opt = DhcpOpt {
             opt: code as i32,
-            flags: 0,
+            flags: DhOptFlags::empty(),
             val: Some(data.clone()),
             netid: vec![],
             encap: 0,

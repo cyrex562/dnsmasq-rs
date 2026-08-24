@@ -1178,8 +1178,7 @@ pub fn do_opt(
     local:     Option<Ipv4Addr>,
     null_term: bool,
 ) -> usize {
-    use crate::types::dhcp::DHOPT_STRING;
-    use crate::types::dhcp::DHOPT_ADDR;
+    use crate::types::dhcp::DhOptFlags;
 
     let raw = match &opt.val {
         Some(v) => v.as_slice(),
@@ -1187,14 +1186,14 @@ pub fn do_opt(
     };
 
     let mut len = raw.len();
-    if (opt.flags & DHOPT_STRING) != 0 && null_term && len < 255 {
+    if opt.flags.contains(DhOptFlags::STRING) && null_term && len < 255 {
         len += 1; // null terminator
     }
 
     if let Some(buf) = p {
         if len == 0 { return 0; }
 
-        if (opt.flags & DHOPT_ADDR) != 0 && local.is_some() {
+        if opt.flags.contains(DhOptFlags::ADDR) && local.is_some() {
             // Replace every 4-byte zero address with the local address.
             let local_b = local.unwrap().octets();
             for (chunk, out) in raw.chunks(4).zip(buf.chunks_mut(4)) {
@@ -1205,7 +1204,7 @@ pub fn do_opt(
         } else {
             let n = raw.len().min(buf.len());
             buf[..n].copy_from_slice(&raw[..n]);
-            if (opt.flags & DHOPT_STRING) != 0 && null_term && len <= buf.len() {
+            if opt.flags.contains(DhOptFlags::STRING) && null_term && len <= buf.len() {
                 buf[len - 1] = 0;
             }
         }
@@ -1220,10 +1219,10 @@ pub fn do_opt(
 /// Mirrors `match_vendor_opts()` in `rfc2131.c`.
 #[cfg(feature = "dhcp")]
 pub fn match_vendor_opts(vc_data: Option<&[u8]>, opts: &mut Vec<crate::types::dhcp::DhcpOpt>) {
-    use crate::types::dhcp::{DHOPT_VENDOR, DHOPT_VENDOR_MATCH};
+    use crate::types::dhcp::DhOptFlags;
     for opt in opts.iter_mut() {
-        opt.flags &= !DHOPT_VENDOR_MATCH;
-        if vc_data.is_none() || (opt.flags & DHOPT_VENDOR) == 0 {
+        opt.flags.remove(DhOptFlags::VENDOR_MATCH);
+        if vc_data.is_none() || !opt.flags.contains(DhOptFlags::VENDOR) {
             continue;
         }
         let haystack = vc_data.unwrap();
@@ -1233,12 +1232,12 @@ pub fn match_vendor_opts(vc_data: Option<&[u8]>, opts: &mut Vec<crate::types::dh
         };
         // An empty needle matches anything (wildcard).
         if needle.is_empty() {
-            opt.flags |= DHOPT_VENDOR_MATCH;
+            opt.flags.insert(DhOptFlags::VENDOR_MATCH);
             continue;
         }
         // Substring search.
         if haystack.windows(needle.len()).any(|w| w == needle) {
-            opt.flags |= DHOPT_VENDOR_MATCH;
+            opt.flags.insert(DhOptFlags::VENDOR_MATCH);
         }
     }
 }
@@ -1253,14 +1252,14 @@ pub fn match_vendor_opts(vc_data: Option<&[u8]>, opts: &mut Vec<crate::types::dh
 pub fn do_encap_opts(
     config_opts: &[crate::types::dhcp::DhcpOpt],
     encap:       u8,
-    flag:        u32,
+    flag:        crate::types::dhcp::DhOptFlags,
     opts:        &mut Vec<u8>,
     null_term:   bool,
 ) -> bool {
     // Collect matching options.
     let matching: Vec<&crate::types::dhcp::DhcpOpt> = config_opts
         .iter()
-        .filter(|o| (o.flags & flag) != 0)
+        .filter(|o| o.flags.intersects(flag))
         .collect();
 
     if matching.is_empty() { return false; }
@@ -1293,14 +1292,14 @@ pub fn prune_vendor_opts(
     opts:  &mut Vec<crate::types::dhcp::DhcpOpt>,
     netid: &[crate::types::dhcp::DhcpNetid],
 ) -> bool {
-    use crate::types::dhcp::{DHOPT_VENDOR_MATCH, DHOPT_FORCE};
+    use crate::types::dhcp::DhOptFlags;
     use crate::dhcp_common::match_netid;
     let mut force = false;
     for opt in opts.iter_mut() {
-        if (opt.flags & DHOPT_VENDOR_MATCH) != 0 {
+        if opt.flags.contains(DhOptFlags::VENDOR_MATCH) {
             if !match_netid(netid, &opt.netid) {
-                opt.flags &= !DHOPT_VENDOR_MATCH;
-            } else if (opt.flags & DHOPT_FORCE) != 0 {
+                opt.flags.remove(DhOptFlags::VENDOR_MATCH);
+            } else if opt.flags.contains(DhOptFlags::FORCE) {
                 force = true;
             }
         }
@@ -1391,7 +1390,7 @@ pub fn do_options(pkt: &mut DhcpPacket, cfg: &mut DoOptionsConfig<'_>) {
         OPTION_MAXMESSAGE, OPTION_SNAME, OPTION_FILENAME,
         OPTION_VENDOR_ID,
     };
-    use crate::types::dhcp::{DHOPT_TAGOK, DHOPT_FORCE, DHOPT_VENDOR_MATCH};
+    use crate::types::dhcp::DhOptFlags;
 
     let opts = &mut pkt.options;
 
@@ -1504,8 +1503,8 @@ pub fn do_options(pkt: &mut DhcpPacket, cfg: &mut DoOptionsConfig<'_>) {
 
     for opt in &config_opts_snapshot {
         let code = opt.opt as u8;
-        if (opt.flags & DHOPT_TAGOK) == 0 { continue; }
-        if ((opt.flags & DHOPT_FORCE) == 0 || cfg.leasequery) && !in_list(cfg.req_options, code) { continue; }
+        if !opt.flags.contains(DhOptFlags::TAGOK) { continue; }
+        if (!opt.flags.contains(DhOptFlags::FORCE) || cfg.leasequery) && !in_list(cfg.req_options, code) { continue; }
         if skip_set.contains(&code) { continue; }
         if code == OPTION_VENDOR_ID && cfg.pxe_arch != -1 { continue; }
 
@@ -1539,7 +1538,7 @@ pub fn do_options(pkt: &mut DhcpPacket, cfg: &mut DoOptionsConfig<'_>) {
             || in_list(cfg.req_options, OPTION_VENDOR_CLASS_OPT)
             || in_list(cfg.req_options, OPTION_VENDOR_ID))
     {
-        do_encap_opts(cfg.config_opts, OPTION_VENDOR_CLASS_OPT, DHOPT_VENDOR_MATCH, opts, cfg.null_term);
+        do_encap_opts(cfg.config_opts, OPTION_VENDOR_CLASS_OPT, DhOptFlags::VENDOR_MATCH, opts, cfg.null_term);
     }
 
     // ── PXE misc ─────────────────────────────────────────────────────────────
@@ -2346,8 +2345,8 @@ mod tests {
 
     #[test]
     fn do_opt_len_only() {
-        use crate::types::dhcp::{DhcpOpt, DHOPT_STRING};
-        let opt = DhcpOpt { opt: 15, flags: DHOPT_STRING, val: Some(b"hi".to_vec()),
+        use crate::types::dhcp::{DhcpOpt, DhOptFlags};
+        let opt = DhcpOpt { opt: 15, flags: DhOptFlags::STRING, val: Some(b"hi".to_vec()),
                             netid: vec![], encap: 0, vendor_class: None };
         // null_term → len + 1
         assert_eq!(do_opt(&opt, None, None, true), 3);
@@ -2356,8 +2355,8 @@ mod tests {
 
     #[test]
     fn do_opt_writes_data() {
-        use crate::types::dhcp::{DhcpOpt, DHOPT_STRING};
-        let opt = DhcpOpt { opt: 15, flags: DHOPT_STRING, val: Some(b"hi".to_vec()),
+        use crate::types::dhcp::{DhcpOpt, DhOptFlags};
+        let opt = DhcpOpt { opt: 15, flags: DhOptFlags::STRING, val: Some(b"hi".to_vec()),
                             netid: vec![], encap: 0, vendor_class: None };
         let mut buf = vec![0u8; 2];
         let n = do_opt(&opt, Some(&mut buf), None, false);
@@ -2367,8 +2366,8 @@ mod tests {
 
     #[test]
     fn do_opt_null_terminator() {
-        use crate::types::dhcp::{DhcpOpt, DHOPT_STRING};
-        let opt = DhcpOpt { opt: 15, flags: DHOPT_STRING, val: Some(b"hi".to_vec()),
+        use crate::types::dhcp::{DhcpOpt, DhOptFlags};
+        let opt = DhcpOpt { opt: 15, flags: DhOptFlags::STRING, val: Some(b"hi".to_vec()),
                             netid: vec![], encap: 0, vendor_class: None };
         let mut buf = vec![0u8; 3];
         do_opt(&opt, Some(&mut buf), None, true);
@@ -2379,42 +2378,42 @@ mod tests {
 
     #[test]
     fn match_vendor_opts_marks_match() {
-        use crate::types::dhcp::{DhcpOpt, DHOPT_VENDOR, DHOPT_VENDOR_MATCH};
+        use crate::types::dhcp::{DhcpOpt, DhOptFlags};
         let mut opts = vec![DhcpOpt {
-            opt: 43, flags: DHOPT_VENDOR,
+            opt: 43, flags: DhOptFlags::VENDOR,
             val: Some(b"v".to_vec()),
             netid: vec![], encap: 0,
             vendor_class: Some(b"PXEClient".to_vec()),
         }];
         match_vendor_opts(Some(b"PXEClient:Arch:00000"), &mut opts);
-        assert!((opts[0].flags & DHOPT_VENDOR_MATCH) != 0);
+        assert!(opts[0].flags.contains(DhOptFlags::VENDOR_MATCH));
     }
 
     #[test]
     fn match_vendor_opts_no_match() {
-        use crate::types::dhcp::{DhcpOpt, DHOPT_VENDOR, DHOPT_VENDOR_MATCH};
+        use crate::types::dhcp::{DhcpOpt, DhOptFlags};
         let mut opts = vec![DhcpOpt {
-            opt: 43, flags: DHOPT_VENDOR,
+            opt: 43, flags: DhOptFlags::VENDOR,
             val: Some(b"v".to_vec()),
             netid: vec![], encap: 0,
             vendor_class: Some(b"PXEClient".to_vec()),
         }];
         match_vendor_opts(Some(b"MSFT 5.0"), &mut opts);
-        assert!((opts[0].flags & DHOPT_VENDOR_MATCH) == 0);
+        assert!(!opts[0].flags.contains(DhOptFlags::VENDOR_MATCH));
     }
 
     #[test]
     fn match_vendor_opts_clears_previous_match() {
-        use crate::types::dhcp::{DhcpOpt, DHOPT_VENDOR, DHOPT_VENDOR_MATCH};
+        use crate::types::dhcp::{DhcpOpt, DhOptFlags};
         let mut opts = vec![DhcpOpt {
-            opt: 43, flags: DHOPT_VENDOR | DHOPT_VENDOR_MATCH,
+            opt: 43, flags: DhOptFlags::VENDOR | DhOptFlags::VENDOR_MATCH,
             val: Some(b"v".to_vec()),
             netid: vec![], encap: 0,
             vendor_class: Some(b"PXEClient".to_vec()),
         }];
         // No vc_data → should clear VENDOR_MATCH.
         match_vendor_opts(None, &mut opts);
-        assert!((opts[0].flags & DHOPT_VENDOR_MATCH) == 0);
+        assert!(!opts[0].flags.contains(DhOptFlags::VENDOR_MATCH));
     }
 
     // ── pxe_misc ──────────────────────────────────────────────────────────────

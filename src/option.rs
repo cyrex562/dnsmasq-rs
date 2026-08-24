@@ -22,7 +22,7 @@ use crate::types::daemon::{DhcpBridge, SharedNetwork};
 use crate::domain::CondDomain;
 #[cfg(feature = "dhcp")]
 use crate::types::dhcp::{
-    CONFIG_ADDR, CONFIG_CLID, CONFIG_DISABLE, CONFIG_NAME, CONTEXT_DHCP, DHOPT_VENDOR, DHOPT_VENDOR_PXE,
+    CONFIG_ADDR, CONFIG_CLID, CONFIG_DISABLE, CONFIG_NAME, CONTEXT_DHCP, DhOptFlags,
     DhcpBoot, DhcpConfig, DhcpContext, DhcpMacRule, DhcpNetid, DhcpNetidList, DhcpOpt, DhcpPxeVendor,
     DhcpRelay, DhcpRelayIdRule, DhcpReplyDelay, DhcpUserClassRule, DhcpVendorRule, HwaddrConfig, PxeService,
 };
@@ -1402,7 +1402,7 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             let v = require_value("dhcp-option")?;
             #[cfg(feature = "dhcp")]
             {
-                daemon.dhcp_opts.push(parse_dhcp_option(v, cl, "dhcp-option", 0)?);
+                daemon.dhcp_opts.push(parse_dhcp_option(v, cl, "dhcp-option", crate::types::dhcp::DhOptFlags::empty())?);
             }
             #[cfg(not(feature = "dhcp"))]
             {
@@ -1414,7 +1414,7 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             let v = require_value("dhcp-option-force")?;
             #[cfg(feature = "dhcp")]
             {
-                daemon.dhcp_opts.push(parse_dhcp_option(v, cl, "dhcp-option-force", crate::types::dhcp::DHOPT_FORCE)?);
+                daemon.dhcp_opts.push(parse_dhcp_option(v, cl, "dhcp-option-force", crate::types::dhcp::DhOptFlags::FORCE)?);
             }
             #[cfg(not(feature = "dhcp"))]
             {
@@ -1426,7 +1426,7 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             let v = require_value("dhcp-option-pxe")?;
             #[cfg(feature = "dhcp")]
             {
-                daemon.dhcp_opts.push(parse_dhcp_option(v, cl, "dhcp-option-pxe", crate::types::dhcp::DHOPT_PXE_OPT)?);
+                daemon.dhcp_opts.push(parse_dhcp_option(v, cl, "dhcp-option-pxe", crate::types::dhcp::DhOptFlags::PXE_OPT)?);
             }
             #[cfg(not(feature = "dhcp"))]
             {
@@ -4089,7 +4089,7 @@ fn parse_pxe_prompt(value: &str, cl: &ConfigLine) -> Result<DhcpOpt, ConfigError
     val.extend_from_slice(prompt.as_bytes());
     Ok(DhcpOpt {
         opt: 10,
-        flags: DHOPT_VENDOR | DHOPT_VENDOR_PXE,
+        flags: DhOptFlags::VENDOR | DhOptFlags::VENDOR_PXE,
         val: Some(val),
         netid: vec![],
         encap: 0,
@@ -4216,10 +4216,10 @@ fn parse_tag_if(value: &str, cl: &ConfigLine) -> Result<crate::dhcp_common::TagI
 /// `encap:`/`vendor:` combinations as `"illegal dhcp-match"` (option.c:1966-1969).
 #[cfg(feature = "dhcp")]
 fn parse_dhcp_match(value: &str, cl: &ConfigLine) -> Result<DhcpOpt, ConfigError> {
-    use crate::types::dhcp::{DHOPT_ENCAPSULATE, DHOPT_MATCH, DHOPT_VENDOR};
+    use crate::types::dhcp::DhOptFlags;
 
-    let opt = parse_dhcp_option(value, cl, "dhcp-match", DHOPT_MATCH)?;
-    if opt.flags & (DHOPT_ENCAPSULATE | DHOPT_VENDOR) != 0 || opt.netid.len() != 1 {
+    let opt = parse_dhcp_option(value, cl, "dhcp-match", DhOptFlags::MATCH)?;
+    if opt.flags.intersects(DhOptFlags::ENCAPSULATE | DhOptFlags::VENDOR) || opt.netid.len() != 1 {
         return Err(invalid_value_for(cl, "dhcp-match", value, "illegal dhcp-match"));
     }
     Ok(opt)
@@ -4619,10 +4619,9 @@ fn parse_dhcp_option(
     value: &str,
     cl: &ConfigLine,
     key: &str,
-    extra_flags: u32,
+    extra_flags: DhOptFlags,
 ) -> Result<DhcpOpt, ConfigError> {
     use crate::dhcp_common::lookup_dhcp_len;
-    use crate::types::dhcp::{DHOPT_ENCAPSULATE, DHOPT_PXE_OPT, DHOPT_VENDOR};
 
     let mut parts = split_csv(value);
     if parts.is_empty() {
@@ -4648,23 +4647,23 @@ fn parse_dhcp_option(
             continue;
         }
         if let Some(class) = part.strip_prefix("vendor:") {
-            if flags & DHOPT_ENCAPSULATE != 0 {
+            if flags.contains(DhOptFlags::ENCAPSULATE) {
                 return Err(invalid_value_for(cl, key, part, "vendor: cannot be combined with encap:"));
             }
             vendor_class = Some(class.as_bytes().to_vec());
-            flags |= DHOPT_VENDOR;
+            flags.insert(DhOptFlags::VENDOR);
             parts.remove(0);
             continue;
         }
         if let Some(rest) = part.strip_prefix("encap:") {
-            if flags & DHOPT_VENDOR != 0 {
+            if flags.contains(DhOptFlags::VENDOR) {
                 return Err(invalid_value_for(cl, key, part, "encap: cannot be combined with vendor:"));
             }
-            if flags & DHOPT_PXE_OPT != 0 {
+            if flags.contains(DhOptFlags::PXE_OPT) {
                 return Err(invalid_value_for(cl, key, part, "encap: is not supported in dhcp-option-pxe"));
             }
             encap = i32::from(parse_u16_token(rest, key, cl, "encapsulated option")?);
-            flags |= DHOPT_ENCAPSULATE;
+            flags.insert(DhOptFlags::ENCAPSULATE);
             parts.remove(0);
             continue;
         }
@@ -4761,7 +4760,7 @@ fn parse_dhcp_option_value(
     size_flags: u16,
     key: &str,
     cl: &ConfigLine,
-    flags: &mut u32,
+    flags: &mut DhOptFlags,
 ) -> Result<Option<Vec<u8>>, ConfigError> {
     let fixed_size = size_flags & !(crate::dhcp_common::OT_ADDR_LIST
         | crate::dhcp_common::OT_RFC1035_NAME
@@ -4834,7 +4833,7 @@ fn parse_dhcp_option_value(
         return Ok(Some(encode_u32_minimal(n)));
     }
 
-    *flags |= crate::types::dhcp::DHOPT_STRING;
+    flags.insert(crate::types::dhcp::DhOptFlags::STRING);
     Ok(Some(value_token.into_bytes()))
 }
 
@@ -6238,7 +6237,7 @@ mod tests {
             assert_eq!(d.dhcp_opts.len(), 1);
             let opt = &d.dhcp_opts[0];
             assert_eq!(opt.opt, 10);
-            assert_eq!(opt.flags, crate::types::dhcp::DHOPT_VENDOR | crate::types::dhcp::DHOPT_VENDOR_PXE);
+            assert_eq!(opt.flags, crate::types::dhcp::DhOptFlags::VENDOR | crate::types::dhcp::DhOptFlags::VENDOR_PXE);
             let val = opt.val.as_ref().unwrap();
             assert_eq!(val[0], 5);
             assert_eq!(&val[1..], b"Boot from network");
@@ -7869,7 +7868,7 @@ mod tests {
         #[cfg(feature = "dhcp")]
         {
             let opt = &d.dhcp_opts[0];
-            assert_ne!(opt.flags & crate::types::dhcp::DHOPT_FORCE, 0);
+            assert!(opt.flags.contains(crate::types::dhcp::DhOptFlags::FORCE));
             assert_eq!(opt.opt, 3);
         }
     }
@@ -7882,7 +7881,7 @@ mod tests {
         #[cfg(feature = "dhcp")]
         {
             let opt = &d.dhcp_opts[0];
-            assert_ne!(opt.flags & crate::types::dhcp::DHOPT_PXE_OPT, 0);
+            assert!(opt.flags.contains(crate::types::dhcp::DhOptFlags::PXE_OPT));
             assert_eq!(opt.opt, 67);
         }
     }
@@ -7895,7 +7894,7 @@ mod tests {
         #[cfg(feature = "dhcp")]
         {
             let opt = &d.dhcp_opts[0];
-            assert_ne!(opt.flags & crate::types::dhcp::DHOPT_VENDOR, 0);
+            assert!(opt.flags.contains(crate::types::dhcp::DhOptFlags::VENDOR));
             assert_eq!(opt.vendor_class.as_deref(), Some(b"PXEClient".as_slice()));
         }
     }
@@ -7908,7 +7907,7 @@ mod tests {
         #[cfg(feature = "dhcp")]
         {
             let opt = &d.dhcp_opts[0];
-            assert_ne!(opt.flags & crate::types::dhcp::DHOPT_ENCAPSULATE, 0);
+            assert!(opt.flags.contains(crate::types::dhcp::DhOptFlags::ENCAPSULATE));
             assert_eq!(opt.encap, 175);
             assert_eq!(opt.opt, 190);
         }
