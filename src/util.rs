@@ -444,41 +444,36 @@ pub fn close_fds(max_fd: i64, spare1: i32, spare2: i32, spare3: i32) {
 
     #[cfg(target_os = "linux")]
     {
-        unsafe {
-            let d = libc::opendir(b"/proc/self/fd\0".as_ptr() as *const i8);
-            if !d.is_null() {
-                let dirfd = libc::dirfd(d);
-                if dirfd >= 0 {
-                    loop {
-                        let entry_ptr = libc::readdir(d);
-                        if entry_ptr.is_null() {
-                            break;
-                        }
-                        let entry = &*entry_ptr;
-                        // Try to parse the directory entry name as an fd number
-                        let name_cstr = std::ffi::CStr::from_ptr(entry.d_name.as_ptr());
-                        if let Ok(name) = name_cstr.to_str() {
-                            if let Ok(fd) = name.parse::<i32>() {
-                                // Skip the directory fd itself (matching util.c:848 "fd == dirfd(d)")
-                                // and all the standard spare fds
-                                let is_spare = spares.contains(&fd);
-                                if fd != dirfd && !is_spare {
-                                    libc::close(fd);
-                                }
-                            }
+        use nix::fcntl::OFlag;
+        use nix::sys::stat::Mode;
+        use std::os::fd::AsRawFd;
+
+        if let Ok(mut dir) = nix::dir::Dir::open(
+            "/proc/self/fd",
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY,
+            Mode::empty(),
+        ) {
+            let dirfd = dir.as_raw_fd();
+            for entry in dir.iter().flatten() {
+                if let Ok(name) = entry.file_name().to_str() {
+                    if let Ok(fd) = name.parse::<i32>() {
+                        // Skip the directory fd itself (matching util.c:848 "fd == dirfd(d)")
+                        // and all the standard spare fds
+                        let is_spare = spares.contains(&fd);
+                        if fd != dirfd && !is_spare {
+                            let _ = nix::unistd::close(fd);
                         }
                     }
                 }
-                libc::closedir(d);
-                return;
             }
+            return;
         }
     }
 
     // Fallback: dumb iteration
     for fd in (0..max_fd as i32).rev() {
         if !spares.contains(&fd) {
-            unsafe { libc::close(fd) };
+            let _ = nix::unistd::close(fd);
         }
     }
 }
@@ -532,32 +527,28 @@ pub fn retry_send(rc: isize) -> bool {
 /// Retries on `EINTR`/`ENOMEM`/`ENOBUFS`; returns `false` on any other error
 /// or on EOF during a read.
 pub fn read_write(fd: i32, buf: &mut [u8], rw: bool) -> bool {
+    use nix::errno::Errno;
+
     if buf.is_empty() {
         return true;
     }
+    // Safety: `fd` is a valid, live fd for the duration of this call, per
+    // this function's own contract (same as the raw libc calls it replaces).
+    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
     let mut done = 0usize;
     while done < buf.len() {
         let slice = &mut buf[done..];
-        let n = if rw {
-            unsafe {
-                libc::read(fd, slice.as_mut_ptr() as *mut libc::c_void, slice.len())
-            }
+        let result = if rw {
+            nix::unistd::read(fd, slice)
         } else {
-            unsafe {
-                libc::write(fd, slice.as_ptr() as *const libc::c_void, slice.len())
-            }
+            nix::unistd::write(borrowed, slice)
         };
-        if n < 0 {
-            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            if e == libc::EINTR || e == libc::ENOMEM || e == libc::ENOBUFS {
-                continue;
-            }
-            return false;
+        match result {
+            Ok(0) if rw => return false, // EOF
+            Ok(n) => done += n,
+            Err(Errno::EINTR | Errno::ENOMEM | Errno::ENOBUFS) => continue,
+            Err(_) => return false,
         }
-        if n == 0 && rw {
-            return false; // EOF
-        }
-        done += n as usize;
     }
     true
 }

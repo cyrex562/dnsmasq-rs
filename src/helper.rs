@@ -507,44 +507,33 @@ pub fn create_helper(command: Option<String>, drop_to: Option<(Uid, Gid)>, log_d
 /// log files, or other fds it inherited across `fork()`. Port of
 /// `close_fds()` (util.c:789), called at helper.c:134.
 ///
-/// Uses `/proc/self/fd` (Linux-only, matching this file's existing use of
-/// `nix`/`libc` platform APIs); if that can't be read, this silently does
-/// nothing rather than failing the helper child outright.
+/// Uses `/proc/self/fd` via `nix::dir::Dir` (Linux-only, matching this
+/// file's existing use of `nix`/`libc` platform APIs); if that can't be
+/// opened, this silently does nothing rather than failing the helper child
+/// outright.
 fn close_inherited_fds(keep: std::os::unix::io::RawFd) {
+    use nix::fcntl::OFlag;
+    use nix::sys::stat::Mode;
+    use std::os::fd::AsRawFd;
     use std::os::unix::io::RawFd;
 
-    unsafe {
-        let d = libc::opendir(b"/proc/self/fd\0".as_ptr() as *const i8);
-        if d.is_null() {
-            return; // Silently skip if /proc/self/fd can't be opened
+    let Ok(mut dir) = nix::dir::Dir::open(
+        "/proc/self/fd",
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY,
+        Mode::empty(),
+    ) else {
+        return; // Silently skip if /proc/self/fd can't be opened
+    };
+    let dirfd = dir.as_raw_fd();
+
+    for entry in dir.iter().flatten() {
+        // Try to parse the directory entry name as an fd number
+        let Ok(name) = entry.file_name().to_str() else { continue };
+        let Ok(fd) = name.parse::<RawFd>() else { continue };
+        // Skip stdin/stdout/stderr, the keep fd, and the directory fd itself
+        if fd > 2 && fd != keep && fd != dirfd {
+            let _ = nix::unistd::close(fd);
         }
-
-        let dirfd = libc::dirfd(d);
-        if dirfd < 0 {
-            libc::closedir(d);
-            return;
-        }
-
-        loop {
-            let entry_ptr = libc::readdir(d);
-            if entry_ptr.is_null() {
-                break;
-            }
-
-            let entry = &*entry_ptr;
-            // Try to parse the directory entry name as an fd number
-            let name_cstr = std::ffi::CStr::from_ptr(entry.d_name.as_ptr());
-            if let Ok(name) = name_cstr.to_str() {
-                if let Ok(fd) = name.parse::<RawFd>() {
-                    // Skip stdin/stdout/stderr, the keep fd, and the directory fd itself
-                    if fd > 2 && fd != keep && fd != dirfd {
-                        libc::close(fd);
-                    }
-                }
-            }
-        }
-
-        libc::closedir(d);
     }
 }
 

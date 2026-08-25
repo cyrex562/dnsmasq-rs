@@ -1390,21 +1390,16 @@ fn bind_tftp_listeners(daemon: &Daemon) -> Result<Vec<BoundTftpSocket>, DnsmasqE
 fn adopt_tftp_listeners(
     listeners: Vec<crate::network::Listener>,
 ) -> Result<Vec<BoundTftpSocket>, DnsmasqError> {
-    use std::os::unix::io::FromRawFd;
-
     let mut out = Vec::with_capacity(listeners.len());
     for mut l in listeners {
-        // Nothing serves the DNS/TCP descriptors on this path; close them
+        // Nothing serves the DNS/TCP descriptors on this path; drop them
         // rather than leak, same as `adopt_dns_listeners`.
-        for fd in [std::mem::replace(&mut l.udp_fd, -1), std::mem::replace(&mut l.tcp_fd, -1)] {
-            if fd >= 0 {
-                unsafe { libc::close(fd) };
-            }
-        }
-        if l.tftp_fd < 0 {
+        l.udp_fd = None;
+        l.tcp_fd = None;
+        let Some(fd) = l.tftp_fd.take() else {
             continue;
-        }
-        let sock = unsafe { std::net::UdpSocket::from_raw_fd(l.tftp_fd) };
+        };
+        let sock = std::net::UdpSocket::from(fd);
         sock.set_nonblocking(true)?;
         let addr = sock.local_addr().unwrap_or(l.addr);
         let mtu = l.iface.as_deref().and_then(crate::network::interface_mtu);

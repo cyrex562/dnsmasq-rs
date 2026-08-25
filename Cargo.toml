@@ -55,7 +55,7 @@ lru = "0.12"
 rand = "0.8"
 
 # System / networking
-nix = { version = "0.29", features = ["net", "socket", "signal", "process", "user", "fs"] }
+nix = { version = "0.29", features = ["net", "socket", "signal", "process", "user", "fs", "dir"] }
 socket2 = { version = "0.5", features = ["all"] }
 if-addrs = "0.13"
 libc = "0.2"

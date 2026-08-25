@@ -1183,12 +1183,12 @@ pub fn recv_with_dest(_fd: i32, _buf: &mut [u8]) -> std::io::Result<RecvMeta> {
 pub struct Listener {
     /// Bound address.
     pub addr:     std::net::SocketAddr,
-    /// UDP socket fd (`-1` if absent).
-    pub udp_fd:   i32,
-    /// TCP socket fd (`-1` if absent).
-    pub tcp_fd:   i32,
-    /// TFTP UDP socket fd (`-1` if absent).
-    pub tftp_fd:  i32,
+    /// UDP socket fd, if requested and successfully bound.
+    pub udp_fd:   Option<std::os::fd::OwnedFd>,
+    /// TCP socket fd, if requested and successfully bound.
+    pub tcp_fd:   Option<std::os::fd::OwnedFd>,
+    /// TFTP UDP socket fd, if requested and successfully bound.
+    pub tftp_fd:  Option<std::os::fd::OwnedFd>,
     /// Reference count — how many interfaces share this socket pair.
     pub used:     u32,
     /// Interface name, if known.
@@ -1206,20 +1206,12 @@ pub struct Listener {
 /// fails), matching what a bind of port 0 needs.
 #[cfg(unix)]
 pub fn listener_take_udp(mut l: Listener) -> std::io::Result<(std::net::UdpSocket, std::net::SocketAddr)> {
-    use std::os::unix::io::FromRawFd;
-
-    for fd in [std::mem::replace(&mut l.tcp_fd, -1), std::mem::replace(&mut l.tftp_fd, -1)] {
-        if fd >= 0 {
-            unsafe { libc::close(fd) };
-        }
-    }
-    if l.udp_fd < 0 {
+    l.tcp_fd = None;
+    l.tftp_fd = None;
+    let Some(fd) = l.udp_fd.take() else {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "listener has no UDP socket"));
-    }
-    // Safety: `create_listeners`/`create_listeners_checked` just returned this
-    // fd and we take sole ownership of it here; `l` is consumed and never
-    // reaches `release()`.
-    let sock = unsafe { std::net::UdpSocket::from_raw_fd(l.udp_fd) };
+    };
+    let sock = std::net::UdpSocket::from(fd);
     sock.set_nonblocking(true)?;
     let addr = sock.local_addr().unwrap_or(l.addr);
     Ok((sock, addr))
@@ -1233,15 +1225,10 @@ impl Listener {
             self.used -= 1;
             return false;
         }
-        #[cfg(unix)]
-        {
-            if self.udp_fd  >= 0 { unsafe { libc::close(self.udp_fd);  } }
-            if self.tcp_fd  >= 0 { unsafe { libc::close(self.tcp_fd);  } }
-            if self.tftp_fd >= 0 { unsafe { libc::close(self.tftp_fd); } }
-        }
-        self.udp_fd  = -1;
-        self.tcp_fd  = -1;
-        self.tftp_fd = -1;
+        // Dropping each `OwnedFd` closes it.
+        self.udp_fd  = None;
+        self.tcp_fd  = None;
+        self.tftp_fd = None;
         true
     }
 }
@@ -1518,22 +1505,27 @@ pub fn create_listeners(
     kinds: ListenerKinds,
     nowild: bool,
 ) -> Option<Listener> {
-    let udp_fd = if kinds.udp {
-        make_sock(addr, SockType::Udp, nowild).unwrap_or(-1)
-    } else { -1 };
-    let tcp_fd = if kinds.tcp {
-        make_sock(addr, SockType::Tcp, nowild).unwrap_or(-1)
-    } else { -1 };
+    use std::os::fd::{FromRawFd, OwnedFd};
 
+    // Safety: `make_sock` just returned this fd and hands us sole ownership.
+    let open = |want: bool, addr: std::net::SocketAddr, kind: SockType| -> Option<OwnedFd> {
+        if !want {
+            return None;
+        }
+        make_sock(addr, kind, nowild).ok().map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+
+    let udp_fd = open(kinds.udp, addr, SockType::Udp);
+    let tcp_fd = open(kinds.tcp, addr, SockType::Tcp);
     let tftp_fd = if kinds.tftp {
         let mut tftp_addr = addr;
         tftp_addr.set_port(69); // TFTP_PORT
-        make_sock(tftp_addr, SockType::Udp, nowild).unwrap_or(-1)
+        open(true, tftp_addr, SockType::Udp)
     } else {
-        -1
+        None
     };
 
-    if udp_fd < 0 && tcp_fd < 0 && tftp_fd < 0 {
+    if udp_fd.is_none() && tcp_fd.is_none() && tftp_fd.is_none() {
         return None;
     }
 
@@ -1607,14 +1599,17 @@ pub fn create_listeners_checked(
     nowild:     bool,
     cleverbind: bool,
 ) -> std::io::Result<Option<Listener>> {
-    let sock = |addr: std::net::SocketAddr, kind: SockType, want: bool| {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    let sock = |addr: std::net::SocketAddr, kind: SockType, want: bool| -> std::io::Result<Option<OwnedFd>> {
         if !want {
-            return Ok(-1);
+            return Ok(None);
         }
         match make_sock(addr, kind, nowild) {
-            Ok(fd) => Ok(fd),
-            Err(e) if family_unsupported(&e) => Ok(-1),
-            Err(e) if cleverbind && addr_not_available(&e) => Ok(-1),
+            // Safety: `make_sock` just returned this fd and hands us sole ownership.
+            Ok(fd) => Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) })),
+            Err(e) if family_unsupported(&e) => Ok(None),
+            Err(e) if cleverbind && addr_not_available(&e) => Ok(None),
             Err(e) => Err(e),
         }
     };
@@ -1627,7 +1622,7 @@ pub fn create_listeners_checked(
         sock(tftp_addr, SockType::Udp, kinds.tftp)?
     };
 
-    if udp_fd < 0 && tcp_fd < 0 && tftp_fd < 0 {
+    if udp_fd.is_none() && tcp_fd.is_none() && tftp_fd.is_none() {
         // Every requested socket was skipped, or none was requested at all.
         return Ok(None);
     }
@@ -3351,13 +3346,8 @@ mod tests {
         let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
         let l = create_listeners(addr, ListenerKinds::default(), true).expect("should create listener");
         // At least one of UDP/TCP must be valid.
-        assert!(l.udp_fd >= 0 || l.tcp_fd >= 0);
-        // Manual cleanup.
-        unsafe {
-            if l.udp_fd >= 0 { libc::close(l.udp_fd); }
-            if l.tcp_fd >= 0 { libc::close(l.tcp_fd); }
-        }
-        // Prevent double-close by forgetting the Listener (which has no Drop impl).
+        assert!(l.udp_fd.is_some() || l.tcp_fd.is_some());
+        // `l`'s `OwnedFd` fields close themselves on drop.
     }
 
     #[test]
@@ -3366,13 +3356,7 @@ mod tests {
         let listeners = create_wildcard_listeners(0, ListenerKinds::default());
         // At least the IPv4 wildcard listener must be created.
         assert!(!listeners.is_empty(), "wildcard listeners should not be empty");
-        #[cfg(unix)]
-        for l in listeners {
-            unsafe {
-                if l.udp_fd >= 0 { libc::close(l.udp_fd); }
-                if l.tcp_fd >= 0 { libc::close(l.tcp_fd); }
-            }
-        }
+        // `listeners`' `OwnedFd` fields close themselves on drop.
     }
 
     /// `make_sock`'s third argument is upstream's *global* `OPT_NOWILD`, not
@@ -3437,8 +3421,7 @@ mod tests {
         );
         match result {
             Err(_) => {}
-            Ok(Some(l)) => {
-                unsafe { if l.udp_fd >= 0 { libc::close(l.udp_fd); } }
+            Ok(Some(_l)) => {
                 panic!("binding {addr} unexpectedly succeeded");
             }
             Ok(None) => panic!("a bind() failure was silently swallowed as Ok(None)"),
@@ -3476,8 +3459,8 @@ mod tests {
         let addr1: std::net::SocketAddr = "127.0.0.1:5300".parse().unwrap();
         let addr2: std::net::SocketAddr = "127.0.0.1:5301".parse().unwrap();
         let mut listeners = vec![
-            Listener { addr: addr1, udp_fd: -1, tcp_fd: -1, tftp_fd: -1, used: 1, iface: None },
-            Listener { addr: addr2, udp_fd: -1, tcp_fd: -1, tftp_fd: -1, used: 1, iface: None },
+            Listener { addr: addr1, udp_fd: None, tcp_fd: None, tftp_fd: None, used: 1, iface: None },
+            Listener { addr: addr2, udp_fd: None, tcp_fd: None, tftp_fd: None, used: 1, iface: None },
         ];
         let found = find_listener(&mut listeners, addr1);
         assert!(found.is_some());
@@ -3489,7 +3472,7 @@ mod tests {
         let addr: std::net::SocketAddr = "127.0.0.1:5300".parse().unwrap();
         let other: std::net::SocketAddr = "127.0.0.1:5301".parse().unwrap();
         let mut listeners = vec![
-            Listener { addr, udp_fd: -1, tcp_fd: -1, tftp_fd: -1, used: 1, iface: None },
+            Listener { addr, udp_fd: None, tcp_fd: None, tftp_fd: None, used: 1, iface: None },
         ];
         assert!(find_listener(&mut listeners, other).is_none());
     }
@@ -3498,7 +3481,7 @@ mod tests {
     fn listener_release_decrements_used() {
         let addr: std::net::SocketAddr = "127.0.0.1:5302".parse().unwrap();
         let mut l = Listener {
-            addr, udp_fd: -1, tcp_fd: -1, tftp_fd: -1, used: 2, iface: None,
+            addr, udp_fd: None, tcp_fd: None, tftp_fd: None, used: 2, iface: None,
         };
         let freed = l.release();
         assert!(!freed, "should not free when used > 1");
@@ -3509,7 +3492,7 @@ mod tests {
     fn listener_release_frees_when_last() {
         let addr: std::net::SocketAddr = "127.0.0.1:5303".parse().unwrap();
         let mut l = Listener {
-            addr, udp_fd: -1, tcp_fd: -1, tftp_fd: -1, used: 1, iface: None,
+            addr, udp_fd: None, tcp_fd: None, tftp_fd: None, used: 1, iface: None,
         };
         let freed = l.release();
         assert!(freed, "should free when used == 1");
@@ -3519,7 +3502,7 @@ mod tests {
     fn create_bound_listeners_reuses_existing() {
         let addr: std::net::SocketAddr = "127.0.0.1:5304".parse().unwrap();
         let mut listeners = vec![
-            Listener { addr, udp_fd: -1, tcp_fd: -1, tftp_fd: -1, used: 1, iface: None },
+            Listener { addr, udp_fd: None, tcp_fd: None, tftp_fd: None, used: 1, iface: None },
         ];
         let ifaces = vec![(addr, "lo".to_string())];
         let created = create_bound_listeners(&mut listeners, &ifaces, ListenerKinds::default(), /*nowild=*/true);
@@ -3537,10 +3520,7 @@ mod tests {
         assert_eq!(created, 1);
         assert_eq!(listeners.len(), 1);
         assert_eq!(listeners[0].iface.as_deref(), Some("lo"));
-        unsafe {
-            if listeners[0].udp_fd >= 0 { libc::close(listeners[0].udp_fd); }
-            if listeners[0].tcp_fd >= 0 { libc::close(listeners[0].tcp_fd); }
-        }
+        // `listeners`' `OwnedFd` fields close themselves on drop.
     }
 
     // ── label_exception ───────────────────────────────────────────────────────

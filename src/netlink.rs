@@ -512,8 +512,13 @@ pub fn netlink_open() -> std::io::Result<(i32, u32)> {
     // Retrieve the kernel-assigned pid via getsockname
     let mut bound = [0u8; 12];
     let mut len = 12u32;
-    unsafe {
-        libc::getsockname(fd, bound.as_mut_ptr() as *mut libc::sockaddr, &mut len as *mut libc::socklen_t);
+    let getsockname_ret = unsafe {
+        libc::getsockname(fd, bound.as_mut_ptr() as *mut libc::sockaddr, &mut len as *mut libc::socklen_t)
+    };
+    if getsockname_ret == -1 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(err);
     }
     let pid = u32::from_ne_bytes([bound[4], bound[5], bound[6], bound[7]]);
 
@@ -525,17 +530,8 @@ pub fn netlink_open() -> std::io::Result<(i32, u32)> {
 /// at startup and reused for the life of the daemon rather than per-call.
 #[derive(Debug)]
 pub struct NetlinkSocket {
-    pub fd:  i32,
+    pub fd:  std::os::fd::OwnedFd,
     pub pid: u32,
-}
-
-impl Drop for NetlinkSocket {
-    fn drop(&mut self) {
-        #[cfg(target_os = "linux")]
-        unsafe {
-            libc::close(self.fd);
-        }
-    }
 }
 
 /// Open and return an owned, self-closing netlink socket. Thin wrapper over
@@ -543,8 +539,11 @@ impl Drop for NetlinkSocket {
 /// live for the daemon's lifetime rather than manage the raw fd themselves.
 #[cfg(target_os = "linux")]
 pub fn open_netlink_socket() -> std::io::Result<NetlinkSocket> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
     let (fd, pid) = netlink_open()?;
-    Ok(NetlinkSocket { fd, pid })
+    // Safety: `netlink_open` just returned this fd and hands us sole ownership.
+    Ok(NetlinkSocket { fd: unsafe { OwnedFd::from_raw_fd(fd) }, pid })
 }
 
 /// Receive a netlink message into `buf`, growing it as needed.
@@ -1302,7 +1301,7 @@ mod tests {
         // privilege on Linux, so this is expected to succeed in normal and
         // sandboxed test environments alike.
         let sock = open_netlink_socket().expect("open_netlink_socket failed");
-        assert!(sock.fd >= 0);
+        assert!(std::os::fd::AsRawFd::as_raw_fd(&sock.fd) >= 0);
         // Dropping must close the fd without panicking.
         drop(sock);
     }

@@ -348,7 +348,7 @@ fn ensure_netlink_open(netlink: &mut Option<crate::netlink::NetlinkSocket>) -> O
             }
         }
     }
-    netlink.as_ref().map(|s| (s.fd, s.pid))
+    netlink.as_ref().map(|s| (std::os::fd::AsRawFd::as_raw_fd(&s.fd), s.pid))
 }
 
 /// Enumerate the kernel neighbour table into `cache` via `(fd, pid)`.
