@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use lru::LruCache;
@@ -49,44 +48,6 @@ pub fn next_uid() -> u32 {
 // record_source — uid -> origin-file lookup (mirrors C `record_source()`)
 // ---------------------------------------------------------------------------
 
-/// Registry mapping a hosts-file-derived `uid` back to the file it was loaded
-/// from. Populated by [`load_hosts_file`], consulted by [`record_source`].
-///
-/// C keeps this as a linked list of `struct hostsfile` (`daemon->addn_hosts`)
-/// plus two fixed constants (`SRC_CONFIG`, `SRC_HOSTS` for `/etc/hosts`); a
-/// flat `uid -> path` map is equivalent here because every hosts-format file
-/// this port loads — `/etc/hosts` included — goes through
-/// [`load_hosts_file`] with its own path, so the registered string is always
-/// the exact path `--log-queries` should attribute the answer to.
-fn record_sources() -> &'static Mutex<HashMap<u32, String>> {
-    static SOURCES: OnceLock<Mutex<HashMap<u32, String>>> = OnceLock::new();
-    SOURCES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Register `uid` as having been loaded from `source` (a file path).
-fn register_record_source(uid: u32, source: &str) {
-    if uid == UID_NONE {
-        return;
-    }
-    if let Ok(mut sources) = record_sources().lock() {
-        sources.insert(uid, source.to_string());
-    }
-}
-
-/// Resolve a cache record's `uid` back to the file it was loaded from.
-///
-/// Port of C's `record_source()` (`cache.c:2190-2215`): used as the `arg` to
-/// [`log_query`] for `F_HOSTS`-flagged answers, so `--log-queries` output
-/// names the actual `/etc/hosts` / `--addn-hosts` file an answer came from
-/// instead of leaving the source blank. Returns `"<unknown>"` for a `uid`
-/// nothing registered, matching C's fallback.
-pub fn record_source(uid: u32) -> String {
-    record_sources()
-        .lock()
-        .ok()
-        .and_then(|sources| sources.get(&uid).cloned())
-        .unwrap_or_else(|| "<unknown>".to_string())
-}
 
 // ---------------------------------------------------------------------------
 // Type-flag mask
@@ -199,6 +160,11 @@ pub struct DnsCache {
     /// `insert_error` (`cache.c:635`, `really_insert()`'s
     /// `if (insert_error) return NULL;` at `cache.c:700-701`).
     insert_error: bool,
+    /// Registry mapping a hosts-file-derived `uid` back to the file it was
+    /// loaded from. Populated by [`load_hosts_file`], consulted by
+    /// [`Self::record_source`]. See that method's doc for why a flat map is
+    /// equivalent to C's `daemon->addn_hosts` linked list here.
+    source_registry: HashMap<u32, String>,
 }
 
 /// A [`DnsCache`] shared between the forwarding loop and reload handling.
@@ -276,6 +242,7 @@ impl DnsCache {
             misses:    0,
             new_chain: Vec::new(),
             insert_error: false,
+            source_registry: HashMap::new(),
         }
     }
 
@@ -289,6 +256,36 @@ impl DnsCache {
         c.min_cache_ttl = min_ttl;
         c.max_cache_ttl = max_ttl;
         c
+    }
+
+    /// Register `uid` as having been loaded from `source` (a file path).
+    ///
+    /// C keeps this as a linked list of `struct hostsfile` (`daemon->addn_hosts`)
+    /// plus two fixed constants (`SRC_CONFIG`, `SRC_HOSTS` for `/etc/hosts`); a
+    /// flat `uid -> path` map on the cache itself is equivalent here because
+    /// every hosts-format file this port loads — `/etc/hosts` included —
+    /// goes through [`load_hosts_file`] with its own path, so the registered
+    /// string is always the exact path `--log-queries` should attribute the
+    /// answer to.
+    pub fn register_record_source(&mut self, uid: u32, source: &str) {
+        if uid == UID_NONE {
+            return;
+        }
+        self.source_registry.insert(uid, source.to_string());
+    }
+
+    /// Resolve a cache record's `uid` back to the file it was loaded from.
+    ///
+    /// Port of C's `record_source()` (`cache.c:2190-2215`): used as the `arg`
+    /// to [`log_query`] for `F_HOSTS`-flagged answers, so `--log-queries`
+    /// output names the actual `/etc/hosts` / `--addn-hosts` file an answer
+    /// came from instead of leaving the source blank. Returns `"<unknown>"`
+    /// for a `uid` nothing registered, matching C's fallback.
+    pub fn record_source(&self, uid: u32) -> String {
+        self.source_registry
+            .get(&uid)
+            .cloned()
+            .unwrap_or_else(|| "<unknown>".to_string())
     }
 
     /// Insert (or replace) a record in the cache.
@@ -1794,7 +1791,7 @@ pub fn load_hosts_file(
 ) -> std::io::Result<(u32, usize)> {
     let uid = next_uid();
     let text = std::fs::read_to_string(path)?;
-    register_record_source(uid, path);
+    cache.register_record_source(uid, path);
     let total = text.lines()
         .map(|l| parse_hosts_line(l, ttl, uid, now, cache))
         .sum();
@@ -2367,7 +2364,8 @@ mod tests {
     fn record_source_unregistered_uid_returns_unknown() {
         // Mirrors C's `record_source()` fallback: an index nothing registered
         // returns "<unknown>" rather than panicking or an empty string.
-        assert_eq!(record_source(u32::MAX - 1), "<unknown>");
+        let cache = DnsCache::new(100);
+        assert_eq!(cache.record_source(u32::MAX - 1), "<unknown>");
     }
 
     #[test]
@@ -2385,7 +2383,7 @@ mod tests {
 
         let (uid, count) = load_hosts_file(&path, 60, now, &mut cache).unwrap();
         assert!(count > 0);
-        assert_eq!(record_source(uid), path);
+        assert_eq!(cache.record_source(uid), path);
 
         let rec = cache.lookup_by_name("recordsourcehost", F_IPV4, now).unwrap();
         assert_eq!(rec.uid, uid);

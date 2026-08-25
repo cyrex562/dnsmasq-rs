@@ -1157,8 +1157,8 @@ fn domain_matches_any_suffix(name: &str, domains: &[String]) -> bool {
 /// that call shape exactly — rather than only computing it when `F_HOSTS` is
 /// set — keeps this a literal port instead of an equivalent-but-different
 /// shortcut.
-fn cached_answer_source_arg(uid: u32) -> Option<String> {
-    Some(crate::cache::record_source(uid))
+fn cached_answer_source_arg(cache: &DnsCache, uid: u32) -> Option<String> {
+    Some(cache.record_source(uid))
 }
 
 /// Port of C's `answer_request()`.  Answers DNS queries from local config and cache.
@@ -1278,7 +1278,7 @@ pub fn answer_request(
                 answers.push(DnsRr {
                     name: name.clone(), rtype: 5, class: 1, ttl: cname_ttl, rdata: rd.to_vec(),
                 });
-                log(cname_flags, Some(&name), None, cached_answer_source_arg(cname_uid).as_deref(), 0);
+                log(cname_flags, Some(&name), None, cached_answer_source_arg(cache, cname_uid).as_deref(), 0);
                 name = target.to_lowercase();
                 if qtype == 5 /* CNAME */ {
                     // The CNAME *is* the answer the client asked for.
@@ -1289,9 +1289,12 @@ pub fn answer_request(
             }
 
             // Cached NXDOMAIN.
-            if let Some(r) = cache.lookup_by_name(&name, F_NXDOMAIN | F_NEG, now) {
-                let arg = cached_answer_source_arg(r.uid);
-                log(r.flags, Some(&name), None, arg.as_deref(), 0);
+            if let Some((flags, uid)) = cache
+                .lookup_by_name(&name, F_NXDOMAIN | F_NEG, now)
+                .map(|r| (r.flags, r.uid))
+            {
+                let arg = cached_answer_source_arg(cache, uid);
+                log(flags, Some(&name), None, arg.as_deref(), 0);
                 nxdomain = true;
                 ans      = true;
             }
@@ -1419,7 +1422,7 @@ pub fn answer_request(
                                 name: name.clone(), rtype: 12, class: 1,
                                 ttl: cached_ttl, rdata: rd.to_vec(),
                             });
-                            let arg = cached_answer_source_arg(uid);
+                            let arg = cached_answer_source_arg(cache, uid);
                             log(flags & !F_FORWARD, Some(&name), Some(&addr), arg.as_deref(), 0);
                             ans = true;
                         }
@@ -1502,7 +1505,7 @@ pub fn answer_request(
                             name: name.clone(), rtype: 1, class: 1,
                             ttl: cached_ttl, rdata: ip.octets().to_vec(),
                         });
-                        let arg = cached_answer_source_arg(uid);
+                        let arg = cached_answer_source_arg(cache, uid);
                         log(flags, Some(&name), Some(&AllAddr::Addr4(ip)), arg.as_deref(), 0);
                         ans = true;
                     }
@@ -1536,7 +1539,7 @@ pub fn answer_request(
                             name: name.clone(), rtype: 28, class: 1,
                             ttl: cached_ttl, rdata: ip.octets().to_vec(),
                         });
-                        let arg = cached_answer_source_arg(uid);
+                        let arg = cached_answer_source_arg(cache, uid);
                         log(flags, Some(&name), Some(&AllAddr::Addr6(ip)), arg.as_deref(), 0);
                         ans = true;
                     }
@@ -4653,7 +4656,7 @@ mod tests {
         let path = file.path().to_str().unwrap().to_string();
 
         let (uid, _count) = crate::cache::load_hosts_file(&path, 60, now, &mut cache).unwrap();
-        assert_eq!(cached_answer_source_arg(uid), Some(path));
+        assert_eq!(cached_answer_source_arg(&cache, uid), Some(path));
     }
 
     #[test]
@@ -4661,7 +4664,8 @@ mod tests {
         // Mirrors C computing `record_source()` unconditionally even for a
         // non-hosts record — `log_query` only renders it when `F_HOSTS` is
         // set, so a harmless placeholder here is correct, not a bug.
-        assert_eq!(cached_answer_source_arg(UID_NONE), Some("<unknown>".to_string()));
+        let cache = DnsCache::new(16);
+        assert_eq!(cached_answer_source_arg(&cache, UID_NONE), Some("<unknown>".to_string()));
     }
 
     #[test]

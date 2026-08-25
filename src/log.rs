@@ -161,6 +161,44 @@ fn log_state() -> &'static Mutex<LogConfig> {
     LOG_STATE.get_or_init(|| Mutex::new(LogConfig::default()))
 }
 
+/// Zero-sized handle to the global [`LogConfig`] singleton.
+///
+/// The multi-field, deadlock-sensitive critical sections below (`log_start`,
+/// `log_reopen`, `my_syslog`'s file-write block, `deliver_to_syslog`,
+/// `flush_log`, `LogSink`) keep locking `log_state()` directly — their exact
+/// lock-drop timing (releasing before a recursive `my_syslog` call, or before
+/// a backoff sleep) is part of their documented correctness and doesn't
+/// simplify by going through a named wrapper. `LogHandle` exists for the
+/// handful of call sites that only need one field, so they read as "what do
+/// I want" instead of "lock, map, unwrap_or".
+#[derive(Clone, Copy)]
+struct LogHandle;
+
+impl LogHandle {
+    fn current() -> Self {
+        LogHandle
+    }
+
+    /// Whether `MS_DEBUG`-tagged messages should be emitted.
+    fn is_debug_enabled(self) -> bool {
+        log_state().lock().map(|c| c.log_debug).unwrap_or(false)
+    }
+
+    /// The configured syslog facility, or `LOG_DAEMON` if the lock is
+    /// poisoned.
+    fn facility(self) -> u32 {
+        log_state().lock().map(|c| c.log_fac).unwrap_or(LOG_DAEMON)
+    }
+
+    /// Force stderr echoing on, unconditionally — `die()`'s "always print to
+    /// stderr when dying" step.
+    fn force_echo_stderr(self) {
+        if let Ok(mut cfg) = log_state().lock() {
+            cfg.echo_stderr = true;
+        }
+    }
+}
+
 /// Set once [`log_start`] has successfully installed [`LogSink`] as the global
 /// `tracing` writer.  Sticky: a subscriber cannot be replaced once installed.
 static SINK_INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -699,14 +737,8 @@ pub fn my_syslog(priority: u32, message: &str) {
     let tag   = subsystem_tag(priority);
 
     // Check whether MS_DEBUG messages are enabled
-    if fac == MS_DEBUG {
-        let enabled = log_state()
-            .lock()
-            .map(|c| c.log_debug)
-            .unwrap_or(false);
-        if !enabled {
-            return;
-        }
+    if fac == MS_DEBUG && !LogHandle::current().is_debug_enabled() {
+        return;
     }
 
     // Build the final log line (tracing macros already add context).
@@ -750,13 +782,7 @@ pub fn my_syslog(priority: u32, message: &str) {
     // above via the tracing/file sink; the no-file (default) case reaches
     // the actual syslog socket here.
     if !log_to_file {
-        deliver_to_syslog(level, fac_or_default(), tag, message);
-    }
-
-    // `fac_or_default` needs the lock too, so it's a tiny local helper
-    // rather than inlining another `log_state().lock()` above.
-    fn fac_or_default() -> u32 {
-        log_state().lock().map(|c| c.log_fac).unwrap_or(LOG_DAEMON)
+        deliver_to_syslog(level, LogHandle::current().facility(), tag, message);
     }
 }
 
@@ -918,12 +944,7 @@ pub fn flush_log() {
 /// Mirrors `die()` from the C source.
 /// `arg` is substituted for `%s` in the message (like the C `arg1` parameter).
 pub fn die(message: &str, arg: Option<&str>, exit_code: i32) -> ! {
-    {
-        let state = log_state();
-        if let Ok(mut cfg) = state.lock() {
-            cfg.echo_stderr = true; // always print to stderr when dying
-        }
-    }
+    LogHandle::current().force_echo_stderr(); // always print to stderr when dying
     let full = match arg {
         Some(a) => format!("{}: {}", message, a),
         None    => message.to_string(),
