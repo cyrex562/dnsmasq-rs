@@ -514,9 +514,13 @@ pub fn handle_leasequery(
 /// Returns the byte index of the option's type byte within `buf`, or `None`.
 /// PAD bytes (0x00) are skipped; the scan stops at END (0xFF) or end of buffer.
 ///
-/// Mirrors C's `option_find1()`.
+/// Private: nothing outside this module should be indexing into an options
+/// buffer by hand — see [`DhcpOptionRef`]/[`find_dhcp_option`], which bundle
+/// a match's data slice so a caller can only read bytes the type already
+/// guarantees are in-bounds, rather than passing a possibly-stale index back
+/// into a separate accessor call. Mirrors C's `option_find1()`.
 #[cfg(feature = "dhcp")]
-pub fn option_find1(buf: &[u8], opt_type: u8, minsize: usize) -> Option<usize> {
+fn option_find1(buf: &[u8], opt_type: u8, minsize: usize) -> Option<usize> {
     use crate::dhcp_protocol::{OPTION_END, OPTION_PAD};
     let mut i = 0;
     while i < buf.len() {
@@ -543,46 +547,77 @@ pub fn option_find1(buf: &[u8], opt_type: u8, minsize: usize) -> Option<usize> {
     None
 }
 
-/// Return the length field of the option whose type byte is at `idx` in `buf`.
-#[cfg(feature = "dhcp")]
-#[inline]
-pub fn option_len_at(buf: &[u8], idx: usize) -> usize {
-    buf[idx + 1] as usize
-}
-
-/// Return the data slice of the option whose type byte is at `idx` in `buf`.
-#[cfg(feature = "dhcp")]
-#[inline]
-pub fn option_val_at(buf: &[u8], idx: usize) -> &[u8] {
-    let len = option_len_at(buf, idx);
-    &buf[idx + 2..idx + 2 + len]
-}
-
-/// Read a big-endian unsigned integer of `size` bytes from an option's data,
-/// starting at `offset` bytes into that data.
+/// A single DHCP option found by [`find_dhcp_option`]/[`option_find`],
+/// bundling its data slice (and, for the rare caller that needs to mutate
+/// the option out of the buffer afterward — see `relay_reply4` — its byte
+/// offset within the buffer that was scanned).
 ///
-/// Mirrors C's `option_uint()`.
+/// Replaces the old `option_len_at`/`option_val_at`/`option_uint_at`/
+/// `option_addr_at(buf, idx)` accessors, which took a bare `usize` index
+/// with nothing tying it to the buffer it came from: a stale index, or one
+/// hand-constructed against the wrong buffer, would panic instead of being
+/// caught by the type system.
 #[cfg(feature = "dhcp")]
-pub fn option_uint_at(buf: &[u8], idx: usize, offset: usize, size: usize) -> u32 {
-    let data = option_val_at(buf, idx);
-    let mut ret: u32 = 0;
-    for i in offset..offset + size {
-        ret = (ret << 8) | u32::from(*data.get(i).unwrap_or(&0));
-    }
-    ret
+#[derive(Clone, Copy, Debug)]
+pub struct DhcpOptionRef<'a> {
+    index: usize,
+    data:  &'a [u8],
 }
 
-/// Read an IPv4 address from an option's data field.
-///
-/// Returns `None` if the option data is fewer than 4 bytes.
-/// Mirrors C's `option_addr()`.
 #[cfg(feature = "dhcp")]
-pub fn option_addr_at(buf: &[u8], idx: usize) -> Option<std::net::Ipv4Addr> {
-    let data = option_val_at(buf, idx);
-    if data.len() < 4 {
-        return None;
+impl<'a> DhcpOptionRef<'a> {
+    /// Byte offset of the option's type byte within the buffer that was
+    /// scanned. Only needed by callers that mutate the option away after
+    /// reading it.
+    pub fn index(&self) -> usize {
+        self.index
     }
-    Some(std::net::Ipv4Addr::new(data[0], data[1], data[2], data[3]))
+
+    /// The option's data length in bytes.
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    /// The option's data slice.
+    pub fn value(&self) -> &'a [u8] {
+        self.data
+    }
+
+    /// Read a big-endian unsigned integer of `size` bytes (at most 4),
+    /// starting at `offset` bytes into this option's data. Bytes past the
+    /// end of the data read as 0. Mirrors C's `option_uint()`.
+    pub fn uint(&self, offset: usize, size: usize) -> u32 {
+        debug_assert!(size <= 4, "option_uint only supports sizes up to 4 bytes");
+        let mut bytes = [0u8; 4];
+        let start = 4usize.saturating_sub(size);
+        for (i, b) in bytes.iter_mut().enumerate().skip(start) {
+            *b = self.data.get(offset + (i - start)).copied().unwrap_or(0);
+        }
+        u32::from_be_bytes(bytes)
+    }
+
+    /// Read an IPv4 address from this option's data. Returns `None` if the
+    /// data is fewer than 4 bytes. Mirrors C's `option_addr()`.
+    pub fn addr(&self) -> Option<std::net::Ipv4Addr> {
+        if self.data.len() < 4 {
+            return None;
+        }
+        Some(std::net::Ipv4Addr::new(self.data[0], self.data[1], self.data[2], self.data[3]))
+    }
+}
+
+/// Scan a flat options buffer for an option of type `opt_type` with at least
+/// `minsize` data bytes, returning a safe bundled view instead of a bare
+/// index. See [`DhcpOptionRef`].
+#[cfg(feature = "dhcp")]
+pub fn find_dhcp_option(buf: &[u8], opt_type: u8, minsize: usize) -> Option<DhcpOptionRef<'_>> {
+    let index = option_find1(buf, opt_type, minsize)?;
+    let len = buf[index + 1] as usize;
+    Some(DhcpOptionRef { index, data: &buf[index + 2..index + 2 + len] })
 }
 
 /// Search a [`DhcpPacket`]'s options for option `opt_type` with at least
@@ -592,14 +627,13 @@ pub fn option_addr_at(buf: &[u8], idx: usize) -> Option<std::net::Ipv4Addr> {
 /// 1. The primary options area (after the 4-byte DHCP cookie).
 /// 2. If OPTION_OVERLOAD (52) is set, the `file` and/or `sname` fields.
 ///
-/// Returns `(buffer_slice, index_within_slice)` on success.
 /// Mirrors C's `option_find()`.
 #[cfg(feature = "dhcp")]
 pub fn option_find<'a>(
     pkt: &'a DhcpPacket,
     opt_type: u8,
     minsize: usize,
-) -> Option<(&'a [u8], usize)> {
+) -> Option<DhcpOptionRef<'a>> {
     use crate::dhcp_protocol::OPTION_OVERLOAD;
     const COOKIE_LEN: usize = 4;
 
@@ -610,25 +644,25 @@ pub fn option_find<'a>(
         &pkt.options[..]
     };
 
-    if let Some(idx) = option_find1(opts, opt_type, minsize) {
-        return Some((opts, idx));
+    if let Some(found) = find_dhcp_option(opts, opt_type, minsize) {
+        return Some(found);
     }
 
     // Look for OPTION_OVERLOAD to check sname/file areas.
-    let overload_idx = option_find1(opts, OPTION_OVERLOAD, 1)?;
-    let overload_val = option_uint_at(opts, overload_idx, 0, 1);
+    let overload = find_dhcp_option(opts, OPTION_OVERLOAD, 1)?;
+    let overload_val = overload.uint(0, 1);
 
     // Bit 0 → filename field used for options.
     if (overload_val & 1) != 0 {
-        if let Some(idx) = option_find1(&pkt.file, opt_type, minsize) {
-            return Some((&pkt.file, idx));
+        if let Some(found) = find_dhcp_option(&pkt.file, opt_type, minsize) {
+            return Some(found);
         }
     }
 
     // Bit 1 → sname field used for options.
     if (overload_val & 2) != 0 {
-        if let Some(idx) = option_find1(&pkt.sname, opt_type, minsize) {
-            return Some((&pkt.sname, idx));
+        if let Some(found) = find_dhcp_option(&pkt.sname, opt_type, minsize) {
+            return Some(found);
         }
     }
 
@@ -957,14 +991,14 @@ pub fn relay_reply4(pkt: &mut DhcpPacket, relays: &[crate::types::dhcp::DhcpRela
         if relay.split_mode != 0 {
             if let AllAddr::Addr4(uplink4) = relay.uplink_addr {
                 if pkt.giaddr == uplink4 {
-                    if let Some(idx) = option_find1(&pkt.options, OPTION_AGENT_ID, 1) {
-                        let data = option_val_at(&pkt.options, idx);
-                        if let Some(sidx) = option_find1(data, SUBOPT_REMOTE_ID, 4) {
-                            return_iface = option_uint_at(data, sidx, 0, 4) as i32;
+                    if let Some(opt) = find_dhcp_option(&pkt.options, OPTION_AGENT_ID, 1) {
+                        if let Some(remote) = find_dhcp_option(opt.value(), SUBOPT_REMOTE_ID, 4) {
+                            return_iface = remote.uint(0, 4) as i32;
                         }
 
                         // Delete agent info before returning it to the client (RFC 3046 §2.1).
-                        let len = option_len_at(&pkt.options, idx);
+                        let idx = opt.index();
+                        let len = opt.len();
                         pkt.options[idx] = OPTION_END;
                         let start = idx + 1;
                         let end = (start + len + 2).min(pkt.options.len());
@@ -1766,53 +1800,53 @@ mod tests {
         opts
     }
 
-    // ── option_find1 ──────────────────────────────────────────────────────────
+    // ── find_dhcp_option ─────────────────────────────────────────────────────
 
     #[test]
-    fn option_find1_finds_option() {
+    fn find_dhcp_option_finds_option() {
         let buf = vec![12, 6, b'h', b'o', b's', b't', b'o', b'k', OPTION_END];
-        let idx = option_find1(&buf, 12, 1).unwrap();
-        assert_eq!(idx, 0);
-        assert_eq!(option_val_at(&buf, idx), b"hostok");
+        let opt = find_dhcp_option(&buf, 12, 1).unwrap();
+        assert_eq!(opt.index(), 0);
+        assert_eq!(opt.value(), b"hostok");
     }
 
     #[test]
-    fn option_find1_skips_pad() {
+    fn find_dhcp_option_skips_pad() {
         let buf = vec![OPTION_PAD, OPTION_PAD, 12, 3, 1, 2, 3, OPTION_END];
-        let idx = option_find1(&buf, 12, 1).unwrap();
-        assert_eq!(idx, 2);
+        let opt = find_dhcp_option(&buf, 12, 1).unwrap();
+        assert_eq!(opt.index(), 2);
     }
 
     #[test]
-    fn option_find1_not_found() {
+    fn find_dhcp_option_not_found() {
         let buf = vec![12, 1, 0x42, OPTION_END];
-        assert!(option_find1(&buf, 53, 1).is_none());
+        assert!(find_dhcp_option(&buf, 53, 1).is_none());
     }
 
     #[test]
-    fn option_find1_minsize_too_large() {
+    fn find_dhcp_option_minsize_too_large() {
         let buf = vec![12, 1, 0x42, OPTION_END];
         // option 12 exists but only 1 byte; asking for 2 should fail
-        assert!(option_find1(&buf, 12, 2).is_none());
+        assert!(find_dhcp_option(&buf, 12, 2).is_none());
     }
 
-    // ── option_uint_at ────────────────────────────────────────────────────────
+    // ── DhcpOptionRef::uint ──────────────────────────────────────────────────
 
     #[test]
-    fn option_uint_at_big_endian() {
+    fn dhcp_option_ref_uint_big_endian() {
         // Option 51 (IP Address Lease Time), value 0x0001_5180 = 86400
         let buf = vec![51, 4, 0x00, 0x01, 0x51, 0x80, OPTION_END];
-        let idx = option_find1(&buf, 51, 4).unwrap();
-        assert_eq!(option_uint_at(&buf, idx, 0, 4), 86400);
+        let opt = find_dhcp_option(&buf, 51, 4).unwrap();
+        assert_eq!(opt.uint(0, 4), 86400);
     }
 
-    // ── option_addr_at ────────────────────────────────────────────────────────
+    // ── DhcpOptionRef::addr ──────────────────────────────────────────────────
 
     #[test]
-    fn option_addr_at_parses_ipv4() {
+    fn dhcp_option_ref_addr_parses_ipv4() {
         let buf = vec![1, 4, 255, 255, 255, 0, OPTION_END]; // subnet mask
-        let idx = option_find1(&buf, 1, 4).unwrap();
-        let addr = option_addr_at(&buf, idx).unwrap();
+        let opt = find_dhcp_option(&buf, 1, 4).unwrap();
+        let addr = opt.addr().unwrap();
         assert_eq!(addr, std::net::Ipv4Addr::new(255, 255, 255, 0));
     }
 
@@ -1823,8 +1857,8 @@ mod tests {
         let mut pkt = base_packet();
         // cookie + option 12
         pkt.options = vec![0x63, 0x82, 0x53, 0x63, 12, 3, b'a', b'b', b'c', OPTION_END];
-        let (buf, idx) = option_find(&pkt, 12, 1).unwrap();
-        assert_eq!(option_val_at(buf, idx), b"abc");
+        let opt = option_find(&pkt, 12, 1).unwrap();
+        assert_eq!(opt.value(), b"abc");
     }
 
     #[test]
@@ -1839,8 +1873,8 @@ mod tests {
         pkt.file[3] = b'y';
         pkt.file[4] = b'z';
         pkt.file[5] = OPTION_END;
-        let (buf, idx) = option_find(&pkt, 12, 1).unwrap();
-        assert_eq!(option_val_at(buf, idx), b"xyz");
+        let opt = option_find(&pkt, 12, 1).unwrap();
+        assert_eq!(opt.value(), b"xyz");
     }
 
     // ── option_put ────────────────────────────────────────────────────────────
@@ -2243,15 +2277,15 @@ mod tests {
         assert_eq!(fwd.packet.giaddr, uplink);
         assert!(matches!(relays[0].uplink_addr, crate::types::addr::AllAddr::Addr4(a) if a == uplink));
 
-        let idx = option_find1(&fwd.packet.options, OPTION_AGENT_ID, 1).expect("agent-id option present");
-        assert_eq!(option_len_at(&fwd.packet.options, idx), 21);
-        let data = option_val_at(&fwd.packet.options, idx);
-        let subnet_idx = option_find1(data, crate::dhcp_protocol::SUBOPT_SUBNET_SELECT, 4).unwrap();
-        assert_eq!(option_val_at(data, subnet_idx), iface_addr.octets());
-        let remote_idx = option_find1(data, crate::dhcp_protocol::SUBOPT_REMOTE_ID, 4).unwrap();
-        assert_eq!(option_uint_at(data, remote_idx, 0, 4), 5);
-        let flags_idx = option_find1(data, crate::dhcp_protocol::SUBOPT_FLAGS, 1).unwrap();
-        assert_eq!(option_val_at(data, flags_idx), [0x80]); // unicast
+        let agent_opt = find_dhcp_option(&fwd.packet.options, OPTION_AGENT_ID, 1).expect("agent-id option present");
+        assert_eq!(agent_opt.len(), 21);
+        let data = agent_opt.value();
+        let subnet_opt = find_dhcp_option(data, crate::dhcp_protocol::SUBOPT_SUBNET_SELECT, 4).unwrap();
+        assert_eq!(subnet_opt.value(), iface_addr.octets());
+        let remote_opt = find_dhcp_option(data, crate::dhcp_protocol::SUBOPT_REMOTE_ID, 4).unwrap();
+        assert_eq!(remote_opt.uint(0, 4), 5);
+        let flags_opt = find_dhcp_option(data, crate::dhcp_protocol::SUBOPT_FLAGS, 1).unwrap();
+        assert_eq!(flags_opt.value(), [0x80]); // unicast
     }
 
     #[test]
@@ -2320,7 +2354,7 @@ mod tests {
 
         assert_eq!(iface, 7);
         // Agent-id must be stripped per RFC 3046 §2.1 before the reply reaches the client.
-        assert!(option_find1(&reply.options, OPTION_AGENT_ID, 0).is_none());
+        assert!(find_dhcp_option(&reply.options, OPTION_AGENT_ID, 0).is_none());
     }
 
     // ── append_opt / has_opt_raw ──────────────────────────────────────────────
@@ -2806,8 +2840,9 @@ mod tests {
         .expect("address is in-range, so rapid commit should succeed");
         assert_eq!(ack.msg_type, DhcpMsgType::Ack);
         assert_eq!(ack.yiaddr, Ipv4Addr::new(10, 0, 0, 5));
-        assert!(option_find1(&ack.options, crate::dhcp_protocol::OPTION_RAPID_COMMIT, 0).is_some());
-        assert_eq!(option_len_at(&ack.options, option_find1(&ack.options, crate::dhcp_protocol::OPTION_RAPID_COMMIT, 0).unwrap()), 0);
+        let rapid_commit_opt = find_dhcp_option(&ack.options, crate::dhcp_protocol::OPTION_RAPID_COMMIT, 0);
+        assert!(rapid_commit_opt.is_some());
+        assert_eq!(rapid_commit_opt.unwrap().len(), 0);
     }
 
     #[test]

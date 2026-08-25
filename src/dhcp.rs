@@ -282,8 +282,8 @@ fn derived_tags(
 
     if let Some(agent_info) = find_option(&pkt.options, OPTION_AGENT_ID) {
         for rule in &cfg.relay_id_rules {
-            if let Some(idx) = crate::rfc2131::option_find1(agent_info, rule.subopt, 1) {
-                if crate::rfc2131::option_val_at(agent_info, idx) == rule.data.as_slice() {
+            if let Some(opt) = crate::rfc2131::find_dhcp_option(agent_info, rule.subopt, 1) {
+                if opt.value() == rule.data.as_slice() {
                     tags.push(rule.netid.clone());
                 }
             }
@@ -2630,9 +2630,9 @@ mod tests {
         let cfg = default_cfg();
         let reply = dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new()).expect("offer reply");
 
-        let idx = crate::rfc2131::option_find1(&reply.options, OPTION_AGENT_ID, 1)
+        let opt = crate::rfc2131::find_dhcp_option(&reply.options, OPTION_AGENT_ID, 1)
             .expect("agent-id echoed in reply");
-        assert_eq!(crate::rfc2131::option_val_at(&reply.options, idx), &agent_info[2..]);
+        assert_eq!(opt.value(), &agent_info[2..]);
     }
 
     #[test]
@@ -2640,7 +2640,7 @@ mod tests {
         let pkt = base_packet();
         let cfg = default_cfg();
         let reply = dispatch_dhcp(&pkt, &cfg, &mut LeaseDb::new()).expect("offer reply");
-        assert!(crate::rfc2131::option_find1(&reply.options, OPTION_AGENT_ID, 0).is_none());
+        assert!(crate::rfc2131::find_dhcp_option(&reply.options, OPTION_AGENT_ID, 0).is_none());
     }
 
     #[test]
