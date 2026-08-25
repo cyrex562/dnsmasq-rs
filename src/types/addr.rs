@@ -141,9 +141,96 @@ impl From<MySockAddr> for SocketAddr {
     }
 }
 
+// ── IPv4/IPv6 subnet and prefix helpers ──────────────────────────────────────
+// Ported from util.c.
+
+/// Returns the prefix length of an IPv4 netmask (e.g. 255.255.255.0 → 24).
+pub fn netmask_length(mask: Ipv4Addr) -> u32 {
+    let m = u32::from(mask);
+    m.count_ones()
+}
+
+/// True if `a` and `b` are in the same IPv4 subnet defined by `mask`.
+pub fn is_same_net(a: Ipv4Addr, b: Ipv4Addr, mask: Ipv4Addr) -> bool {
+    let ma = u32::from(mask);
+    (u32::from(a) & ma) == (u32::from(b) & ma)
+}
+
+/// Same as `is_same_net` but takes a prefix length instead of a mask.
+pub fn is_same_net_prefix(a: Ipv4Addr, b: Ipv4Addr, prefix: u8) -> bool {
+    if prefix == 0 { return true; }
+    if prefix >= 32 { return u32::from(a) == u32::from(b); }
+    let mask = !((1u32 << (32 - prefix)) - 1);
+    (u32::from(a) & mask) == (u32::from(b) & mask)
+}
+
+/// True if `a` and `b` share the same IPv6 prefix.
+pub fn is_same_net6(a: &Ipv6Addr, b: &Ipv6Addr, prefixlen: usize) -> bool {
+    let ab = a.octets();
+    let bb = b.octets();
+    let pfbytes = prefixlen / 8;
+    let pfbits  = prefixlen % 8;
+
+    if ab[..pfbytes] != bb[..pfbytes] {
+        return false;
+    }
+    if pfbits == 0 || pfbytes >= 16 {
+        return true;
+    }
+    ab[pfbytes] >> (8 - pfbits) == bb[pfbytes] >> (8 - pfbits)
+}
+
+/// Extract the least-significant 64 bits of an IPv6 address.
+pub fn addr6part(addr: &Ipv6Addr) -> u64 {
+    let o = addr.octets();
+    u64::from_be_bytes(o[8..16].try_into().unwrap())
+}
+
+/// Set the least-significant 64 bits of an IPv6 address.
+pub fn setaddr6part(addr: &Ipv6Addr, host: u64) -> Ipv6Addr {
+    let mut o = addr.octets();
+    let hb = host.to_be_bytes();
+    o[8..16].copy_from_slice(&hb);
+    Ipv6Addr::from(o)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn netmask_length_standard() {
+        assert_eq!(netmask_length("255.255.255.0".parse().unwrap()), 24);
+        assert_eq!(netmask_length("255.255.0.0".parse().unwrap()), 16);
+        assert_eq!(netmask_length("255.255.255.255".parse().unwrap()), 32);
+    }
+
+    #[test]
+    fn is_same_net_basic() {
+        let a: Ipv4Addr = "192.168.1.100".parse().unwrap();
+        let b: Ipv4Addr = "192.168.1.200".parse().unwrap();
+        let c: Ipv4Addr = "192.168.2.1".parse().unwrap();
+        let mask: Ipv4Addr = "255.255.255.0".parse().unwrap();
+        assert!(is_same_net(a, b, mask));
+        assert!(!is_same_net(a, c, mask));
+    }
+
+    #[test]
+    fn is_same_net6_basic() {
+        let a: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let b: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let c: Ipv6Addr = "2001:db9::1".parse().unwrap();
+        assert!(is_same_net6(&a, &b, 32));
+        assert!(!is_same_net6(&a, &c, 32));
+    }
+
+    #[test]
+    fn addr6part_roundtrip() {
+        let addr: Ipv6Addr = "2001:db8::cafe:babe".parse().unwrap();
+        let part = addr6part(&addr);
+        let reconstructed = setaddr6part(&"2001:db8::".parse().unwrap(), part);
+        assert_eq!(reconstructed, addr);
+    }
 
     #[test]
     fn all_addr_ipv4() {

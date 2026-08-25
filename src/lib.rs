@@ -23,9 +23,11 @@ pub mod edns0;
 pub mod rrfilter;
 pub mod domain;
 pub mod domain_match;
+pub mod hostname;
 pub mod log;
 pub mod pattern;
 pub mod poll;
+pub mod sys;
 pub mod util;
 
 pub mod hash_questions;

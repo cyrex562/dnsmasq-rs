@@ -25,7 +25,7 @@ use crate::types::dhcp::{
     ACTION_ADD, ACTION_ARP, ACTION_ARP_DEL, ACTION_DEL, ACTION_OLD, ACTION_OLD_HOSTNAME,
     ACTION_RELAY_SNOOP, ACTION_TFTP, DhcpLease, LeaseFlags,
 };
-use crate::util::legal_hostname;
+use crate::hostname::legal_hostname;
 
 const IF_NAMESIZE: usize = 16;
 

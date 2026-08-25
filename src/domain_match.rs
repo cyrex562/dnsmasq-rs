@@ -13,8 +13,8 @@ use crate::types::addr::MySockAddr;
 use crate::types::constants::{
     F_CONFIG, F_DNSSECOK, F_DOMAINSRV, F_DS, F_IPV4, F_IPV6, F_NXDOMAIN, F_NOERR, F_SERVER,
 };
+use crate::hostname::{hostname_isequal, hostname_order};
 use crate::types::server::{Server, ServFlags};
-use crate::util::{hostname_isequal, hostname_order};
 
 // ── Combined flag masks (from dnsmasq.h) ─────────────────────────────────────
 

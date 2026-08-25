@@ -3,7 +3,6 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use crate::dns_protocol::{MAXLABEL, NAME_ESCAPE};
 use crate::types::addr::MySockAddr;
 use crate::types::dns_records::RrList;
 
@@ -32,144 +31,6 @@ pub fn rand64() -> u64 {
 /// Return true if `rr` appears in `list`.
 pub fn rr_on_list(list: &[RrList], rr: u16) -> bool {
     list.iter().any(|e| e.rr != 0 && e.rr == rr)
-}
-
-// ── Hostname / domain name helpers ───────────────────────────────────────────
-
-/// Case-insensitive hostname comparison that does not depend on locale.
-pub fn hostname_order(a: &str, b: &str) -> std::cmp::Ordering {
-    let mut ai = a.chars().map(|c| c.to_ascii_lowercase());
-    let mut bi = b.chars().map(|c| c.to_ascii_lowercase());
-    loop {
-        match (ai.next(), bi.next()) {
-            (Some(ca), Some(cb)) => {
-                let ord = ca.cmp(&cb);
-                if ord != std::cmp::Ordering::Equal {
-                    return ord;
-                }
-            }
-            (None, None) => return std::cmp::Ordering::Equal,
-            (None, _)    => return std::cmp::Ordering::Less,
-            (_, None)    => return std::cmp::Ordering::Greater,
-        }
-    }
-}
-
-/// Case-insensitive hostname equality (locale-independent).
-pub fn hostname_isequal(a: &str, b: &str) -> bool {
-    a.len() == b.len() && hostname_order(a, b) == std::cmp::Ordering::Equal
-}
-
-/// Returns `Some(2)` if `b == a`, `Some(1)` if `b` is a subdomain of `a`, `None` otherwise.
-pub fn hostname_issubdomain(a: &str, b: &str) -> Option<u8> {
-    let a = a.to_ascii_lowercase();
-    let b = b.to_ascii_lowercase();
-
-    if b.len() < a.len() {
-        return None;
-    }
-
-    // Compare from the right
-    let mut ai = a.chars().rev();
-    let mut bi = b.chars().rev();
-
-    loop {
-        match (ai.next(), bi.next()) {
-            (None, None)          => return Some(2), // equal
-            (None, Some('.'))     => return Some(1), // b is subdomain
-            (None, _)             => return None,    // b is a.foo (no dot separator)
-            (Some(ca), Some(cb)) if ca == cb => {}
-            _                    => return None,
-        }
-    }
-}
-
-/// Returns true if `name` is a legal DNS hostname (first label only checked strictly).
-pub fn legal_hostname(name: &str) -> bool {
-    if name.is_empty() || name.len() > 253 {
-        return false;
-    }
-
-    let label = name.split('.').next().unwrap_or("");
-    if label.is_empty() || label.len() > MAXLABEL {
-        return false;
-    }
-
-    for (i, c) in label.chars().enumerate() {
-        match c {
-            'a'..='z' | 'A'..='Z' | '0'..='9' => {}
-            '-' | '_' if i > 0 => {}
-            _ => return false,
-        }
-    }
-    true
-}
-
-/// Canonicalise a domain name: strip trailing dot, lowercase.
-/// Returns `None` if the name is illegal.
-pub fn canonicalise(input: &str) -> Option<String> {
-    let s = input.trim_end_matches('.');
-    if s.is_empty() || s.len() > 253 {
-        return None;
-    }
-    for label in s.split('.') {
-        if label.is_empty() || label.len() > MAXLABEL {
-            return None;
-        }
-    }
-    Some(s.to_ascii_lowercase())
-}
-
-// ── Address helpers ───────────────────────────────────────────────────────────
-
-/// Returns the prefix length of an IPv4 netmask (e.g. 255.255.255.0 → 24).
-pub fn netmask_length(mask: Ipv4Addr) -> u32 {
-    let m = u32::from(mask);
-    m.count_ones()
-}
-
-/// True if `a` and `b` are in the same IPv4 subnet defined by `mask`.
-pub fn is_same_net(a: Ipv4Addr, b: Ipv4Addr, mask: Ipv4Addr) -> bool {
-    let ma = u32::from(mask);
-    (u32::from(a) & ma) == (u32::from(b) & ma)
-}
-
-/// Same as `is_same_net` but takes a prefix length instead of a mask.
-pub fn is_same_net_prefix(a: Ipv4Addr, b: Ipv4Addr, prefix: u8) -> bool {
-    if prefix == 0 { return true; }
-    if prefix >= 32 { return u32::from(a) == u32::from(b); }
-    let mask = !((1u32 << (32 - prefix)) - 1);
-    (u32::from(a) & mask) == (u32::from(b) & mask)
-}
-
-/// True if `a` and `b` share the same IPv6 prefix.
-pub fn is_same_net6(a: &Ipv6Addr, b: &Ipv6Addr, prefixlen: usize) -> bool {
-    let ab = a.octets();
-    let bb = b.octets();
-    let pfbytes = prefixlen / 8;
-    let pfbits  = prefixlen % 8;
-
-    if ab[..pfbytes] != bb[..pfbytes] {
-        return false;
-    }
-    if pfbits == 0 || pfbytes >= 16 {
-        return true;
-    }
-    ab[pfbytes] >> (8 - pfbits) == bb[pfbytes] >> (8 - pfbits)
-}
-
-/// Extract the least-significant 64 bits of an IPv6 address.
-pub fn addr6part(addr: &Ipv6Addr) -> u64 {
-    let o = addr.octets();
-    u64::from_be_bytes(o[8..16].try_into().unwrap())
-}
-
-/// Set the least-significant 64 bits of an IPv6 address.
-pub fn setaddr6part(addr: &Ipv6Addr, host: u64) -> Ipv6Addr {
-    let mut o = addr.octets();
-    let hb = host.to_be_bytes();
-    o[8..16].copy_from_slice(&hb);
-    Ipv6Addr::from(o)
 }
 
 // ── Time helpers ──────────────────────────────────────────────────────────────
@@ -236,51 +97,51 @@ pub fn wildcard_matchn(wildcard: &str, target: &str, n: usize) -> bool {
 
 // ── Hex parsing ───────────────────────────────────────────────────────────────
 
-/// Parse a colon/hyphen/space-separated hex string into bytes.
-/// `*` bytes set the corresponding bit in `wildcard_mask`.
-/// Returns the number of bytes written, or -1 on error.
-pub fn parse_hex(
-    input: &str,
-    out: &mut Vec<u8>,
-    maxlen: Option<usize>,
-    wildcard_mask: Option<&mut u32>,
-) -> i32 {
-    let mut mask: u32 = 0;
-    let mut count = 0i32;
+/// A hex digit in the input to [`parse_hex`] wasn't `0-9`/`a-f`/`A-F`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HexParseError;
 
-    for token in input.split(|c| c == ':' || c == '-' || c == ' ') {
+impl std::fmt::Display for HexParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid hex digit")
+    }
+}
+
+impl std::error::Error for HexParseError {}
+
+/// Parse a colon/hyphen/space-separated hex string into bytes.
+///
+/// `*` tokens produce a zero byte and set the corresponding bit (in token
+/// order) of the returned wildcard mask. Stops after `maxlen` bytes if
+/// given.
+pub fn parse_hex(input: &str, maxlen: Option<usize>) -> Result<(Vec<u8>, u32), HexParseError> {
+    let mut out = Vec::new();
+    let mut mask: u32 = 0;
+
+    'tokens: for token in input.split(|c| c == ':' || c == '-' || c == ' ') {
         if let Some(max) = maxlen {
-            if count as usize >= max { break; }
+            if out.len() >= max { break; }
         }
         if token == "*" {
             mask = (mask << 1) | 1;
             out.push(0);
-            count += 1;
         } else if !token.is_empty() {
             // parse one or two hex chars per byte
             let bytes_in_token = (token.len() + 1) / 2;
             for j in 0..bytes_in_token {
                 let start = j * 2;
                 let end   = (start + 2).min(token.len());
-                match u8::from_str_radix(&token[start..end], 16) {
-                    Ok(b) => {
-                        mask <<= 1;
-                        out.push(b);
-                        count += 1;
-                        if let Some(max) = maxlen {
-                            if count as usize >= max { break; }
-                        }
-                    }
-                    Err(_) => return -1,
+                let b = u8::from_str_radix(&token[start..end], 16).map_err(|_| HexParseError)?;
+                mask <<= 1;
+                out.push(b);
+                if let Some(max) = maxlen {
+                    if out.len() >= max { break 'tokens; }
                 }
             }
         }
     }
 
-    if let Some(wm) = wildcard_mask {
-        *wm = mask;
-    }
-    count
+    Ok((out, mask))
 }
 
 /// Format a MAC address as colon-separated hex (e.g. "aa:bb:cc:dd:ee:ff").
@@ -307,52 +168,6 @@ pub fn sockaddr_isnull(s: &MySockAddr) -> bool {
         MySockAddr::V4(a)  => *a.ip() == Ipv4Addr::UNSPECIFIED,
         MySockAddr::V6(a)  => *a.ip() == Ipv6Addr::UNSPECIFIED,
     }
-}
-
-// ── DNS wire-format helpers ───────────────────────────────────────────────────
-
-/// Write a DNS name in wire format (RFC 1035 label encoding) into `buf`.
-///
-/// The name is written as a sequence of `<length><label>` pairs.
-/// Characters that are `NAME_ESCAPE` are stored as escape sequences
-/// (`NAME_ESCAPE` byte followed by original_byte+1), matching the C encoding.
-/// Does **not** write the terminal zero-byte; the caller must append it.
-///
-/// Returns `false` if writing would exceed `limit` bytes in `buf`.
-pub fn do_rfc1035_name(buf: &mut Vec<u8>, name: &str, limit: Option<usize>) -> bool {
-    for label in name.split('.') {
-        if label.is_empty() {
-            // trailing dot or consecutive dots — skip
-            continue;
-        }
-        // Reserve one byte for the length field
-        let len_pos = buf.len();
-        buf.push(0u8);
-        if let Some(lim) = limit {
-            if buf.len() > lim {
-                return false;
-            }
-        }
-        let mut label_len: u8 = 0;
-        for b in label.bytes() {
-            if b == NAME_ESCAPE {
-                // Escape: write NAME_ESCAPE then (b + 1)
-                buf.push(NAME_ESCAPE);
-                buf.push(b.wrapping_add(1));
-                label_len = label_len.saturating_add(2);
-            } else {
-                buf.push(b);
-                label_len += 1;
-            }
-            if let Some(lim) = limit {
-                if buf.len() > lim {
-                    return false;
-                }
-            }
-        }
-        buf[len_pos] = label_len;
-    }
-    true
 }
 
 // ── Pretty-print address ──────────────────────────────────────────────────────
@@ -425,134 +240,6 @@ pub fn memcmp_masked(a: &[u8], b: &[u8], mask: u32) -> usize {
     count
 }
 
-// ── File-descriptor management ───────────────────────────────────────────────
-
-/// Close all open file descriptors except stdin/stdout/stderr and the three
-/// `spare` descriptors.  Used during daemon startup to clean up inherited fds.
-///
-/// On Linux the `/proc/self/fd` directory is scanned for efficiency; on other
-/// platforms we fall back to iterating `0..max_fd`.
-pub fn close_fds(max_fd: i64, spare1: i32, spare2: i32, spare3: i32) {
-    let spares = [
-        libc::STDIN_FILENO,
-        libc::STDOUT_FILENO,
-        libc::STDERR_FILENO,
-        spare1,
-        spare2,
-        spare3,
-    ];
-
-    #[cfg(target_os = "linux")]
-    {
-        use nix::fcntl::OFlag;
-        use nix::sys::stat::Mode;
-        use std::os::fd::AsRawFd;
-
-        if let Ok(mut dir) = nix::dir::Dir::open(
-            "/proc/self/fd",
-            OFlag::O_RDONLY | OFlag::O_DIRECTORY,
-            Mode::empty(),
-        ) {
-            let dirfd = dir.as_raw_fd();
-            for entry in dir.iter().flatten() {
-                if let Ok(name) = entry.file_name().to_str() {
-                    if let Ok(fd) = name.parse::<i32>() {
-                        // Skip the directory fd itself (matching util.c:848 "fd == dirfd(d)")
-                        // and all the standard spare fds
-                        let is_spare = spares.contains(&fd);
-                        if fd != dirfd && !is_spare {
-                            let _ = nix::unistd::close(fd);
-                        }
-                    }
-                }
-            }
-            return;
-        }
-    }
-
-    // Fallback: dumb iteration
-    for fd in (0..max_fd as i32).rev() {
-        if !spares.contains(&fd) {
-            let _ = nix::unistd::close(fd);
-        }
-    }
-}
-
-// ── Retry-aware I/O helpers ───────────────────────────────────────────────────
-
-/// Inspect the return value of `sendto`/`sendmsg` and decide whether to retry.
-///
-/// Mirrors the C `retry_send()`:
-/// - Returns `false` (no retry needed) when `rc != -1` (success).
-/// - On `EAGAIN`/`EWOULDBLOCK` sleeps 10 µs and retries up to 1000 times.
-/// - On `EINTR` returns `true` immediately (caller should retry).
-/// - On any other error returns `false`.
-///
-/// A thread-local counter tracks the retry budget, reset on each success.
-pub fn retry_send(rc: isize) -> bool {
-    use std::cell::Cell;
-    thread_local! {
-        static RETRIES: Cell<u32> = Cell::new(0);
-    }
-
-    if rc != -1 {
-        RETRIES.with(|r| r.set(0));
-        return false;
-    }
-
-    let err = std::io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK => {
-            std::thread::sleep(std::time::Duration::from_nanos(10_000));
-            let retries = RETRIES.with(|r| {
-                let v = r.get();
-                r.set(v + 1);
-                v
-            });
-            if retries < 1000 {
-                return true;
-            }
-        }
-        Some(e) if e == libc::EINTR => return true,
-        _ => {}
-    }
-
-    RETRIES.with(|r| r.set(0));
-    false
-}
-
-/// Blocking read or write of exactly `buf.len()` bytes on a raw file descriptor.
-///
-/// `rw = false` → write; `rw = true` → read.
-/// Retries on `EINTR`/`ENOMEM`/`ENOBUFS`; returns `false` on any other error
-/// or on EOF during a read.
-pub fn read_write(fd: i32, buf: &mut [u8], rw: bool) -> bool {
-    use nix::errno::Errno;
-
-    if buf.is_empty() {
-        return true;
-    }
-    // Safety: `fd` is a valid, live fd for the duration of this call, per
-    // this function's own contract (same as the raw libc calls it replaces).
-    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-    let mut done = 0usize;
-    while done < buf.len() {
-        let slice = &mut buf[done..];
-        let result = if rw {
-            nix::unistd::read(fd, slice)
-        } else {
-            nix::unistd::write(borrowed, slice)
-        };
-        match result {
-            Ok(0) if rw => return false, // EOF
-            Ok(n) => done += n,
-            Err(Errno::EINTR | Errno::ENOMEM | Errno::ENOBUFS) => continue,
-            Err(_) => return false,
-        }
-    }
-    true
-}
-
 // ── Workspace buffer helpers ──────────────────────────────────────────────────
 
 /// Ensure `workspace` has at least `needed + 1` slots, growing by 5 if needed.
@@ -611,155 +298,11 @@ pub fn kernel_version() -> u32 {
     }
 }
 
-// ── Domain name validation (ported from util.c:137-202) ──────────────────────
-
-/// Maximum DNS name length.
-const MAXDNAME: usize = 1025;
-
-/// Result of checking a domain name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NameCheckResult {
-    /// Invalid name (empty, too long, control chars, etc.).
-    Invalid,
-    /// Valid ASCII-only name.
-    Valid,
-    /// Valid name with non-ASCII characters requiring IDN encoding.
-    NeedsIdn,
-}
-
-/// Validate a domain name string.
-///
-/// Checks: non-empty, total length ≤ MAXDNAME, labels ≤ 63 chars,
-/// no control characters, not all whitespace. Non-ASCII chars return
-/// `NeedsIdn`. Trailing dot is stripped.
-/// Port of `check_name()` from util.c:137-202.
-pub fn check_name(name: &str) -> NameCheckResult {
-    let trimmed = name.trim_end_matches('.');
-    if trimmed.is_empty() || trimmed.len() > MAXDNAME {
-        return NameCheckResult::Invalid;
-    }
-
-    let mut has_idn = false;
-    let mut has_non_space = name.ends_with('.');  // trailing dot counts as non-space input
-
-    for label in trimmed.split('.') {
-        if label.len() > MAXLABEL {
-            return NameCheckResult::Invalid;
-        }
-        for c in label.chars() {
-            if c.is_ascii_control() {
-                return NameCheckResult::Invalid;
-            }
-            if !c.is_ascii() {
-                has_idn = true;
-            }
-            if c != ' ' {
-                has_non_space = true;
-            }
-        }
-    }
-
-    // Reject all-whitespace names
-    if !has_non_space {
-        return NameCheckResult::Invalid;
-    }
-
-    // Uppercase ASCII also suggests IDN processing might be needed
-    if trimmed.chars().any(|c| c.is_ascii_uppercase()) {
-        has_idn = true;
-    }
-
-    if has_idn {
-        NameCheckResult::NeedsIdn
-    } else {
-        NameCheckResult::Valid
-    }
-}
-
-/// Validate a hostname (more restricted than a domain name).
-///
-/// Only the first label is checked: allowed chars are a-z, A-Z, 0-9, '-', '_'.
-/// Port of `legal_hostname()` from util.c:204+ (already partially ported).
-pub fn check_hostname_label(name: &str) -> bool {
-    let first_label = name.split('.').next().unwrap_or("");
-    if first_label.is_empty() {
-        return false;
-    }
-    first_label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
-
-    #[test]
-    fn hostname_isequal_case_insensitive() {
-        assert!(hostname_isequal("Example.COM", "example.com"));
-        assert!(!hostname_isequal("example.com", "example.net"));
-    }
-
-    #[test]
-    fn hostname_issubdomain_cases() {
-        assert_eq!(hostname_issubdomain("example.com", "example.com"), Some(2));
-        assert_eq!(hostname_issubdomain("example.com", "sub.example.com"), Some(1));
-        assert_eq!(hostname_issubdomain("example.com", "other.com"), None);
-        assert_eq!(hostname_issubdomain("example.com", "notexample.com"), None);
-    }
-
-    #[test]
-    fn legal_hostname_valid() {
-        assert!(legal_hostname("example"));
-        assert!(legal_hostname("foo-bar"));
-        assert!(legal_hostname("foo.bar.baz"));
-    }
-
-    #[test]
-    fn legal_hostname_invalid() {
-        assert!(!legal_hostname(""));
-        assert!(!legal_hostname("-foo"));
-        assert!(!legal_hostname("foo bar"));
-    }
-
-    #[test]
-    fn canonicalise_strips_trailing_dot() {
-        assert_eq!(canonicalise("example.com."), Some("example.com".to_string()));
-        assert_eq!(canonicalise("EXAMPLE.COM"), Some("example.com".to_string()));
-    }
-
-    #[test]
-    fn netmask_length_standard() {
-        assert_eq!(netmask_length("255.255.255.0".parse().unwrap()), 24);
-        assert_eq!(netmask_length("255.255.0.0".parse().unwrap()), 16);
-        assert_eq!(netmask_length("255.255.255.255".parse().unwrap()), 32);
-    }
-
-    #[test]
-    fn is_same_net_basic() {
-        let a: Ipv4Addr = "192.168.1.100".parse().unwrap();
-        let b: Ipv4Addr = "192.168.1.200".parse().unwrap();
-        let c: Ipv4Addr = "192.168.2.1".parse().unwrap();
-        let mask: Ipv4Addr = "255.255.255.0".parse().unwrap();
-        assert!(is_same_net(a, b, mask));
-        assert!(!is_same_net(a, c, mask));
-    }
-
-    #[test]
-    fn is_same_net6_basic() {
-        let a: Ipv6Addr = "2001:db8::1".parse().unwrap();
-        let b: Ipv6Addr = "2001:db8::2".parse().unwrap();
-        let c: Ipv6Addr = "2001:db9::1".parse().unwrap();
-        assert!(is_same_net6(&a, &b, 32));
-        assert!(!is_same_net6(&a, &c, 32));
-    }
-
-    #[test]
-    fn addr6part_roundtrip() {
-        let addr: Ipv6Addr = "2001:db8::cafe:babe".parse().unwrap();
-        let part = addr6part(&addr);
-        let reconstructed = setaddr6part(&"2001:db8::".parse().unwrap(), part);
-        assert_eq!(reconstructed, addr);
-    }
 
     #[test]
     fn prettyprint_time_cases() {
@@ -785,10 +328,28 @@ mod tests {
 
     #[test]
     fn parse_hex_basic() {
-        let mut out = Vec::new();
-        let n = parse_hex("aa:bb:cc", &mut out, None, None);
-        assert_eq!(n, 3);
+        let (out, _mask) = parse_hex("aa:bb:cc", None).unwrap();
         assert_eq!(out, vec![0xaa, 0xbb, 0xcc]);
+    }
+
+    #[test]
+    fn parse_hex_wildcard_mask() {
+        let (out, mask) = parse_hex("aa:*:cc", None).unwrap();
+        assert_eq!(out, vec![0xaa, 0x00, 0xcc]);
+        // The '*' token is the middle of 3, so it sets bit 1 (mask built via
+        // `(mask << 1) | 1` in wildcard position order).
+        assert_eq!(mask, 0b010);
+    }
+
+    #[test]
+    fn parse_hex_maxlen_truncates() {
+        let (out, _mask) = parse_hex("aa:bb:cc:dd", Some(2)).unwrap();
+        assert_eq!(out, vec![0xaa, 0xbb]);
+    }
+
+    #[test]
+    fn parse_hex_invalid_digit_errors() {
+        assert!(parse_hex("zz", None).is_err());
     }
 
     #[test]
@@ -798,40 +359,6 @@ mod tests {
         assert!(sockaddr_isnull(&s));
         let s2 = MySockAddr::V4(SocketAddrV4::new("1.2.3.4".parse().unwrap(), 53));
         assert!(!sockaddr_isnull(&s2));
-    }
-
-    #[test]
-    fn do_rfc1035_name_basic() {
-        let mut buf = Vec::new();
-        assert!(do_rfc1035_name(&mut buf, "example.com", None));
-        // "example" → [7, 'e','x','a','m','p','l','e'], "com" → [3, 'c','o','m']
-        assert_eq!(&buf[..8], b"\x07example");
-        assert_eq!(&buf[8..], b"\x03com");
-    }
-
-    #[test]
-    fn do_rfc1035_name_single_label() {
-        let mut buf = Vec::new();
-        assert!(do_rfc1035_name(&mut buf, "localhost", None));
-        assert_eq!(buf, b"\x09localhost");
-    }
-
-    #[test]
-    fn do_rfc1035_name_trailing_dot() {
-        // A trailing dot (FQDN) should produce the same output as without one
-        let mut no_dot = Vec::new();
-        let mut with_dot = Vec::new();
-        do_rfc1035_name(&mut no_dot, "example.com", None);
-        do_rfc1035_name(&mut with_dot, "example.com.", None);
-        assert_eq!(no_dot, with_dot);
-    }
-
-    #[test]
-    fn do_rfc1035_name_limit() {
-        let mut buf = Vec::new();
-        // limit of 5 bytes — cannot fit "example" label (8 bytes incl. length)
-        let ok = do_rfc1035_name(&mut buf, "example.com", Some(5));
-        assert!(!ok);
     }
 
     #[test]
@@ -886,85 +413,6 @@ mod tests {
         assert_eq!(ws.len(), 5);
     }
 
-    // ── check_name ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn check_name_valid_simple() {
-        assert_eq!(check_name("example.com"), NameCheckResult::Valid);
-    }
-
-    #[test]
-    fn check_name_valid_trailing_dot() {
-        // Trailing dot should be stripped; result is valid
-        assert_ne!(check_name("example.com."), NameCheckResult::Invalid);
-    }
-
-    #[test]
-    fn check_name_empty() {
-        assert_eq!(check_name(""), NameCheckResult::Invalid);
-    }
-
-    #[test]
-    fn check_name_control_char() {
-        assert_eq!(check_name("bad\x01name.com"), NameCheckResult::Invalid);
-    }
-
-    #[test]
-    fn check_name_label_too_long() {
-        let long_label = "a".repeat(64);
-        assert_eq!(check_name(&format!("{}.com", long_label)), NameCheckResult::Invalid);
-    }
-
-    #[test]
-    fn check_name_label_max_ok() {
-        let label = "a".repeat(63);
-        assert_ne!(check_name(&format!("{}.com", label)), NameCheckResult::Invalid);
-    }
-
-    #[test]
-    fn check_name_uppercase_needs_idn() {
-        assert_eq!(check_name("Example.COM"), NameCheckResult::NeedsIdn);
-    }
-
-    #[test]
-    fn check_name_non_ascii_needs_idn() {
-        assert_eq!(check_name("münchen.de"), NameCheckResult::NeedsIdn);
-    }
-
-    #[test]
-    fn check_name_all_spaces_invalid() {
-        assert_eq!(check_name("   "), NameCheckResult::Invalid);
-    }
-
-    #[test]
-    fn check_name_single_label() {
-        assert_eq!(check_name("localhost"), NameCheckResult::Valid);
-    }
-
-    // ── check_hostname_label ─────────────────────────────────────────────────
-
-    #[test]
-    fn check_hostname_label_valid() {
-        assert!(check_hostname_label("my-host_1"));
-    }
-
-    #[test]
-    fn check_hostname_label_fqdn() {
-        // Only checks first label
-        assert!(check_hostname_label("host.example.com"));
-    }
-
-    #[test]
-    fn check_hostname_label_invalid_chars() {
-        assert!(!check_hostname_label("host name")); // space
-        assert!(!check_hostname_label("host@name")); // @
-    }
-
-    #[test]
-    fn check_hostname_label_empty() {
-        assert!(!check_hostname_label(""));
-    }
-
     // ── kernel_version ───────────────────────────────────────────────────────
 
     #[test]
@@ -976,85 +424,5 @@ mod tests {
         assert!(version > 0, "kernel_version should return non-zero on Linux");
         // Sanity check: major version should be at most 2 bytes (< 256 << 16)
         assert!(version < (256u32 << 16), "major version seems unreasonably high");
-    }
-
-    // ── close_fds ────────────────────────────────────────────────────────────
-
-    // close_fds() closes every fd in the process, including ones Tokio
-    // runtimes on other test threads depend on (epoll/eventfd/timerfd), so it
-    // must never run in-process inside the shared `cargo test` binary. Fork
-    // first, exactly like helper.rs's
-    // close_inherited_fds_closes_unrelated_descriptors, so the real close-all
-    // only ever happens in a throwaway child.
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn close_fds_skips_directory_fd() {
-        use nix::sys::wait::waitpid;
-        use nix::unistd::{fork, pipe, ForkResult};
-        use std::io::{Read, Write};
-        use std::os::unix::io::AsRawFd;
-
-        let (result_r, result_w) = pipe().expect("pipe failed");
-
-        match unsafe { fork() }.expect("fork failed") {
-            ForkResult::Child => {
-                drop(result_r);
-                // close_fds() closes every fd except its spares, including
-                // this one — it must be spared too or the child can never
-                // report its result back to the parent.
-                let result_w_fd = result_w.as_raw_fd();
-
-                // Create a pipe to have fds we want to spare.
-                let (spare_read, spare_write) = nix::unistd::pipe().expect("pipe failed");
-                let spare_write_fd = spare_write.as_raw_fd();
-                let spare_read_fd = spare_read.as_raw_fd();
-                let max_fd = spare_write_fd as i64 + 10;
-
-                // Create some other fds that should get closed.
-                let fd1 = unsafe { libc::open(b"/dev/null\0".as_ptr() as *const i8, libc::O_WRONLY) };
-                let fd2 = unsafe { libc::open(b"/dev/null\0".as_ptr() as *const i8, libc::O_WRONLY) };
-
-                let mut ok = fd1 > 2 && fd1 != spare_write_fd && fd2 > 2 && fd2 != spare_write_fd;
-
-                // Forget the OwnedFds so close_fds is the only thing that
-                // touches them from here on.
-                std::mem::forget(spare_read);
-                std::mem::forget(spare_write);
-
-                // Call close_fds, sparing stdin/stdout/stderr, both pipe
-                // ends, and the result-reporting fd. If close_fds closed its
-                // own /proc/self/fd directory fd mid-scan, this call would
-                // misbehave (panic, loop incorrectly, or fail to close
-                // fd1/fd2) rather than return cleanly.
-                close_fds(max_fd, spare_write_fd, spare_read_fd, result_w_fd);
-
-                // fd1/fd2 should now be closed (EBADF on write).
-                let write_result = unsafe { libc::write(fd1, b"test" as *const u8 as *const libc::c_void, 4) };
-                ok &= write_result == -1;
-
-                // spare_write_fd must still be open and functional.
-                let write_result = unsafe {
-                    libc::write(spare_write_fd, b"X" as *const u8 as *const libc::c_void, 1)
-                };
-                ok &= write_result == 1;
-
-                unsafe {
-                    libc::close(spare_write_fd);
-                    libc::close(spare_read_fd);
-                }
-
-                let mut f = std::fs::File::from(result_w);
-                let _ = f.write_all(&[u8::from(ok)]);
-                unsafe { libc::_exit(0) };
-            }
-            ForkResult::Parent { child } => {
-                drop(result_w);
-                let mut f = std::fs::File::from(result_r);
-                let mut buf = [0u8; 1];
-                f.read_exact(&mut buf).expect("child did not report a result");
-                waitpid(child, None).expect("waitpid failed");
-                assert_eq!(buf[0], 1, "close_fds misbehaved when run against its own directory fd");
-            }
-        }
     }
 }

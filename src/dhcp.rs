@@ -309,9 +309,9 @@ fn derived_tags(
         for rule in &cfg.name_match_rules {
             let matched = match name.len().cmp(&rule.name.len()) {
                 std::cmp::Ordering::Less => false,
-                std::cmp::Ordering::Equal => crate::util::hostname_isequal(name, &rule.name),
+                std::cmp::Ordering::Equal => crate::hostname::hostname_isequal(name, &rule.name),
                 std::cmp::Ordering::Greater => {
-                    rule.wildcard && crate::util::hostname_isequal(&name[..rule.name.len()], &rule.name)
+                    rule.wildcard && crate::hostname::hostname_isequal(&name[..rule.name.len()], &rule.name)
                 }
             };
             if matched {
@@ -1135,7 +1135,7 @@ fn dispatch_leasequery(
         && !cfg.leasequery_addr.iter().any(|b| {
             !b.is6
                 && b.addr.as_ipv4().is_some_and(|a| {
-                    crate::util::is_same_net_prefix(cfg.leasequery_source, a, b.prefix.clamp(0, 32) as u8)
+                    crate::types::addr::is_same_net_prefix(cfg.leasequery_source, a, b.prefix.clamp(0, 32) as u8)
                 })
         })
     {
@@ -2357,8 +2357,10 @@ fn parse_ethers_text(text: &str) -> Vec<EthersRecord> {
             continue; // "bad line" — no IP/name field (dhcp.c:970-975)
         }
 
-        let mut hwaddr_vec = Vec::new();
-        if crate::util::parse_hex(mac_part, &mut hwaddr_vec, Some(6), None) != 6 {
+        let Ok((hwaddr_vec, _)) = crate::util::parse_hex(mac_part, Some(6)) else {
+            continue; // "bad line" (dhcp.c:970-975)
+        };
+        if hwaddr_vec.len() != 6 {
             continue; // "bad line" (dhcp.c:970-975)
         }
         let mut hwaddr = [0u8; 6];
@@ -2373,8 +2375,8 @@ fn parse_ethers_text(text: &str) -> Vec<EthersRecord> {
                 Err(_) => continue, // "bad address" (dhcp.c:984-988)
             }
         } else {
-            match crate::util::canonicalise(rest) {
-                Some(host) if crate::util::legal_hostname(&host) => EthersKey::Name(host),
+            match crate::hostname::canonicalise(rest) {
+                Some(host) if crate::hostname::legal_hostname(&host) => EthersKey::Name(host),
                 _ => continue, // "bad name" (dhcp.c:1000-1004)
             }
         };
@@ -2402,7 +2404,7 @@ fn apply_ethers_records(dhcp_conf: &mut Vec<DhcpConfig>, records: Vec<EthersReco
             EthersKey::Addr(addr) => c.flags.contains(ConfigFlags::ADDR) && c.addr == *addr,
             EthersKey::Name(name) => {
                 c.flags.contains(ConfigFlags::NAME)
-                    && c.hostname.as_deref().is_some_and(|h| crate::util::hostname_isequal(h, name))
+                    && c.hostname.as_deref().is_some_and(|h| crate::hostname::hostname_isequal(h, name))
             }
         });
 

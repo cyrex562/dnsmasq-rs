@@ -21,7 +21,9 @@ use crate::types::network::{Iname, IfaceNameFlags};
 #[cfg(feature = "dhcp6")]
 use crate::dhcp6::{LiveAddr6, is_same_net6};
 #[cfg(feature = "dhcp6")]
-use crate::util::{addr6part, setaddr6part, wildcard_match, wildcard_matchn};
+use crate::types::addr::{addr6part, setaddr6part};
+#[cfg(feature = "dhcp6")]
+use crate::util::{wildcard_match, wildcard_matchn};
 
 // ICMPv6 type 134 = Router Advertisement
 #[cfg(feature = "dhcp6")]

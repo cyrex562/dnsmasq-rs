@@ -3,8 +3,8 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use crate::types::addr::{is_same_net6, is_same_net_prefix};
 use crate::types::dns_records::{Addrlist, ADDRLIST_IPV6};
-use crate::util::{is_same_net6, is_same_net_prefix};
 
 /// A conditional domain mapping: maps a range of IP addresses to a domain.
 #[derive(Debug, Clone)]

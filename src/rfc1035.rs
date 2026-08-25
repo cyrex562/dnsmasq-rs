@@ -2249,10 +2249,93 @@ pub fn crec_ttl(ttd: u64, now: u64, flags: u32, max_ttl: u32, local_ttl: u32) ->
     }
 }
 
+// ── DNS wire-format helpers ───────────────────────────────────────────────────
+
+/// Write a DNS name in wire format (RFC 1035 label encoding) into `buf`.
+///
+/// The name is written as a sequence of `<length><label>` pairs.
+/// Characters that are `NAME_ESCAPE` are stored as escape sequences
+/// (`NAME_ESCAPE` byte followed by original_byte+1), matching the C encoding.
+/// Does **not** write the terminal zero-byte; the caller must append it.
+///
+/// Returns `false` if writing would exceed `limit` bytes in `buf`.
+pub fn do_rfc1035_name(buf: &mut Vec<u8>, name: &str, limit: Option<usize>) -> bool {
+    use crate::dns_protocol::NAME_ESCAPE;
+    for label in name.split('.') {
+        if label.is_empty() {
+            // trailing dot or consecutive dots — skip
+            continue;
+        }
+        // Reserve one byte for the length field
+        let len_pos = buf.len();
+        buf.push(0u8);
+        if let Some(lim) = limit {
+            if buf.len() > lim {
+                return false;
+            }
+        }
+        let mut label_len: u8 = 0;
+        for b in label.bytes() {
+            if b == NAME_ESCAPE {
+                // Escape: write NAME_ESCAPE then (b + 1)
+                buf.push(NAME_ESCAPE);
+                buf.push(b.wrapping_add(1));
+                label_len = label_len.saturating_add(2);
+            } else {
+                buf.push(b);
+                label_len += 1;
+            }
+            if let Some(lim) = limit {
+                if buf.len() > lim {
+                    return false;
+                }
+            }
+        }
+        buf[len_pos] = label_len;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dns_protocol::{HB3_QR, HB3_RD, HB4_RA};
+
+    // ── do_rfc1035_name ──────────────────────────────────────────────────────
+
+    #[test]
+    fn do_rfc1035_name_basic() {
+        let mut buf = Vec::new();
+        assert!(do_rfc1035_name(&mut buf, "example.com", None));
+        // "example" → [7, 'e','x','a','m','p','l','e'], "com" → [3, 'c','o','m']
+        assert_eq!(&buf[..8], b"\x07example");
+        assert_eq!(&buf[8..], b"\x03com");
+    }
+
+    #[test]
+    fn do_rfc1035_name_single_label() {
+        let mut buf = Vec::new();
+        assert!(do_rfc1035_name(&mut buf, "localhost", None));
+        assert_eq!(buf, b"\x09localhost");
+    }
+
+    #[test]
+    fn do_rfc1035_name_trailing_dot() {
+        // A trailing dot (FQDN) should produce the same output as without one
+        let mut no_dot = Vec::new();
+        let mut with_dot = Vec::new();
+        do_rfc1035_name(&mut no_dot, "example.com", None);
+        do_rfc1035_name(&mut with_dot, "example.com.", None);
+        assert_eq!(no_dot, with_dot);
+    }
+
+    #[test]
+    fn do_rfc1035_name_limit() {
+        let mut buf = Vec::new();
+        // limit of 5 bytes — cannot fit "example" label (8 bytes incl. length)
+        let ok = do_rfc1035_name(&mut buf, "example.com", Some(5));
+        assert!(!ok);
+    }
 
     // ── helper ────────────────────────────────────────────────────────────────
 

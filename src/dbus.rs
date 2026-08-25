@@ -374,12 +374,9 @@ pub mod dhcp_leases {
         let addr: Ipv4Addr =
             ipaddr.parse().map_err(|_| format!("Invalid IP address '{ipaddr}'"))?;
 
-        let mut hw = Vec::new();
-        let hw_len =
-            crate::util::parse_hex(hwaddr, &mut hw, Some(DHCP_CHADDR_MAX), None);
-        if hw_len < 0 {
+        let Ok((hw, _)) = crate::util::parse_hex(hwaddr, Some(DHCP_CHADDR_MAX)) else {
             return Err(format!("Invalid HW address '{hwaddr}'"));
-        }
+        };
         let mut hwaddr_fixed = [0u8; DHCP_CHADDR_MAX];
         hwaddr_fixed[..hw.len()].copy_from_slice(&hw);
 

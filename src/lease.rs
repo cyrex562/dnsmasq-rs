@@ -406,7 +406,7 @@ impl LeaseDb {
                 .filter(|l| {
                     l.hostname
                         .as_deref()
-                        .map(|h| crate::util::hostname_isequal(h, new_name))
+                        .map(|h| crate::hostname::hostname_isequal(h, new_name))
                         .unwrap_or(false)
                 })
                 .map(|l| l.addr)
@@ -423,7 +423,7 @@ impl LeaseDb {
         // Now set the hostname on the target lease.
         if let Some(lease) = Self::get_mut_by_addr(&mut self.leases, &self.addr_index, addr) {
             let name_changed = match (&lease.hostname, name) {
-                (Some(old), Some(new)) => !crate::util::hostname_isequal(old, new),
+                (Some(old), Some(new)) => !crate::hostname::hostname_isequal(old, new),
                 (None, None) => false,
                 _ => true,
             };

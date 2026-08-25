@@ -4562,12 +4562,10 @@ fn parse_relay_id_data(value: &str, cl: &ConfigLine, key: &str) -> Result<Vec<u8
             .bytes()
             .all(|b| b == b':' || b.is_ascii_hexdigit());
     if is_hex {
-        let mut out = Vec::new();
-        let len = crate::util::parse_hex(value, &mut out, None, None);
-        if len <= 0 || out.len() != len as usize {
-            return Err(invalid_value_for(cl, key, value, "invalid colon-separated hex relay id"));
+        match crate::util::parse_hex(value, None) {
+            Ok((out, _)) if !out.is_empty() => Ok(out),
+            _ => Err(invalid_value_for(cl, key, value, "invalid colon-separated hex relay id")),
         }
-        Ok(out)
     } else {
         Ok(value.as_bytes().to_vec())
     }
@@ -4582,17 +4580,15 @@ fn parse_mac_pattern(
     let (mac_type, pattern) = parse_mac_type_prefix(value)
         .ok_or_else(|| invalid_value_for(cl, key, value, "invalid hardware type prefix"))?;
 
-    let mut bytes = Vec::new();
-    let mut wildcard_mask = 0u32;
-    let len = crate::util::parse_hex(
-        pattern,
-        &mut bytes,
-        Some(crate::dhcp_protocol::DHCP_CHADDR_MAX),
-        Some(&mut wildcard_mask),
-    );
-    if len <= 0 || bytes.len() != len as usize {
+    let Ok((bytes, wildcard_mask)) =
+        crate::util::parse_hex(pattern, Some(crate::dhcp_protocol::DHCP_CHADDR_MAX))
+    else {
+        return Err(invalid_value_for(cl, key, value, "expected MAC address pattern"));
+    };
+    if bytes.is_empty() {
         return Err(invalid_value_for(cl, key, value, "expected MAC address pattern"));
     }
+    let len = bytes.len() as i32;
 
     let mut hwaddr = [0u8; 16];
     hwaddr[..bytes.len()].copy_from_slice(&bytes);
@@ -4786,7 +4782,7 @@ fn parse_dhcp_option_value(
     if (size_flags & crate::dhcp_common::OT_RFC1035_NAME) != 0 {
         let mut out = Vec::new();
         for token in value_parts {
-            if !crate::util::do_rfc1035_name(&mut out, token, None) {
+            if !crate::rfc1035::do_rfc1035_name(&mut out, token, None) {
                 return Err(invalid_value_for(cl, key, token, "expected valid RFC1035 domain name"));
             }
         }
@@ -4838,12 +4834,10 @@ fn parse_dhcp_option_value(
 #[cfg(feature = "dhcp")]
 fn parse_client_id(value: &str, cl: &ConfigLine, key: &str) -> Result<Vec<u8>, ConfigError> {
     if value.contains(':') {
-        let mut out = Vec::new();
-        let len = crate::util::parse_hex(value, &mut out, None, None);
-        if len <= 0 || out.len() != len as usize {
-            return Err(invalid_value_for(cl, key, value, "bad hex client-id"));
+        match crate::util::parse_hex(value, None) {
+            Ok((out, _)) if !out.is_empty() => Ok(out),
+            _ => Err(invalid_value_for(cl, key, value, "bad hex client-id")),
         }
-        Ok(out)
     } else {
         Ok(value.as_bytes().to_vec())
     }
@@ -7955,8 +7949,8 @@ mod tests {
         #[cfg(feature = "dhcp")]
         {
             let mut expected = Vec::new();
-            assert!(crate::util::do_rfc1035_name(&mut expected, "example.com", None));
-            assert!(crate::util::do_rfc1035_name(&mut expected, "lab.local", None));
+            assert!(crate::rfc1035::do_rfc1035_name(&mut expected, "example.com", None));
+            assert!(crate::rfc1035::do_rfc1035_name(&mut expected, "lab.local", None));
             let opt = &d.dhcp_opts[0];
             assert_eq!(opt.val.as_deref(), Some(expected.as_slice()));
         }
