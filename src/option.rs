@@ -302,197 +302,82 @@ pub fn config_lines_from_cli(args: &CliArgs) -> Vec<ConfigLine> {
         });
     };
 
-    if let Some(port) = args.port {
-        push_line("port", Some(port.to_string()));
+    // `flag!` emits a bare directive when a bool CLI field is set.
+    // `value!` emits `key=value` when an `Option<T: Display>` CLI field is set.
+    // `values!` emits one `key=value` line per entry of a repeatable CLI field.
+    macro_rules! flag {
+        ($field:ident, $key:literal) => {
+            if args.$field {
+                push_line($key, None);
+            }
+        };
+    }
+    macro_rules! value {
+        ($field:ident, $key:literal) => {
+            if let Some(v) = &args.$field {
+                push_line($key, Some(v.to_string()));
+            }
+        };
+    }
+    macro_rules! values {
+        ($field:ident, $key:literal) => {
+            for v in &args.$field {
+                push_line($key, Some(v.to_string()));
+            }
+        };
     }
 
-    if let Some(query_port) = args.query_port {
-        push_line("query-port", Some(query_port.to_string()));
-    }
+    value!(port, "port");
+    value!(query_port, "query-port");
+    value!(min_port, "min-port");
+    value!(max_port, "max-port");
 
-    if let Some(min_port) = args.min_port {
-        push_line("min-port", Some(min_port.to_string()));
-    }
+    flag!(no_resolv, "no-resolv");
+    flag!(no_poll, "no-poll");
+    flag!(no_hosts, "no-hosts");
+    flag!(bogus_priv, "bogus-priv");
+    flag!(expand_hosts, "expand-hosts");
+    flag!(log_queries, "log-queries");
+    flag!(no_negcache, "no-negcache");
+    flag!(all_servers, "all-servers");
+    flag!(strict_order, "strict-order");
+    flag!(dnssec, "dnssec");
+    flag!(local_service, "local-service");
+    flag!(no_rebind, "no-rebind");
+    flag!(no_daemon, "no-daemon");
+    flag!(keep_in_foreground, "keep-in-foreground");
+    flag!(bind_interfaces, "bind-interfaces");
+    flag!(dnssec_debug, "dnssec-debug");
 
-    if let Some(max_port) = args.max_port {
-        push_line("max-port", Some(max_port.to_string()));
-    }
+    value!(cache_size, "cache-size");
+    value!(local_ttl, "local-ttl");
+    value!(neg_ttl, "neg-ttl");
+    value!(max_ttl, "max-ttl");
+    value!(min_cache_ttl, "min-cache-ttl");
+    value!(max_cache_ttl, "max-cache-ttl");
+    value!(use_stale_cache, "use-stale-cache");
+    value!(edns_packet_max, "edns-packet-max");
+    value!(fast_dns_retry, "fast-dns-retry");
+    value!(domain, "domain");
+    value!(user, "user");
+    value!(group, "group");
+    value!(pid_file, "pid-file");
+    value!(log_facility, "log-facility");
+    value!(log_async, "log-async");
+    value!(servers_file, "servers-file");
+    value!(lease_file, "lease-file");
+    value!(dns_forward_max, "dns-forward-max");
+    value!(dhcp_alternate_port, "dhcp-alternate-port");
 
-    if args.no_resolv {
-        push_line("no-resolv", None);
-    }
-
-    if args.no_poll {
-        push_line("no-poll", None);
-    }
-
-    if args.no_hosts {
-        push_line("no-hosts", None);
-    }
-
-    if args.bogus_priv {
-        push_line("bogus-priv", None);
-    }
-
-    if args.expand_hosts {
-        push_line("expand-hosts", None);
-    }
-
-    if args.log_queries {
-        push_line("log-queries", None);
-    }
-
-    if args.no_negcache {
-        push_line("no-negcache", None);
-    }
-
-    if args.all_servers {
-        push_line("all-servers", None);
-    }
-
-    if args.strict_order {
-        push_line("strict-order", None);
-    }
-
-    if args.dnssec {
-        push_line("dnssec", None);
-    }
-
-    if args.local_service {
-        push_line("local-service", None);
-    }
-
-    if args.no_rebind {
-        push_line("no-rebind", None);
-    }
-
-    if args.no_daemon {
-        push_line("no-daemon", None);
-    }
-
-    if args.keep_in_foreground {
-        push_line("keep-in-foreground", None);
-    }
-
-    if args.bind_interfaces {
-        push_line("bind-interfaces", None);
-    }
-
-    if args.dnssec_debug {
-        push_line("dnssec-debug", None);
-    }
-
-    if let Some(cache_size) = args.cache_size {
-        push_line("cache-size", Some(cache_size.to_string()));
-    }
-
-    if let Some(local_ttl) = args.local_ttl {
-        push_line("local-ttl", Some(local_ttl.to_string()));
-    }
-
-    if let Some(neg_ttl) = args.neg_ttl {
-        push_line("neg-ttl", Some(neg_ttl.to_string()));
-    }
-
-    if let Some(max_ttl) = args.max_ttl {
-        push_line("max-ttl", Some(max_ttl.to_string()));
-    }
-
-    if let Some(min_cache_ttl) = args.min_cache_ttl {
-        push_line("min-cache-ttl", Some(min_cache_ttl.to_string()));
-    }
-
-    if let Some(max_cache_ttl) = args.max_cache_ttl {
-        push_line("max-cache-ttl", Some(max_cache_ttl.to_string()));
-    }
-
-    if let Some(use_stale_cache) = args.use_stale_cache {
-        push_line("use-stale-cache", Some(use_stale_cache.to_string()));
-    }
-
-    if let Some(edns_packet_max) = args.edns_packet_max {
-        push_line("edns-packet-max", Some(edns_packet_max.to_string()));
-    }
-
-    if let Some(fast_dns_retry) = &args.fast_dns_retry {
-        push_line("fast-dns-retry", Some(fast_dns_retry.clone()));
-    }
-
-    if let Some(domain) = &args.domain {
-        push_line("domain", Some(domain.clone()));
-    }
-
-    if let Some(user) = &args.user {
-        push_line("user", Some(user.clone()));
-    }
-
-    if let Some(group) = &args.group {
-        push_line("group", Some(group.clone()));
-    }
-
-    if let Some(pid_file) = &args.pid_file {
-        push_line("pid-file", Some(pid_file.clone()));
-    }
-
-    if let Some(log_facility) = &args.log_facility {
-        push_line("log-facility", Some(log_facility.clone()));
-    }
-
-    if let Some(log_async) = args.log_async {
-        push_line("log-async", Some(log_async.to_string()));
-    }
-
-    if let Some(servers_file) = &args.servers_file {
-        push_line("servers-file", Some(servers_file.clone()));
-    }
-
-    if let Some(lease_file) = &args.lease_file {
-        push_line("lease-file", Some(lease_file.clone()));
-    }
-
-    if let Some(dns_forward_max) = args.dns_forward_max {
-        push_line("dns-forward-max", Some(dns_forward_max.to_string()));
-    }
-
-    if let Some(dhcp_alternate_port) = &args.dhcp_alternate_port {
-        push_line("dhcp-alternate-port", Some(dhcp_alternate_port.clone()));
-    }
-
-    for resolv_file in &args.resolv_file {
-        push_line("resolv-file", Some(resolv_file.clone()));
-    }
-
-    for interface in &args.interface {
-        push_line("interface", Some(interface.clone()));
-    }
-
-    for except_interface in &args.except_interface {
-        push_line("except-interface", Some(except_interface.clone()));
-    }
-
-    for listen_address in &args.listen_address {
-        push_line("listen-address", Some(listen_address.clone()));
-    }
-
-    for server in &args.server {
-        push_line("server", Some(server.clone()));
-    }
-
-    for rev_server in &args.rev_server {
-        push_line("rev-server", Some(rev_server.clone()));
-    }
-
-    for synth_domain in &args.synth_domain {
-        push_line("synth-domain", Some(synth_domain.clone()));
-    }
-
-    for bridge_interface in &args.bridge_interface {
-        push_line("bridge-interface", Some(bridge_interface.clone()));
-    }
-
-    for shared_network in &args.shared_network {
-        push_line("shared-network", Some(shared_network.clone()));
-    }
+    values!(resolv_file, "resolv-file");
+    values!(interface, "interface");
+    values!(except_interface, "except-interface");
+    values!(listen_address, "listen-address");
+    values!(server, "server");
+    values!(rev_server, "rev-server");
+    values!(synth_domain, "synth-domain");
+    values!(bridge_interface, "bridge-interface");
+    values!(shared_network, "shared-network");
 
     lines
 }
@@ -529,12 +414,12 @@ fn parse_config_text_depth(
         // Handle recursive inclusion.
         if key == "conf-file" {
             if depth >= MAX_DEPTH {
-                return Err(ConfigError::InvalidValue(
-                    value.unwrap_or_default(),
-                    "conf-file".to_string(),
-                    filename.to_string(),
+                return Err(invalid_value(
+                    filename,
                     lineno,
-                    "maximum conf-file inclusion depth exceeded".to_string(),
+                    "conf-file",
+                    &value.unwrap_or_default(),
+                    "maximum conf-file inclusion depth exceeded",
                 ));
             }
             let path = value.ok_or_else(|| {
@@ -690,13 +575,7 @@ fn apply_mx_defaults(daemon: &mut Daemon) -> Result<(), ConfigError> {
     }
 
     let hostname = local_hostname_for_mx().ok_or_else(|| {
-        ConfigError::InvalidValue(
-            String::new(),
-            "mx-target".to_string(),
-            "<runtime>".to_string(),
-            0,
-            "failed to determine local hostname".to_string(),
-        )
+        invalid_value("<runtime>", 0, "mx-target", "", "failed to determine local hostname")
     })?;
 
     if (daemon.mxtarget.is_some() || daemon.option_bool(OPT_LOCALMX))
@@ -767,12 +646,12 @@ fn apply_local_service_defaults(daemon: &mut Daemon) {
 
 fn validate_auth_config(daemon: &Daemon) -> Result<(), ConfigError> {
     if !daemon.auth_zones.is_empty() && daemon.authserver.is_none() {
-        return Err(ConfigError::InvalidValue(
-            String::new(),
-            "auth-server".to_string(),
-            "<runtime>".to_string(),
+        return Err(invalid_value(
+            "<runtime>",
             0,
-            "--auth-server required when an auth zone is defined".to_string(),
+            "auth-server",
+            "",
+            "--auth-server required when an auth zone is defined",
         ));
     }
 
@@ -794,26 +673,12 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
 
     let require_no_value = |opt: &str| -> Result<(), ConfigError> {
         if let Some(value) = cl.value.as_deref() {
-            return Err(ConfigError::InvalidValue(
-                value.to_string(),
-                opt.to_string(),
-                file.clone(),
-                lineno,
-                "unexpected value".to_string(),
-            ));
+            return Err(invalid_value_for(cl, opt, value, "unexpected value"));
         }
         Ok(())
     };
 
-    let invalid = |val: &str, reason: &str| -> ConfigError {
-        ConfigError::InvalidValue(
-            val.to_string(),
-            key.to_string(),
-            file.clone(),
-            lineno,
-            reason.to_string(),
-        )
-    };
+    let invalid = |val: &str, reason: &str| -> ConfigError { invalid_value_for(cl, key, val, reason) };
 
     match key {
         // ── Boolean flags ──────────────────────────────────────────────────
@@ -1138,12 +1003,11 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             }
             #[cfg(not(feature = "script"))]
             {
-                return Err(ConfigError::InvalidValue(
-                    "".to_string(),
-                    "dhcp-script".to_string(),
-                    cl.file.clone(),
-                    cl.line,
-                    "recompile with HAVE_SCRIPT defined to enable lease-change scripts".to_string(),
+                return Err(invalid_value_for(
+                    cl,
+                    "dhcp-script",
+                    "",
+                    "recompile with HAVE_SCRIPT defined to enable lease-change scripts",
                 ));
             }
         }
@@ -1156,12 +1020,11 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             }
             #[cfg(not(feature = "script"))]
             {
-                return Err(ConfigError::InvalidValue(
-                    "".to_string(),
-                    "dhcp-luascript".to_string(),
-                    cl.file.clone(),
-                    cl.line,
-                    "recompile with HAVE_SCRIPT defined to enable lease-change scripts".to_string(),
+                return Err(invalid_value_for(
+                    cl,
+                    "dhcp-luascript",
+                    "",
+                    "recompile with HAVE_SCRIPT defined to enable lease-change scripts",
                 ));
             }
         }
@@ -2171,15 +2034,7 @@ fn parse_server_or_address(
     v: &str,
     cl: &ConfigLine,
 ) -> Result<(), ConfigError> {
-    let invalid = |val: &str, reason: &str| -> ConfigError {
-        ConfigError::InvalidValue(
-            val.to_string(),
-            key.to_string(),
-            cl.file.clone(),
-            cl.line,
-            reason.to_string(),
-        )
-    };
+    let invalid = |val: &str, reason: &str| -> ConfigError { invalid_value_for(cl, key, val, reason) };
 
     // Split optional /domain/ prefix from the address part.
     let (domains, addr_part): (Vec<String>, &str) = if v.starts_with('/') {
@@ -2331,14 +2186,18 @@ pub(crate) fn new_server(flags: ServFlags, domain: String, addr: MySockAddr, sou
     }
 }
 
-fn invalid_value_for(cl: &ConfigLine, key: &str, val: &str, reason: &str) -> ConfigError {
+fn invalid_value(file: &str, line: usize, key: &str, val: &str, reason: &str) -> ConfigError {
     ConfigError::InvalidValue(
         val.to_string(),
         key.to_string(),
-        cl.file.clone(),
-        cl.line,
+        file.to_string(),
+        line,
         reason.to_string(),
     )
+}
+
+fn invalid_value_for(cl: &ConfigLine, key: &str, val: &str, reason: &str) -> ConfigError {
+    invalid_value(&cl.file, cl.line, key, val, reason)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2554,8 +2413,8 @@ fn parse_umbrella(daemon: &mut Daemon, v: &str, cl: &ConfigLine) -> Result<(), C
             if hex.len() != 16 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err(invalid_value_for(cl, key, part, "deviceid must be 16 hex characters"));
             }
-            for (i, byte) in daemon.umbrella_device.iter_mut().enumerate() {
-                *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
+            for (byte, pair) in daemon.umbrella_device.iter_mut().zip(hex.as_bytes().chunks(2)) {
+                *byte = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
             }
             daemon.set_option(OPT_UMBRELLA_DEVID);
         } else if let Some(n) = part.strip_prefix("orgid:") {
@@ -3152,20 +3011,16 @@ fn parse_hex_bytes(token: &str, key: &str, cl: &ConfigLine, field: &str) -> Resu
     if hex.len() % 2 != 0 {
         return Err(invalid_value_for(cl, key, token, &format!("{field} must contain an even number of hex digits")));
     }
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    let bytes = hex.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let pair = std::str::from_utf8(&bytes[i..i + 2]).map_err(|_| {
-            invalid_value_for(cl, key, token, &format!("expected a hexadecimal {field}"))
-        })?;
-        let byte = u8::from_str_radix(pair, 16).map_err(|_| {
-            invalid_value_for(cl, key, token, &format!("expected a hexadecimal {field}"))
-        })?;
-        out.push(byte);
-        i += 2;
-    }
-    Ok(out)
+    hex.as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).map_err(|_| {
+                invalid_value_for(cl, key, token, &format!("expected a hexadecimal {field}"))
+            })?;
+            u8::from_str_radix(pair, 16)
+                .map_err(|_| invalid_value_for(cl, key, token, &format!("expected a hexadecimal {field}")))
+        })
+        .collect()
 }
 
 fn parse_mx_host(value: &str, cl: &ConfigLine) -> Result<MxSrvRecord, ConfigError> {
