@@ -6,9 +6,10 @@
 //! that used to be entirely missing from this port.
 #![cfg(feature = "tftp")]
 
+use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
@@ -517,6 +518,20 @@ pub struct TftpFile {
     posn: u64,
 }
 
+/// Lock a shared `TftpFile`, recovering the guard even if a previous holder
+/// panicked while holding it.
+///
+/// A `TftpFile` is shared (via `Arc<Mutex<_>>`) across every concurrent
+/// transfer of the same file by design, for refcounting — so a plain
+/// `.lock().unwrap()` would let one transfer's panic poison the mutex and
+/// take down every other transfer of that file too. `TftpFile`'s own
+/// invariants (the open `fd`, `posn`) are never left inconsistent by a
+/// panic — nothing here does partial mutation across an await point — so
+/// recovering a poisoned guard is safe.
+fn lock_file(file: &Mutex<TftpFile>) -> MutexGuard<'_, TftpFile> {
+    file.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[derive(Debug)]
 pub enum TftpOpenError {
     NotFound,
@@ -573,7 +588,7 @@ pub fn open_tftp_file(
 
         for existing in shared {
             let matches = {
-                let f = existing.lock().unwrap();
+                let f = lock_file(existing);
                 f.dev == dev && f.inode == inode && f.filename == namebuff
             };
             if matches {
@@ -768,7 +783,7 @@ pub fn get_block(transfer: &mut TftpTransfer) -> io::Result<GetBlockResult> {
             opts.push(("blksize".to_string(), transfer.blocksize.to_string()));
         }
         if transfer.opt_transize {
-            let size = transfer.file.lock().unwrap().size;
+            let size = lock_file(&transfer.file).size;
             opts.push(("tsize".to_string(), size.to_string()));
         }
         if transfer.opt_timeout {
@@ -785,7 +800,7 @@ pub fn get_block(transfer: &mut TftpTransfer) -> io::Result<GetBlockResult> {
         transfer.offset = (transfer.block as u64 - 1) * transfer.blocksize as u64;
     }
 
-    let file_size = transfer.file.lock().unwrap().size;
+    let file_size = lock_file(&transfer.file).size;
     if transfer.offset > file_size {
         return Ok(GetBlockResult::Done);
     }
@@ -801,7 +816,7 @@ pub fn get_block(transfer: &mut TftpTransfer) -> io::Result<GetBlockResult> {
     let want = ((file_size - transfer.offset).min(transfer.blocksize as u64)) as usize;
     let mut raw = vec![0u8; want];
     if want != 0 {
-        let mut f = transfer.file.lock().unwrap();
+        let mut f = lock_file(&transfer.file);
         if f.posn != transfer.offset {
             f.file.seek(SeekFrom::Start(transfer.offset))?;
         }
@@ -981,7 +996,7 @@ fn drop_transfer(mut t: TftpTransfer) {
 }
 
 fn log_transfer_end(t: &TftpTransfer, timeout: bool, error: bool, config: &TftpConfig) {
-    let fname = t.file.lock().unwrap().filename.clone();
+    let fname = lock_file(&t.file).filename.clone();
     if timeout {
         warn!("timeout sending {fname} to {}", t.peer);
     } else if error {
@@ -1024,7 +1039,7 @@ async fn send_window(transfer: &mut TftpTransfer) -> (bool, bool) {
                 transfer.block += 1;
             }
             Err(e) => {
-                let fname = transfer.file.lock().unwrap().filename.clone();
+                let fname = lock_file(&transfer.file).filename.clone();
                 let err = tftp_err_oops(&fname, &e);
                 send_packet(transfer, &err).await;
                 return (true, true);
@@ -1146,6 +1161,37 @@ async fn send_transfer_reply(
     }
 }
 
+/// Live TFTP transfer runtime state: the transfer table (keyed by the id
+/// each transfer's forwarder task tags its `TftpEvent::Transfer` messages
+/// with), the next id to hand out, and the sender every forwarder task
+/// (listener and per-transfer alike) pushes events through.
+///
+/// Bundling these together — rather than threading `transfers`, `ids`,
+/// `next_id`, and `tx` as four separate parameters — also retires the old
+/// parallel `transfers: Vec<TftpTransfer>` / `ids: Vec<u64>` pair: they were
+/// always mutated in lockstep (same index removed from both), which a single
+/// `HashMap<u64, TftpTransfer>` keyed by id makes structurally impossible to
+/// desync.
+#[cfg(unix)]
+struct TftpRuntime {
+    transfers: HashMap<u64, TftpTransfer>,
+    next_id: u64,
+    tx: tokio::sync::mpsc::Sender<TftpEvent>,
+}
+
+#[cfg(unix)]
+impl TftpRuntime {
+    fn new(tx: tokio::sync::mpsc::Sender<TftpEvent>) -> Self {
+        Self { transfers: HashMap::new(), next_id: 1, tx }
+    }
+
+    fn alloc_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+}
+
 /// Handle a fresh (or single-port-shared-socket) RRQ, exactly as
 /// `tftp_request()` does after the single-port peer-matching dance: parse
 /// filename/mode/options, resolve+open the file, and send exactly one
@@ -1155,16 +1201,12 @@ async fn send_transfer_reply(
 ///
 /// Port of `tftp_request()` (tftp.c:44-536).
 #[cfg(unix)]
-#[allow(clippy::too_many_arguments)]
 async fn handle_new_request(
     listener: &TftpListenerHandle,
     meta: &crate::network::RecvMeta,
     data: &[u8],
     config: &TftpConfig,
-    transfers: &mut Vec<TftpTransfer>,
-    ids: &mut Vec<u64>,
-    next_id: &mut u64,
-    tx: &tokio::sync::mpsc::Sender<TftpEvent>,
+    runtime: &mut TftpRuntime,
 ) {
     if data.len() < 2 {
         return;
@@ -1266,7 +1308,7 @@ async fn handle_new_request(
         },
     );
 
-    let shared: Vec<Arc<Mutex<TftpFile>>> = transfers.iter().map(|t| t.file.clone()).collect();
+    let shared: Vec<Arc<Mutex<TftpFile>>> = runtime.transfers.values().map(|t| t.file.clone()).collect();
     let file = match open_tftp_file(&namebuff, config.prefix.is_some(), config.secure, &shared) {
         Ok(f) => f,
         Err(TftpOpenError::NotFound) => {
@@ -1289,7 +1331,7 @@ async fn handle_new_request(
         }
     };
 
-    if transfers.len() as i32 >= effective_max(config) {
+    if runtime.transfers.len() as i32 >= effective_max(config) {
         return;
     }
 
@@ -1312,7 +1354,7 @@ async fn handle_new_request(
         Ok(GetBlockResult::Oack(p)) | Ok(GetBlockResult::Data(p)) => p,
         Ok(GetBlockResult::Done) => return,
         Err(e) => {
-            let fname = transfer.file.lock().unwrap().filename.clone();
+            let fname = lock_file(&transfer.file).filename.clone();
             let err = tftp_err_oops(&fname, &e);
             send_packet(&transfer, &err).await;
             drop_transfer(transfer);
@@ -1321,12 +1363,11 @@ async fn handle_new_request(
     };
     send_packet(&transfer, &pkt).await;
 
-    let id = *next_id;
-    *next_id += 1;
+    let id = runtime.alloc_id();
 
     if !single_port {
         let sock2 = sock.clone();
-        let tx2 = tx.clone();
+        let tx2 = runtime.tx.clone();
         transfer.forwarder = Some(tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
             loop {
@@ -1342,102 +1383,105 @@ async fn handle_new_request(
         }));
     }
 
-    transfers.push(transfer);
-    ids.push(id);
+    runtime.transfers.insert(id, transfer);
 }
 
 #[cfg(unix)]
-#[allow(clippy::too_many_arguments)]
 async fn handle_listener_datagram(
     listener: &TftpListenerHandle,
     meta: crate::network::RecvMeta,
     data: Vec<u8>,
     config: &TftpConfig,
-    transfers: &mut Vec<TftpTransfer>,
-    ids: &mut Vec<u64>,
-    next_id: &mut u64,
-    tx: &tokio::sync::mpsc::Sender<TftpEvent>,
+    runtime: &mut TftpRuntime,
 ) {
     if config.single_port && data.len() >= 2 {
         let opcode = u16::from_be_bytes([data[0], data[1]]);
-        if let Some(pos) = transfers.iter().position(|t| t.peer == meta.src) {
+        let matched_id = runtime.transfers.iter().find(|(_, t)| t.peer == meta.src).map(|(&id, _)| id);
+        if let Some(id) = matched_id {
             if opcode == TftpOpcode::Rrq as u16 {
-                let t = transfers.remove(pos);
-                ids.remove(pos);
-                drop_transfer(t);
+                if let Some(t) = runtime.transfers.remove(&id) {
+                    drop_transfer(t);
+                }
             } else {
-                if process_transfer_packet(&mut transfers[pos], &data, config).await {
-                    let t = transfers.remove(pos);
-                    ids.remove(pos);
+                let Some(transfer) = runtime.transfers.get_mut(&id) else { return };
+                if process_transfer_packet(transfer, &data, config).await {
+                    let t = runtime.transfers.remove(&id).expect("id was just looked up above");
                     log_transfer_end(&t, false, true, config);
                     drop_transfer(t);
                 }
                 return;
             }
-        } else if transfers.len() as i32 >= effective_max(config) {
+        } else if runtime.transfers.len() as i32 >= effective_max(config) {
             return;
         }
     }
 
-    handle_new_request(listener, &meta, &data, config, transfers, ids, next_id, tx).await;
+    handle_new_request(listener, &meta, &data, config, runtime).await;
 }
 
 #[cfg(unix)]
-async fn sweep_transfers(transfers: &mut Vec<TftpTransfer>, ids: &mut Vec<u64>, config: &TftpConfig) {
+async fn sweep_transfers(transfers: &mut HashMap<u64, TftpTransfer>, config: &TftpConfig) {
     let now = Instant::now();
-    let mut i = 0;
-    while i < transfers.len() {
+    // Two-phase: decide which transfers end during one pass over the map
+    // (mutating each transfer in place as upstream's single indexed loop
+    // does), then remove them afterward — a `HashMap` can't have entries
+    // removed while an iterator over it is live, unlike the old `Vec`'s
+    // index-based `while i < transfers.len()` loop.
+    let mut ended: Vec<(u64, bool, bool)> = Vec::new(); // (id, timeout_flag, error)
+
+    for (&id, transfer) in transfers.iter_mut() {
         let mut endcon = false;
         let mut error = false;
         let mut timeout_flag = false;
 
-        if transfers[i].start.is_none() {
+        if transfer.start.is_none() {
             endcon = true;
             error = true;
-        } else if now.duration_since(transfers[i].start.unwrap()) > Duration::from_secs(TFTP_TRANSFER_TIME_SECS) {
+        } else if now.duration_since(transfer.start.expect("checked Some above")) > Duration::from_secs(TFTP_TRANSFER_TIME_SECS) {
             endcon = true;
             // Don't complain when we're just awaiting the last ACK — some
             // clients never send it.
-            if !matches!(get_block(&mut transfers[i]), Ok(GetBlockResult::Done)) {
+            if !matches!(get_block(transfer), Ok(GetBlockResult::Done)) {
                 error = true;
                 timeout_flag = true;
             }
-        } else if now >= transfers[i].retransmit {
+        } else if now >= transfer.retransmit {
             // Additive from the previous deadline, not from `now`, matching
             // upstream's `transfer->retransmit += transfer->timeout +
             // (1<<(backoff/2))` (`tftp.c:689`). Under scheduling delay (the
             // sweep tick firing later than the deadline it's checking), `now`
-            // can run meaningfully ahead of `transfers[i].retransmit`; basing
+            // can run meaningfully ahead of `transfer.retransmit`; basing
             // the next deadline on `now` instead of the missed one would push
             // every subsequent retry later than upstream's cadence.
-            let backoff = transfers[i].backoff;
+            let backoff = transfer.backoff;
             let shift = (backoff / 2).min(20);
-            transfers[i].retransmit = transfers[i].retransmit
-                + Duration::from_secs(transfers[i].timeout as u64)
+            transfer.retransmit = transfer.retransmit
+                + Duration::from_secs(transfer.timeout as u64)
                 + Duration::from_secs(1u64 << shift);
-            transfers[i].backoff = backoff.saturating_add(1);
-            transfers[i].block = transfers[i].lastack;
+            transfer.backoff = backoff.saturating_add(1);
+            transfer.block = transfer.lastack;
 
-            let (ec, err) = send_window(&mut transfers[i]).await;
+            let (ec, err) = send_window(transfer).await;
             endcon = ec;
             error = err;
             if !endcon {
-                let _ = get_block(&mut transfers[i]); // prefetch
+                let _ = get_block(transfer); // prefetch
             }
         }
 
         if endcon {
-            let t = transfers.remove(i);
-            ids.remove(i);
-            log_transfer_end(&t, timeout_flag, error, config);
-            drop_transfer(t);
-            // `do_tftp_script_run`'s completion hook (tftp.c:1024-1039) would
-            // fire here; the external-script pipeline it feeds
-            // (`helper::create_helper`/`HelperHandle`) isn't wired into the
-            // main loop for any daemon subsystem yet — see tasks.md.
-        } else {
-            i += 1;
+            ended.push((id, timeout_flag, error));
         }
+    }
+
+    for (id, timeout_flag, error) in ended {
+        let Some(t) = transfers.remove(&id) else { continue };
+        log_transfer_end(&t, timeout_flag, error, config);
+        drop_transfer(t);
+        // `do_tftp_script_run`'s completion hook (tftp.c:1024-1039) would
+        // fire here; the external-script pipeline it feeds
+        // (`helper::create_helper`/`HelperHandle`) isn't wired into the main
+        // loop for any daemon subsystem yet — see tasks.md.
     }
 }
 
@@ -1485,9 +1529,7 @@ pub async fn run_tftp_loop(listeners: Vec<TftpListenerHandle>, config: TftpConfi
             }
         });
     }
-    let mut transfers: Vec<TftpTransfer> = Vec::new();
-    let mut ids: Vec<u64> = Vec::new();
-    let mut next_id: u64 = 1;
+    let mut runtime = TftpRuntime::new(tx);
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -1497,25 +1539,21 @@ pub async fn run_tftp_loop(listeners: Vec<TftpListenerHandle>, config: TftpConfi
                 let Some(ev) = ev else { break };
                 match ev {
                     TftpEvent::Listener { listener_idx, meta, data } => {
-                        handle_listener_datagram(
-                            &listeners[listener_idx], meta, data, &config,
-                            &mut transfers, &mut ids, &mut next_id, &tx,
-                        ).await;
+                        handle_listener_datagram(&listeners[listener_idx], meta, data, &config, &mut runtime).await;
                     }
                     TftpEvent::Transfer { id, peer, data } => {
-                        let Some(pos) = ids.iter().position(|&i| i == id) else { continue };
-                        if peer != transfers[pos].peer {
+                        let Some(transfer) = runtime.transfers.get_mut(&id) else { continue };
+                        if peer != transfer.peer {
                             // Wrong source address — RFC 1350 §4.
                             let err = tftp_err_packet(
                                 TftpError::UnknownTransferId,
                                 &format!("ignoring packet from {peer} (TID mismatch)"),
                             );
-                            send_packet_to(&transfers[pos], peer, &err).await;
+                            send_packet_to(transfer, peer, &err).await;
                             continue;
                         }
-                        if process_transfer_packet(&mut transfers[pos], &data, &config).await {
-                            let t = transfers.remove(pos);
-                            ids.remove(pos);
+                        if process_transfer_packet(transfer, &data, &config).await {
+                            let t = runtime.transfers.remove(&id).expect("id was just looked up above");
                             log_transfer_end(&t, false, true, &config);
                             drop_transfer(t);
                         }
@@ -1523,7 +1561,7 @@ pub async fn run_tftp_loop(listeners: Vec<TftpListenerHandle>, config: TftpConfi
                 }
             }
             _ = tick.tick() => {
-                sweep_transfers(&mut transfers, &mut ids, &config).await;
+                sweep_transfers(&mut runtime.transfers, &config).await;
             }
         }
     }
@@ -2066,11 +2104,10 @@ mod tests {
         // Directly assert the no-double-send invariant: an immediate sweep,
         // with no simulated time passing, must not treat the transfer as
         // overdue for retransmission.
-        let mut transfers = vec![t];
-        let mut ids = vec![0u64];
-        sweep_transfers(&mut transfers, &mut ids, &config).await;
+        let mut transfers = HashMap::from([(0u64, t)]);
+        sweep_transfers(&mut transfers, &config).await;
         assert_eq!(transfers.len(), 1, "transfer must still be active");
-        assert_eq!(transfers[0].backoff, 1, "sweep must not have re-sent (which would bump backoff again)");
+        assert_eq!(transfers[&0].backoff, 1, "sweep must not have re-sent (which would bump backoff again)");
     }
 
     #[tokio::test]
@@ -2097,15 +2134,14 @@ mod tests {
         t.retransmit = missed_deadline;
 
         let config = TftpConfig::default();
-        let mut transfers = vec![t];
-        let mut ids = vec![0u64];
-        sweep_transfers(&mut transfers, &mut ids, &config).await;
+        let mut transfers = HashMap::from([(0u64, t)]);
+        sweep_transfers(&mut transfers, &config).await;
 
         assert_eq!(transfers.len(), 1, "3-block transfer must not finish after one retransmit window");
         // backoff was 0, so shift = (0/2).min(20) = 0, and 1<<0 = 1.
         let expected = missed_deadline + Duration::from_secs(2) + Duration::from_secs(1);
         assert_eq!(
-            transfers[0].retransmit, expected,
+            transfers[&0].retransmit, expected,
             "next deadline must be computed from the missed deadline, not from `now`"
         );
     }
