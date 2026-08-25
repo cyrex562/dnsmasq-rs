@@ -297,29 +297,41 @@ fn select_address_for_ia(
     address6_allocate(contexts, client_id, iaid, &[], &mut |a| addr_in_use(lease_db, configs, a))
 }
 
+/// Build the reply for a packet with no IA in it at all: upstream's per-IA
+/// loop simply never runs, leaving `address_assigned == 0` — a reply with
+/// no IA_NA option and a top-level NoAddrsAvail.
+///
+/// Shared by [`dispatch_solicit`] (rfc3315.c:660-807 vs. :774-804) and
+/// [`dispatch_request`] (rfc3315.c:824-901 vs. :903-918), which differ only
+/// in `reply_type` (Solicit answers Advertise unless rapid-commit; Request
+/// always answers Reply).
+fn no_ia_reply(reply_type: Dhcp6MsgType, xid: u32, duid: &[u8], client_id: &[u8]) -> Dhcp6Reply {
+    let mut options = Vec::new();
+    options.extend(build_option6(OPTION6_CLIENT_ID, client_id));
+    options.extend(build_option6(OPTION6_SERVER_ID, duid));
+    options.extend(status_option(crate::rfc3315::STATUS_NO_ADDRS_AVAIL, "no addresses available"));
+    Dhcp6Reply { msg_type: reply_type, xid, options }
+}
+
 /// Build a Solicit-shaped (Advertise or, with rapid-commit, Reply) result.
 ///
 /// Shared by [`dispatch_solicit`] and the Request-with-no-address redirect
 /// in [`dispatch_request`] (rfc3315.c:833-839).
-#[allow(clippy::too_many_arguments)]
 fn build_solicit_style_reply(
     xid: u32,
     duid: &[u8],
     client_id: &[u8],
     iaid_bytes: [u8; 4],
-    contexts: &[DhcpContext],
-    lease_db: &mut LeaseDb,
+    ctx: &mut Dhcp6RequestContext,
     addr: Option<Ipv6Addr>,
     persist: bool,
     reply_type: Dhcp6MsgType,
     include_rapid_commit_opt: bool,
-    authoritative: bool,
-    now_secs: u64,
 ) -> Dhcp6Reply {
     let iaid = u32::from_be_bytes(iaid_bytes);
     let (preferred, valid, t1, t2) = match addr {
-        Some(a) if persist => persist_lease(lease_db, client_id, iaid, a, contexts, now_secs),
-        Some(a) => compute_times_for_addr(contexts, &a),
+        Some(a) if persist => persist_lease(ctx.lease_db, client_id, iaid, a, ctx.contexts, ctx.now_secs),
+        Some(a) => compute_times_for_addr(ctx.contexts, &a),
         None => (0, 0, 0, 0),
     };
 
@@ -336,7 +348,7 @@ fn build_solicit_style_reply(
     options.extend(build_ia_na_option(iaid_bytes, t1, t2, ia_sub));
     if addr.is_some() {
         options.extend(status_option(crate::rfc3315::STATUS_SUCCESS, "success"));
-        options.extend(build_option6(OPTION6_PREFERENCE, &[if authoritative { 255 } else { 0 }]));
+        options.extend(build_option6(OPTION6_PREFERENCE, &[if ctx.authoritative { 255 } else { 0 }]));
     } else {
         options.extend(status_option(crate::rfc3315::STATUS_NO_ADDRS_AVAIL, "no addresses available"));
     }
@@ -344,38 +356,49 @@ fn build_solicit_style_reply(
     Dhcp6Reply { msg_type: reply_type, xid, options }
 }
 
+/// Server-state parameters threaded identically through every DHCPv6
+/// message-type dispatcher that can allocate or renew a lease — dhcp-range
+/// contexts, static host configs, the lease database, `--dhcp-authoritative`,
+/// and the current time (as UNIX-epoch seconds, for computing lease expiry).
+/// Bundled here instead of repeating the same 5-parameter list on
+/// [`dispatch_solicit`], [`dispatch_request`], [`dispatch_renew_rebind`], and
+/// [`build_solicit_style_reply`] (which no longer needs
+/// `#[allow(clippy::too_many_arguments)]` as a result).
+///
+/// [`dispatch_confirm`]/[`dispatch_release_or_decline`]/[`dispatch_inforeq`]
+/// don't take this — each already used only a small, non-repeated subset of
+/// these fields (or none), so bundling would add unused-field noise rather
+/// than remove duplication.
+struct Dhcp6RequestContext<'a> {
+    contexts: &'a [DhcpContext],
+    configs: &'a [DhcpConfig],
+    lease_db: &'a mut LeaseDb,
+    authoritative: bool,
+    now_secs: u64,
+}
+
 /// `DHCP6SOLICIT` (rfc3315.c:627-808).
 fn dispatch_solicit(
     pkt: &Dhcp6Packet,
     duid: &[u8],
-    contexts: &[DhcpContext],
-    configs: &[DhcpConfig],
-    lease_db: &mut LeaseDb,
-    authoritative: bool,
-    now_secs: u64,
+    ctx: &mut Dhcp6RequestContext,
 ) -> Option<Dhcp6Reply> {
     let client_id = extract_client_id(pkt).to_vec();
     let rapid_commit = find_option6(&pkt.options, OPTION6_RAPID_COMMIT).is_some();
     let reply_type = if rapid_commit { Dhcp6MsgType::Reply } else { Dhcp6MsgType::Advertise };
 
-    // No IA in the packet at all: upstream's per-IA loop simply never runs,
-    // leaving `address_assigned == 0` -> a reply with no IA_NA option and a
-    // top-level NoAddrsAvail (rfc3315.c:660-807's loop body vs. :774-804).
+    // No IA in the packet at all — see `no_ia_reply`'s doc.
     let Some((ia_data, iaid)) = extract_ia(pkt) else {
-        let mut options = Vec::new();
-        options.extend(build_option6(OPTION6_CLIENT_ID, &client_id));
-        options.extend(build_option6(OPTION6_SERVER_ID, duid));
-        options.extend(status_option(crate::rfc3315::STATUS_NO_ADDRS_AVAIL, "no addresses available"));
-        return Some(Dhcp6Reply { msg_type: reply_type, xid: pkt.xid, options });
+        return Some(no_ia_reply(reply_type, pkt.xid, duid, &client_id));
     };
     let iaid_bytes = iaid.to_be_bytes();
     let requested = ia_na_first_addr(ia_data);
 
-    let addr = select_address_for_ia(contexts, configs, lease_db, &client_id, iaid, requested);
+    let addr = select_address_for_ia(ctx.contexts, ctx.configs, ctx.lease_db, &client_id, iaid, requested);
 
     Some(build_solicit_style_reply(
-        pkt.xid, duid, &client_id, iaid_bytes, contexts, lease_db,
-        addr, rapid_commit, reply_type, rapid_commit, authoritative, now_secs,
+        pkt.xid, duid, &client_id, iaid_bytes, ctx,
+        addr, rapid_commit, reply_type, rapid_commit,
     ))
 }
 
@@ -385,42 +408,33 @@ fn dispatch_solicit(
 fn dispatch_request(
     pkt: &Dhcp6Packet,
     duid: &[u8],
-    contexts: &[DhcpContext],
-    configs: &[DhcpConfig],
-    lease_db: &mut LeaseDb,
-    authoritative: bool,
-    now_secs: u64,
+    ctx: &mut Dhcp6RequestContext,
 ) -> Option<Dhcp6Reply> {
     let client_id = extract_client_id(pkt).to_vec();
     // No IA in the packet at all (distinct from an IA present but empty,
-    // handled by the redirect below): same "loop never runs" fall-through as
-    // Solicit (rfc3315.c:824-901 vs. :903-918).
+    // handled by the redirect below) — see `no_ia_reply`'s doc.
     let Some((ia_data, iaid)) = extract_ia(pkt) else {
-        let mut options = Vec::new();
-        options.extend(build_option6(OPTION6_CLIENT_ID, &client_id));
-        options.extend(build_option6(OPTION6_SERVER_ID, duid));
-        options.extend(status_option(crate::rfc3315::STATUS_NO_ADDRS_AVAIL, "no addresses available"));
-        return Some(Dhcp6Reply { msg_type: Dhcp6MsgType::Reply, xid: pkt.xid, options });
+        return Some(no_ia_reply(Dhcp6MsgType::Reply, pkt.xid, duid, &client_id));
     };
     let iaid_bytes = iaid.to_be_bytes();
     let requested = ia_na_first_addr(ia_data);
 
     let Some(req_addr) = requested else {
-        let addr = select_address_for_ia(contexts, configs, lease_db, &client_id, iaid, None);
+        let addr = select_address_for_ia(ctx.contexts, ctx.configs, ctx.lease_db, &client_id, iaid, None);
         return Some(build_solicit_style_reply(
-            pkt.xid, duid, &client_id, iaid_bytes, contexts, lease_db,
-            addr, true, Dhcp6MsgType::Reply, false, authoritative, now_secs,
+            pkt.xid, duid, &client_id, iaid_bytes, ctx,
+            addr, true, Dhcp6MsgType::Reply, false,
         ));
     };
 
-    let on_link = address6_valid(contexts, &req_addr);
-    let dynamic = address6_available(contexts, &req_addr);
-    let config_ok = config_find_by_address6(configs, &req_addr);
+    let on_link = address6_valid(ctx.contexts, &req_addr);
+    let dynamic = address6_available(ctx.contexts, &req_addr);
+    let config_ok = config_find_by_address6(ctx.configs, &req_addr);
 
     let (status, addr) = if dynamic || on_link {
         if !dynamic && !config_ok {
             (Some((crate::rfc3315::STATUS_NO_ADDRS_AVAIL, "address unavailable")), None)
-        } else if !check_address(lease_db, &client_id, iaid, &req_addr) {
+        } else if !check_address(ctx.lease_db, &client_id, iaid, &req_addr) {
             (Some((crate::rfc3315::STATUS_UNSPEC_FAIL, "address in use")), None)
         } else {
             (None, Some(req_addr))
@@ -430,7 +444,7 @@ fn dispatch_request(
     };
 
     let (preferred, valid, t1, t2) = match addr {
-        Some(a) => persist_lease(lease_db, &client_id, iaid, a, contexts, now_secs),
+        Some(a) => persist_lease(ctx.lease_db, &client_id, iaid, a, ctx.contexts, ctx.now_secs),
         None => (0, 0, 0, 0),
     };
 
@@ -462,11 +476,8 @@ fn dispatch_request(
 fn dispatch_renew_rebind(
     pkt: &Dhcp6Packet,
     duid: &[u8],
-    contexts: &[DhcpContext],
-    lease_db: &mut LeaseDb,
+    ctx: &mut Dhcp6RequestContext,
     is_rebind: bool,
-    authoritative: bool,
-    now_secs: u64,
 ) -> Option<Dhcp6Reply> {
     let client_id = extract_client_id(pkt).to_vec();
     let (ia_data, iaid) = extract_ia(pkt)?;
@@ -477,17 +488,17 @@ fn dispatch_renew_rebind(
     options.extend(build_option6(OPTION6_CLIENT_ID, &client_id));
     options.extend(build_option6(OPTION6_SERVER_ID, duid));
 
-    let has_lease = lease_db.find_v6_by_clid_iaid(&client_id, iaid, &addr).is_some();
+    let has_lease = ctx.lease_db.find_v6_by_clid_iaid(&client_id, iaid, &addr).is_some();
 
     if !has_lease {
         // Authoritative REBIND may create a lease the server doesn't
         // remember, as long as the address is still plausible for some
         // context (rfc3315.c:962-972).
         if is_rebind
-            && authoritative
-            && (address6_available(contexts, &addr) || address6_valid(contexts, &addr))
+            && ctx.authoritative
+            && (address6_available(ctx.contexts, &addr) || address6_valid(ctx.contexts, &addr))
         {
-            let (preferred, valid, t1, t2) = persist_lease(lease_db, &client_id, iaid, addr, contexts, now_secs);
+            let (preferred, valid, t1, t2) = persist_lease(ctx.lease_db, &client_id, iaid, addr, ctx.contexts, ctx.now_secs);
             options.extend(build_ia_na_option(iaid_bytes, t1, t2, iaaddr_suboption(addr, preferred, valid)));
             options.extend(status_option(crate::rfc3315::STATUS_SUCCESS, "success"));
             return Some(Dhcp6Reply { msg_type: Dhcp6MsgType::Reply, xid: pkt.xid, options });
@@ -505,7 +516,7 @@ fn dispatch_renew_rebind(
         return Some(Dhcp6Reply { msg_type: Dhcp6MsgType::Reply, xid: pkt.xid, options });
     }
 
-    if !(address6_available(contexts, &addr) || address6_valid(contexts, &addr)) {
+    if !(address6_available(ctx.contexts, &addr) || address6_valid(ctx.contexts, &addr)) {
         // Address no longer valid for any live context: deprecate it
         // (preferred=valid=0) without touching the lease (rfc3315.c:1026-1030).
         options.extend(build_ia_na_option(iaid_bytes, 0, 0, iaaddr_suboption(addr, 0, 0)));
@@ -513,7 +524,7 @@ fn dispatch_renew_rebind(
         return Some(Dhcp6Reply { msg_type: Dhcp6MsgType::Reply, xid: pkt.xid, options });
     }
 
-    let (preferred, valid, t1, t2) = persist_lease(lease_db, &client_id, iaid, addr, contexts, now_secs);
+    let (preferred, valid, t1, t2) = persist_lease(ctx.lease_db, &client_id, iaid, addr, ctx.contexts, ctx.now_secs);
     options.extend(build_ia_na_option(iaid_bytes, t1, t2, iaaddr_suboption(addr, preferred, valid)));
     options.extend(status_option(crate::rfc3315::STATUS_SUCCESS, "success"));
     Some(Dhcp6Reply { msg_type: Dhcp6MsgType::Reply, xid: pkt.xid, options })
@@ -625,14 +636,16 @@ pub fn dispatch_dhcp6(
 ) -> Option<Dhcp6Reply> {
     debug!("DHCPv6 {:?} xid={:#x}", pkt.msg_type, pkt.xid);
 
+    let mut ctx = Dhcp6RequestContext { contexts, configs, lease_db, authoritative, now_secs };
+
     match pkt.msg_type {
-        Dhcp6MsgType::Solicit => dispatch_solicit(pkt, duid, contexts, configs, lease_db, authoritative, now_secs),
-        Dhcp6MsgType::Request => dispatch_request(pkt, duid, contexts, configs, lease_db, authoritative, now_secs),
-        Dhcp6MsgType::Renew => dispatch_renew_rebind(pkt, duid, contexts, lease_db, false, authoritative, now_secs),
-        Dhcp6MsgType::Rebind => dispatch_renew_rebind(pkt, duid, contexts, lease_db, true, authoritative, now_secs),
-        Dhcp6MsgType::Confirm => dispatch_confirm(pkt, duid, contexts),
-        Dhcp6MsgType::Release => dispatch_release_or_decline(pkt, duid, lease_db, false),
-        Dhcp6MsgType::Decline => dispatch_release_or_decline(pkt, duid, lease_db, true),
+        Dhcp6MsgType::Solicit => dispatch_solicit(pkt, duid, &mut ctx),
+        Dhcp6MsgType::Request => dispatch_request(pkt, duid, &mut ctx),
+        Dhcp6MsgType::Renew => dispatch_renew_rebind(pkt, duid, &mut ctx, false),
+        Dhcp6MsgType::Rebind => dispatch_renew_rebind(pkt, duid, &mut ctx, true),
+        Dhcp6MsgType::Confirm => dispatch_confirm(pkt, duid, ctx.contexts),
+        Dhcp6MsgType::Release => dispatch_release_or_decline(pkt, duid, ctx.lease_db, false),
+        Dhcp6MsgType::Decline => dispatch_release_or_decline(pkt, duid, ctx.lease_db, true),
         Dhcp6MsgType::InfoReq => dispatch_inforeq(pkt, duid),
         // Relay messages handled separately by relay_dispatch().
         Dhcp6MsgType::RelayForw | Dhcp6MsgType::RelayRepl |
@@ -708,20 +721,17 @@ pub fn is_same_net6(a: &Ipv6Addr, b: &Ipv6Addr, prefix_len: i32) -> bool {
 pub fn address6_available(contexts: &[crate::types::dhcp::DhcpContext], addr: &Ipv6Addr) -> bool {
     let a = addr6part(addr);
     for ctx in contexts {
-        #[cfg(feature = "dhcp6")]
-        {
-            use crate::types::dhcp::ContextFlags;
-            if ctx.flags.intersects(ContextFlags::STATIC | ContextFlags::RA_STATELESS) {
-                continue;
-            }
-            if !is_same_net6(&ctx.start6, addr, ctx.prefix) {
-                continue;
-            }
-            let start = addr6part(&ctx.start6);
-            let end = addr6part(&ctx.end6);
-            if a >= start && a <= end {
-                return true;
-            }
+        use crate::types::dhcp::ContextFlags;
+        if ctx.flags.intersects(ContextFlags::STATIC | ContextFlags::RA_STATELESS) {
+            continue;
+        }
+        if !is_same_net6(&ctx.start6, addr, ctx.prefix) {
+            continue;
+        }
+        let start = addr6part(&ctx.start6);
+        let end = addr6part(&ctx.end6);
+        if a >= start && a <= end {
+            return true;
         }
     }
     false
@@ -733,11 +743,8 @@ pub fn address6_available(contexts: &[crate::types::dhcp::DhcpContext], addr: &I
 /// Port of `address6_valid()` from dhcp6.c:601-615.
 pub fn address6_valid(contexts: &[crate::types::dhcp::DhcpContext], addr: &Ipv6Addr) -> bool {
     for ctx in contexts {
-        #[cfg(feature = "dhcp6")]
-        {
-            if is_same_net6(&ctx.start6, addr, ctx.prefix) {
-                return true;
-            }
+        if is_same_net6(&ctx.start6, addr, ctx.prefix) {
+            return true;
         }
     }
     false
