@@ -1023,42 +1023,40 @@ pub fn recv_with_dest(
 #[cfg(unix)]
 fn parse_pktinfo(msg: &libc::msghdr) -> (Option<IpAddr>, u32) {
     use std::mem;
+    use crate::cmsg::CmsgIter;
 
-    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(msg) };
-    while !cmsg.is_null() {
-        let (level, ctype, clen) = unsafe {
-            ((*cmsg).cmsg_level, (*cmsg).cmsg_type, (*cmsg).cmsg_len as usize)
-        };
-        let payload = unsafe { libc::CMSG_DATA(cmsg) };
-        let hdr_len = unsafe { libc::CMSG_LEN(0) as usize };
-
+    for cmsg in CmsgIter::new(msg) {
         #[cfg(target_os = "linux")]
-        if level == libc::IPPROTO_IP
-            && ctype == libc::IP_PKTINFO
-            && clen >= hdr_len + mem::size_of::<libc::in_pktinfo>()
+        if cmsg.level == libc::IPPROTO_IP
+            && cmsg.cmsg_type == libc::IP_PKTINFO
+            && cmsg.data.len() >= mem::size_of::<libc::in_pktinfo>()
         {
-            let pi: libc::in_pktinfo =
-                unsafe { std::ptr::read_unaligned(payload as *const libc::in_pktinfo) };
+            // Safety: length checked above; `in_pktinfo` has no alignment
+            // requirement this buffer isn't already guaranteed to satisfy on
+            // Linux, but `read_unaligned` is used anyway since `cmsg.data`'s
+            // address isn't statically known to be aligned.
+            let pi: libc::in_pktinfo = unsafe {
+                std::ptr::read_unaligned(cmsg.data.as_ptr() as *const libc::in_pktinfo)
+            };
             let addr = Ipv4Addr::from(u32::from_be(u32::from_ne_bytes(
                 pi.ipi_addr.s_addr.to_ne_bytes(),
             )));
             return (Some(IpAddr::V4(addr)), pi.ipi_ifindex as u32);
         }
 
-        if level == libc::IPPROTO_IPV6
-            && ctype == libc::IPV6_PKTINFO
-            && clen >= hdr_len + mem::size_of::<libc::in6_pktinfo>()
+        if cmsg.level == libc::IPPROTO_IPV6
+            && cmsg.cmsg_type == libc::IPV6_PKTINFO
+            && cmsg.data.len() >= mem::size_of::<libc::in6_pktinfo>()
         {
-            let pi: libc::in6_pktinfo =
-                unsafe { std::ptr::read_unaligned(payload as *const libc::in6_pktinfo) };
+            // Safety: same reasoning as the `in_pktinfo` read above.
+            let pi: libc::in6_pktinfo = unsafe {
+                std::ptr::read_unaligned(cmsg.data.as_ptr() as *const libc::in6_pktinfo)
+            };
             return (
                 Some(IpAddr::V6(Ipv6Addr::from(pi.ipi6_addr.s6_addr))),
                 pi.ipi6_ifindex,
             );
         }
-
-        let _ = (payload, hdr_len, clen);
-        cmsg = unsafe { libc::CMSG_NXTHDR(msg, cmsg) };
     }
     (None, 0)
 }
@@ -1906,6 +1904,21 @@ pub fn label_exception(
     })
 }
 
+/// The IPv4 interface/address values [`iface_allowed_v4`] needs, bundled from
+/// the [`IfaceInfo`] the caller already built plus the `Ipv4Addr`/netmask it
+/// already extracted from `info.addr`/`info.netmask` to call the right one of
+/// [`iface_allowed_v4`]/[`iface_allowed_v6`].
+#[derive(Debug, Clone, Copy)]
+pub struct CandidateIfaceV4<'a> {
+    pub name:     &'a str,
+    pub label:    Option<&'a str>,
+    pub index:    u32,
+    pub addr:     Ipv4Addr,
+    pub netmask:  Ipv4Addr,
+    pub loopback: bool,
+    pub dad:      bool,
+}
+
 /// Decide whether an IPv4 interface/address should be added to the served set.
 ///
 /// This is the Rust equivalent of `iface_allowed_v4()` (the adapter around
@@ -1917,17 +1930,12 @@ pub fn label_exception(
 /// The caller is responsible for deduplication (checking whether the same
 /// address is already in the list) before calling this function.
 pub fn iface_allowed_v4(
-    name:       &str,
-    label:      Option<&str>,
-    index:      u32,
-    addr:       Ipv4Addr,
-    netmask:    Ipv4Addr,
-    loopback:   bool,
-    dad:        bool,
+    candidate: &CandidateIfaceV4,
     config:     &IfaceAllowedConfig,
     iface_check_cfg: &IfaceCheckConfig,
     used:       &mut IfaceCheckUsed,
 ) -> Option<IfaceRecord> {
+    let &CandidateIfaceV4 { name, label, index, addr, netmask, loopback, dad } = candidate;
     let effective_name = label.unwrap_or(name);
     let is_label = label.map(|l| l != name).unwrap_or(false);
 
@@ -2001,6 +2009,19 @@ pub fn iface_allowed_v4(
     })
 }
 
+/// The IPv6 interface/address values [`iface_allowed_v6`] needs, bundled from
+/// the [`IfaceInfo`] the caller already built plus the `Ipv6Addr`/prefix
+/// length it already extracted from `info.addr`/`info.netmask`.
+#[derive(Debug, Clone, Copy)]
+pub struct CandidateIfaceV6<'a> {
+    pub name:       &'a str,
+    pub index:      u32,
+    pub addr:       Ipv6Addr,
+    pub prefix_len: u8,
+    pub loopback:   bool,
+    pub dad:        bool,
+}
+
 /// Decide whether an IPv6 interface/address should be added to the served set.
 ///
 /// Mirrors `iface_allowed_v6()` + the IPv6 path in `iface_allowed()` in
@@ -2009,16 +2030,12 @@ pub fn iface_allowed_v4(
 /// Returns `Some(IfaceRecord)` if the interface should be added, `None` if it
 /// should be skipped (link-local with DHCP-except, or filtered by name).
 pub fn iface_allowed_v6(
-    name:       &str,
-    index:      u32,
-    addr:       Ipv6Addr,
-    prefix_len: u8,
-    loopback:   bool,
-    dad:        bool,
+    candidate: &CandidateIfaceV6,
     config:     &IfaceAllowedConfig,
     iface_check_cfg: &IfaceCheckConfig,
     used:       &mut IfaceCheckUsed,
 ) -> Option<IfaceRecord> {
+    let &CandidateIfaceV6 { name, index, addr, prefix_len, loopback, dad } = candidate;
     let dummy = IfaceInfo {
         name:    name.to_string(),
         index,
@@ -2159,13 +2176,21 @@ pub fn enumerate_allowed_interfaces(
 
         let record = match (info.addr, info.netmask) {
             (IpAddr::V4(addr), netmask) => {
-                let mask = match netmask {
+                let netmask = match netmask {
                     Some(IpAddr::V4(m)) => m,
                     _ => Ipv4Addr::UNSPECIFIED,
                 };
                 iface_allowed_v4(
-                    &info.name, info.label.as_deref(), info.index, addr, mask,
-                    info.is_loopback(), info.dad, allowed, check, &mut out.used,
+                    &CandidateIfaceV4 {
+                        name: &info.name,
+                        label: info.label.as_deref(),
+                        index: info.index,
+                        addr,
+                        netmask,
+                        loopback: info.is_loopback(),
+                        dad: info.dad,
+                    },
+                    allowed, check, &mut out.used,
                 )
             }
             (IpAddr::V6(addr), netmask) => {
@@ -2174,8 +2199,15 @@ pub fn enumerate_allowed_interfaces(
                     _ => 0,
                 };
                 iface_allowed_v6(
-                    &info.name, info.index, addr, prefix_len,
-                    info.is_loopback(), info.dad, allowed, check, &mut out.used,
+                    &CandidateIfaceV6 {
+                        name: &info.name,
+                        index: info.index,
+                        addr,
+                        prefix_len,
+                        loopback: info.is_loopback(),
+                        dad: info.dad,
+                    },
+                    allowed, check, &mut out.used,
                 )
             }
         };
@@ -3561,10 +3593,12 @@ mod tests {
     #[test]
     fn iface_allowed_v4_accepts_normal_iface() {
         let rec = iface_allowed_v4(
-            "eth0", None, 2,
-            Ipv4Addr::new(192, 168, 1, 1),
-            Ipv4Addr::new(255, 255, 255, 0),
-            false, false,
+            &CandidateIfaceV4 {
+                name: "eth0", label: None, index: 2,
+                addr: Ipv4Addr::new(192, 168, 1, 1),
+                netmask: Ipv4Addr::new(255, 255, 255, 0),
+                loopback: false, dad: false,
+            },
             &default_allowed_cfg(), &default_check_cfg(), &mut IfaceCheckUsed::default(),
         );
         assert!(rec.is_some());
@@ -3576,10 +3610,12 @@ mod tests {
     #[test]
     fn iface_allowed_v4_loopback_disables_dhcp() {
         let rec = iface_allowed_v4(
-            "lo", None, 1,
-            Ipv4Addr::new(127, 0, 0, 1),
-            Ipv4Addr::new(255, 0, 0, 0),
-            true, false,
+            &CandidateIfaceV4 {
+                name: "lo", label: None, index: 1,
+                addr: Ipv4Addr::new(127, 0, 0, 1),
+                netmask: Ipv4Addr::new(255, 0, 0, 0),
+                loopback: true, dad: false,
+            },
             &default_allowed_cfg(), &default_check_cfg(), &mut IfaceCheckUsed::default(),
         ).unwrap();
         assert!(!rec.dhcp4_ok, "loopback should have dhcp4 disabled");
@@ -3593,10 +3629,12 @@ mod tests {
             ..Default::default()
         };
         let rec = iface_allowed_v4(
-            "eth0", None, 2,
-            Ipv4Addr::new(192, 168, 1, 1),
-            Ipv4Addr::new(255, 255, 255, 0),
-            false, false,
+            &CandidateIfaceV4 {
+                name: "eth0", label: None, index: 2,
+                addr: Ipv4Addr::new(192, 168, 1, 1),
+                netmask: Ipv4Addr::new(255, 255, 255, 0),
+                loopback: false, dad: false,
+            },
             &cfg, &default_check_cfg(), &mut IfaceCheckUsed::default(),
         ).unwrap();
         assert!(!rec.dhcp4_ok, "dhcp_except should disable dhcp");
@@ -3611,10 +3649,12 @@ mod tests {
             ..Default::default()
         };
         let rec = iface_allowed_v4(
-            "eth0", None, 2,
-            Ipv4Addr::new(192, 168, 1, 1),
-            Ipv4Addr::new(255, 255, 255, 0),
-            false, false,
+            &CandidateIfaceV4 {
+                name: "eth0", label: None, index: 2,
+                addr: Ipv4Addr::new(192, 168, 1, 1),
+                netmask: Ipv4Addr::new(255, 255, 255, 0),
+                loopback: false, dad: false,
+            },
             &cfg, &default_check_cfg(), &mut IfaceCheckUsed::default(),
         ).unwrap();
         assert!(rec.dhcp4_ok, "no-dhcpv6-interface must not disable dhcp4");
@@ -3628,10 +3668,12 @@ mod tests {
             ..Default::default()
         };
         let rec = iface_allowed_v6(
-            "eth0", 2,
-            "fe80::1".parse().unwrap(),
-            64,
-            false, false,
+            &CandidateIfaceV6 {
+                name: "eth0", index: 2,
+                addr: "fe80::1".parse().unwrap(),
+                prefix_len: 64,
+                loopback: false, dad: false,
+            },
             &cfg, &default_check_cfg(), &mut IfaceCheckUsed::default(),
         ).unwrap();
         assert!(rec.dhcp6_ok, "no-dhcpv4-interface must not disable dhcp6");
@@ -3644,10 +3686,12 @@ mod tests {
             ..Default::default()
         };
         let rec = iface_allowed_v6(
-            "eth0", 2,
-            "fe80::1".parse().unwrap(),
-            64,
-            false, false,
+            &CandidateIfaceV6 {
+                name: "eth0", index: 2,
+                addr: "fe80::1".parse().unwrap(),
+                prefix_len: 64,
+                loopback: false, dad: false,
+            },
             &cfg, &default_check_cfg(), &mut IfaceCheckUsed::default(),
         ).unwrap();
         assert!(!rec.dhcp6_ok, "no-dhcpv6-interface should disable dhcp6");
@@ -3660,10 +3704,12 @@ mod tests {
             ..Default::default()
         };
         let rec = iface_allowed_v4(
-            "docker0", None, 5,
-            Ipv4Addr::new(172, 17, 0, 1),
-            Ipv4Addr::new(255, 255, 0, 0),
-            false, false,
+            &CandidateIfaceV4 {
+                name: "docker0", label: None, index: 5,
+                addr: Ipv4Addr::new(172, 17, 0, 1),
+                netmask: Ipv4Addr::new(255, 255, 0, 0),
+                loopback: false, dad: false,
+            },
             &default_allowed_cfg(), &check_cfg, &mut IfaceCheckUsed::default(),
         );
         assert!(rec.is_none(), "docker0 should be denied by check_cfg deny list");
@@ -3675,7 +3721,7 @@ mod tests {
     fn iface_allowed_v6_accepts_global_addr() {
         let addr = "2001:db8::1".parse::<Ipv6Addr>().unwrap();
         let rec = iface_allowed_v6(
-            "eth0", 2, addr, 64, false, false,
+            &CandidateIfaceV6 { name: "eth0", index: 2, addr, prefix_len: 64, loopback: false, dad: false },
             &default_allowed_cfg(), &default_check_cfg(), &mut IfaceCheckUsed::default(),
         );
         assert!(rec.is_some());
@@ -3688,7 +3734,7 @@ mod tests {
     fn iface_allowed_v6_loopback_disables_dhcp6() {
         let addr = "::1".parse::<Ipv6Addr>().unwrap();
         let rec = iface_allowed_v6(
-            "lo", 1, addr, 128, true, false,
+            &CandidateIfaceV6 { name: "lo", index: 1, addr, prefix_len: 128, loopback: true, dad: false },
             &default_allowed_cfg(), &default_check_cfg(), &mut IfaceCheckUsed::default(),
         ).unwrap();
         assert!(!rec.dhcp6_ok);
@@ -3738,10 +3784,12 @@ mod tests {
             ..Default::default()
         };
         let rec = iface_allowed_v4(
-            "eth0", None, 2,
-            Ipv4Addr::new(192, 168, 1, 1),
-            Ipv4Addr::new(255, 255, 255, 0),
-            false, false,
+            &CandidateIfaceV4 {
+                name: "eth0", label: None, index: 2,
+                addr: Ipv4Addr::new(192, 168, 1, 1),
+                netmask: Ipv4Addr::new(255, 255, 255, 0),
+                loopback: false, dad: false,
+            },
             &allowed_cfg, &check_cfg, &mut IfaceCheckUsed::default(),
         ).expect("auth-server match must force inclusion despite except-interface");
         assert!(rec.auth_dns, "matched interface must be marked dns_auth");
@@ -3757,7 +3805,11 @@ mod tests {
             ..Default::default()
         };
         let rec = iface_allowed_v4(
-            "eth0", None, 2, addr, Ipv4Addr::new(255, 255, 255, 0), false, false,
+            &CandidateIfaceV4 {
+                name: "eth0", label: None, index: 2, addr,
+                netmask: Ipv4Addr::new(255, 255, 255, 0),
+                loopback: false, dad: false,
+            },
             &allowed_cfg, &default_check_cfg(), &mut IfaceCheckUsed::default(),
         ).unwrap();
         assert!(rec.auth_dns);
@@ -3767,10 +3819,12 @@ mod tests {
     #[test]
     fn iface_allowed_v4_no_auth_server_leaves_dns_auth_false() {
         let rec = iface_allowed_v4(
-            "eth0", None, 2,
-            Ipv4Addr::new(192, 168, 1, 1),
-            Ipv4Addr::new(255, 255, 255, 0),
-            false, false,
+            &CandidateIfaceV4 {
+                name: "eth0", label: None, index: 2,
+                addr: Ipv4Addr::new(192, 168, 1, 1),
+                netmask: Ipv4Addr::new(255, 255, 255, 0),
+                loopback: false, dad: false,
+            },
             &default_allowed_cfg(), &default_check_cfg(), &mut IfaceCheckUsed::default(),
         ).unwrap();
         assert!(!rec.auth_dns);
@@ -3785,7 +3839,7 @@ mod tests {
             ..Default::default()
         };
         let rec = iface_allowed_v6(
-            "eth0", 2, addr, 64, false, false,
+            &CandidateIfaceV6 { name: "eth0", index: 2, addr, prefix_len: 64, loopback: false, dad: false },
             &allowed_cfg, &default_check_cfg(), &mut IfaceCheckUsed::default(),
         ).unwrap();
         assert!(rec.auth_dns);
@@ -3973,7 +4027,10 @@ mod tests {
     #[test]
     fn iface_allowed_v6_threads_dad_flag_into_record() {
         let rec = iface_allowed_v6(
-            "eth0", 2, "fe80::1".parse().unwrap(), 64, false, /*dad=*/true,
+            &CandidateIfaceV6 {
+                name: "eth0", index: 2, addr: "fe80::1".parse().unwrap(), prefix_len: 64,
+                loopback: false, dad: true,
+            },
             &default_allowed_cfg(), &default_check_cfg(), &mut IfaceCheckUsed::default(),
         ).unwrap();
         assert!(rec.dad, "an address mid-DAD must be recorded as such (network.c:577)");
@@ -3982,7 +4039,10 @@ mod tests {
     #[test]
     fn iface_allowed_v6_not_dad_by_default() {
         let rec = iface_allowed_v6(
-            "eth0", 2, "2001:db8::1".parse().unwrap(), 64, false, false,
+            &CandidateIfaceV6 {
+                name: "eth0", index: 2, addr: "2001:db8::1".parse().unwrap(), prefix_len: 64,
+                loopback: false, dad: false,
+            },
             &default_allowed_cfg(), &default_check_cfg(), &mut IfaceCheckUsed::default(),
         ).unwrap();
         assert!(!rec.dad);
@@ -3991,10 +4051,12 @@ mod tests {
     #[test]
     fn iface_allowed_v4_threads_real_label_into_is_label() {
         let rec = iface_allowed_v4(
-            "eth0", Some("eth0:0"), 2,
-            Ipv4Addr::new(192, 168, 1, 2),
-            Ipv4Addr::new(255, 255, 255, 0),
-            false, false,
+            &CandidateIfaceV4 {
+                name: "eth0", label: Some("eth0:0"), index: 2,
+                addr: Ipv4Addr::new(192, 168, 1, 2),
+                netmask: Ipv4Addr::new(255, 255, 255, 0),
+                loopback: false, dad: false,
+            },
             &default_allowed_cfg(), &default_check_cfg(), &mut IfaceCheckUsed::default(),
         ).unwrap();
         assert!(rec.is_label, "a label distinct from the base name must set is_label (network.c:266-269)");

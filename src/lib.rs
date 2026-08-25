@@ -8,6 +8,7 @@ pub mod option;
 pub mod network;
 pub mod netlink;
 pub mod arp;
+pub mod cmsg;
 
 pub mod cache;
 pub mod dns_protocol;
