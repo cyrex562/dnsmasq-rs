@@ -150,6 +150,44 @@ pub struct DhcpLease {
     pub vendorclass_count: i32,
 }
 
+/// A freshly-allocated, otherwise-empty lease: no client-id/hostname/agent
+/// info, no hardware address, unspecified addresses, no flags set. Callers
+/// building a new `DhcpLease` only need to name the handful of fields that
+/// differ from this baseline via `..Default::default()`, rather than
+/// repeating all ~20 fields (`Ipv4Addr`/`Ipv6Addr` don't implement `Default`
+/// in std, so this can't be `#[derive(Default)]`).
+impl Default for DhcpLease {
+    fn default() -> Self {
+        Self {
+            clid: None,
+            hostname: None,
+            fqdn: None,
+            old_hostname: None,
+            flags: LeaseFlags::empty(),
+            expires: None,
+            hwaddr: [0u8; DHCP_CHADDR_MAX],
+            hwaddr_len: 0,
+            hwaddr_type: 0,
+            addr: Ipv4Addr::UNSPECIFIED,
+            giaddr: Ipv4Addr::UNSPECIFIED,
+            extradata: Vec::new(),
+            last_interface: 0,
+            new_interface: 0,
+            new_prefixlen: 0,
+            agent_id: None,
+            vendorclass: None,
+            #[cfg(feature = "dhcp6")]
+            addr6: Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            iaid: 0,
+            #[cfg(feature = "dhcp6")]
+            slaac_address: Vec::new(),
+            #[cfg(feature = "dhcp6")]
+            vendorclass_count: 0,
+        }
+    }
+}
+
 #[cfg(feature = "dhcp6")]
 #[derive(Debug, Clone)]
 pub struct SlaacAddress {

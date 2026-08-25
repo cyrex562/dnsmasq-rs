@@ -50,6 +50,14 @@ fn lease_key(lease: &DhcpLease) -> [u8; 16] {
 #[cfg(feature = "dhcp")]
 pub struct LeaseDb {
     leases: HashMap<[u8; 16], DhcpLease>,
+    /// Secondary index from a lease's IPv4 address to its primary key, so
+    /// `find_by_addr` and the by-address mutators below are O(1) instead of
+    /// an O(n) scan of every lease. Only leases with a real (non-
+    /// `UNSPECIFIED`) `addr` are indexed — `allocate_v6`/`bind_v6` always
+    /// leave `addr` at `Ipv4Addr::UNSPECIFIED` for a v6-only lease, and that
+    /// is not a queryable address (indexing it would mean every v6-only
+    /// lease overwrites the others' entry).
+    addr_index: HashMap<Ipv4Addr, [u8; 16]>,
     /// Maximum number of leases allowed.
     pub max_leases: usize,
     /// Set to `true` when the lease file needs rewriting.
@@ -68,6 +76,7 @@ impl LeaseDb {
     pub fn new() -> Self {
         Self {
             leases: HashMap::new(),
+            addr_index: HashMap::new(),
             max_leases: 1000,
             file_dirty: false,
             dns_dirty: false,
@@ -75,15 +84,66 @@ impl LeaseDb {
         }
     }
 
+    /// Record `addr -> key` in the secondary index, unless `addr` is the
+    /// `UNSPECIFIED` placeholder a v6-only lease carries (see the field doc
+    /// on [`Self::addr_index`]).
+    fn index_addr(&mut self, addr: Ipv4Addr, key: [u8; 16]) {
+        if addr != Ipv4Addr::UNSPECIFIED {
+            self.addr_index.insert(addr, key);
+        }
+    }
+
+    /// Remove `addr`'s secondary-index entry, if any.
+    fn unindex_addr(&mut self, addr: Ipv4Addr) {
+        if addr != Ipv4Addr::UNSPECIFIED {
+            self.addr_index.remove(&addr);
+        }
+    }
+
+    /// The primary-key lease for `addr`, mutably, via the secondary index.
+    ///
+    /// A free function taking the two fields separately (rather than a
+    /// `&mut self` method) so the borrow it returns is tied only to
+    /// `leases`, leaving callers free to also touch `self.file_dirty`/
+    /// `self.dns_dirty` while the returned `&mut DhcpLease` is still live.
+    fn get_mut_by_addr<'a>(
+        leases: &'a mut HashMap<[u8; 16], DhcpLease>,
+        addr_index: &HashMap<Ipv4Addr, [u8; 16]>,
+        addr: Ipv4Addr,
+    ) -> Option<&'a mut DhcpLease> {
+        let key = *addr_index.get(&addr)?;
+        leases.get_mut(&key)
+    }
+
+    /// Insert `lease` under `key`, keeping the secondary address index in
+    /// sync — including dropping the previous occupant's index entry when
+    /// `key` already holds a lease with a *different* address. That happens
+    /// when two leases collide on the same clid/hwaddr key (an outright
+    /// replacement via [`Self::insert`]) or, before hwaddr is set, when two
+    /// `allocate_v4`/`allocate_v6` calls share the same placeholder all-zero
+    /// key (a documented pre-existing quirk — see `bind_v6`'s doc comment).
+    /// Without this, `find_by_addr` on the old address would keep resolving
+    /// to whatever lease ends up at `key`.
+    fn insert_raw(&mut self, key: [u8; 16], lease: DhcpLease) {
+        if let Some(old) = self.leases.get(&key) {
+            if old.addr != lease.addr {
+                self.unindex_addr(old.addr);
+            }
+        }
+        self.index_addr(lease.addr, key);
+        self.leases.insert(key, lease);
+    }
+
     /// Add or renew a lease (identified by its client-id / hardware address).
     pub fn insert(&mut self, lease: DhcpLease) {
         let key = lease_key(&lease);
-        self.leases.insert(key, lease);
+        self.insert_raw(key, lease);
     }
 
     /// Find a lease by its assigned IPv4 address.
     pub fn find_by_addr(&self, addr: Ipv4Addr) -> Option<&DhcpLease> {
-        self.leases.values().find(|l| l.addr == addr)
+        let key = self.addr_index.get(&addr)?;
+        self.leases.get(key)
     }
 
     /// Find a lease by client identifier (hardware address or option 61 bytes).
@@ -97,9 +157,13 @@ impl LeaseDb {
     pub fn prune(&mut self, now_secs: u64) -> Vec<DhcpLease> {
         let now = UNIX_EPOCH + Duration::from_secs(now_secs);
         let mut pruned = Vec::new();
+        let addr_index = &mut self.addr_index;
         self.leases.retain(|_, lease| {
             if let Some(exp) = lease.expires {
                 if exp < now {
+                    if lease.addr != Ipv4Addr::UNSPECIFIED {
+                        addr_index.remove(&lease.addr);
+                    }
                     pruned.push(lease.clone());
                     return false;
                 }
@@ -199,29 +263,12 @@ impl LeaseDb {
             let lease = DhcpLease {
                 clid,
                 hostname,
-                fqdn: None,
-                old_hostname: None,
-                flags: LeaseFlags::empty(),
                 expires,
                 hwaddr,
                 hwaddr_len,
                 hwaddr_type: 1,
                 addr: ip,
-                giaddr: Ipv4Addr::UNSPECIFIED,
-                extradata: Vec::new(),
-                last_interface: 0,
-                new_interface: 0,
-                new_prefixlen: 0,
-                agent_id: None,
-                vendorclass: None,
-                #[cfg(feature = "dhcp6")]
-                addr6: std::net::Ipv6Addr::UNSPECIFIED,
-                #[cfg(feature = "dhcp6")]
-                iaid: 0,
-                #[cfg(feature = "dhcp6")]
-                slaac_address: Vec::new(),
-                #[cfg(feature = "dhcp6")]
-                vendorclass_count: 0,
+                ..Default::default()
             };
             db.insert(lease);
         }
@@ -237,35 +284,13 @@ impl LeaseDb {
         }
 
         let lease = DhcpLease {
-            clid: None,
-            hostname: None,
-            fqdn: None,
-            old_hostname: None,
             flags: LeaseFlags::NEW,
-            expires: None,
-            hwaddr: [0u8; DHCP_CHADDR_MAX],
-            hwaddr_len: 0,
-            hwaddr_type: 0,
             addr,
-            giaddr: Ipv4Addr::UNSPECIFIED,
-            extradata: Vec::new(),
-            last_interface: 0,
-            new_interface: 0,
-            new_prefixlen: 0,
-            agent_id: None,
-            vendorclass: None,
-            #[cfg(feature = "dhcp6")]
-            addr6: std::net::Ipv6Addr::UNSPECIFIED,
-            #[cfg(feature = "dhcp6")]
-            iaid: 0,
-            #[cfg(feature = "dhcp6")]
-            slaac_address: Vec::new(),
-            #[cfg(feature = "dhcp6")]
-            vendorclass_count: 0,
+            ..Default::default()
         };
 
         let key = lease_key(&lease);
-        self.leases.insert(key, lease);
+        self.insert_raw(key, lease);
         self.file_dirty = true;
         self.dns_dirty = true;
         self.leases.get_mut(&key)
@@ -276,7 +301,7 @@ impl LeaseDb {
     pub fn set_expires(&mut self, addr: Ipv4Addr, duration_secs: u32) {
         use crate::types::dhcp::LeaseFlags;
 
-        if let Some(lease) = self.leases.values_mut().find(|l| l.addr == addr) {
+        if let Some(lease) = Self::get_mut_by_addr(&mut self.leases, &self.addr_index, addr) {
             let new_expires = if duration_secs == 0xFFFF_FFFF {
                 None
             } else {
@@ -313,12 +338,9 @@ impl LeaseDb {
         force: bool,
     ) -> bool {
         // We need to find the lease, potentially remove/re-key it if clid changes.
-        let key = {
-            let lease = match self.leases.values().find(|l| l.addr == addr) {
-                Some(l) => l,
-                None => return false,
-            };
-            lease_key(lease)
+        let key = match self.addr_index.get(&addr) {
+            Some(&k) => k,
+            None => return false,
         };
 
         let lease = match self.leases.get_mut(&key) {
@@ -361,7 +383,7 @@ impl LeaseDb {
                 lease.flags.insert(LeaseFlags::AUX_CHANGED);
                 self.file_dirty = true;
                 let new_key = lease_key(&lease);
-                self.leases.insert(new_key, lease);
+                self.insert_raw(new_key, lease);
             }
         }
 
@@ -391,7 +413,7 @@ impl LeaseDb {
                 .collect();
 
             for dup_addr in duplicates {
-                if let Some(dup) = self.leases.values_mut().find(|l| l.addr == dup_addr) {
+                if let Some(dup) = Self::get_mut_by_addr(&mut self.leases, &self.addr_index, dup_addr) {
                     dup.old_hostname = dup.hostname.take();
                     dup.flags.insert(LeaseFlags::CHANGED);
                 }
@@ -399,7 +421,7 @@ impl LeaseDb {
         }
 
         // Now set the hostname on the target lease.
-        if let Some(lease) = self.leases.values_mut().find(|l| l.addr == addr) {
+        if let Some(lease) = Self::get_mut_by_addr(&mut self.leases, &self.addr_index, addr) {
             let name_changed = match (&lease.hostname, name) {
                 (Some(old), Some(new)) => !crate::util::hostname_isequal(old, new),
                 (None, None) => false,
@@ -424,7 +446,7 @@ impl LeaseDb {
 
     /// Record the interface a lease is bound to.
     pub fn set_interface(&mut self, addr: Ipv4Addr, interface: i32) {
-        if let Some(lease) = self.leases.values_mut().find(|l| l.addr == addr) {
+        if let Some(lease) = Self::get_mut_by_addr(&mut self.leases, &self.addr_index, addr) {
             lease.last_interface = interface;
         }
     }
@@ -433,7 +455,7 @@ impl LeaseDb {
     pub fn set_agent_id(&mut self, addr: Ipv4Addr, agent_id: Option<&[u8]>) {
         use crate::types::dhcp::LeaseFlags;
 
-        if let Some(lease) = self.leases.values_mut().find(|l| l.addr == addr) {
+        if let Some(lease) = Self::get_mut_by_addr(&mut self.leases, &self.addr_index, addr) {
             let new_val = agent_id.map(|a| a.to_vec());
             if lease.agent_id != new_val {
                 lease.agent_id = new_val;
@@ -447,7 +469,7 @@ impl LeaseDb {
     pub fn set_vendorclass(&mut self, addr: Ipv4Addr, vendorclass: Option<&[u8]>) {
         use crate::types::dhcp::LeaseFlags;
 
-        if let Some(lease) = self.leases.values_mut().find(|l| l.addr == addr) {
+        if let Some(lease) = Self::get_mut_by_addr(&mut self.leases, &self.addr_index, addr) {
             let new_val = vendorclass.map(|v| v.to_vec());
             if lease.vendorclass != new_val {
                 lease.vendorclass = new_val;
@@ -626,14 +648,11 @@ impl LeaseDb {
     /// Port of `lease_prune()`'s free-the-matching-lease behaviour from
     /// lease.c, restricted to the by-address case used by RELEASE/DECLINE.
     pub fn remove_by_addr(&mut self, addr: Ipv4Addr) -> Option<DhcpLease> {
-        let key = self
-            .leases
-            .iter()
-            .find(|(_, l)| l.addr == addr)
-            .map(|(k, _)| *k)?;
+        let key = *self.addr_index.get(&addr)?;
         self.file_dirty = true;
         self.dns_dirty = true;
         let removed = self.leases.remove(&key)?;
+        self.unindex_addr(addr);
         self.old_leases.push(removed.clone());
         Some(removed)
     }
@@ -789,31 +808,13 @@ impl LeaseDb {
         }
 
         let lease = DhcpLease {
-            clid: None,
-            hostname: None,
-            fqdn: None,
-            old_hostname: None,
             flags: LeaseFlags::NEW | lease_type,
-            expires: None,
-            hwaddr: [0u8; DHCP_CHADDR_MAX],
-            hwaddr_len: 0,
-            hwaddr_type: 0,
-            addr: Ipv4Addr::UNSPECIFIED,
-            giaddr: Ipv4Addr::UNSPECIFIED,
-            extradata: Vec::new(),
-            last_interface: 0,
-            new_interface: 0,
-            new_prefixlen: 0,
-            agent_id: None,
-            vendorclass: None,
             addr6: addr,
-            iaid: 0,
-            slaac_address: Vec::new(),
-            vendorclass_count: 0,
+            ..Default::default()
         };
 
         let key = lease_key(&lease);
-        self.leases.insert(key, lease);
+        self.insert_raw(key, lease);
         self.file_dirty = true;
         self.dns_dirty = true;
         self.leases.get_mut(&key)
@@ -868,27 +869,9 @@ impl LeaseDb {
                 return None;
             }
             DhcpLease {
-                clid: None,
-                hostname: None,
-                fqdn: None,
-                old_hostname: None,
                 flags: LeaseFlags::NEW | lease_type,
-                expires: None,
-                hwaddr: [0u8; DHCP_CHADDR_MAX],
-                hwaddr_len: 0,
-                hwaddr_type: 0,
-                addr: Ipv4Addr::UNSPECIFIED,
-                giaddr: Ipv4Addr::UNSPECIFIED,
-                extradata: Vec::new(),
-                last_interface: 0,
-                new_interface: 0,
-                new_prefixlen: 0,
-                agent_id: None,
-                vendorclass: None,
                 addr6: addr,
-                iaid: 0,
-                slaac_address: Vec::new(),
-                vendorclass_count: 0,
+                ..Default::default()
             }
         };
 
@@ -897,7 +880,7 @@ impl LeaseDb {
         lease.expires = expires;
 
         let key = lease_key(&lease);
-        self.leases.insert(key, lease);
+        self.insert_raw(key, lease);
         self.file_dirty = true;
         self.dns_dirty = true;
         self.leases.get_mut(&key)
@@ -987,31 +970,13 @@ mod tests {
         let mut hwaddr = [0u8; DHCP_CHADDR_MAX];
         hwaddr[..6].copy_from_slice(&hw);
         DhcpLease {
-            clid: None,
             hostname: Some("host1".into()),
-            fqdn: None,
-            old_hostname: None,
-            flags: LeaseFlags::empty(),
             expires: expires_secs.map(|s| UNIX_EPOCH + Duration::from_secs(s)),
             hwaddr,
             hwaddr_len: 6,
             hwaddr_type: 1,
             addr,
-            giaddr: Ipv4Addr::UNSPECIFIED,
-            extradata: Vec::new(),
-            last_interface: 0,
-            new_interface: 0,
-            new_prefixlen: 0,
-            agent_id: None,
-            vendorclass: None,
-            #[cfg(feature = "dhcp6")]
-            addr6: std::net::Ipv6Addr::UNSPECIFIED,
-            #[cfg(feature = "dhcp6")]
-            iaid: 0,
-            #[cfg(feature = "dhcp6")]
-            slaac_address: Vec::new(),
-            #[cfg(feature = "dhcp6")]
-            vendorclass_count: 0,
+            ..Default::default()
         }
     }
 
@@ -1188,6 +1153,25 @@ mod tests {
         let addr = Ipv4Addr::new(10, 0, 0, 50);
         db.allocate_v4(addr);
         assert!(db.find_by_addr(addr).is_some());
+    }
+
+    #[test]
+    fn allocate_v4_second_call_before_hwaddr_set_evicts_first_by_addr() {
+        // A freshly allocated lease has no hwaddr yet, so lease_key() always
+        // returns the same all-zero placeholder key until set_hwaddr runs —
+        // a second allocate_v4 before that point silently evicts the first
+        // (a documented pre-existing quirk, not something this test is
+        // meant to change). What this locks in is that the secondary
+        // address index doesn't go stale when that happens: the evicted
+        // lease's address must stop resolving via find_by_addr once its
+        // primary-key slot has been overwritten by the second lease.
+        let mut db = LeaseDb::new();
+        let addr1 = Ipv4Addr::new(10, 0, 0, 60);
+        let addr2 = Ipv4Addr::new(10, 0, 0, 61);
+        db.allocate_v4(addr1);
+        db.allocate_v4(addr2);
+        assert!(db.find_by_addr(addr1).is_none());
+        assert_eq!(db.find_by_addr(addr2).unwrap().addr, addr2);
     }
 
     // ── set_expires tests ──
