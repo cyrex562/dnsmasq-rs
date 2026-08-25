@@ -312,6 +312,25 @@ pub fn display_opts6() -> Vec<(u16, &'static str)> {
 // option_string — format option value for logging / display
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Decode up to the last 4 bytes of `val` as a big-endian `u32`, zero-padded
+/// on the left for shorter input. Used for `OT_DEC`/`OT_TIME` option values.
+///
+/// Matches upstream's `for (i = 0; i < opt_len; i++) dec = (dec << 8) |
+/// val[i];` accumulating into a 32-bit `unsigned int` (`dhcp-common.c:913`):
+/// for `val.len() <= 4` this is just "decode these bytes big-endian"; for a
+/// malformed longer value, C's shift silently drops the earliest bytes once
+/// the accumulator fills — equivalent to keeping only the last 4 bytes here.
+/// Every `OT_DEC`/`OT_TIME` option in `OPTTAB`/`OPTTAB6` declares a size of
+/// 4 bytes or fewer, so the truncation path is a malformed-input fallback,
+/// never real traffic.
+#[cfg(feature = "dhcp")]
+fn decode_be_u32(val: &[u8]) -> u32 {
+    let mut bytes = [0u8; 4];
+    let n = val.len().min(4);
+    bytes[4 - n..].copy_from_slice(&val[val.len() - n..]);
+    u32::from_be_bytes(bytes)
+}
+
 /// Format a DHCP option value as a human-readable string.
 ///
 /// Uses the `OT_*` type flags in `OPTTAB` to decide how to decode `val`:
@@ -319,48 +338,14 @@ pub fn display_opts6() -> Vec<(u16, &'static str)> {
 /// - `OT_NAME`      → printable ASCII string
 /// - `OT_DEC`       → big-endian decimal integer
 /// - `OT_TIME`      → seconds, formatted as "Xs" or "Xm Ys"
-/// - anything else  → hex bytes
+/// - anything else  → hex bytes (truncated to 14 bytes, matching upstream)
 ///
-/// Mirrors C's `option_string()`.
+/// A thin wrapper around [`option_string_ex`], which does the real work —
+/// see that function's doc for why the two aren't independent
+/// implementations. Mirrors C's `option_string()`.
 #[cfg(feature = "dhcp")]
 pub fn option_string(is_v6: bool, opt: u16, val: &[u8]) -> String {
-    let _ = is_v6;
-    let table: &[DhcpOptEntry] = OPTTAB;
-    let entry = table.iter().find(|e| e.val == opt);
-    let size_flags = entry.map(|e| e.size).unwrap_or(0);
-
-    if (size_flags & OT_ADDR_LIST) != 0 && val.len() >= 4 && !is_v6 {
-        // IPv4 address list
-        return val
-            .chunks(4)
-            .filter(|c| c.len() == 4)
-            .map(|c| format!("{}.{}.{}.{}", c[0], c[1], c[2], c[3]))
-            .collect::<Vec<_>>()
-            .join(", ");
-    }
-
-    if (size_flags & OT_NAME) != 0 {
-        // Printable ASCII string
-        return val
-            .iter()
-            .filter(|&&b| b.is_ascii_graphic() || b == b' ')
-            .map(|&b| b as char)
-            .collect();
-    }
-
-    if (size_flags & OT_DEC) != 0 {
-        // Big-endian unsigned integer
-        let n: u64 = val.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b));
-        return n.to_string();
-    }
-
-    if (size_flags & OT_TIME) != 0 {
-        let secs: u32 = val.iter().take(4).fold(0u32, |acc, &b| (acc << 8) | u32::from(b));
-        return format_time(secs);
-    }
-
-    // Default: hex dump
-    val.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+    option_string_ex(is_v6, opt, val).1.unwrap_or_default()
 }
 
 /// Format a time in seconds as a human-readable duration string.
@@ -437,13 +422,11 @@ pub fn option_string_ex(is_v6: bool, opt: u16, val: &[u8]) -> (&'static str, Opt
             }
 
             if (size_flags & OT_DEC) != 0 {
-                let n: u64 = val.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b));
-                return (name, Some(n.to_string()));
+                return (name, Some(decode_be_u32(val).to_string()));
             }
 
             if (size_flags & OT_TIME) != 0 {
-                let secs: u32 = val.iter().take(4).fold(0u32, |acc, &b| (acc << 8) | u32::from(b));
-                return (name, Some(format_time(secs)));
+                return (name, Some(format_time(decode_be_u32(val))));
             }
 
             let formatted = format_hex_truncate(val);
@@ -484,13 +467,11 @@ pub fn option_string_ex(is_v6: bool, opt: u16, val: &[u8]) -> (&'static str, Opt
     }
 
     if (size_flags & OT_DEC) != 0 {
-        let n: u64 = val.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b));
-        return (name, Some(n.to_string()));
+        return (name, Some(decode_be_u32(val).to_string()));
     }
 
     if (size_flags & OT_TIME) != 0 {
-        let secs: u32 = val.iter().take(4).fold(0u32, |acc, &b| (acc << 8) | u32::from(b));
-        return (name, Some(format_time(secs)));
+        return (name, Some(format_time(decode_be_u32(val))));
     }
 
     let formatted = format_hex_truncate(val);
@@ -1135,7 +1116,7 @@ pub fn option_filter(
         }
 
         // Mark options that only match with the context tags.
-        let opt_codes: Vec<i32> = opts.iter()
+        let opt_codes: std::collections::HashSet<i32> = opts.iter()
             .filter(|o| o.flags.contains(DhOptFlags::TAGOK))
             .map(|o| o.opt)
             .collect();
@@ -1149,7 +1130,7 @@ pub fn option_filter(
     }
 
     // Phase 3: mark untagged options not overridden by a tagged one.
-    let tagged_codes: Vec<i32> = opts.iter()
+    let tagged_codes: std::collections::HashSet<i32> = opts.iter()
         .filter(|o| o.flags.contains(DhOptFlags::TAGOK) && !o.netid.is_empty())
         .map(|o| o.opt)
         .collect();
@@ -1296,65 +1277,44 @@ pub fn find_config<'a>(
     };
 
     // 1. Match by client-id
-    if let Some(clid) = clid {
-        for config in configs {
-            if !matches_filter(config) {
-                continue;
-            }
-            if config.flags.contains(ConfigFlags::CLID) {
-                if let Some(ref cfg_clid) = config.clid {
-                    if cfg_clid == clid {
-                        return Some(config);
-                    }
-                    // dhcpcd workaround: client IDs prefixed with 0x00
-                    if clid.first() == Some(&0)
-                        && clid.len() > 1
-                        && cfg_clid.len() == clid.len() - 1
-                        && *cfg_clid == clid[1..]
-                    {
-                        return Some(config);
-                    }
-                }
-            }
-        }
-    }
+    let by_clid = || {
+        let clid = clid?;
+        configs.iter().filter(|c| matches_filter(c)).find(|config| {
+            config.flags.contains(ConfigFlags::CLID)
+                && config.clid.as_deref().is_some_and(|cfg_clid| {
+                    cfg_clid == clid
+                        // dhcpcd workaround: client IDs prefixed with 0x00
+                        || (clid.first() == Some(&0)
+                            && clid.len() > 1
+                            && cfg_clid.len() == clid.len() - 1
+                            && cfg_clid == &clid[1..])
+                })
+        })
+    };
 
     // 2. Match by exact MAC
-    if let Some(hwaddr) = hwaddr {
-        for config in configs {
-            if !matches_filter(config) {
-                continue;
-            }
-            if config_has_mac(config, hwaddr, hw_type) {
-                return Some(config);
-            }
-        }
-    }
+    let by_mac = || {
+        let hwaddr = hwaddr?;
+        configs.iter().filter(|c| matches_filter(c)).find(|config| config_has_mac(config, hwaddr, hw_type))
+    };
 
     // 3. Match by hostname
-    if let Some(hostname) = hostname {
-        for config in configs {
-            if !matches_filter(config) {
-                continue;
-            }
-            if config.flags.contains(ConfigFlags::NAME) {
-                if let Some(ref cfg_name) = config.hostname {
-                    if cfg_name.eq_ignore_ascii_case(hostname) {
-                        return Some(config);
-                    }
-                }
-            }
-        }
-    }
+    let by_hostname = || {
+        let hostname = hostname?;
+        configs.iter().filter(|c| matches_filter(c)).find(|config| {
+            config.flags.contains(ConfigFlags::NAME)
+                && config.hostname.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(hostname))
+        })
+    };
 
-    // 4. Wildcard MAC match (fewest wildcards wins)
-    if let Some(hwaddr) = hwaddr {
+    // 4. Wildcard MAC match — fewest wildcards wins (highest
+    // memcmp_masked match count); ties keep the earliest-listed config,
+    // matching upstream's strict `> count` comparison (dhcp-common.c:429).
+    let by_wildcard_mac = || {
+        let hwaddr = hwaddr?;
         let mut best: Option<&crate::types::dhcp::DhcpConfig> = None;
-        let mut best_count = 0;
-        for config in configs {
-            if !matches_filter(config) {
-                continue;
-            }
+        let mut best_count = 0usize;
+        for config in configs.iter().filter(|c| matches_filter(c)) {
             for conf_addr in &config.hwaddrs {
                 if conf_addr.wildcard_mask != 0
                     && conf_addr.hwaddr_len as usize == hwaddr.len()
@@ -1368,12 +1328,10 @@ pub fn find_config<'a>(
                 }
             }
         }
-        if best.is_some() {
-            return best;
-        }
-    }
+        best
+    };
 
-    None
+    by_clid().or_else(by_mac).or_else(by_hostname).or_else(by_wildcard_mac)
 }
 
 #[cfg(all(test, feature = "dhcp"))]
@@ -2007,6 +1965,46 @@ mod tests {
             Some("myhost"),
             &[DhcpNetid { net: "pxe".into() }, DhcpNetid { net: "lab".into() }]
         ).is_some());
+    }
+
+    #[test]
+    fn find_config_wildcard_mac_prefers_fewer_wildcards() {
+        let mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+
+        // Wildcards only the last byte (mask bit 0 set) -> more specific.
+        let mut specific = make_config_with_mac(&mac, 1);
+        specific.hwaddrs[0].wildcard_mask = 0b0000_0001;
+
+        // Wildcards the last three bytes -> less specific.
+        let mut loose = make_config_with_mac(&mac, 1);
+        loose.hwaddrs[0].wildcard_mask = 0b0000_0111;
+
+        // Listed loose-first so a naive "first match" would pick the wrong
+        // one; the more specific (fewer-wildcard, higher memcmp_masked
+        // count) config must win regardless of list order.
+        let configs = [loose, specific];
+        let found = find_config(&configs, None, Some(&mac), 1, None, &[]).unwrap();
+        assert_eq!(found.hwaddrs[0].wildcard_mask, 0b0000_0001);
+    }
+
+    #[test]
+    fn find_config_wildcard_mac_tie_keeps_earliest_listed() {
+        // Two equally-specific wildcard configs: upstream's strict `>`
+        // comparison (dhcp-common.c:429) means ties keep the earliest in
+        // the list, not the last.
+        let mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+
+        let mut first = make_config_with_mac(&mac, 1);
+        first.hwaddrs[0].wildcard_mask = 0b0000_0001;
+        first.hostname = Some("first".to_string());
+
+        let mut second = make_config_with_mac(&mac, 1);
+        second.hwaddrs[0].wildcard_mask = 0b0000_0001;
+        second.hostname = Some("second".to_string());
+
+        let configs = [first, second];
+        let found = find_config(&configs, None, Some(&mac), 1, None, &[]).unwrap();
+        assert_eq!(found.hostname.as_deref(), Some("first"));
     }
 
     // ── option_string_ex (enhanced with name return) ────────────────────────────
