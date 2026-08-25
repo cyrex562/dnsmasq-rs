@@ -341,6 +341,47 @@ fn select_reply_delay(
         .map_or(0, |rule| rule.delay_secs)
 }
 
+/// A borrowed view of a [`DhcpServerConfig`] whose `contexts` list can be
+/// narrowed to a caller-provided subset without cloning the rest of the
+/// config.
+///
+/// [`dispatch_dhcp_with_arrival`] uses this to hand the dispatch pipeline the
+/// per-interface linked-context chain (dhcp.c's `context->current`,
+/// `complete_context()`) instead of deep-cloning the whole `DhcpServerConfig`
+/// (~19 `Vec` fields) just to swap in a shorter `contexts` list. `Deref`s to
+/// `DhcpServerConfig` so every other field reads exactly as it did through a
+/// plain `&DhcpServerConfig`; only context reads need the explicit
+/// [`Self::contexts`] method instead of field syntax.
+#[derive(Clone, Copy)]
+struct DhcpConfigView<'a> {
+    cfg: &'a DhcpServerConfig,
+    contexts_override: Option<&'a [crate::types::dhcp::DhcpContext]>,
+}
+
+impl<'a> DhcpConfigView<'a> {
+    /// A view over the whole config — `.contexts()` reads `cfg.contexts`
+    /// unmodified.
+    fn whole(cfg: &'a DhcpServerConfig) -> Self {
+        Self { cfg, contexts_override: None }
+    }
+
+    /// A view whose `.contexts()` reads `contexts` instead of `cfg.contexts`.
+    fn narrowed(cfg: &'a DhcpServerConfig, contexts: &'a [crate::types::dhcp::DhcpContext]) -> Self {
+        Self { cfg, contexts_override: Some(contexts) }
+    }
+
+    fn contexts(&self) -> &'a [crate::types::dhcp::DhcpContext] {
+        self.contexts_override.unwrap_or(&self.cfg.contexts)
+    }
+}
+
+impl<'a> std::ops::Deref for DhcpConfigView<'a> {
+    type Target = DhcpServerConfig;
+    fn deref(&self) -> &DhcpServerConfig {
+        self.cfg
+    }
+}
+
 /// Select the context that best describes `reply.yiaddr`, for filling in
 /// lease-time/router/netmask reply options.
 ///
@@ -349,19 +390,19 @@ fn select_reply_delay(
 /// subnet, then any context on the same subnet — instead of the previous
 /// "first pool match or else the first context regardless of subnet"
 /// heuristic. This is `narrow_context()`'s upstream role (dhcp.c:717-752).
-/// `cfg.contexts` is `narrow_context`'s whole search domain here; when the
+/// `cfg.contexts()` is `narrow_context`'s whole search domain here; when the
 /// caller is [`dispatch_dhcp_with_arrival`], that list has already been
 /// restricted to the arriving interface's linked chain
 /// (`complete_context()`'s `->current` list, dhcp.c:589-660) — see
 /// [`link_contexts_for_interface`].
 fn context_for_reply<'a>(
-    cfg: &'a DhcpServerConfig,
+    cfg: &DhcpConfigView<'a>,
     reply: &DhcpReply,
 ) -> Option<&'a crate::types::dhcp::DhcpContext> {
     if reply.yiaddr == Ipv4Addr::UNSPECIFIED {
-        return cfg.contexts.first();
+        return cfg.contexts().first();
     }
-    narrow_context(&cfg.contexts, reply.yiaddr).or_else(|| cfg.contexts.first())
+    narrow_context(cfg.contexts(), reply.yiaddr).or_else(|| cfg.contexts().first())
 }
 
 fn requested_arch(pkt: &DhcpPacket) -> i32 {
@@ -377,7 +418,7 @@ fn requested_arch(pkt: &DhcpPacket) -> i32 {
 fn decorate_reply(
     reply: &mut DhcpReply,
     pkt: &DhcpPacket,
-    cfg: &DhcpServerConfig,
+    cfg: &DhcpConfigView<'_>,
     tags: &[crate::types::dhcp::DhcpNetid],
     config: Option<&crate::types::dhcp::DhcpConfig>,
 ) {
@@ -734,6 +775,19 @@ pub fn dispatch_dhcp_with_meta(
     ping_cache: &mut PingCache,
     probe: &dyn AddressProbe,
 ) -> Option<DispatchedDhcpReply> {
+    dispatch_dhcp_with_meta_view(pkt, &DhcpConfigView::whole(cfg), lease_db, ping_cache, probe)
+}
+
+/// [`dispatch_dhcp_with_meta`], taking a [`DhcpConfigView`] so
+/// [`dispatch_dhcp_with_arrival`] can pass a narrowed context list without
+/// cloning the rest of the config.
+fn dispatch_dhcp_with_meta_view(
+    pkt: &DhcpPacket,
+    cfg: &DhcpConfigView<'_>,
+    lease_db: &mut LeaseDb,
+    ping_cache: &mut PingCache,
+    probe: &dyn AddressProbe,
+) -> Option<DispatchedDhcpReply> {
     // `mess_type` stays `None` when option 53 is absent — that's how upstream
     // recognises a BOOTP request (`mess_type == 0`, rfc2131.c:125-133,:564),
     // not a reason to drop the packet, so this can't be an early-return `?`
@@ -963,7 +1017,7 @@ fn bootp_dynamic_allowed(rules: &[Vec<crate::types::dhcp::DhcpNetid>], tags: &[c
 #[allow(clippy::too_many_arguments)]
 fn dispatch_bootp(
     pkt: &DhcpPacket,
-    cfg: &DhcpServerConfig,
+    cfg: &DhcpConfigView<'_>,
     lease_db: &mut LeaseDb,
     ping_cache: &mut PingCache,
     probe: &dyn AddressProbe,
@@ -1066,7 +1120,7 @@ fn dispatch_bootp(
 /// building the RFC 4388 reply through [`handle_leasequery`].
 fn dispatch_leasequery(
     pkt: &DhcpPacket,
-    cfg: &DhcpServerConfig,
+    cfg: &DhcpConfigView<'_>,
     lease_db: &LeaseDb,
     tags: &[crate::types::dhcp::DhcpNetid],
     lease_by_client: Option<&DhcpLease>,
@@ -1695,9 +1749,10 @@ pub fn dispatch_dhcp_with_arrival(
     let dispatched = if linked.is_empty() {
         dispatch_dhcp_with_meta(pkt, cfg, lease_db, ping_cache, probe)
     } else {
-        let mut narrowed = cfg.clone();
-        narrowed.contexts = linked.iter().map(|&i| cfg.contexts[i].clone()).collect();
-        dispatch_dhcp_with_meta(pkt, &narrowed, lease_db, ping_cache, probe)
+        let narrowed_contexts: Vec<crate::types::dhcp::DhcpContext> =
+            linked.iter().map(|&i| cfg.contexts[i].clone()).collect();
+        let view = DhcpConfigView::narrowed(cfg, &narrowed_contexts);
+        dispatch_dhcp_with_meta_view(pkt, &view, lease_db, ping_cache, probe)
     };
 
     // Port of lease_set_interface() (lease.c:1148-1159), called from
@@ -2216,11 +2271,11 @@ fn synthetic_pool_context(start: Ipv4Addr, end: Ipv4Addr) -> DhcpContext {
     }
 }
 
-fn allocation_contexts(cfg: &DhcpServerConfig) -> std::borrow::Cow<'_, [DhcpContext]> {
-    if cfg.contexts.is_empty() {
+fn allocation_contexts<'a>(cfg: &DhcpConfigView<'a>) -> std::borrow::Cow<'a, [DhcpContext]> {
+    if cfg.contexts().is_empty() {
         std::borrow::Cow::Owned(vec![synthetic_pool_context(cfg.pool_start, cfg.pool_end)])
     } else {
-        std::borrow::Cow::Borrowed(&cfg.contexts)
+        std::borrow::Cow::Borrowed(cfg.contexts())
     }
 }
 
