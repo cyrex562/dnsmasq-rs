@@ -20,6 +20,19 @@ pub const MAXLABEL: usize = 63;
 /// Name escape sentinel byte used in dnsmasq's internal presentation format.
 pub const NAME_ESCAPE: u8 = 1;
 
+/// A raw wire-format value with no corresponding enum variant in this port's
+/// currently modeled range (`Rcode`/`Opcode`/`Class`/`RrType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidWireValue(pub u16);
+
+impl std::fmt::Display for InvalidWireValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unrecognized DNS wire value: {}", self.0)
+    }
+}
+
+impl std::error::Error for InvalidWireValue {}
+
 /// DNS RCODE values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -30,6 +43,22 @@ pub enum Rcode {
     NxDomain = 3,
     NotImpl  = 4,
     Refused  = 5,
+}
+
+impl TryFrom<u8> for Rcode {
+    type Error = InvalidWireValue;
+
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
+        match v {
+            0 => Ok(Self::NoError),
+            1 => Ok(Self::FormErr),
+            2 => Ok(Self::ServFail),
+            3 => Ok(Self::NxDomain),
+            4 => Ok(Self::NotImpl),
+            5 => Ok(Self::Refused),
+            _ => Err(InvalidWireValue(v as u16)),
+        }
+    }
 }
 
 /// DNS opcode values.
@@ -43,6 +72,21 @@ pub enum Opcode {
     Update = 5,
 }
 
+impl TryFrom<u8> for Opcode {
+    type Error = InvalidWireValue;
+
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
+        match v {
+            0 => Ok(Self::Query),
+            1 => Ok(Self::IQuery),
+            2 => Ok(Self::Status),
+            4 => Ok(Self::Notify),
+            5 => Ok(Self::Update),
+            _ => Err(InvalidWireValue(v as u16)),
+        }
+    }
+}
+
 /// DNS query class values.
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +96,20 @@ pub enum Class {
     CHAOS  = 3,
     HESIOD = 4,
     ANY    = 255,
+}
+
+impl TryFrom<u16> for Class {
+    type Error = InvalidWireValue;
+
+    fn try_from(v: u16) -> Result<Self, Self::Error> {
+        match v {
+            1   => Ok(Self::IN),
+            3   => Ok(Self::CHAOS),
+            4   => Ok(Self::HESIOD),
+            255 => Ok(Self::ANY),
+            _   => Err(InvalidWireValue(v)),
+        }
+    }
 }
 
 /// DNS resource record types.
@@ -97,47 +155,57 @@ pub enum RrType {
     CAA    = 257,
 }
 
-impl RrType {
-    pub fn from_u16(v: u16) -> Option<Self> {
+impl TryFrom<u16> for RrType {
+    type Error = InvalidWireValue;
+
+    fn try_from(v: u16) -> Result<Self, Self::Error> {
         match v {
-            1   => Some(Self::A),
-            2   => Some(Self::NS),
-            3   => Some(Self::MD),
-            4   => Some(Self::MF),
-            5   => Some(Self::CNAME),
-            6   => Some(Self::SOA),
-            7   => Some(Self::MB),
-            8   => Some(Self::MG),
-            9   => Some(Self::MR),
-            12  => Some(Self::PTR),
-            14  => Some(Self::MINFO),
-            15  => Some(Self::MX),
-            16  => Some(Self::TXT),
-            17  => Some(Self::RP),
-            18  => Some(Self::AFSDB),
-            21  => Some(Self::RT),
-            24  => Some(Self::SIG),
-            26  => Some(Self::PX),
-            28  => Some(Self::AAAA),
-            30  => Some(Self::NXT),
-            33  => Some(Self::SRV),
-            35  => Some(Self::NAPTR),
-            36  => Some(Self::KX),
-            39  => Some(Self::DNAME),
-            41  => Some(Self::OPT),
-            43  => Some(Self::DS),
-            46  => Some(Self::RRSIG),
-            47  => Some(Self::NSEC),
-            48  => Some(Self::DNSKEY),
-            50  => Some(Self::NSEC3),
-            249 => Some(Self::TKEY),
-            250 => Some(Self::TSIG),
-            252 => Some(Self::AXFR),
-            253 => Some(Self::MAILB),
-            255 => Some(Self::ANY),
-            257 => Some(Self::CAA),
-            _   => None,
+            1   => Ok(Self::A),
+            2   => Ok(Self::NS),
+            3   => Ok(Self::MD),
+            4   => Ok(Self::MF),
+            5   => Ok(Self::CNAME),
+            6   => Ok(Self::SOA),
+            7   => Ok(Self::MB),
+            8   => Ok(Self::MG),
+            9   => Ok(Self::MR),
+            12  => Ok(Self::PTR),
+            14  => Ok(Self::MINFO),
+            15  => Ok(Self::MX),
+            16  => Ok(Self::TXT),
+            17  => Ok(Self::RP),
+            18  => Ok(Self::AFSDB),
+            21  => Ok(Self::RT),
+            24  => Ok(Self::SIG),
+            26  => Ok(Self::PX),
+            28  => Ok(Self::AAAA),
+            30  => Ok(Self::NXT),
+            33  => Ok(Self::SRV),
+            35  => Ok(Self::NAPTR),
+            36  => Ok(Self::KX),
+            39  => Ok(Self::DNAME),
+            41  => Ok(Self::OPT),
+            43  => Ok(Self::DS),
+            46  => Ok(Self::RRSIG),
+            47  => Ok(Self::NSEC),
+            48  => Ok(Self::DNSKEY),
+            50  => Ok(Self::NSEC3),
+            249 => Ok(Self::TKEY),
+            250 => Ok(Self::TSIG),
+            252 => Ok(Self::AXFR),
+            253 => Ok(Self::MAILB),
+            255 => Ok(Self::ANY),
+            257 => Ok(Self::CAA),
+            _   => Err(InvalidWireValue(v)),
         }
+    }
+}
+
+impl RrType {
+    /// Equivalent to `RrType::try_from(v).ok()`, kept for the existing
+    /// `Option`-returning call sites that predate the `TryFrom` impl above.
+    pub fn from_u16(v: u16) -> Option<Self> {
+        Self::try_from(v).ok()
     }
 }
 
@@ -200,8 +268,11 @@ pub const HB4_CD:    u8 = 0x10;
 pub const HB4_RCODE: u8 = 0x0f;
 
 /// On-wire DNS packet header (12 bytes).
+///
+/// Parsed/serialized entirely by hand in `from_bytes`/`to_bytes` below (no
+/// transmute from a raw buffer), so this carries no `#[repr(C)]` — one would
+/// promise a memory layout nothing here relies on.
 #[derive(Debug, Clone, Copy, Default)]
-#[repr(C)]
 pub struct DnsHeader {
     pub id:      u16,
     pub hb3:     u8,
@@ -339,5 +410,32 @@ mod tests {
         assert_eq!(RrType::from_u16(249), Some(RrType::TKEY));
         assert_eq!(RrType::from_u16(250), Some(RrType::TSIG));
         assert_eq!(RrType::from_u16(253), Some(RrType::MAILB));
+    }
+
+    #[test]
+    fn rrtype_try_from_matches_from_u16() {
+        assert_eq!(RrType::try_from(1u16), Ok(RrType::A));
+        assert_eq!(RrType::try_from(9999u16), Err(InvalidWireValue(9999)));
+    }
+
+    #[test]
+    fn rcode_try_from_valid_and_invalid() {
+        assert_eq!(Rcode::try_from(0u8), Ok(Rcode::NoError));
+        assert_eq!(Rcode::try_from(3u8), Ok(Rcode::NxDomain));
+        assert_eq!(Rcode::try_from(6u8), Err(InvalidWireValue(6)));
+    }
+
+    #[test]
+    fn opcode_try_from_valid_and_invalid() {
+        assert_eq!(Opcode::try_from(0u8), Ok(Opcode::Query));
+        assert_eq!(Opcode::try_from(5u8), Ok(Opcode::Update));
+        assert_eq!(Opcode::try_from(3u8), Err(InvalidWireValue(3))); // 3 is unassigned
+    }
+
+    #[test]
+    fn class_try_from_valid_and_invalid() {
+        assert_eq!(Class::try_from(1u16), Ok(Class::IN));
+        assert_eq!(Class::try_from(255u16), Ok(Class::ANY));
+        assert_eq!(Class::try_from(2u16), Err(InvalidWireValue(2)));
     }
 }
