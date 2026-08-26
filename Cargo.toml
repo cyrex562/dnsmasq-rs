@@ -25,6 +25,9 @@ legacy-config = []
 # YAML conf-file support (`--conf-file=*.yaml`/`*.yml`) plus the
 # --convert-config legacy-to-YAML migration flag. Off by default until proven.
 yaml-config = ["dep:serde", "dep:serde_norway"]
+# Read-only HTTP status/diagnostics API (`--web-api-listen=<addr:port>`).
+# Off by default. See issue #165; no authentication yet (issue #166).
+web-api = ["dep:axum", "dep:serde", "dep:serde_json", "dep:tower"]
 
 [lib]
 name = "dnsmasq_rs"
@@ -85,5 +88,10 @@ tempfile = "3"
 proptest = "1"
 
 # YAML config support (optional, see the yaml-config feature)
-serde = { version = "1", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
 serde_norway = { version = "0.9", optional = true }
+
+# Web API support (optional, see the web-api feature)
+axum = { version = "0.8", optional = true }
+serde_json = { version = "1", optional = true }
+tower = { version = "0.5", features = ["util"], optional = true }

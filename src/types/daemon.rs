@@ -160,6 +160,10 @@ pub struct Daemon {
     pub secondary_forward_servers: Vec<String>,
     pub domain_suffix:   Option<String>,
     pub runfile:         Option<String>,
+    /// `--web-api-listen` (`web-api` feature). `None` (the default) means
+    /// the read-only HTTP status/diagnostics API does not listen at all.
+    #[cfg(feature = "web-api")]
+    pub web_api_listen:  Option<std::net::SocketAddr>,
     pub lease_change_command: Option<String>,
     pub lease_file:      Option<String>,
     pub dns_client_id:   Option<String>,
@@ -467,6 +471,8 @@ impl Default for Daemon {
             secondary_forward_servers: vec![],
             domain_suffix: None,
             runfile: None,
+            #[cfg(feature = "web-api")]
+            web_api_listen: None,
             lease_change_command: None,
             lease_file: None,
             dns_client_id: None,

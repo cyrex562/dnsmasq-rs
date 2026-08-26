@@ -211,6 +211,12 @@ pub struct CliArgs {
     #[arg(long = "pid-file", value_name = "FILE")]
     pub pid_file: Option<String>,
 
+    /// Listen address for the read-only HTTP status/diagnostics API
+    /// (`web-api` feature). Not listening at all unless set.
+    #[cfg(feature = "web-api")]
+    #[arg(long = "web-api-listen", value_name = "ADDR:PORT")]
+    pub web_api_listen: Option<String>,
+
     /// Log to this file/facility.
     #[arg(long = "log-facility", value_name = "TARGET")]
     pub log_facility: Option<String>,
@@ -371,6 +377,8 @@ pub fn config_lines_from_cli(args: &CliArgs) -> Vec<ConfigLine> {
     value!(user, "user");
     value!(group, "group");
     value!(pid_file, "pid-file");
+    #[cfg(feature = "web-api")]
+    value!(web_api_listen, "web-api-listen");
     value!(log_facility, "log-facility");
     value!(log_async, "log-async");
     value!(servers_file, "servers-file");
@@ -1043,6 +1051,17 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             // `opt_string_alloc` (option.c:677-691) returns NULL for the empty
             // string, so `pid-file=` is upstream's way of asking for no pid file.
             daemon.runfile = if v.is_empty() { None } else { Some(v.to_string()) };
+        }
+
+        // No upstream counterpart — new management surface for this port
+        // (issue #165), not a C directive.
+        #[cfg(feature = "web-api")]
+        "web-api-listen" => {
+            let v = require_value("web-api-listen")?;
+            daemon.web_api_listen = Some(
+                v.parse::<std::net::SocketAddr>()
+                    .map_err(|e| invalid_value_for(cl, key, v, &format!("expected an address:port pair: {e}")))?,
+            );
         }
 
         "log-facility" => {

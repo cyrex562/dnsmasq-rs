@@ -1814,6 +1814,45 @@ async fn spawn_ubus_task(daemon_handle: &DaemonHandle) -> Option<tokio::task::Jo
     Some(tokio::spawn(crate::ubus::run_ubus_task(ctx)))
 }
 
+/// Spawn [`crate::web_api::serve_on`] if `--web-api-listen` is set.
+///
+/// No upstream counterpart — new management surface for this port
+/// (issue #165). Logs its own bind failure and returns `Err(())`, matching
+/// every other fallible spawn helper's convention.
+#[cfg(feature = "web-api")]
+async fn spawn_web_api_task(
+    listen: Option<std::net::SocketAddr>,
+    daemon_handle: &DaemonHandle,
+    cache: crate::cache::SharedDnsCache,
+) -> Result<Option<tokio::task::JoinHandle<()>>, ()> {
+    let Some(addr) = listen else { return Ok(None) };
+
+    // Bind synchronously before spawning, so a bad address is a startup
+    // error rather than a silently-dead background task — matching how
+    // `bind_listeners`/`adopt_or_bind` report DNS/DHCP socket failures.
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("failed to bind web API socket on {addr}: {e}");
+            return Err(());
+        }
+    };
+    if !addr.ip().is_loopback() {
+        tracing::warn!(
+            "web API listening on {addr}, which is not a loopback address — every route is \
+             read-only for now, but there is no authentication in front of them yet (see issue #166)"
+        );
+    }
+    tracing::info!("web API listening on {addr}");
+
+    let daemon = daemon_handle.clone();
+    Ok(Some(tokio::spawn(async move {
+        if let Err(e) = crate::web_api::serve_on(listener, daemon, cache).await {
+            tracing::error!("web API server exited: {e}");
+        }
+    })))
+}
+
 /// Adopt the TFTP sockets bound before the fork (if any) and spawn
 /// [`crate::tftp::run_tftp_loop`] over them.
 #[cfg(feature = "tftp")]
@@ -2104,6 +2143,11 @@ pub async fn run_main_loop_with(
     #[cfg(feature = "dbus")]
     let dbus_task = spawn_dbus_task(&daemon_handle, cache.clone()).await;
 
+    // Captured here, before `fwd_task` below consumes `cache` by value —
+    // needed by the web API spawn much further down.
+    #[cfg(feature = "web-api")]
+    let web_api_cache = cache.clone();
+
     // ── inotify: dynamic-dir initial scan + watch task ───────────────────────
     //
     // Resolv-file directory watches were already established synchronously in
@@ -2234,6 +2278,46 @@ pub async fn run_main_loop_with(
         None => (None, None),
     };
 
+    // ── Web API (`--web-api-listen`) ──────────────────────────────────────────
+    #[cfg(feature = "web-api")]
+    let web_api_task = {
+        let listen = daemon_handle.read().await.web_api_listen;
+        match spawn_web_api_task(listen, &daemon_handle, web_api_cache).await {
+            Ok(t) => t,
+            Err(()) => {
+                fwd_task.abort();
+                arp_task.abort();
+                #[cfg(feature = "tftp")]
+                if let Some(t) = tftp_task.as_ref() { t.abort(); }
+                #[cfg(feature = "dhcp")]
+                {
+                    if let Some(tx) = dhcp_shutdown_tx.as_ref() {
+                        let _ = tx.send(true);
+                    }
+                    if let Some(task) = dhcp_task.as_ref() {
+                        task.abort();
+                    }
+                }
+                #[cfg(feature = "dhcp6")]
+                {
+                    if let Some(tx) = dhcp6_shutdown_tx.as_ref() {
+                        let _ = tx.send(true);
+                    }
+                    if let Some(task) = dhcp6_task.as_ref() {
+                        task.abort();
+                    }
+                    if let Some(tx) = radv_shutdown_tx.as_ref() {
+                        let _ = tx.send(true);
+                    }
+                    if let Some(task) = radv_task.as_ref() {
+                        task.abort();
+                    }
+                }
+                return RunResult::IoError;
+            }
+        }
+    };
+
     // ── Signal handling ──────────────────────────────────────────────────────
     let mut sigterm = match signal(SignalKind::terminate()) {
         Ok(s) => s,
@@ -2275,6 +2359,10 @@ pub async fn run_main_loop_with(
             if let Some(t) = tftp_task.as_ref() { t.abort(); }
             #[cfg(feature = "ubus")]
             if let Some(task) = ubus_task.as_ref() {
+                task.abort();
+            }
+            #[cfg(feature = "web-api")]
+            if let Some(task) = web_api_task.as_ref() {
                 task.abort();
             }
             fwd_task.abort();
@@ -2324,6 +2412,10 @@ pub async fn run_main_loop_with(
             if let Some(task) = ubus_task.as_ref() {
                 task.abort();
             }
+            #[cfg(feature = "web-api")]
+            if let Some(task) = web_api_task.as_ref() {
+                task.abort();
+            }
             fwd_task.abort();
             arp_task.abort();
             return RunResult::IoError;
@@ -2366,6 +2458,10 @@ pub async fn run_main_loop_with(
     arp_task.abort();
     #[cfg(feature = "ubus")]
     if let Some(task) = ubus_task {
+        task.abort();
+    }
+    #[cfg(feature = "web-api")]
+    if let Some(task) = web_api_task {
         task.abort();
     }
     #[cfg(feature = "dhcp")]
