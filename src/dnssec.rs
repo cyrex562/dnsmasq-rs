@@ -1980,12 +1980,12 @@ mod tests {
             key_tag:     compute_key_tag(&dnskey_rdata),
             algorithm:   8,
             digest_type: 1,
-            digest:      digest.clone(),
+            digest,
         };
 
         assert!(ds_matches_dnskey(&ds, &dnskey_rdata, owner));
 
-        let mut bad_ds = ds.clone();
+        let mut bad_ds = ds;
         bad_ds.digest[0] ^= 0xFF;
         assert!(!ds_matches_dnskey(&bad_ds, &dnskey_rdata, owner));
     }
@@ -2007,12 +2007,12 @@ mod tests {
             key_tag:     compute_key_tag(&dnskey_rdata),
             algorithm:   8,
             digest_type: 4,
-            digest:      digest.clone(),
+            digest,
         };
 
         assert!(ds_matches_dnskey(&ds, &dnskey_rdata, owner));
 
-        let mut bad_ds = ds.clone();
+        let mut bad_ds = ds;
         bad_ds.digest[0] ^= 0xFF;
         assert!(!ds_matches_dnskey(&bad_ds, &dnskey_rdata, owner));
     }
@@ -2048,13 +2048,13 @@ mod tests {
             key_tag:     compute_key_tag(&dnskey_rdata),
             algorithm:   8,
             digest_type: 2,
-            digest:      digest.clone(),
+            digest,
         };
 
         assert!(ds_matches_dnskey(&ds, &dnskey_rdata, owner));
 
         // Wrong digest should fail.
-        let mut bad_ds = ds.clone();
+        let mut bad_ds = ds;
         bad_ds.digest[0] ^= 0xFF;
         assert!(!ds_matches_dnskey(&bad_ds, &dnskey_rdata, owner));
     }
