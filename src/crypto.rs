@@ -63,6 +63,15 @@ pub enum DnssecPublicKey {
 pub enum CryptoError {
     #[error("unsupported algorithm: {0}")]
     UnsupportedAlgorithm(u8),
+    /// `verify_sig` was asked to check a signature against a `DnssecPublicKey`
+    /// whose variant doesn't match `requested` — e.g. an `EcdsaP256` key
+    /// checked against `DnssecAlgorithm::Ed25519`. Distinct from
+    /// `UnsupportedAlgorithm`: the algorithm itself is one this crate
+    /// implements, the caller just paired it with the wrong key. This is an
+    /// internal-caller bug (mismatched key/algorithm pairing), never a
+    /// property of the wire data alone.
+    #[error("algorithm {requested:?} does not match the parsed key's algorithm")]
+    KeyAlgorithmMismatch { requested: DnssecAlgorithm },
     #[error("invalid key data")]
     InvalidKey,
     #[error("invalid signature")]
@@ -233,7 +242,12 @@ pub fn verify_sig(
                 .map(|_| true)
                 .map_err(|_| CryptoError::VerificationFailed)
         }
-        _ => Err(CryptoError::UnsupportedAlgorithm(algorithm as u8)),
+        // `Ed448` has no `DnssecPublicKey` variant at all (`parse_dnskey`
+        // rejects it before one could ever be constructed), so it alone is
+        // genuinely unsupported here; every other combination reaching this
+        // arm is a real key, just paired with the wrong algorithm.
+        (_, DnssecAlgorithm::Ed448) => Err(CryptoError::UnsupportedAlgorithm(algorithm as u8)),
+        _ => Err(CryptoError::KeyAlgorithmMismatch { requested: algorithm }),
     }
 }
 
@@ -523,7 +537,25 @@ mod tests {
 
         // Try to verify with wrong algorithm
         let result = verify_sig(b"data", &[0u8; 64], &dnskey, DnssecAlgorithm::RsaSha256);
-        assert!(matches!(result, Err(CryptoError::UnsupportedAlgorithm(_))));
+        assert!(matches!(
+            result,
+            Err(CryptoError::KeyAlgorithmMismatch { requested: DnssecAlgorithm::RsaSha256 })
+        ));
+    }
+
+    #[test]
+    fn verify_sig_ed448_algorithm_is_unsupported_not_a_mismatch() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        // Ed448 has no DnssecPublicKey variant at all, so it must report
+        // UnsupportedAlgorithm even when paired with an unrelated real key —
+        // never KeyAlgorithmMismatch, which implies the algorithm itself is
+        // one this crate implements.
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let dnskey = DnssecPublicKey::Ed25519(signing_key.verifying_key());
+        let result = verify_sig(b"data", &[0u8; 64], &dnskey, DnssecAlgorithm::Ed448);
+        assert!(matches!(result, Err(CryptoError::UnsupportedAlgorithm(16))));
     }
 
     #[test]

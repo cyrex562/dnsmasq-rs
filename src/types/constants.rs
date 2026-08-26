@@ -279,21 +279,6 @@ pub const SRC_CONFIG: u32 = 1;
 pub const SRC_HOSTS:  u32 = 2;
 pub const SRC_AH:     u32 = 3;
 
-// DNSSEC status values
-pub const STAT_SECURE:    u32 = 0x10000;
-pub const STAT_INSECURE:  u32 = 0x20000;
-pub const STAT_BOGUS:     u32 = 0x30000;
-pub const STAT_NEED_DS:   u32 = 0x40000;
-pub const STAT_NEED_KEY:  u32 = 0x50000;
-pub const STAT_TRUNCATED: u32 = 0x60000;
-pub const STAT_OK:        u32 = 0x70000;
-pub const STAT_ABANDONED: u32 = 0x80000;
-pub const STAT_ASYNC:     u32 = 0x90000;
-
-pub fn stat_is_equal(a: u32, b: u32) -> bool {
-    (a & 0xffff_0000) == b
-}
-
 // DNSSEC failure bit flags
 pub const DNSSEC_FAIL_NYV:        u32 = 0x0001;
 pub const DNSSEC_FAIL_EXP:        u32 = 0x0002;
@@ -358,11 +343,5 @@ mod tests {
     #[test]
     fn option_size_covers_all() {
         assert!(OPTION_SIZE * u32::BITS as usize >= OPT_LAST);
-    }
-
-    #[test]
-    fn stat_is_equal_works() {
-        assert!(stat_is_equal(STAT_BOGUS | 0x0006, STAT_BOGUS));
-        assert!(!stat_is_equal(STAT_BOGUS, STAT_SECURE));
     }
 }
