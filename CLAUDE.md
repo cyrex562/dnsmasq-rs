@@ -85,6 +85,14 @@ conf-file text ─> parse_config_text ─┘                      │           
 - `normalize_config` holds post-processing that upstream does implicitly: DNSSEC fast-retry defaults, local-TTL fill-in for host records and CNAMEs, MX/auth defaults, `local-service` handling, and auth validation. Put new cross-directive defaulting here, in a named helper — not in the tail of `apply_config`.
 - `src/option.rs` is ~6600 lines and the largest parity surface. A directive is not done until it parses valid forms, rejects invalid forms clearly, mutates `Daemon` correctly, affects runtime behavior, and has directive-level plus fixture-level tests. Never accept a directive as a silent no-op; if a no-op is deliberate, document it and track it in `tasks.md`.
 
+#### Config file formats
+
+`--conf-file=<path>` dispatches on extension in `main.rs`'s `load_top_level_conf_file`: `.yaml`/`.yml` goes to `yaml_config::parse_yaml_config_text` (feature `yaml-config`), anything else to `option::parse_config_text` (feature `legacy-config`, default-on). Both produce the exact same `Vec<ConfigLine>` shape, so `resolve_config`/`apply_line`/`normalize_config` never know which format the directives came from — `yaml_config.rs` is purely an alternate *source* of `ConfigLine`s, not a second config-application pipeline. The YAML schema is flat and mirrors existing directive names 1:1 (`port: 5353`, `server: ["8.8.8.8", "1.1.1.1"]` for a repeatable directive, `no-resolv: true` for a bare flag) rather than a nested/sectioned structure, specifically so it needs no separate mapping layer.
+
+`--convert-config <input> <output>` (feature `yaml-config`, also needs `legacy-config` to read the input) parses a legacy file and re-serializes its `ConfigLine`s as YAML, then exits without starting the daemon — see `main.rs`'s `convert_legacy_config_to_yaml`.
+
+Note `legacy-config` only gates the *runtime entry point* (`main.rs`'s dispatch and `yaml_config.rs`'s cross-format `conf-file:` include fallback) — `option::parse_config_text` itself stays unconditionally compiled, since gating it would require touching every one of its hundreds of existing direct unit-test call sites in `option.rs` for a build combination (`legacy-config` off) that isn't part of default features.
+
 ### Runtime flow
 
 `main.rs` reads the config, resolves it once, calls `dnsmasq::init_daemon_with`, installs SIGTERM/SIGHUP handlers, and enters `dnsmasq::run_main_loop`. `run_main_loop` snapshots port/upstreams/DHCP runtime from the handle, binds the DNS UDP socket, and spawns `forward::run_forward_loop` (plus `dhcp::run_dhcp_loop` under the `dhcp` feature).
@@ -113,6 +121,7 @@ Integration tests in `tests/` import through the library (`dnsmasq_rs::*`), so t
 | `src/cache.rs` | Bounded LRU DNS cache keyed by `(name, type-flags)` |
 | `src/forward.rs` | DNS query forwarding engine |
 | `src/option.rs` | Config parsing and application — port of `option.c` |
+| `src/yaml_config.rs` | YAML `conf-file` support (`yaml-config` feature) — parses into the same `ConfigLine`s `option.rs`'s text parser produces; no upstream counterpart |
 | `src/dnsmasq.rs`, `src/main.rs` | Daemon init, privilege drop, daemonization, signals, main loop |
 | `src/rfc2131.rs`, `src/dhcp.rs`, `src/lease.rs`, `src/helper.rs` | DHCPv4 |
 | `src/rfc3315.rs`, `src/dhcp6.rs`, `src/radv.rs`, `src/slaac.rs` | DHCPv6 and RA |
@@ -124,6 +133,8 @@ Integration tests in `tests/` import through the library (`dnsmasq_rs::*`), so t
 ### Feature flags
 
 Cargo features mirror upstream's compile-time `HAVE_*` defines. Defaults: `dhcp dhcp6 dnssec auth tftp loop inotify dump`. `dhcp6` implies `dhcp`. Non-default: `conntrack`, `dbus` (pulls `zbus`), `ubus`, `ipset`, `nftset`. There is no `bpf` feature — `src/bpf.rs` was speculative classic-BPF filter code with no upstream counterpart and no caller; it was removed (see `tasks.md` P5). Upstream `bpf.c` is BSD/Solaris-only routing-socket code with no Linux relevance; its Linux analog is `netlink.rs`.
+
+`legacy-config` (default-on) and `yaml-config` (default-off, pulls `serde`/`serde_norway`) are dnsmasq-rs-specific, with no upstream `HAVE_*` counterpart — see "Config file formats" below.
 
 Gates apply both to `pub mod` declarations (in *both* `lib.rs` and `main.rs`) and inside modules. Gate leakage is a live bug class — see the `--no-default-features` failure above.
 

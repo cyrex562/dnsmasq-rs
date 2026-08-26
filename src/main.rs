@@ -3,6 +3,7 @@
 pub mod error;
 pub mod dnsmasq;
 pub mod option;
+pub mod yaml_config;
 
 pub mod network;
 pub mod netlink;
@@ -116,16 +117,89 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// True when `path`'s extension (case-insensitive) is `.yaml` or `.yml`.
+fn has_yaml_extension(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".yaml") || lower.ends_with(".yml")
+}
+
+/// Load a top-level `--conf-file`, dispatching by extension: `.yaml`/`.yml`
+/// goes to [`yaml_config::parse_yaml_config_text`] (when built with
+/// `yaml-config`), anything else to the legacy `key=value`
+/// [`option::parse_config_text`] (when built with `legacy-config`).
+fn load_top_level_conf_file(path: &str) -> Result<Vec<option::ConfigLine>, error::DnsmasqError> {
+    #[cfg_attr(not(any(feature = "yaml-config", feature = "legacy-config")), allow(unused_variables))]
+    let text = std::fs::read_to_string(path)?;
+
+    if has_yaml_extension(path) {
+        #[cfg(feature = "yaml-config")]
+        {
+            return Ok(yaml_config::parse_yaml_config_text(&text, path)?);
+        }
+        #[cfg(not(feature = "yaml-config"))]
+        {
+            return Err(error::DnsmasqError::BadConfig(format!(
+                "{path} looks like a YAML config file, but this build was compiled without the yaml-config feature"
+            )));
+        }
+    }
+
+    #[cfg(feature = "legacy-config")]
+    {
+        Ok(option::parse_config_text(&text, path)?)
+    }
+    #[cfg(not(feature = "legacy-config"))]
+    {
+        Err(error::DnsmasqError::BadConfig(format!(
+            "{path} is not a YAML config file, and this build was compiled without the legacy-config feature"
+        )))
+    }
+}
+
+/// `--convert-config <input> <output>`: parse a legacy `key=value` config
+/// file and write its directives back out as YAML, then exit without
+/// starting the daemon.
+#[cfg(feature = "yaml-config")]
+fn convert_legacy_config_to_yaml(input: &str, output: &str) -> Result<(), error::DnsmasqError> {
+    #[cfg(not(feature = "legacy-config"))]
+    {
+        let _ = (input, output);
+        return Err(error::DnsmasqError::BadConfig(
+            "cannot convert a legacy config file: this build was compiled without the legacy-config feature"
+                .to_string(),
+        ));
+    }
+    #[cfg(feature = "legacy-config")]
+    {
+        let text = std::fs::read_to_string(input)?;
+        let lines = option::parse_config_text(&text, input)?;
+        let yaml_text = yaml_config::config_lines_to_yaml(&lines)?;
+        std::fs::write(output, yaml_text)?;
+        println!(
+            "wrote {output} ({} directive{})",
+            lines.len(),
+            if lines.len() == 1 { "" } else { "s" }
+        );
+        Ok(())
+    }
+}
+
 fn start() -> Result<(), error::DnsmasqError> {
     use clap::Parser as _;
     use tracing::info;
 
     let args = option::CliArgs::parse();
+
+    #[cfg(feature = "yaml-config")]
+    if let Some(pair) = &args.convert_config {
+        let [input, output] = [pair[0].as_str(), pair[1].as_str()];
+        return convert_legacy_config_to_yaml(input, output);
+    }
+
     let mut lines = Vec::new();
     let conf_loaded = match args.conf_file {
         Some(ref conf_path) => {
-            let text = std::fs::read_to_string(conf_path)?;
-            lines.extend(option::parse_config_text(&text, conf_path)?);
+            lines.extend(load_top_level_conf_file(conf_path)?);
             Some(conf_path.clone())
         }
         None => None,

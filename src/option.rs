@@ -66,9 +66,18 @@ const DEFAULT_LEASEFILE: &str = "/var/lib/misc/dnsmasq.leases";
 #[derive(clap::Parser, Debug, Clone, PartialEq, Eq, Default)]
 #[command(name = "dnsmasq-rs", version, about = "A Rust port of dnsmasq")]
 pub struct CliArgs {
-    /// Path to the configuration file.
+    /// Path to the configuration file. A `.yaml`/`.yml` extension loads it
+    /// as YAML (requires the `yaml-config` feature); anything else loads it
+    /// as the legacy `key=value` format (requires `legacy-config`).
     #[arg(long = "conf-file", value_name = "FILE")]
     pub conf_file: Option<String>,
+
+    /// Convert a legacy `key=value` config file to YAML and exit, without
+    /// starting the daemon. Requires the `yaml-config` feature (to write the
+    /// YAML) and `legacy-config` (to read the input).
+    #[cfg(feature = "yaml-config")]
+    #[arg(long = "convert-config", value_names = ["INPUT", "OUTPUT"], num_args = 2)]
+    pub convert_config: Option<Vec<String>>,
 
     /// DNS port to listen on (overrides config file).
     #[arg(long, value_name = "PORT")]

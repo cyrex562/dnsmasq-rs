@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["dhcp", "dhcp6", "auth", "tftp", "loop", "inotify", "dump", "ipset", "script"]
+default = ["dhcp", "dhcp6", "auth", "tftp", "loop", "inotify", "dump", "ipset", "script", "legacy-config"]
 dhcp     = []
 dhcp6    = ["dhcp"]
 dnssec   = []
@@ -19,6 +19,12 @@ ubus     = []
 ipset    = []
 nftset   = []
 script   = []
+# The original dnsmasq key=value conf-file format. On by default so existing
+# configs keep working unchanged; a build can drop it to accept only YAML.
+legacy-config = []
+# YAML conf-file support (`--conf-file=*.yaml`/`*.yml`) plus the
+# --convert-config legacy-to-YAML migration flag. Off by default until proven.
+yaml-config = ["dep:serde", "dep:serde_norway"]
 
 [lib]
 name = "dnsmasq_rs"
@@ -77,3 +83,7 @@ caps = "0.5"
 
 tempfile = "3"
 proptest = "1"
+
+# YAML config support (optional, see the yaml-config feature)
+serde = { version = "1", optional = true }
+serde_norway = { version = "0.9", optional = true }
