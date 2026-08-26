@@ -768,6 +768,62 @@ fn commit_staged(
     cache.end_insert();
 }
 
+/// `extract_addresses` stage: handle a PTR (rtype 12) query. Only cache when
+/// the question name is a valid `.arpa` reverse zone name; for PTR queries
+/// with no matching PTR answer, no negative entry is cached.
+///
+/// Every path through the original `qtype == 12` branch in `extract_addresses`
+/// returns, so this stage always produces the final [`ExtractOutcome`] rather
+/// than an `Option` the caller might fall through past.
+fn extract_ptr_answers(
+    packet:      &DnsPacket,
+    qname_lower: &str,
+    secflag:     u32,
+    cache:       &mut DnsCache,
+    now:         Instant,
+    config:      &ExtractConfig,
+) -> ExtractOutcome {
+    let qname = &packet.questions[0].name;
+    let mut staged: Vec<CacheRecord> = Vec::new();
+    let bad_packet = || ExtractOutcome { result: ExtractResult::BadPacket, ipset_hits: Vec::new(), nftset_hits: Vec::new() };
+    let cached     = || ExtractOutcome { result: ExtractResult::Cached, ipset_hits: Vec::new(), nftset_hits: Vec::new() };
+
+    if let Some(ip_addr) = in_arpa_name_2_addr(qname_lower) {
+        let addr_flag = match &ip_addr {
+            AllAddr::Addr4(_) => F_IPV4,
+            AllAddr::Addr6(_) => F_IPV6,
+            _ => 0,
+        };
+        let mut found = false;
+        for rr in &packet.answers {
+            if rr.rtype != 12 || rr.class != 1 { continue; }
+            if !rr.name.eq_ignore_ascii_case(qname) { continue; }
+            let mut off = 0usize;
+            let target = match extract_name(&rr.rdata, &mut off) {
+                Ok(t)  => t,
+                Err(_) => return bad_packet(),
+            };
+            let ttl = clamp_ttl(rr.ttl, config.max_ttl);
+            staged.push(CacheRecord {
+                name:    target,
+                flags:   addr_flag | F_REVERSE | secflag,
+                ttl,
+                expires: now + Duration::from_secs(u64::from(ttl)),
+                addr:    Some(ip_addr.clone()),
+                rdata:   None,
+                uid:     UID_NONE,
+            });
+            found = true;
+        }
+        if found {
+            commit_staged(cache, staged, &packet.header, now);
+            return cached();
+        }
+    }
+    // For PTR queries with no PTR answer we do not cache a negative entry.
+    cached()
+}
+
 /// Extract DNS records from a parsed reply and insert them into `cache`.
 ///
 /// This is the Rust port of `extract_addresses()` from `rfc1035.c`.
@@ -823,41 +879,7 @@ pub fn extract_addresses(
 
     // ── PTR reverse lookup ────────────────────────────────────────────────────
     if qtype == 12 /* PTR */ {
-        // Only cache when the question name is a valid .arpa reverse zone name.
-        if let Some(ip_addr) = in_arpa_name_2_addr(&qname_lower) {
-            let addr_flag = match &ip_addr {
-                AllAddr::Addr4(_) => F_IPV4,
-                AllAddr::Addr6(_) => F_IPV6,
-                _ => 0,
-            };
-            let mut found = false;
-            for rr in &packet.answers {
-                if rr.rtype != 12 || rr.class != 1 { continue; }
-                if !rr.name.eq_ignore_ascii_case(&q.name) { continue; }
-                let mut off = 0usize;
-                let target = match extract_name(&rr.rdata, &mut off) {
-                    Ok(t)  => t,
-                    Err(_) => return bad_packet(ipset_hits, nftset_hits),
-                };
-                let ttl = clamp_ttl(rr.ttl, config.max_ttl);
-                staged.push(CacheRecord {
-                    name:    target,
-                    flags:   addr_flag | F_REVERSE | secflag,
-                    ttl,
-                    expires: now + Duration::from_secs(u64::from(ttl)),
-                    addr:    Some(ip_addr.clone()),
-                    rdata:   None,
-                    uid:     UID_NONE,
-                });
-                found = true;
-            }
-            if found {
-                commit_staged(cache, staged, header, now);
-                return cached(ipset_hits, nftset_hits);
-            }
-        }
-        // For PTR queries with no PTR answer we do not cache a negative entry.
-        return cached(ipset_hits, nftset_hits);
+        return extract_ptr_answers(packet, &qname_lower, secflag, cache, now, config);
     }
 
     // ── Forward lookup (A, AAAA, or arbitrary RR) ─────────────────────────────
@@ -1161,6 +1183,139 @@ fn cached_answer_source_arg(cache: &DnsCache, uid: u32) -> Option<String> {
     Some(cache.record_source(uid))
 }
 
+/// `answer_request` stage 5a: walk the CNAME chain (config or cached), up to
+/// 16 hops, mutating `name` to the final target and pushing each hop's CNAME
+/// RR into `answers`. Returns the final `name` plus whatever this stage
+/// contributed to `ans`/`nxdomain` — the caller ORs them into its own running
+/// state, since neither ever flips back to `false`.
+///
+/// `ans` is what decides, at the end, whether this query is answered locally
+/// or forwarded.  A CNAME on its own only sets it when the record came from
+/// config or the client asked for `T_CNAME` (`rfc1035.c:1704-1705`); a
+/// cached, upstream-derived CNAME leaves `ans` alone, so the chain has to
+/// bottom out in something that actually answers.  Otherwise a cached CNAME
+/// whose target has expired — the everyday CDN TTL pattern — would be served
+/// as a CNAME-only NOERROR, which is a resolution failure, instead of being
+/// re-resolved upstream.
+///
+/// C gates this whole loop on `qclass == C_IN` (`rfc1035.c:1669`) — the
+/// cache never holds CNAME/NXDOMAIN entries for a CHAOS query anyway, but
+/// matching the gate keeps this a faithful port rather than relying on
+/// that as an accident of what the cache happens to contain. The caller only
+/// calls this stage under that same gate.
+fn resolve_cname_chain(
+    mut name:  String,
+    answers:   &mut Vec<DnsRr>,
+    qtype:     u16,
+    ttl:       u32,
+    cache:     &mut DnsCache,
+    now:       Instant,
+    config:    &LocalConfig<'_>,
+) -> (String, bool, bool) {
+    let log = |flags: u32, name: Option<&str>, addr: Option<&AllAddr>, arg: Option<&str>, rrtype: u16| {
+        if let Some(line) = crate::cache::log_query(&config.log_opts, flags, name, addr, arg, rrtype, 0, None) {
+            crate::log::my_syslog(crate::log::LOG_INFO, &line);
+        }
+    };
+    let mut ans      = false;
+    let mut nxdomain = false;
+
+    for _ in 0..16 {
+        // Config CNAMEs first.  These are C's `F_CONFIG` cache entries, and
+        // they do answer the question on their own.
+        if let Some(c) = config.cnames.iter().find(|c| c.alias.to_lowercase() == name) {
+            let target = c.target.clone();
+            let mut rd = BytesMut::new();
+            write_name(&mut rd, &target);
+            answers.push(DnsRr { name: name.clone(), rtype: 5, class: 1, ttl, rdata: rd.to_vec() });
+            log(F_CONFIG | F_CNAME, Some(&name), None, None, 0);
+            name = target.to_lowercase();
+            ans  = true;
+            if qtype == 5 /* CNAME */ {
+                break;
+            }
+            continue;
+        }
+
+        // Cached CNAME.  It carries its own TTL — `ttl` here is `local-ttl`,
+        // a static-record default that says nothing about an upstream answer.
+        let cname_target: Option<(String, u32, u32, u32)> = cache
+            .lookup_by_name(&name, F_CNAME, now)
+            .and_then(|r| {
+                if let Some(AllAddr::Cname(ref c)) = r.addr {
+                    c.target_name.clone().map(|t| (t, DnsCache::crec_ttl(r, now), r.flags, r.uid))
+                } else {
+                    None
+                }
+            });
+        if let Some((target, cname_ttl, cname_flags, cname_uid)) = cname_target {
+            let mut rd = BytesMut::new();
+            write_name(&mut rd, &target);
+            answers.push(DnsRr {
+                name: name.clone(), rtype: 5, class: 1, ttl: cname_ttl, rdata: rd.to_vec(),
+            });
+            log(cname_flags, Some(&name), None, cached_answer_source_arg(cache, cname_uid).as_deref(), 0);
+            name = target.to_lowercase();
+            if qtype == 5 /* CNAME */ {
+                // The CNAME *is* the answer the client asked for.
+                ans = true;
+                break;
+            }
+            continue;
+        }
+
+        // Cached NXDOMAIN.
+        if let Some((flags, uid)) = cache
+            .lookup_by_name(&name, F_NXDOMAIN | F_NEG, now)
+            .map(|r| (r.flags, r.uid))
+        {
+            let arg = cached_answer_source_arg(cache, uid);
+            log(flags, Some(&name), None, arg.as_deref(), 0);
+            nxdomain = true;
+            ans      = true;
+        }
+        break;
+    }
+
+    (name, ans, nxdomain)
+}
+
+/// `answer_request` stage 5b: the CHAOS `*.bind` / `*.server` fallback, only
+/// when nothing local answered (a stat/version TXT record earlier in
+/// `answer_request` may already have).  Returns the resulting `(notimp,
+/// ans)`, either unchanged (`ans` passed straight through) or both `true`.
+///
+/// Port of `rfc1035.c:1757-1772`, argument order preserved deliberately: C
+/// calls `hostname_issubdomain("bind", name)` — literal-first,
+/// query-name-second — the reverse of every *other* call site in upstream
+/// (`name` first, `rfc1035.c:1311-1327`, `auth.c:298-397`), where
+/// `hostname_issubdomain` means "is the first arg equal to, or a subdomain
+/// of, the second".  With the arguments this way round the comment's
+/// "*.bind and *.server" is misleading: `hostname_issubdomain("bind", name)`
+/// only matches when `name` itself is `"bind"` (or shorter), because `a`
+/// must be at least as long as `b` (`util.c:426-428`) — an actual
+/// `version.bind` query never reaches this branch. Preserving the exact
+/// call, quirk included, matches this port's rule to keep observable
+/// behaviour over what looks "more correct".
+fn answer_chaos_bind_fallback(qclass: u16, name: &str, ans: bool, config: &LocalConfig<'_>) -> (bool, bool) {
+    let log = |flags: u32, name: Option<&str>, addr: Option<&AllAddr>, arg: Option<&str>, rrtype: u16| {
+        if let Some(line) = crate::cache::log_query(&config.log_opts, flags, name, addr, arg, rrtype, 0, None) {
+            crate::log::my_syslog(crate::log::LOG_INFO, &line);
+        }
+    };
+    if qclass == 3 && !ans
+        && (hostname_issubdomain("bind", name) || hostname_issubdomain("server", name))
+    {
+        let addr = AllAddr::Log(crate::types::addr::LogAddr {
+            keytag: 0, algo: 0, digest: 0, rcode: 4 /* NOTIMP */, ede: 0,
+        });
+        log(F_CONFIG | F_RCODE, Some(name), Some(&addr), None, 0);
+        (true, true)
+    } else {
+        (false, ans)
+    }
+}
+
 /// Port of C's `answer_request()`.  Answers DNS queries from local config and cache.
 ///
 /// Returns `None` when the query should be forwarded to an upstream resolver.
@@ -1229,77 +1384,12 @@ pub fn answer_request(
     };
 
     // 5a. CNAME chain (max 16 hops).
-    //
-    // `ans` is what decides, at the end, whether this query is answered locally
-    // or forwarded.  A CNAME on its own only sets it when the record came from
-    // config or the client asked for `T_CNAME` (`rfc1035.c:1704-1705`); a
-    // cached, upstream-derived CNAME leaves `ans` alone, so the chain has to
-    // bottom out in something that actually answers.  Otherwise a cached CNAME
-    // whose target has expired — the everyday CDN TTL pattern — would be served
-    // as a CNAME-only NOERROR, which is a resolution failure, instead of being
-    // re-resolved upstream.
-    //
-    // C gates this whole loop on `qclass == C_IN` (`rfc1035.c:1669`) — the
-    // cache never holds CNAME/NXDOMAIN entries for a CHAOS query anyway, but
-    // matching the gate keeps this a faithful port rather than relying on
-    // that as an accident of what the cache happens to contain.
     if qclass == 1 {
-        for _ in 0..16 {
-            // Config CNAMEs first.  These are C's `F_CONFIG` cache entries, and
-            // they do answer the question on their own.
-            if let Some(c) = config.cnames.iter().find(|c| c.alias.to_lowercase() == name) {
-                let target = c.target.clone();
-                let mut rd = BytesMut::new();
-                write_name(&mut rd, &target);
-                answers.push(DnsRr { name: name.clone(), rtype: 5, class: 1, ttl, rdata: rd.to_vec() });
-                log(F_CONFIG | F_CNAME, Some(&name), None, None, 0);
-                name = target.to_lowercase();
-                ans  = true;
-                if qtype == 5 /* CNAME */ {
-                    break;
-                }
-                continue;
-            }
-
-            // Cached CNAME.  It carries its own TTL — `ttl` here is `local-ttl`,
-            // a static-record default that says nothing about an upstream answer.
-            let cname_target: Option<(String, u32, u32, u32)> = cache
-                .lookup_by_name(&name, F_CNAME, now)
-                .and_then(|r| {
-                    if let Some(AllAddr::Cname(ref c)) = r.addr {
-                        c.target_name.clone().map(|t| (t, DnsCache::crec_ttl(r, now), r.flags, r.uid))
-                    } else {
-                        None
-                    }
-                });
-            if let Some((target, cname_ttl, cname_flags, cname_uid)) = cname_target {
-                let mut rd = BytesMut::new();
-                write_name(&mut rd, &target);
-                answers.push(DnsRr {
-                    name: name.clone(), rtype: 5, class: 1, ttl: cname_ttl, rdata: rd.to_vec(),
-                });
-                log(cname_flags, Some(&name), None, cached_answer_source_arg(cache, cname_uid).as_deref(), 0);
-                name = target.to_lowercase();
-                if qtype == 5 /* CNAME */ {
-                    // The CNAME *is* the answer the client asked for.
-                    ans = true;
-                    break;
-                }
-                continue;
-            }
-
-            // Cached NXDOMAIN.
-            if let Some((flags, uid)) = cache
-                .lookup_by_name(&name, F_NXDOMAIN | F_NEG, now)
-                .map(|r| (r.flags, r.uid))
-            {
-                let arg = cached_answer_source_arg(cache, uid);
-                log(flags, Some(&name), None, arg.as_deref(), 0);
-                nxdomain = true;
-                ans      = true;
-            }
-            break;
-        }
+        let (new_name, cname_ans, cname_nxdomain) =
+            resolve_cname_chain(name, &mut answers, qtype, ttl, cache, now, config);
+        name      = new_name;
+        ans      |= cname_ans;
+        nxdomain |= cname_nxdomain;
     }
 
     // 5b. TXT (qtype 16 or ANY=255).  Reachable for both IN and CHAOS class —
@@ -1339,30 +1429,10 @@ pub fn answer_request(
         }
     }
 
-    // CHAOS `*.bind` / `*.server` fallback: only when nothing local answered
-    // (a stat/version TXT record above may already have).  Port of
-    // `rfc1035.c:1757-1772`, argument order preserved deliberately: C calls
-    // `hostname_issubdomain("bind", name)` — literal-first, query-name-second
-    // — the reverse of every *other* call site in upstream (`name` first,
-    // `rfc1035.c:1311-1327`, `auth.c:298-397`), where `hostname_issubdomain`
-    // means "is the first arg equal to, or a subdomain of, the second".  With
-    // the arguments this way round the comment's "*.bind and *.server" is
-    // misleading: `hostname_issubdomain("bind", name)` only matches when
-    // `name` itself is `"bind"` (or shorter), because `a` must be at least as
-    // long as `b` (`util.c:426-428`) — an actual `version.bind` query never
-    // reaches this branch. Preserving the exact call, quirk included, matches
-    // this port's rule to keep observable behaviour over what looks "more
-    // correct".
-    if qclass == 3 && !ans
-        && (hostname_issubdomain("bind", &name) || hostname_issubdomain("server", &name))
-    {
-        notimp = true;
-        let addr = AllAddr::Log(crate::types::addr::LogAddr {
-            keytag: 0, algo: 0, digest: 0, rcode: 4 /* NOTIMP */, ede: 0,
-        });
-        log(F_CONFIG | F_RCODE, Some(&name), Some(&addr), None, 0);
-        ans = true;
-    }
+    // CHAOS `*.bind` / `*.server` fallback.
+    let (chaos_notimp, chaos_ans) = answer_chaos_bind_fallback(qclass, &name, ans, config);
+    notimp |= chaos_notimp;
+    ans      = chaos_ans;
 
     // 5c. Arbitrary cached-RR (qclass IN only).
     if qclass == 1 {
