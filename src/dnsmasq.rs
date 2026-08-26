@@ -1874,6 +1874,57 @@ async fn spawn_web_api_task(
     })))
 }
 
+/// Bind and spawn the Prometheus-compatible `/metrics` endpoint
+/// (`--metrics-listen`), if configured.
+///
+/// No upstream counterpart — new observability surface for this port
+/// (issue #173). Deliberately standalone from `spawn_web_api_task`: no
+/// token required, no dependency on `web-api` being enabled at all. Logs
+/// its own bind failure and returns `Err(())`, matching every other
+/// fallible spawn helper's convention.
+#[cfg(feature = "metrics-api")]
+async fn spawn_metrics_task(
+    listen: Option<std::net::SocketAddr>,
+    daemon_handle: &DaemonHandle,
+    cache: crate::cache::SharedDnsCache,
+    #[cfg(feature = "dhcp")] leases: Option<crate::dhcp::SharedLeaseDb>,
+) -> Result<Option<tokio::task::JoinHandle<()>>, ()> {
+    let Some(addr) = listen else { return Ok(None) };
+
+    // Bind synchronously before spawning, so a bad address is a startup
+    // error rather than a silently-dead background task.
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("failed to bind metrics socket on {addr}: {e}");
+            return Err(());
+        }
+    };
+    if !addr.ip().is_loopback() {
+        tracing::warn!(
+            "metrics endpoint listening on {addr}, which is not a loopback address — \
+             /metrics is unauthenticated by design, so consider whether this host should be \
+             reachable from beyond loopback at all"
+        );
+    }
+    tracing::info!("metrics endpoint listening on {addr}");
+
+    let daemon = daemon_handle.clone();
+    Ok(Some(tokio::spawn(async move {
+        if let Err(e) = crate::metrics_api::serve_on(
+            listener,
+            daemon,
+            cache,
+            #[cfg(feature = "dhcp")]
+            leases,
+        )
+        .await
+        {
+            tracing::error!("metrics server exited: {e}");
+        }
+    })))
+}
+
 /// Adopt the TFTP sockets bound before the fork (if any) and spawn
 /// [`crate::tftp::run_tftp_loop`] over them.
 #[cfg(feature = "tftp")]
@@ -2177,6 +2228,8 @@ pub async fn run_main_loop_with(
     // needed by the web API spawn much further down.
     #[cfg(feature = "web-api")]
     let web_api_cache = cache.clone();
+    #[cfg(feature = "metrics-api")]
+    let metrics_cache = cache.clone();
 
     // ── inotify: dynamic-dir initial scan + watch task ───────────────────────
     //
@@ -2360,6 +2413,58 @@ pub async fn run_main_loop_with(
         }
     };
 
+    // ── Metrics (`--metrics-listen`) ────────────────────────────────────────
+    #[cfg(feature = "metrics-api")]
+    let metrics_task = {
+        let listen = daemon_handle.read().await.metrics_listen;
+        match spawn_metrics_task(
+            listen,
+            &daemon_handle,
+            metrics_cache,
+            #[cfg(feature = "dhcp")]
+            dhcp_lease_db.clone(),
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(()) => {
+                fwd_task.abort();
+                arp_task.abort();
+                #[cfg(feature = "tftp")]
+                if let Some(t) = tftp_task.as_ref() { t.abort(); }
+                #[cfg(feature = "dhcp")]
+                {
+                    if let Some(tx) = dhcp_shutdown_tx.as_ref() {
+                        let _ = tx.send(true);
+                    }
+                    if let Some(task) = dhcp_task.as_ref() {
+                        task.abort();
+                    }
+                }
+                #[cfg(feature = "dhcp6")]
+                {
+                    if let Some(tx) = dhcp6_shutdown_tx.as_ref() {
+                        let _ = tx.send(true);
+                    }
+                    if let Some(task) = dhcp6_task.as_ref() {
+                        task.abort();
+                    }
+                    if let Some(tx) = radv_shutdown_tx.as_ref() {
+                        let _ = tx.send(true);
+                    }
+                    if let Some(task) = radv_task.as_ref() {
+                        task.abort();
+                    }
+                }
+                #[cfg(feature = "web-api")]
+                if let Some(task) = web_api_task.as_ref() {
+                    task.abort();
+                }
+                return RunResult::IoError;
+            }
+        }
+    };
+
     // ── Signal handling ──────────────────────────────────────────────────────
     let mut sigterm = match signal(SignalKind::terminate()) {
         Ok(s) => s,
@@ -2405,6 +2510,10 @@ pub async fn run_main_loop_with(
             }
             #[cfg(feature = "web-api")]
             if let Some(task) = web_api_task.as_ref() {
+                task.abort();
+            }
+            #[cfg(feature = "metrics-api")]
+            if let Some(task) = metrics_task.as_ref() {
                 task.abort();
             }
             fwd_task.abort();
@@ -2458,6 +2567,10 @@ pub async fn run_main_loop_with(
             if let Some(task) = web_api_task.as_ref() {
                 task.abort();
             }
+            #[cfg(feature = "metrics-api")]
+            if let Some(task) = metrics_task.as_ref() {
+                task.abort();
+            }
             fwd_task.abort();
             arp_task.abort();
             return RunResult::IoError;
@@ -2504,6 +2617,10 @@ pub async fn run_main_loop_with(
     }
     #[cfg(feature = "web-api")]
     if let Some(task) = web_api_task {
+        task.abort();
+    }
+    #[cfg(feature = "metrics-api")]
+    if let Some(task) = metrics_task {
         task.abort();
     }
     #[cfg(feature = "dhcp")]

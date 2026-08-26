@@ -124,6 +124,7 @@ Integration tests in `tests/` import through the library (`dnsmasq_rs::*`), so t
 | `src/yaml_config.rs` | YAML `conf-file` support (`yaml-config` feature) — parses into the same `ConfigLine`s `option.rs`'s text parser produces; no upstream counterpart |
 | `src/web_api.rs` | HTTP status/diagnostics/control API (`web-api` feature, `--web-api-listen`), bearer-token auth (`--web-api-token-file`/`--web-api-create-token`) — no upstream counterpart |
 | `src/web_ui.rs` | Self-hosted server-rendered web UI (`web-ui` feature, layered on `web-api`) — login + dashboard, htmx for partial updates, vendored `assets/htmx.min.js`, same bearer token as a cookie — no upstream counterpart |
+| `src/metrics_api.rs` | Prometheus-compatible `/metrics` endpoint (`metrics-api` feature, `--metrics-listen`) — standalone from `web-api`/`web-ui`, unauthenticated by design — no upstream counterpart |
 | `src/dnsmasq.rs`, `src/main.rs` | Daemon init, privilege drop, daemonization, signals, main loop |
 | `src/rfc2131.rs`, `src/dhcp.rs`, `src/lease.rs`, `src/helper.rs` | DHCPv4 |
 | `src/rfc3315.rs`, `src/dhcp6.rs`, `src/radv.rs`, `src/slaac.rs` | DHCPv6 and RA |
@@ -136,7 +137,7 @@ Integration tests in `tests/` import through the library (`dnsmasq_rs::*`), so t
 
 Cargo features mirror upstream's compile-time `HAVE_*` defines. Defaults: `dhcp dhcp6 dnssec auth tftp loop inotify dump`. `dhcp6` implies `dhcp`. Non-default: `conntrack`, `dbus` (pulls `zbus`), `ubus`, `ipset`, `nftset`. There is no `bpf` feature — `src/bpf.rs` was speculative classic-BPF filter code with no upstream counterpart and no caller; it was removed (see `tasks.md` P5). Upstream `bpf.c` is BSD/Solaris-only routing-socket code with no Linux relevance; its Linux analog is `netlink.rs`.
 
-`legacy-config` (default-on) and `yaml-config` (default-off, pulls `serde`/`serde_norway`) are dnsmasq-rs-specific, with no upstream `HAVE_*` counterpart — see "Config file formats" below. `web-api`/`web-ui`/`journald` are likewise dnsmasq-rs-specific (see the module map below); `journald` gates a hand-rolled native journald client (`--log-facility=journald`, `src/log.rs`) with no new dependency.
+`legacy-config` (default-on) and `yaml-config` (default-off, pulls `serde`/`serde_norway`) are dnsmasq-rs-specific, with no upstream `HAVE_*` counterpart — see "Config file formats" below. `web-api`/`web-ui`/`journald`/`metrics-api` are likewise dnsmasq-rs-specific (see the module map below); `journald` gates a hand-rolled native journald client (`--log-facility=journald`, `src/log.rs`) with no new dependency; `metrics-api` gates the Prometheus `/metrics` endpoint, deliberately independent of `web-api` (own feature, own `--metrics-listen`, own listener).
 
 Gates apply both to `pub mod` declarations (in *both* `lib.rs` and `main.rs`) and inside modules. Gate leakage is a live bug class — see the `--no-default-features` failure above.
 

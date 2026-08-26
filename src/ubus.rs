@@ -1328,42 +1328,12 @@ async fn dispatch_invoke(
 /// `ubus_handle_metrics()` (ubus.c:184-201): every daemon metric as a
 /// `blobmsg` table of `u32` counters.
 fn handle_metrics() -> Vec<u8> {
-    use crate::metrics::{get_metric, metric_name, Metric};
+    use crate::metrics::{get_metric, metric_name, ALL_METRICS};
 
-    const ALL: &[Metric] = &[
-        Metric::DnsCacheInserted,
-        Metric::DnsCacheLiveFreed,
-        Metric::DnsQueriesForwarded,
-        Metric::DnsAuthAnswered,
-        Metric::DnsLocalAnswered,
-        Metric::DnsStaleAnswered,
-        Metric::DnsUnansweredQuery,
-        Metric::CryptoHwm,
-        Metric::SigFailHwm,
-        Metric::WorkHwm,
-        Metric::Bootp,
-        Metric::Pxe,
-        Metric::Dhcpack,
-        Metric::Dhcpdecline,
-        Metric::Dhcpdiscover,
-        Metric::Dhcpinform,
-        Metric::Dhcpnak,
-        Metric::Dhcpoffer,
-        Metric::Dhcprelease,
-        Metric::Dhcprequest,
-        Metric::Noanswer,
-        Metric::LeasesAllocated4,
-        Metric::LeasesPruned4,
-        Metric::LeasesAllocated6,
-        Metric::LeasesPruned6,
-        Metric::TcpConnections,
-        Metric::Dhcpleasequery,
-        Metric::Dhcpleaseunassigned,
-        Metric::Dhcpleaseactive,
-        Metric::Dhcpleaseunknown,
-    ];
-    let fields: Vec<(&str, blobmsg::Value)> =
-        ALL.iter().map(|&m| (metric_name(m), blobmsg::Value::I32(get_metric(m) as i32))).collect();
+    let fields: Vec<(&str, blobmsg::Value)> = ALL_METRICS
+        .iter()
+        .map(|&m| (metric_name(m), blobmsg::Value::I32(get_metric(m) as i32)))
+        .collect();
     blobmsg::encode_table(&fields)
 }
 

@@ -60,6 +60,23 @@ pub fn get_metric(m: Metric) -> u64 {
     COUNTERS[m as usize].load(Ordering::Relaxed)
 }
 
+/// Every tracked metric except the `MetricMax` sentinel, for callers that
+/// need to enumerate all of them (DBus's `GetMetrics`, UBus's `metrics` RPC,
+/// the Prometheus `/metrics` endpoint). `Metric` doesn't derive an
+/// iteration helper, so this is the one hand-maintained list — keep it in
+/// sync whenever a variant is added or removed.
+pub const ALL_METRICS: &[Metric] = {
+    use Metric::*;
+    &[
+        DnsCacheInserted, DnsCacheLiveFreed, DnsQueriesForwarded, DnsAuthAnswered,
+        DnsLocalAnswered, DnsStaleAnswered, DnsUnansweredQuery, CryptoHwm, SigFailHwm, WorkHwm,
+        Bootp, Pxe, Dhcpack, Dhcpdecline, Dhcpdiscover, Dhcpinform, Dhcpnak, Dhcpoffer,
+        Dhcprelease, Dhcprequest, Noanswer, LeasesAllocated4, LeasesPruned4, LeasesAllocated6,
+        LeasesPruned6, TcpConnections, Dhcpleasequery, Dhcpleaseunassigned, Dhcpleaseactive,
+        Dhcpleaseunknown,
+    ]
+};
+
 /// Reset all metric counters to zero, including per-server statistics.
 pub fn clear_metrics(daemon: &mut Daemon) {
     for c in &COUNTERS {

@@ -664,6 +664,33 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     `tracing` diagnostics and `my_syslog`-ported DHCP/DNS event lines (e.g. `--log-queries`).
     This is the logging half of #127 ("logs/metrics"), split out as #172; the Prometheus
     metrics half is #173.
+
+    **Issue #173 (2026-08-26):** Prometheus metrics half of #127, as a new standalone
+    `metrics-api` Cargo feature (off by default, independent of `web-api`/`dhcp` — no
+    token/UI machinery required just to scrape metrics) and `--metrics-listen=<addr:port>`
+    directive. `src/metrics_api.rs` serves `GET /metrics` in Prometheus text exposition
+    format, unauthenticated by design (standard scrape practice, matches `/healthz`'s
+    precedent): every counter in `crate::metrics::Metric`, per-upstream-server query/
+    failure/retry/nxdomain counters (labeled by `server="ip:port"`), the configured DNS
+    cache size limit and current entry count, and (when `dhcp` is also compiled in and
+    running) the current DHCP lease *count* only — no per-lease hostname/MAC detail, since
+    that stays behind `/api/v1/leases`'s bearer token and this endpoint has none. Reuses
+    the `SharedDnsCache`/`SharedLeaseDb` handles `web_api.rs`/`dnsmasq.rs` already thread
+    around (see #168) rather than inventing a second lease-state path.
+
+    In the process, deduplicated three independent hand-copies of "every `Metric` variant
+    except `MetricMax`" (`dbus.rs`'s `GetMetrics`, `ubus.rs`'s `metrics` RPC, and this new
+    endpoint would have been a fourth) into one `pub const ALL_METRICS` in
+    `src/metrics/mod.rs`; `dbus.rs`/`ubus.rs` now both reference it instead of maintaining
+    their own copies, closing the drift risk the original `dbus.rs` comment ("kept local
+    to this module... since this is the only caller that needs one") explicitly flagged
+    once a second caller showed up.
+
+    Verified live: started the daemon with `dhcp-range` + `metrics-listen` on
+    non-privileged ports, drove a real DHCP DISCOVER/REQUEST exchange and DNS queries,
+    and confirmed the scraped output reflected them (`dhcp_discover` incremented,
+    `dhcp_leases_current` matched the one granted lease, `cache_entries` tracked the real
+    `DnsCache`), plus confirmed an unmatched route 404s with no auth prompt.
   - `my_syslog` output now passes through the `tracing` `EnvFilter`, so `RUST_LOG` can
     suppress records upstream would always write. Upstream filters only on `MS_DEBUG`.
     This is additive, not a replacement: the real `/dev/log` delivery above happens

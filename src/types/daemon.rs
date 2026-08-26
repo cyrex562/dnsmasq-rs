@@ -169,6 +169,11 @@ pub struct Daemon {
     /// store to check bearer tokens against (see `crate::web_api`).
     #[cfg(feature = "web-api")]
     pub web_api_token_file: Option<String>,
+    /// `--metrics-listen` (`metrics-api` feature). `None` (the default)
+    /// means the Prometheus `/metrics` endpoint does not listen at all.
+    /// Standalone from `web_api_listen` by design — see `crate::metrics_api`.
+    #[cfg(feature = "metrics-api")]
+    pub metrics_listen: Option<std::net::SocketAddr>,
     pub lease_change_command: Option<String>,
     pub lease_file:      Option<String>,
     pub dns_client_id:   Option<String>,
@@ -480,6 +485,8 @@ impl Default for Daemon {
             web_api_listen: None,
             #[cfg(feature = "web-api")]
             web_api_token_file: None,
+            #[cfg(feature = "metrics-api")]
+            metrics_listen: None,
             lease_change_command: None,
             lease_file: None,
             dns_client_id: None,

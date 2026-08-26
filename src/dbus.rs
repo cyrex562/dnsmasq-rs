@@ -261,24 +261,9 @@ pub fn apply_set_servers(daemon: &mut Daemon, args: &[ServerArg]) -> Result<(), 
 
 // ─── Metrics (GetMetrics / GetServerMetrics / ClearMetrics) ───────────────
 
-/// All tracked metrics except the `MetricMax` sentinel — kept local to this
-/// module rather than added to `metrics.rs`, since `Metric` doesn't expose an
-/// iteration helper and this is the only caller that needs one.
-const ALL_METRICS: &[crate::metrics::Metric] = {
-    use crate::metrics::Metric::*;
-    &[
-        DnsCacheInserted, DnsCacheLiveFreed, DnsQueriesForwarded, DnsAuthAnswered,
-        DnsLocalAnswered, DnsStaleAnswered, DnsUnansweredQuery, CryptoHwm, SigFailHwm, WorkHwm,
-        Bootp, Pxe, Dhcpack, Dhcpdecline, Dhcpdiscover, Dhcpinform, Dhcpnak, Dhcpoffer,
-        Dhcprelease, Dhcprequest, Noanswer, LeasesAllocated4, LeasesPruned4, LeasesAllocated6,
-        LeasesPruned6, TcpConnections, Dhcpleasequery, Dhcpleaseunassigned, Dhcpleaseactive,
-        Dhcpleaseunknown,
-    ]
-};
-
 /// `GetMetrics` (`dbus.c:703-725`): every counter, keyed by its upstream name.
 pub fn metrics_dict() -> HashMap<String, u32> {
-    ALL_METRICS
+    crate::metrics::ALL_METRICS
         .iter()
         .map(|m| (crate::metrics::metric_name(*m).to_string(), crate::metrics::get_metric(*m) as u32))
         .collect()
@@ -1015,7 +1000,7 @@ mod tests {
     #[test]
     fn metrics_dict_has_one_entry_per_metric() {
         let dict = metrics_dict();
-        assert_eq!(dict.len(), ALL_METRICS.len());
+        assert_eq!(dict.len(), crate::metrics::ALL_METRICS.len());
         assert!(dict.contains_key("dns_queries_forwarded"));
     }
 

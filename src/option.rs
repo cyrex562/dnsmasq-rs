@@ -237,6 +237,13 @@ pub struct CliArgs {
     #[arg(long = "web-api-token-label", value_name = "LABEL", requires = "web_api_create_token")]
     pub web_api_token_label: Option<String>,
 
+    /// Listen address for the Prometheus-compatible `/metrics` endpoint
+    /// (`metrics-api` feature). Not listening at all unless set. Standalone
+    /// from `--web-api-listen` — no auth, no token required.
+    #[cfg(feature = "metrics-api")]
+    #[arg(long = "metrics-listen", value_name = "ADDR:PORT")]
+    pub metrics_listen: Option<String>,
+
     /// Log to this file/facility.
     #[arg(long = "log-facility", value_name = "TARGET")]
     pub log_facility: Option<String>,
@@ -401,6 +408,8 @@ pub fn config_lines_from_cli(args: &CliArgs) -> Vec<ConfigLine> {
     value!(web_api_listen, "web-api-listen");
     #[cfg(feature = "web-api")]
     value!(web_api_token_file, "web-api-token-file");
+    #[cfg(feature = "metrics-api")]
+    value!(metrics_listen, "metrics-listen");
     value!(log_facility, "log-facility");
     value!(log_async, "log-async");
     value!(servers_file, "servers-file");
@@ -1073,6 +1082,17 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             // `opt_string_alloc` (option.c:677-691) returns NULL for the empty
             // string, so `pid-file=` is upstream's way of asking for no pid file.
             daemon.runfile = if v.is_empty() { None } else { Some(v.to_string()) };
+        }
+
+        // No upstream counterpart — new management surface for this port
+        // (issue #173), not a C directive.
+        #[cfg(feature = "metrics-api")]
+        "metrics-listen" => {
+            let v = require_value("metrics-listen")?;
+            daemon.metrics_listen = Some(
+                v.parse::<std::net::SocketAddr>()
+                    .map_err(|e| invalid_value_for(cl, key, v, &format!("expected an address:port pair: {e}")))?,
+            );
         }
 
         // No upstream counterpart — new management surface for this port
