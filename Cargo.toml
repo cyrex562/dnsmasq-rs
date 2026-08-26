@@ -28,6 +28,8 @@ yaml-config = ["dep:serde", "dep:serde_norway"]
 # Read-only HTTP status/diagnostics API (`--web-api-listen=<addr:port>`).
 # Off by default. See issue #165; no authentication yet (issue #166).
 web-api = ["dep:axum", "dep:serde", "dep:serde_json", "dep:tower"]
+# Self-hosted server-rendered web UI (htmx) layered on web-api. See #167.
+web-ui = ["web-api"]
 
 [lib]
 name = "dnsmasq_rs"

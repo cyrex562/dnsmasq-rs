@@ -6,6 +6,7 @@ pub mod dnsmasq;
 pub mod option;
 pub mod yaml_config;
 pub mod web_api;
+pub mod web_ui;
 
 pub mod network;
 pub mod netlink;

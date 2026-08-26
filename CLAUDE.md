@@ -123,6 +123,7 @@ Integration tests in `tests/` import through the library (`dnsmasq_rs::*`), so t
 | `src/option.rs` | Config parsing and application — port of `option.c` |
 | `src/yaml_config.rs` | YAML `conf-file` support (`yaml-config` feature) — parses into the same `ConfigLine`s `option.rs`'s text parser produces; no upstream counterpart |
 | `src/web_api.rs` | HTTP status/diagnostics/control API (`web-api` feature, `--web-api-listen`), bearer-token auth (`--web-api-token-file`/`--web-api-create-token`) — no upstream counterpart |
+| `src/web_ui.rs` | Self-hosted server-rendered web UI (`web-ui` feature, layered on `web-api`) — login + dashboard, htmx for partial updates, vendored `assets/htmx.min.js`, same bearer token as a cookie — no upstream counterpart |
 | `src/dnsmasq.rs`, `src/main.rs` | Daemon init, privilege drop, daemonization, signals, main loop |
 | `src/rfc2131.rs`, `src/dhcp.rs`, `src/lease.rs`, `src/helper.rs` | DHCPv4 |
 | `src/rfc3315.rs`, `src/dhcp6.rs`, `src/radv.rs`, `src/slaac.rs` | DHCPv6 and RA |
