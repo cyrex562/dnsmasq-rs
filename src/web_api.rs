@@ -34,6 +34,9 @@ use crate::metrics::{get_metric, Metric};
 pub(crate) struct AppState {
     pub(crate) daemon: DaemonHandle,
     pub(crate) cache: SharedDnsCache,
+    /// Shared with the live forward loop so `/api/v1/reload` actually takes
+    /// effect on query answering, not just `Daemon` state (issue #174).
+    pub(crate) fwd_config: crate::forward::SharedForwardConfig,
     pub(crate) started_at: Instant,
     pub(crate) token_file: String,
     /// `None` when DHCP isn't configured/running; `/api/v1/leases` then
@@ -87,12 +90,14 @@ pub async fn serve_on(
     listener: tokio::net::TcpListener,
     daemon: DaemonHandle,
     cache: SharedDnsCache,
+    fwd_config: crate::forward::SharedForwardConfig,
     token_file: String,
     #[cfg(feature = "dhcp")] leases: Option<crate::dhcp::SharedLeaseDb>,
 ) -> std::io::Result<()> {
     let state = AppState {
         daemon,
         cache,
+        fwd_config,
         started_at: Instant::now(),
         token_file,
         #[cfg(feature = "dhcp")]
@@ -272,7 +277,7 @@ async fn config_summary(State(state): State<AppState>) -> Json<ConfigSummaryResp
 /// this is the first mutating route, and deliberately reuses the
 /// already-tested reload path rather than a new one.
 async fn reload(State(state): State<AppState>) -> StatusCode {
-    crate::dnsmasq::on_sighup(&state.daemon, &state.cache).await;
+    crate::dnsmasq::on_sighup(&state.daemon, &state.cache, &state.fwd_config).await;
     StatusCode::NO_CONTENT
 }
 
@@ -321,6 +326,7 @@ mod tests {
         AppState {
             daemon: crate::dnsmasq::init_daemon_with(crate::types::daemon::Daemon::default()),
             cache: std::sync::Arc::new(tokio::sync::Mutex::new(crate::cache::DnsCache::new(100))),
+            fwd_config: std::sync::Arc::new(tokio::sync::Mutex::new(crate::forward::ForwardConfig::default())),
             started_at: Instant::now(),
             token_file: token_file.to_string(),
             #[cfg(feature = "dhcp")]

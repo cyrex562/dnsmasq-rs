@@ -341,23 +341,15 @@ fn write_pid_file_if_configured(
 
 /// The async half of startup: everything that needs the tokio runtime.
 async fn run(daemon: Daemon, listeners: Listeners) {
-    use tracing::{info, warn};
+    use tracing::info;
 
     let daemon_handle = dnsmasq::init_daemon_with(daemon);
     let cache = dnsmasq::build_shared_cache(&daemon_handle).await;
 
-    let (sighup_tx, mut sighup_rx) = tokio::sync::mpsc::channel::<()>(4);
-    let daemon_clone = daemon_handle.clone();
-    let cache_clone = cache.clone();
-    tokio::spawn(async move {
-        while sighup_rx.recv().await.is_some() {
-            warn!("SIGHUP: reloading configuration");
-            dnsmasq::on_sighup(&daemon_clone, &cache_clone).await;
-        }
-    });
-
-    let result =
-        dnsmasq::run_main_loop_with(daemon_handle, Some(sighup_tx), Some(listeners), cache).await;
+    // SIGHUP reload is handled inside `run_main_loop_with` itself now (issue
+    // #174) — it builds the `SharedForwardConfig` the live forward loop
+    // reads from, which a separately-spawned task here could never reach.
+    let result = dnsmasq::run_main_loop_with(daemon_handle, Some(listeners), cache).await;
 
     info!("dnsmasq-rs stopped ({result:?})");
 }

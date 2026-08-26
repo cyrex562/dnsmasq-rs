@@ -1610,9 +1610,10 @@ fn spawn_netlink_watch_task() -> Option<tokio::task::JoinHandle<()>> {
 fn spawn_inotify_watch_task(
     daemon_handle: DaemonHandle,
     cache: crate::cache::SharedDnsCache,
+    fwd_config: crate::forward::SharedForwardConfig,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = crate::inotify::watch_inotify_changes(daemon_handle, cache).await {
+        if let Err(e) = crate::inotify::watch_inotify_changes(daemon_handle, cache, fwd_config).await {
             tracing::warn!("inotify watch loop exited: {e}");
         }
     })
@@ -1767,6 +1768,7 @@ async fn prepare_listeners(
 async fn spawn_dbus_task(
     daemon_handle: &DaemonHandle,
     cache: crate::cache::SharedDnsCache,
+    fwd_config: crate::forward::SharedForwardConfig,
 ) -> Option<tokio::task::JoinHandle<()>> {
     use std::sync::Arc;
 
@@ -1785,6 +1787,7 @@ async fn spawn_dbus_task(
     let ctx = crate::dbus::DbusContext {
         daemon: daemon_handle.clone(),
         cache,
+        fwd_config,
         #[cfg(feature = "dhcp")]
         leases: Arc::new(tokio::sync::Mutex::new(crate::lease::LeaseDb::new())),
         #[cfg(feature = "dhcp")]
@@ -1827,6 +1830,7 @@ async fn spawn_web_api_task(
     token_file: Option<String>,
     daemon_handle: &DaemonHandle,
     cache: crate::cache::SharedDnsCache,
+    fwd_config: crate::forward::SharedForwardConfig,
     #[cfg(feature = "dhcp")] leases: Option<crate::dhcp::SharedLeaseDb>,
 ) -> Result<Option<tokio::task::JoinHandle<()>>, ()> {
     let Some(addr) = listen else { return Ok(None) };
@@ -1863,6 +1867,7 @@ async fn spawn_web_api_task(
             listener,
             daemon,
             cache,
+            fwd_config,
             token_file,
             #[cfg(feature = "dhcp")]
             leases,
@@ -2109,19 +2114,19 @@ async fn spawn_radv_task(
 ///    `--interface`, `--except-interface`, `--listen-address` and the
 ///    `--bind-interfaces` / `--bind-dynamic` mode.
 /// 2. Spawns a tokio task running the forwarding engine.
-/// 3. Waits for SIGTERM, SIGINT, or SIGHUP.  On SIGHUP it notifies
-///    the provided `sighup_tx` channel (so the caller can reload config).
-///    On SIGTERM/SIGINT it shuts down.
+/// 3. Waits for SIGTERM, SIGINT, or SIGHUP.  On SIGHUP it calls
+///    [`on_sighup`] directly (see issue #174 — this used to forward the
+///    signal to a separately-spawned task in `main.rs` via an `mpsc`
+///    channel, which could never see the `SharedForwardConfig` this
+///    function builds; doing the reload here instead is what lets it reach
+///    the live forward loop). On SIGTERM/SIGINT it shuts down.
 ///
 /// The forwarding task is cancelled when the main loop exits.
 ///
 /// Returns [`RunResult::Clean`] on orderly shutdown.
-pub async fn run_main_loop(
-    daemon_handle: DaemonHandle,
-    sighup_tx: Option<tokio::sync::mpsc::Sender<()>>,
-) -> RunResult {
+pub async fn run_main_loop(daemon_handle: DaemonHandle) -> RunResult {
     let cache = build_shared_cache(&daemon_handle).await;
-    run_main_loop_with(daemon_handle, sighup_tx, None, cache).await
+    run_main_loop_with(daemon_handle, None, cache).await
 }
 
 /// Run the main daemon event loop over sockets that were bound earlier.
@@ -2136,7 +2141,6 @@ pub async fn run_main_loop(
 /// forward loop is reading from, rather than a disconnected copy.
 pub async fn run_main_loop_with(
     daemon_handle: DaemonHandle,
-    sighup_tx: Option<tokio::sync::mpsc::Sender<()>>,
     listeners: Option<Listeners>,
     cache: crate::cache::SharedDnsCache,
 ) -> RunResult {
@@ -2173,6 +2177,14 @@ pub async fn run_main_loop_with(
         Ok(dump) => fwd_config.dump = dump,
         Err(()) => return RunResult::IoError,
     }
+
+    // Shared so a reload (`clear_cache_and_reload`, issue #174) can replace
+    // what the *running* forward loop answers queries with — see
+    // `SharedForwardConfig`'s doc comment. Cloned into every subsystem below
+    // that can trigger a reload (SIGHUP here, `/api/v1/reload`, DBus,
+    // inotify), the same way `cache`/`daemon_handle` already are.
+    let fwd_config: crate::forward::SharedForwardConfig =
+        std::sync::Arc::new(tokio::sync::Mutex::new(fwd_config));
 
     // DUID generation mutates `daemon.duid`, so this needs a write lock —
     // taken and released here, separate from the read lock above.
@@ -2222,12 +2234,17 @@ pub async fn run_main_loop_with(
 
     // ── D-Bus (`--enable-dbus`) ───────────────────────────────────────────────
     #[cfg(feature = "dbus")]
-    let dbus_task = spawn_dbus_task(&daemon_handle, cache.clone()).await;
+    let dbus_task = spawn_dbus_task(&daemon_handle, cache.clone(), fwd_config.clone()).await;
 
-    // Captured here, before `fwd_task` below consumes `cache` by value —
-    // needed by the web API spawn much further down.
+    // Captured here, before `fwd_task` below consumes `cache`/`fwd_config` by
+    // value — needed by the web API spawn much further down, and by this
+    // function's own SIGHUP handling (see the main `select!` loop below).
+    let reload_cache = cache.clone();
+    let reload_fwd_config = fwd_config.clone();
     #[cfg(feature = "web-api")]
     let web_api_cache = cache.clone();
+    #[cfg(feature = "web-api")]
+    let web_api_fwd_config = fwd_config.clone();
     #[cfg(feature = "metrics-api")]
     let metrics_cache = cache.clone();
 
@@ -2245,7 +2262,7 @@ pub async fn run_main_loop_with(
         crate::inotify::set_dynamic_inotify(&mut d, &mut c);
     }
     #[cfg(feature = "inotify")]
-    let inotify_task = spawn_inotify_watch_task(daemon_handle.clone(), cache.clone());
+    let inotify_task = spawn_inotify_watch_task(daemon_handle.clone(), cache.clone(), fwd_config.clone());
 
     // ── UBus (`--ubus`) ───────────────────────────────────────────────────────
     #[cfg(feature = "ubus")]
@@ -2253,9 +2270,12 @@ pub async fn run_main_loop_with(
 
     // ── Spawn the forwarding engine ──────────────────────────────────────────
     let arp_housekeeping_state = arp_state.clone();
-    let fwd_task = tokio::spawn(async move {
-        if let Err(e) = run_forward_loop_on(dns_listeners, arrival_filter, fwd_config, cache, arp_state).await {
-            error!("forward loop exited: {e}");
+    let fwd_task = tokio::spawn({
+        let fwd_config = fwd_config.clone();
+        async move {
+            if let Err(e) = run_forward_loop_on(dns_listeners, arrival_filter, fwd_config, cache, arp_state).await {
+                error!("forward loop exited: {e}");
+            }
         }
     });
 
@@ -2373,6 +2393,7 @@ pub async fn run_main_loop_with(
             token_file,
             &daemon_handle,
             web_api_cache,
+            web_api_fwd_config,
             #[cfg(feature = "dhcp")]
             dhcp_lease_db.clone(),
         )
@@ -2585,9 +2606,7 @@ pub async fn run_main_loop_with(
             }
             _ = sighup.recv() => {
                 info!("received SIGHUP — reloading configuration");
-                if let Some(ref tx) = sighup_tx {
-                    let _ = tx.send(()).await;
-                }
+                on_sighup(&daemon_handle, &reload_cache, &reload_fwd_config).await;
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("received SIGINT — shutting down");
@@ -2662,11 +2681,15 @@ pub async fn run_main_loop_with(
 /// `cache` must be the same [`SharedDnsCache`](crate::cache::SharedDnsCache)
 /// the running forward loop was started with (see [`run_main_loop_with`]) —
 /// flushing a disconnected copy would leave the live cache untouched.
-pub async fn on_sighup(daemon_handle: &DaemonHandle, cache: &crate::cache::SharedDnsCache) {
+pub async fn on_sighup(
+    daemon_handle: &DaemonHandle,
+    cache: &crate::cache::SharedDnsCache,
+    fwd_config: &crate::forward::SharedForwardConfig,
+) {
     use tracing::info;
 
     info!("SIGHUP: initiating cache flush and config reload");
-    clear_cache_and_reload(daemon_handle, cache).await;
+    clear_cache_and_reload(daemon_handle, cache, fwd_config).await;
 
     // Increment the reload counter so other subsystems can detect reloads.
     let mut d = daemon_handle.write().await;
@@ -2828,7 +2851,11 @@ pub fn spawn_arp_housekeeping_task(
 ///   `dhcp-hostsdir`/`dhcp-optsdir` (`AH_DHCP_HST`/`AH_DHCP_OPT`) — matching
 ///   `set_dynamic_inotify`'s existing scope limits (see the `src/inotify.rs`
 ///   module doc).
-pub async fn clear_cache_and_reload(daemon_handle: &DaemonHandle, cache: &crate::cache::SharedDnsCache) {
+pub async fn clear_cache_and_reload(
+    daemon_handle: &DaemonHandle,
+    cache: &crate::cache::SharedDnsCache,
+    fwd_config: &crate::forward::SharedForwardConfig,
+) {
     use tracing::{info, warn};
     use crate::types::constants::OPT_NO_HOSTS;
 
@@ -2930,6 +2957,14 @@ pub async fn clear_cache_and_reload(daemon_handle: &DaemonHandle, cache: &crate:
 
     // Mark DNS data as dirty so consumers know to refresh.
     d.dns_dirty = true;
+
+    // Push a fresh snapshot to the *live* forward loop — otherwise the
+    // `daemon.servers`/hosts updates above would only be visible via the
+    // API/DBus/UBus reads of `Daemon`, never to actual query answering
+    // (issue #174: "reload staleness").
+    let fresh_fwd_config = daemon_forward_config(&d);
+    drop(d);
+    *fwd_config.lock().await = fresh_fwd_config;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -3580,6 +3615,14 @@ pub async fn run_radv_loop(
 mod tests {
     use super::*;
 
+    /// A throwaway `SharedForwardConfig` for tests that only care about the
+    /// `Daemon`/cache side-effects of `on_sighup`/`clear_cache_and_reload`,
+    /// not what actually reaches the (nonexistent, in these tests) forward
+    /// loop.
+    fn test_fwd_config() -> crate::forward::SharedForwardConfig {
+        std::sync::Arc::new(tokio::sync::Mutex::new(crate::forward::ForwardConfig::default()))
+    }
+
     /// A minimal upstream server entry; `Server` has no `Default`.
     fn test_server(interface: &str) -> crate::types::server::Server {
         use crate::types::addr::MySockAddr;
@@ -4082,7 +4125,6 @@ mod tests {
         let cache = build_shared_cache(&daemon_handle).await;
         let task = tokio::spawn(run_main_loop_with(
             daemon_handle,
-            None,
             Some(listeners),
             cache,
         ));
@@ -4125,7 +4167,7 @@ mod tests {
 
         let daemon_handle = init_daemon_with(daemon);
         let cache = build_shared_cache(&daemon_handle).await;
-        let task = tokio::spawn(run_main_loop_with(daemon_handle, None, Some(listeners), cache));
+        let task = tokio::spawn(run_main_loop_with(daemon_handle, Some(listeners), cache));
 
         // A freshly opened dump file has only the 24-byte global header.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -4218,7 +4260,6 @@ mod tests {
         let cache = build_shared_cache(&daemon_handle).await;
         let task = tokio::spawn(run_main_loop_with(
             daemon_handle.clone(),
-            None,
             Some(listeners),
             cache,
         ));
@@ -4753,7 +4794,7 @@ mod tests {
         let handle = init_daemon();
         let cache = crate::cache::new_shared_cache(150, 0, 0);
         // Should run without panic; cache clear is a no-op on empty cache.
-        on_sighup(&handle, &cache).await;
+        on_sighup(&handle, &cache, &test_fwd_config()).await;
     }
 
     // ── Alarm timer ───────────────────────────────────────────────────────────
@@ -4916,7 +4957,7 @@ mod tests {
             assert!(!d.dns_dirty);
         }
 
-        clear_cache_and_reload(&handle, &cache).await;
+        clear_cache_and_reload(&handle, &cache, &test_fwd_config()).await;
 
         let d = handle.read().await;
         assert!(d.dns_dirty);
@@ -4947,7 +4988,7 @@ mod tests {
             assert_eq!(c.len(), 1, "the answer must be in the cache before reload");
         }
 
-        clear_cache_and_reload(&handle, &cache).await;
+        clear_cache_and_reload(&handle, &cache, &test_fwd_config()).await;
 
         let c = cache.lock().await;
         assert_eq!(c.len(), 0, "reload must flush a forwarded answer out of the live cache");
@@ -4973,7 +5014,7 @@ mod tests {
         }
         let cache = crate::cache::new_shared_cache(150, 0, 0);
 
-        clear_cache_and_reload(&handle, &cache).await;
+        clear_cache_and_reload(&handle, &cache, &test_fwd_config()).await;
 
         let mut c = cache.lock().await;
         let now = Instant::now();
@@ -5016,7 +5057,7 @@ mod tests {
         }
         let cache = crate::cache::new_shared_cache(150, 0, 0);
 
-        clear_cache_and_reload(&handle, &cache).await;
+        clear_cache_and_reload(&handle, &cache, &test_fwd_config()).await;
 
         let mut c = cache.lock().await;
         assert!(
@@ -5052,7 +5093,7 @@ mod tests {
         }
         let cache = crate::cache::new_shared_cache(150, 0, 0);
 
-        clear_cache_and_reload(&handle, &cache).await;
+        clear_cache_and_reload(&handle, &cache, &test_fwd_config()).await;
 
         let d = handle.read().await;
         assert!(
@@ -5096,7 +5137,7 @@ mod tests {
         }
         let cache = crate::cache::new_shared_cache(150, 0, 0);
 
-        clear_cache_and_reload(&handle, &cache).await;
+        clear_cache_and_reload(&handle, &cache, &test_fwd_config()).await;
         {
             let d = handle.read().await;
             assert_eq!(
@@ -5110,7 +5151,7 @@ mod tests {
         // mid-rewrite resolv.conf): the read fails, and the previously
         // discovered server must survive rather than being wiped.
         std::fs::remove_file(&path).unwrap();
-        clear_cache_and_reload(&handle, &cache).await;
+        clear_cache_and_reload(&handle, &cache, &test_fwd_config()).await;
 
         let d = handle.read().await;
         assert_eq!(
@@ -5124,8 +5165,8 @@ mod tests {
     async fn clear_cache_and_reload_idempotent() {
         let handle = init_daemon();
         let cache = crate::cache::new_shared_cache(150, 0, 0);
-        clear_cache_and_reload(&handle, &cache).await;
-        clear_cache_and_reload(&handle, &cache).await;
+        clear_cache_and_reload(&handle, &cache, &test_fwd_config()).await;
+        clear_cache_and_reload(&handle, &cache, &test_fwd_config()).await;
 
         let d = handle.read().await;
         assert!(d.dns_dirty);
@@ -5160,9 +5201,9 @@ mod tests {
         }
         let cache = crate::cache::new_shared_cache(150, 0, 0);
 
-        clear_cache_and_reload(&handle, &cache).await;
-        clear_cache_and_reload(&handle, &cache).await;
-        clear_cache_and_reload(&handle, &cache).await;
+        clear_cache_and_reload(&handle, &cache, &test_fwd_config()).await;
+        clear_cache_and_reload(&handle, &cache, &test_fwd_config()).await;
+        clear_cache_and_reload(&handle, &cache, &test_fwd_config()).await;
 
         let d = handle.read().await;
         let resolv_derived =
@@ -5204,7 +5245,7 @@ mod tests {
         }
         let cache = crate::cache::new_shared_cache(150, 0, 0);
 
-        clear_cache_and_reload(&handle, &cache).await;
+        clear_cache_and_reload(&handle, &cache, &test_fwd_config()).await;
         {
             let mut d = handle.write().await;
             let server = d
@@ -5216,7 +5257,7 @@ mod tests {
         }
 
         // The file is re-read with identical content; the address is unchanged.
-        clear_cache_and_reload(&handle, &cache).await;
+        clear_cache_and_reload(&handle, &cache, &test_fwd_config()).await;
 
         let d = handle.read().await;
         let server = d
@@ -5261,7 +5302,7 @@ mod tests {
         }
         let cache = crate::cache::new_shared_cache(150, 0, 0);
 
-        clear_cache_and_reload(&handle, &cache).await;
+        clear_cache_and_reload(&handle, &cache, &test_fwd_config()).await;
 
         let d = handle.read().await;
         let server = d
@@ -5290,7 +5331,7 @@ mod tests {
         }
         let cache = crate::cache::new_shared_cache(150, 0, 0);
 
-        clear_cache_and_reload(&handle, &cache).await;
+        clear_cache_and_reload(&handle, &cache, &test_fwd_config()).await;
 
         let d = handle.read().await;
         assert_eq!(d.servers.len(), 1, "an explicit server must not be dropped by reload");
@@ -5358,7 +5399,7 @@ mod tests {
             assert!(!d.dns_dirty);
         }
 
-        on_sighup(&handle, &cache).await;
+        on_sighup(&handle, &cache, &test_fwd_config()).await;
 
         let d = handle.read().await;
         assert!(d.dns_dirty);
@@ -5370,9 +5411,9 @@ mod tests {
         let handle = init_daemon();
         let cache = crate::cache::new_shared_cache(150, 0, 0);
 
-        on_sighup(&handle, &cache).await;
-        on_sighup(&handle, &cache).await;
-        on_sighup(&handle, &cache).await;
+        on_sighup(&handle, &cache, &test_fwd_config()).await;
+        on_sighup(&handle, &cache, &test_fwd_config()).await;
+        on_sighup(&handle, &cache, &test_fwd_config()).await;
 
         let d = handle.read().await;
         assert_eq!(d.reload_count, 3);

@@ -450,6 +450,7 @@ fn should_force_resolv_reload(daemon: &Daemon, hit: bool) -> bool {
 pub async fn watch_inotify_changes(
     daemon_handle: crate::dnsmasq::DaemonHandle,
     cache: crate::cache::SharedDnsCache,
+    fwd_config: crate::forward::SharedForwardConfig,
 ) -> std::io::Result<()> {
     use std::os::fd::{FromRawFd, OwnedFd};
 
@@ -475,7 +476,7 @@ pub async fn watch_inotify_changes(
             should_force_resolv_reload(&d, hit)
         };
         if should_reload {
-            crate::dnsmasq::clear_cache_and_reload(&daemon_handle, &cache).await;
+            crate::dnsmasq::clear_cache_and_reload(&daemon_handle, &cache, &fwd_config).await;
         }
     }
 }

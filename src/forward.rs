@@ -1075,6 +1075,13 @@ impl LocalData {
     }
 }
 
+/// Shared handle to the live forwarding configuration, so a reload
+/// (`dnsmasq::clear_cache_and_reload`) can replace what the *running*
+/// forward loop actually answers queries with, not just what `Daemon`
+/// reports via the API/DBus/UBus. Mirrors [`crate::cache::SharedDnsCache`]'s
+/// `Arc<Mutex<_>>` pattern. See issue #174.
+pub type SharedForwardConfig = std::sync::Arc<tokio::sync::Mutex<ForwardConfig>>;
+
 /// Configuration for the forwarding engine.
 #[derive(Debug, Clone)]
 pub struct ForwardConfig {
@@ -1393,6 +1400,24 @@ impl ForwardEngine {
     pub fn with_arp_state(mut self, arp_state: crate::arp::SharedArpState) -> Self {
         self.arp_state = arp_state;
         self
+    }
+
+    /// Swap in a fresh `ForwardConfig` after a reload (issue #174: the
+    /// forward loop previously only ever saw the `ForwardConfig` it was
+    /// constructed with, so a SIGHUP/API reload's `daemon.servers`/hosts
+    /// update never reached actual query answering). Recomputes
+    /// `upstream_order`/`loop_servers` — the transient state [`Self::new`]
+    /// derives from the upstream list — so a shrunk or grown server list
+    /// doesn't leave stale indices behind. Deliberately leaves `table`
+    /// (in-flight queries) and `rfd_pool` (the socket pool) untouched: a
+    /// reload must not drop or disrupt queries already in progress.
+    pub fn refresh_config(&mut self, config: ForwardConfig) {
+        self.upstream_order = (0..config.upstreams.len()).collect();
+        #[cfg(feature = "loop")]
+        {
+            self.loop_servers = config.loop_servers.clone();
+        }
+        self.config = config;
     }
 
     /// Hand any sockets freed along with a `Frec` back to the pool.
@@ -2365,6 +2390,9 @@ pub async fn run_forward_loop(
         config.min_cache_ttl,
         config.max_cache_ttl,
     );
+    // No reload path exists for this simple single-socket wrapper — nothing
+    // outside this function ever touches the shared handle.
+    let config = std::sync::Arc::new(tokio::sync::Mutex::new(config));
     run_forward_loop_on(
         vec![DnsListener { sock: client_sock, check_dst: false }],
         None,
@@ -2906,7 +2934,7 @@ async fn handle_upstream_reply(
 pub async fn run_forward_loop_on(
     listeners: Vec<DnsListener>,
     filter:    Option<crate::network::ArrivalFilter>,
-    config:    ForwardConfig,
+    config:    SharedForwardConfig,
     cache:     SharedDnsCache,
     arp_state: crate::arp::SharedArpState,
 ) -> std::io::Result<()> {
@@ -2918,14 +2946,19 @@ pub async fn run_forward_loop_on(
     }
     let mut listeners = listeners;
     let mut filter = filter;
-    let port = config.port;
+    let initial_config = config.lock().await.clone();
+    let port = initial_config.port;
 
     // Local data is owned by the loop; `LocalConfig` borrows from `local` and
-    // is rebuilt per query.  The cache is shared with SIGHUP reload handling
-    // (`dnsmasq::clear_cache_and_reload`), which is the only other thing that
-    // ever touches it, so a `tokio::sync::Mutex` needs no fairness tuning.
-    let local            = config.local.clone();
-    let mut engine       = ForwardEngine::new(config).with_arp_state(arp_state);
+    // is rebuilt per query. Refreshed from `config` alongside `engine.config`
+    // on every periodic cleanup tick (see below) — otherwise host-records/
+    // CNAMEs would keep answering from the config the process started with,
+    // forever (issue #174: "reload staleness"). The cache is shared with
+    // SIGHUP reload handling (`dnsmasq::clear_cache_and_reload`), which is
+    // the only other thing that ever touches it, so a `tokio::sync::Mutex`
+    // needs no fairness tuning.
+    let mut local        = initial_config.local.clone();
+    let mut engine       = ForwardEngine::new(initial_config).with_arp_state(arp_state);
     let mut client_buf   = vec![0u8; MAX_PACKET_SIZE];
     let mut upstream_buf = vec![0u8; MAX_PACKET_SIZE];
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -2955,6 +2988,12 @@ pub async fn run_forward_loop_on(
             }
             // ── Periodic expiry cleanup ───────────────────────────────────────
             _ = ticker.tick() => {
+                // Pick up a fresh `ForwardConfig` here rather than on every
+                // query: a reload is rare, a 1-second staleness window is
+                // harmless, and this keeps the per-query hot path lock-free.
+                let fresh = config.lock().await.clone();
+                local = fresh.local.clone();
+                engine.refresh_config(fresh);
                 run_periodic_cleanup(&mut engine, &mut filter, &mut listeners, &mut scan_from, port)?;
             }
         }

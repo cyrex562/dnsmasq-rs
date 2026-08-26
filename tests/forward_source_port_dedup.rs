@@ -120,7 +120,7 @@ async fn spawn_server(config: ForwardConfig) -> Option<SocketAddr> {
     let cache = new_shared_cache(config.cache_size, config.min_cache_ttl, config.max_cache_ttl);
     let listener = DnsListener { sock: Arc::new(sock), check_dst: false };
     tokio::spawn(async move {
-        let _ = run_forward_loop_on(vec![listener], None, config, cache, dnsmasq_rs::arp::new_shared_arp_state()).await;
+        let _ = run_forward_loop_on(vec![listener], None, std::sync::Arc::new(tokio::sync::Mutex::new(config)), cache, dnsmasq_rs::arp::new_shared_arp_state()).await;
     });
     Some(addr)
 }

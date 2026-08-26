@@ -162,16 +162,45 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   which inherits its parent query's admission decision in C rather than
   re-checking, and has no Rust DNSSEC-retry path to hang that inheritance off
   of yet.
-  - Reload staleness (partially fixed). SIGHUP reload (`dnsmasq::on_sighup` /
-    `clear_cache_and_reload`) now flushes and rebuilds the *live* `DnsCache` — it is a
+  - Reload staleness (fixed, issue #174, 2026-08-26). SIGHUP reload (`dnsmasq::on_sighup` /
+    `clear_cache_and_reload`) flushes and rebuilds the *live* `DnsCache` — it is a
     `cache::SharedDnsCache` threaded into `run_forward_loop_on` rather than a task-local
-    value, so cache effects are immediate. What is still stale: `run_main_loop_with`
-    snapshots `ForwardConfig` (upstream server list, host-records, CNAMEs, TXT/MX/PTR/
-    NAPTR records) once at startup and moves the clone into the forward task, so a
-    config change — including the `daemon.servers` update `clear_cache_and_reload` now
-    makes from `--resolv-file` — only reaches the query loop on the next process start,
-    not the next query. Closing this needs the same treatment the cache got: a shared
-    `ArcSwap`/`watch` channel for `ForwardConfig` rather than a moved clone.
+    value, so cache effects are immediate. `ForwardConfig` (upstream server list,
+    host-records, CNAMEs, TXT/MX/PTR/NAPTR records, rebind/filter rules, cache-size/TTL
+    bounds) got the same treatment: `forward::SharedForwardConfig` (`Arc<Mutex<ForwardConfig>>`,
+    mirroring `SharedDnsCache`) is built once in `run_main_loop_with` and threaded to
+    every reload trigger (SIGHUP, `/api/v1/reload`, DBus's `ClearCache`/reload methods,
+    inotify-triggered reload) the same way `cache`/`daemon_handle` already are.
+    `clear_cache_and_reload` rebuilds a fresh `ForwardConfig` via the existing
+    `daemon_forward_config(&daemon)` after updating `daemon.servers`/hosts, and pushes it
+    into the shared handle. `run_forward_loop_on` picks up a fresh snapshot once per
+    second on its existing periodic-cleanup tick (`ForwardEngine::refresh_config`,
+    which also recomputes `upstream_order`/`loop_servers` so a shrunk/grown server list
+    doesn't leave stale indices) rather than checking on every query — a reload is rare,
+    a 1-second staleness window is harmless, and the per-query hot path stays lock-free.
+    `table` (in-flight queries) and `rfd_pool` (the socket pool) are deliberately left
+    untouched by a refresh, so a reload never drops or disrupts a query already in
+    flight. Verified by `tests/forward_cache_integration.rs::config_reload_redirects_the_live_loop_to_a_new_upstream`
+    (real sockets, two fake upstreams, confirms the *next live query* after a config
+    swap goes to the new upstream) and live against the real binary (real SIGHUP,
+    confirmed via log output that `on_sighup` now fires directly from
+    `run_main_loop_with`'s own signal-handling loop rather than being forwarded through
+    `main.rs`'s separately-spawned task via an `mpsc` channel — that indirection existed
+    only because the old code had nothing worth sharing across the boundary; now that
+    there is (`SharedForwardConfig`, constructed inside `run_main_loop_with`), the
+    indirection was removed and `run_main_loop`/`run_main_loop_with` lost their
+    `sighup_tx` parameter entirely).
+
+    This is the first of three issues splitting #128 ("reload while running"); DHCP
+    static-config reload (`reread_dhcp`) is #175, `--conf-file` change-watching is #176.
+    A separate, adjacent finding surfaced during this work but deliberately NOT fixed
+    here (out of scope for #174 — filed as issue #178): `--resolv-file` entries are
+    never read at process startup at all — `daemon.servers` only gets populated from a
+    resolv-file on the *first* reload (SIGHUP/API/inotify), since nothing in
+    `init_daemon_with`/`run_main_loop_with`'s startup sequence calls
+    `clear_cache_and_reload`-equivalent resolv-parsing before entering the main loop,
+    unlike upstream's `main()`, which calls `reload_servers()` once before the select
+    loop in addition to on every SIGHUP.
 
 - [x] Wire the DNS answer cache into the live forward path.
   `run_forward_loop_on` now calls `forward::cache_upstream_reply` → `cache::cache_reply` →

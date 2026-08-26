@@ -95,9 +95,9 @@ Note `legacy-config` only gates the *runtime entry point* (`main.rs`'s dispatch 
 
 ### Runtime flow
 
-`main.rs` reads the config, resolves it once, calls `dnsmasq::init_daemon_with`, installs SIGTERM/SIGHUP handlers, and enters `dnsmasq::run_main_loop`. `run_main_loop` snapshots port/upstreams/DHCP runtime from the handle, binds the DNS UDP socket, and spawns `forward::run_forward_loop` (plus `dhcp::run_dhcp_loop` under the `dhcp` feature).
+`main.rs` reads the config, resolves it once, calls `dnsmasq::init_daemon_with`, and enters `dnsmasq::run_main_loop_with`, which installs the SIGTERM/SIGHUP/SIGINT handlers itself and spawns `forward::run_forward_loop_on` (plus `dhcp::run_dhcp_loop` under the `dhcp` feature).
 
-This path is deliberately simpler than upstream `dnsmasq.c`. SIGHUP reload in `main.rs` is still a logging stub; `dnsmasq::on_sighup` / `clear_cache_and_reload` are the real hooks to grow. Startup, reload, and listener lifecycle parity is open work.
+This path is deliberately simpler than upstream `dnsmasq.c`, but SIGHUP reload is real, not a stub: `run_main_loop_with`'s own SIGHUP branch calls `dnsmasq::on_sighup` directly (as does `POST /api/v1/reload` under `web-api`, DBus's `ClearCache`, and inotify-triggered reload), which calls `clear_cache_and_reload` — cache flush, `/etc/hosts`+`--addn-hosts`+`--hostsdir` reload, `--resolv-file` re-read. As of issue #174, a reload also pushes a fresh `forward::ForwardConfig` through `forward::SharedForwardConfig` (an `Arc<Mutex<_>>`, threaded everywhere `cache`/`daemon_handle` already are), which `run_forward_loop_on` picks up on its 1-second periodic-cleanup tick — before that fix, a reload's `daemon.servers`/hosts update never reached actual query answering, only API/DBus/UBus reads of `Daemon`. DHCP static-config reload (`option::reread_dhcp`) and `--conf-file` change-watching remain open (issues #175/#176).
 
 Daemonization (`dnsmasq::daemonize`) must happen **before** the tokio runtime starts — `fork` is not tokio-safe.
 
@@ -170,6 +170,6 @@ Keep capability-dependent tests (sockets, interface enumeration, bind-to-device)
 
 1. Finish `src/option.rs` for the directives needed to boot realistic parity fixtures.
 2. Fix `--no-default-features` gate leakage in `src/option.rs`.
-3. Close the startup/reload/runtime gap in `src/dnsmasq.rs` and `src/main.rs` — especially real SIGHUP reload behavior.
+3. Close the remaining startup/reload/runtime gaps in `src/dnsmasq.rs` and `src/main.rs` — SIGHUP/API reload now really reaches the live forward loop (issue #174), but DHCP static-config reload (#175) and `--conf-file` change-watching (#176) are still open.
 4. Expand `parity/` beyond the single DNS fixture: cache, reload, forwarding, then a capability-enabled DHCP lane.
 5. Resolve the `lib.rs` / `main.rs` module duplication rather than maintaining two trees.

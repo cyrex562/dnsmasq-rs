@@ -21,7 +21,7 @@ use bytes::{BufMut, BytesMut};
 
 use dnsmasq_rs::cache::{new_shared_cache, SharedDnsCache};
 use dnsmasq_rs::dns_protocol::{DnsHeader, HB3_QR, HB3_RD, HB4_CD, HB4_RA};
-use dnsmasq_rs::forward::{run_forward_loop_on, DnsListener, ForwardConfig};
+use dnsmasq_rs::forward::{run_forward_loop_on, DnsListener, ForwardConfig, SharedForwardConfig};
 use dnsmasq_rs::option::{apply_config, parse_config_text};
 use dnsmasq_rs::rfc1035::{write_name, DnsPacket, DnsQuestion, DnsRr};
 use dnsmasq_rs::types::daemon::Daemon;
@@ -161,22 +161,28 @@ struct Server {
     task: tokio::task::JoinHandle<()>,
 }
 
-/// Spawn the loop over a cache the caller keeps a handle to, so a test can
-/// flush it out-of-band (as SIGHUP reload does) and observe the effect on the
-/// running loop.
-async fn spawn_server_with_cache(config: ForwardConfig, cache: SharedDnsCache) -> Option<Server> {
+/// Spawn the loop over a cache *and* forward-config handle the caller keeps,
+/// so a test can flush/replace them out-of-band (as SIGHUP reload does via
+/// `dnsmasq::clear_cache_and_reload`) and observe the effect on the running
+/// loop — the whole point of issue #174.
+async fn spawn_server_with_cache(
+    config: ForwardConfig,
+    cache: SharedDnsCache,
+) -> Option<(Server, SharedForwardConfig)> {
     let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.ok()?;
     let addr = sock.local_addr().ok()?;
     let listener = DnsListener { sock: Arc::new(sock), check_dst: false };
+    let fwd_config: SharedForwardConfig = Arc::new(tokio::sync::Mutex::new(config));
+    let loop_fwd_config = fwd_config.clone();
     let task = tokio::spawn(async move {
-        let _ = run_forward_loop_on(vec![listener], None, config, cache, dnsmasq_rs::arp::new_shared_arp_state()).await;
+        let _ = run_forward_loop_on(vec![listener], None, loop_fwd_config, cache, dnsmasq_rs::arp::new_shared_arp_state()).await;
     });
-    Some(Server { addr, task })
+    Some((Server { addr, task }, fwd_config))
 }
 
 async fn spawn_server(config: ForwardConfig) -> Option<Server> {
     let cache = new_shared_cache(config.cache_size, config.min_cache_ttl, config.max_cache_ttl);
-    spawn_server_with_cache(config, cache).await
+    spawn_server_with_cache(config, cache).await.map(|(server, _)| server)
 }
 
 /// Build a `ForwardConfig` the way `dnsmasq.rs` does: through the real config
@@ -225,6 +231,40 @@ fn first_a(reply: &DnsPacket) -> Option<(Ipv4Addr, u32)> {
 fn shutdown(server: Server, upstream: Upstream) {
     server.task.abort();
     upstream.task.abort();
+}
+
+/// A minimal `types::server::Server` entry pointing at `addr`, for tests
+/// that need a `Daemon` whose `daemon_forward_config` output actually
+/// matches a fake upstream spawned on an arbitrary port (`--resolv-file`
+/// entries are hardcoded to port 53 by `parse_resolv_conf`, so that path
+/// can't reach an ephemeral-port test upstream).
+fn reload_test_server(addr: SocketAddr) -> dnsmasq_rs::types::server::Server {
+    use dnsmasq_rs::types::addr::MySockAddr;
+    use dnsmasq_rs::types::server::{Server, ServFlags};
+
+    let addr = MySockAddr::from(addr);
+    Server {
+        flags: ServFlags::empty(),
+        domain: String::new(),
+        source_addr: addr.clone(),
+        addr,
+        interface: String::new(),
+        ifindex: 0,
+        queries: 0,
+        failed_queries: 0,
+        nxdomain_replies: 0,
+        retrys: 0,
+        query_latency: 0,
+        mma_latency: 0,
+        forwardtime: None,
+        forwardcount: 0,
+        tcpfd: -1,
+        serial: 0,
+        arrayposn: -1,
+        last_server: 0,
+        #[cfg(feature = "loop")]
+        uid: 0,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1095,7 +1135,7 @@ async fn sighup_reload_flushes_the_live_forward_cache() {
     };
     let config = config_from_text("cache-size=150\n", upstream.addr);
     let cache = new_shared_cache(config.cache_size, config.min_cache_ttl, config.max_cache_ttl);
-    let Some(server) = spawn_server_with_cache(config, cache.clone()).await else {
+    let Some((server, fwd_config)) = spawn_server_with_cache(config, cache.clone()).await else {
         return;
     };
 
@@ -1103,8 +1143,17 @@ async fn sighup_reload_flushes_the_live_forward_cache() {
     assert!(ask(server.addr, &query_wire("reload.test", 1, 2)).await.is_some());
     assert_eq!(upstream.misses(), 1, "the second query must be a cache hit before reload");
 
-    let daemon_handle = dnsmasq_rs::dnsmasq::init_daemon_with(Daemon::default());
-    dnsmasq_rs::dnsmasq::on_sighup(&daemon_handle, &cache).await;
+    // Issue #174: `on_sighup` now also rebuilds `fwd_config` from this
+    // `Daemon`'s server list — a disconnected default `Daemon` (no servers)
+    // would wipe the live loop's real upstream out from under it once the
+    // next periodic refresh picked it up. Give it the same upstream `config`
+    // was built with, matching the invariant every real caller already
+    // satisfies (SIGHUP/API reload always reloads from the daemon that is
+    // actually running, never an unrelated one).
+    let mut daemon = Daemon::default();
+    daemon.servers.push(reload_test_server(upstream.addr));
+    let daemon_handle = dnsmasq_rs::dnsmasq::init_daemon_with(daemon);
+    dnsmasq_rs::dnsmasq::on_sighup(&daemon_handle, &cache, &fwd_config).await;
 
     assert!(ask(server.addr, &query_wire("reload.test", 1, 3)).await.is_some());
     assert_eq!(
@@ -1114,4 +1163,74 @@ async fn sighup_reload_flushes_the_live_forward_cache() {
     );
 
     shutdown(server, upstream);
+}
+
+/// Issue #174: `run_main_loop_with` used to build `ForwardConfig` once and
+/// move it *by value* into the forward task, so a reload's upstream-server
+/// update (`clear_cache_and_reload`'s `daemon.servers` change, driven by
+/// `--resolv-file`) never reached actual query answering — only API/DBus/UBus
+/// reads of `Daemon` ever saw it. This drives the exact mechanism the fix
+/// adds: swapping the `SharedForwardConfig` the running loop reads from and
+/// confirming the *next live query* uses the new upstream, not the one the
+/// loop started with.
+///
+/// Doesn't go through `clear_cache_and_reload`'s resolv-file parsing itself
+/// (already covered by `dnsmasq::tests::clear_cache_and_reload_reloads_resolv_file_servers`
+/// et al. — those prove `daemon.servers` updates correctly) — this test's
+/// job is the other half: that a `ForwardConfig` change actually reaches the
+/// live loop, however it got there.
+#[tokio::test]
+async fn config_reload_redirects_the_live_loop_to_a_new_upstream() {
+    let Some(old_upstream) = spawn_upstream(|q| {
+        Some(reply_to(q, 0, vec![a_rr("switch.test", Ipv4Addr::new(192, 0, 2, 10), 300)], vec![]))
+    })
+    .await
+    else {
+        return;
+    };
+    let Some(new_upstream) = spawn_upstream(|q| {
+        Some(reply_to(q, 0, vec![a_rr("switch.test", Ipv4Addr::new(192, 0, 2, 20), 300)], vec![]))
+    })
+    .await
+    else {
+        return;
+    };
+
+    // cache-size=0: every query must actually reach an upstream, so the
+    // miss counters below reflect exactly which one answered each query.
+    let config = config_from_text("cache-size=0\n", old_upstream.addr);
+    let cache = new_shared_cache(config.cache_size, config.min_cache_ttl, config.max_cache_ttl);
+    let Some((server, fwd_config)) = spawn_server_with_cache(config, cache).await else {
+        return;
+    };
+
+    assert!(ask(server.addr, &query_wire("switch.test", 1, 1)).await.is_some());
+    assert_eq!(old_upstream.misses(), 1, "the first query must reach the original upstream");
+    assert_eq!(new_upstream.misses(), 0, "the new upstream must not see it yet");
+
+    // Swap in a config pointing at the new upstream — exactly what
+    // `clear_cache_and_reload` does internally via `daemon_forward_config`
+    // after a resolv-file re-read, just without going through that parsing.
+    {
+        let mut guard = fwd_config.lock().await;
+        guard.upstreams = vec![new_upstream.addr];
+    }
+    // `run_forward_loop_on` only checks for a fresh config once per second
+    // (its periodic-cleanup tick) — see the doc comment on that branch.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    assert!(ask(server.addr, &query_wire("switch.test", 1, 2)).await.is_some());
+    assert_eq!(
+        old_upstream.misses(),
+        1,
+        "after the reload, the old upstream must not see any more queries",
+    );
+    assert_eq!(
+        new_upstream.misses(),
+        1,
+        "after the reload, the next query must reach the new upstream",
+    );
+
+    shutdown(server, old_upstream);
+    new_upstream.task.abort();
 }

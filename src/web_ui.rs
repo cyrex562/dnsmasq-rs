@@ -204,7 +204,7 @@ async fn cache_fragment(State(state): State<AppState>) -> Html<String> {
 }
 
 async fn reload(State(state): State<AppState>) -> Html<&'static str> {
-    crate::dnsmasq::on_sighup(&state.daemon, &state.cache).await;
+    crate::dnsmasq::on_sighup(&state.daemon, &state.cache, &state.fwd_config).await;
     Html("reloaded")
 }
 
@@ -217,6 +217,7 @@ mod tests {
         AppState {
             daemon: crate::dnsmasq::init_daemon_with(crate::types::daemon::Daemon::default()),
             cache: std::sync::Arc::new(tokio::sync::Mutex::new(crate::cache::DnsCache::new(100))),
+            fwd_config: std::sync::Arc::new(tokio::sync::Mutex::new(crate::forward::ForwardConfig::default())),
             started_at: std::time::Instant::now(),
             token_file: token_file.to_string(),
             #[cfg(feature = "dhcp")]

@@ -148,7 +148,7 @@ async fn run_main_loop_answers_host_record_with_no_upstream_configured() {
         assert!(daemon.servers.is_empty(), "fixture configures no upstreams");
         daemon.port = port;
 
-        let task = tokio::spawn(run_main_loop(init_daemon_with(daemon), None));
+        let task = tokio::spawn(run_main_loop(init_daemon_with(daemon)));
         let server: SocketAddr = ([127, 0, 0, 1], port).into();
         let reply = try_ask(server, "host.test", 1).await;
         let bind_failed = task.is_finished();

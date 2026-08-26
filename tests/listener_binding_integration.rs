@@ -72,7 +72,7 @@ async fn spawn(extra: &str) -> Option<(u16, tokio::task::JoinHandle<()>)> {
         let mut daemon = daemon_from(&format!("{LOCAL_DATA}{extra}"));
         daemon.port = port;
         let handle = tokio::spawn(async move {
-            let _ = run_main_loop(init_daemon_with(daemon), None).await;
+            let _ = run_main_loop(init_daemon_with(daemon)).await;
         });
         // Give the loop a moment to bind before probing.
         tokio::time::sleep(Duration::from_millis(120)).await;
