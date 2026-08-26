@@ -1827,6 +1827,7 @@ async fn spawn_web_api_task(
     token_file: Option<String>,
     daemon_handle: &DaemonHandle,
     cache: crate::cache::SharedDnsCache,
+    #[cfg(feature = "dhcp")] leases: Option<crate::dhcp::SharedLeaseDb>,
 ) -> Result<Option<tokio::task::JoinHandle<()>>, ()> {
     let Some(addr) = listen else { return Ok(None) };
     let Some(token_file) = token_file else {
@@ -1858,7 +1859,16 @@ async fn spawn_web_api_task(
 
     let daemon = daemon_handle.clone();
     Ok(Some(tokio::spawn(async move {
-        if let Err(e) = crate::web_api::serve_on(listener, daemon, cache, token_file).await {
+        if let Err(e) = crate::web_api::serve_on(
+            listener,
+            daemon,
+            cache,
+            token_file,
+            #[cfg(feature = "dhcp")]
+            leases,
+        )
+        .await
+        {
             tracing::error!("web API server exited: {e}");
         }
     })))
@@ -1912,7 +1922,14 @@ async fn spawn_dhcp_task(
     prebound_dhcp: Option<std::net::UdpSocket>,
     #[cfg_attr(not(feature = "dhcp6"), allow(unused_variables))]
     slaac_contexts: Vec<crate::types::dhcp::DhcpContext>,
-) -> Result<(tokio::task::JoinHandle<()>, tokio::sync::watch::Sender<bool>), ()> {
+) -> Result<
+    (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::watch::Sender<bool>,
+        crate::dhcp::SharedLeaseDb,
+    ),
+    (),
+> {
     use std::sync::Arc;
     use crate::dhcp::run_dhcp_loop;
 
@@ -1953,6 +1970,8 @@ async fn spawn_dhcp_task(
         },
         None => crate::lease::LeaseDb::new(),
     };
+    let lease_db = Arc::new(tokio::sync::Mutex::new(lease_db));
+    let lease_db_for_api = lease_db.clone();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     // PING_WAIT (config.h) — per-candidate ICMP echo timeout.
     let probe: Box<dyn crate::dhcp::AddressProbe + Send + Sync> = Box::new(IcmpPinger::new(3000));
@@ -1961,7 +1980,7 @@ async fn spawn_dhcp_task(
             tracing::error!("dhcp loop exited: {e}");
         }
     });
-    Ok((task, shutdown_tx))
+    Ok((task, shutdown_tx, lease_db_for_api))
 }
 
 /// Adopt or bind the DHCPv6 socket, join the DHCPv6 multicast groups on every
@@ -2209,7 +2228,7 @@ pub async fn run_main_loop_with(
     };
 
     #[cfg(feature = "dhcp")]
-    let (dhcp_task, dhcp_shutdown_tx) = match dhcp_runtime {
+    let (dhcp_task, dhcp_shutdown_tx, dhcp_lease_db) = match dhcp_runtime {
         Some(dhcp_runtime) => {
             // Feed the DHCPv6 "current" RA-name context chain to the DHCPv4
             // loop so it can recompute SLAAC addresses for the leases it
@@ -2221,7 +2240,7 @@ pub async fn run_main_loop_with(
             #[cfg(not(feature = "dhcp6"))]
             let slaac_contexts: Vec<crate::types::dhcp::DhcpContext> = Vec::new();
             match spawn_dhcp_task(dhcp_runtime, prebound_dhcp, slaac_contexts).await {
-                Ok((task, tx)) => (Some(task), Some(tx)),
+                Ok((task, tx, lease_db)) => (Some(task), Some(tx), Some(lease_db)),
                 Err(()) => {
                     fwd_task.abort();
                     arp_task.abort();
@@ -2231,7 +2250,7 @@ pub async fn run_main_loop_with(
                 }
             }
         }
-        None => (None, None),
+        None => (None, None, None),
     };
 
     #[cfg(feature = "dhcp6")]
@@ -2296,7 +2315,16 @@ pub async fn run_main_loop_with(
             let d = daemon_handle.read().await;
             (d.web_api_listen, d.web_api_token_file.clone())
         };
-        match spawn_web_api_task(listen, token_file, &daemon_handle, web_api_cache).await {
+        match spawn_web_api_task(
+            listen,
+            token_file,
+            &daemon_handle,
+            web_api_cache,
+            #[cfg(feature = "dhcp")]
+            dhcp_lease_db.clone(),
+        )
+        .await
+        {
             Ok(t) => t,
             Err(()) => {
                 fwd_task.abort();

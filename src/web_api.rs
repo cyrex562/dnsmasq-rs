@@ -3,9 +3,9 @@
 //!
 //! No upstream `dnsmasq` counterpart — this is new management surface for
 //! this port, not a C-to-Rust translation. See issue #165 for the read-only
-//! routes and issue #166 for the token auth this module adds. `/api/v1/leases`
-//! is deliberately absent — `LeaseDb` has no shared handle outside
-//! `run_dhcp_loop`'s own task yet (issue #168).
+//! routes, issue #166 for the token auth this module adds, and issue #168
+//! for `/api/v1/leases`, backed by the `SharedLeaseDb` handle `run_dhcp_loop`
+//! shares with this module.
 #![cfg(feature = "web-api")]
 
 use std::time::Instant;
@@ -36,6 +36,10 @@ pub(crate) struct AppState {
     pub(crate) cache: SharedDnsCache,
     pub(crate) started_at: Instant,
     pub(crate) token_file: String,
+    /// `None` when DHCP isn't configured/running; `/api/v1/leases` then
+    /// returns an empty list rather than erroring.
+    #[cfg(feature = "dhcp")]
+    pub(crate) leases: Option<crate::dhcp::SharedLeaseDb>,
 }
 
 /// Build the router: `/healthz` is always open (liveness probes shouldn't
@@ -54,7 +58,10 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/status", get(status))
         .route("/api/v1/cache/stats", get(cache_stats))
         .route("/api/v1/config", get(config_summary))
-        .route("/api/v1/reload", post(reload))
+        .route("/api/v1/reload", post(reload));
+    #[cfg(feature = "dhcp")]
+    let protected = protected.route("/api/v1/leases", get(leases));
+    let protected = protected
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state.clone());
 
@@ -81,8 +88,16 @@ pub async fn serve_on(
     daemon: DaemonHandle,
     cache: SharedDnsCache,
     token_file: String,
+    #[cfg(feature = "dhcp")] leases: Option<crate::dhcp::SharedLeaseDb>,
 ) -> std::io::Result<()> {
-    let state = AppState { daemon, cache, started_at: Instant::now(), token_file };
+    let state = AppState {
+        daemon,
+        cache,
+        started_at: Instant::now(),
+        token_file,
+        #[cfg(feature = "dhcp")]
+        leases,
+    };
     axum::serve(listener, router(state)).await
 }
 
@@ -261,6 +276,42 @@ async fn reload(State(state): State<AppState>) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+#[cfg(feature = "dhcp")]
+#[derive(Serialize)]
+struct LeaseResponse {
+    mac: String,
+    ip: String,
+    hostname: Option<String>,
+    expires_unix: Option<u64>,
+    client_id: Option<String>,
+}
+
+/// `GET /api/v1/leases`: a flat JSON array of every current DHCPv4 lease, no
+/// pagination — this is a low-traffic diagnostics API, not a bulk-export
+/// endpoint. DHCPv6 leases are out of scope for this pass (issue #168).
+/// Locks [`AppState::leases`] only for the duration of the snapshot copy
+/// below, never across an `.await`, so this can't stall `run_dhcp_loop`.
+#[cfg(feature = "dhcp")]
+async fn leases(State(state): State<AppState>) -> Json<Vec<LeaseResponse>> {
+    let Some(leases) = state.leases.as_ref() else {
+        return Json(Vec::new());
+    };
+    let db = leases.lock().await;
+    let out = db
+        .iter()
+        .map(|lease| LeaseResponse {
+            mac: crate::util::print_mac(&lease.hwaddr[..lease.hwaddr_len]),
+            ip: lease.addr.to_string(),
+            hostname: lease.hostname.clone(),
+            expires_unix: lease.expires.and_then(|t| {
+                t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs())
+            }),
+            client_id: lease.clid.as_ref().map(|c| crate::util::print_mac(c)),
+        })
+        .collect();
+    Json(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +323,8 @@ mod tests {
             cache: std::sync::Arc::new(tokio::sync::Mutex::new(crate::cache::DnsCache::new(100))),
             started_at: Instant::now(),
             token_file: token_file.to_string(),
+            #[cfg(feature = "dhcp")]
+            leases: None,
         }
     }
 
@@ -414,5 +467,59 @@ mod tests {
         let (status_code, _) =
             request(router(test_state(path.to_str().unwrap())), "POST", "/api/v1/reload", Some(&token)).await;
         assert_eq!(status_code, axum::http::StatusCode::NO_CONTENT);
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[tokio::test]
+    async fn leases_requires_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens");
+        let (status_code, _) = request(router(test_state(path.to_str().unwrap())), "GET", "/api/v1/leases", None).await;
+        assert_eq!(status_code, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[tokio::test]
+    async fn leases_empty_when_no_lease_db_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens");
+        let token = create_token(path.to_str().unwrap(), "test").unwrap();
+        let (status_code, body) =
+            request(router(test_state(path.to_str().unwrap())), "GET", "/api/v1/leases", Some(&token)).await;
+        assert_eq!(status_code, axum::http::StatusCode::OK);
+        assert_eq!(body, serde_json::json!([]));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[tokio::test]
+    async fn leases_returns_current_lease_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens");
+        let token = create_token(path.to_str().unwrap(), "test").unwrap();
+
+        let mut db = crate::lease::LeaseDb::new();
+        let lease = crate::types::dhcp::DhcpLease {
+            hostname: Some("myhost".to_string()),
+            addr: std::net::Ipv4Addr::new(192, 168, 0, 42),
+            hwaddr: {
+                let mut hw = [0u8; crate::dhcp_protocol::DHCP_CHADDR_MAX];
+                hw[..6].copy_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+                hw
+            },
+            hwaddr_len: 6,
+            ..Default::default()
+        };
+        db.insert(lease);
+
+        let mut state = test_state(path.to_str().unwrap());
+        state.leases = Some(std::sync::Arc::new(tokio::sync::Mutex::new(db)));
+
+        let (status_code, body) = request(router(state), "GET", "/api/v1/leases", Some(&token)).await;
+        assert_eq!(status_code, axum::http::StatusCode::OK);
+        let arr = body.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["mac"], "02:00:00:00:00:01");
+        assert_eq!(arr[0]["ip"], "192.168.0.42");
+        assert_eq!(arr[0]["hostname"], "myhost");
     }
 }

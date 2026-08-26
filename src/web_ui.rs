@@ -219,6 +219,8 @@ mod tests {
             cache: std::sync::Arc::new(tokio::sync::Mutex::new(crate::cache::DnsCache::new(100))),
             started_at: std::time::Instant::now(),
             token_file: token_file.to_string(),
+            #[cfg(feature = "dhcp")]
+            leases: None,
         }
     }
 

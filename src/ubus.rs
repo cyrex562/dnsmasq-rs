@@ -1791,7 +1791,7 @@ mod integration_tests {
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let loop_task = tokio::spawn(crate::dhcp::run_dhcp_loop(
-            dhcp_server.clone(), cfg, opts, crate::lease::LeaseDb::new(), shutdown_rx, Box::new(NullProbe),
+            dhcp_server.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(crate::lease::LeaseDb::new())), shutdown_rx, Box::new(NullProbe),
         ));
 
         // `loop_reply_dest` (with `reply_port_override` set, as here) routes

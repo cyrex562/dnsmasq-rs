@@ -32,6 +32,12 @@ use crate::rfc2131::{
 use crate::dhcp_common::find_config;
 use crate::types::dhcp::DhcpLease;
 
+/// Shared handle to the DHCPv4 lease table, as held by [`run_dhcp_loop`] and
+/// handed to read-only consumers (e.g. the `/api/v1/leases` web API route)
+/// that must not block on the DHCP loop's own multi-second waits. Mirrors
+/// [`crate::cache::SharedDnsCache`]'s `Arc<Mutex<_>>` pattern.
+pub type SharedLeaseDb = std::sync::Arc<tokio::sync::Mutex<LeaseDb>>;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // DHCP server configuration
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1345,7 +1351,7 @@ pub async fn run_dhcp_loop(
     socket: std::sync::Arc<tokio::net::UdpSocket>,
     mut cfg: DhcpServerConfig,
     opts: DhcpLoopOptions,
-    mut lease_db: LeaseDb,
+    lease_db: SharedLeaseDb,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     probe: Box<dyn AddressProbe + Send + Sync>,
 ) -> std::io::Result<()> {
@@ -1449,8 +1455,9 @@ pub async fn run_dhcp_loop(
                 };
 
                 let arrival = arrival_interface(meta.if_index);
+                let mut lease_db_guard = lease_db.lock().await;
                 let dispatched = dispatch_dhcp_with_arrival(
-                    &pkt, &mut cfg, &mut lease_db, &mut ping_cache, probe.as_ref(), arrival.as_ref(),
+                    &pkt, &mut cfg, &mut lease_db_guard, &mut ping_cache, probe.as_ref(), arrival.as_ref(),
                 );
 
                 // `ubus_event_bcast("dhcp.ack"/"dhcp.release", ...)`
@@ -1493,14 +1500,14 @@ pub async fn run_dhcp_loop(
                 // per-setter.
                 #[cfg(feature = "dhcp6")]
                 if !opts.slaac_contexts.is_empty() {
-                    lease_db.refresh_slaac(
+                    lease_db_guard.refresh_slaac(
                         std::time::SystemTime::now(), &opts.slaac_contexts, false, |_ctx| {},
                     );
                 }
 
-                if lease_db.file_dirty {
+                if lease_db_guard.file_dirty {
                     let write_ok = match cfg.lease_file.as_deref() {
-                        Some(path) => match lease_db.write_to_file(path) {
+                        Some(path) => match lease_db_guard.write_to_file(path) {
                             Ok(()) => true,
                             Err(err) => {
                                 warn!("failed to write DHCP lease file {path}: {err}");
@@ -1513,7 +1520,7 @@ pub async fn run_dhcp_loop(
                     // succeeded (or there was nothing to write); otherwise
                     // the next dispatch would silently skip retrying it.
                     if write_ok {
-                        lease_db.file_dirty = false;
+                        lease_db_guard.file_dirty = false;
                     }
                 }
 
@@ -1533,7 +1540,8 @@ pub async fn run_dhcp_loop(
                     .lease_change_command
                     .as_deref()
                     .filter(|c| !c.is_empty());
-                lease_db.run_lease_scripts(command, cfg.leasefile_ro, cfg.script_on_renewal);
+                lease_db_guard.run_lease_scripts(command, cfg.leasefile_ro, cfg.script_on_renewal);
+                drop(lease_db_guard);
 
                 let Some(dispatched) = dispatched else {
                     continue;
@@ -1547,7 +1555,7 @@ pub async fn run_dhcp_loop(
                     warn!("failed to send DHCP reply to {dest}: {err}");
                 }
             }
-            _ = slaac_dad.poll_tick_or_recv(&mut lease_db, slaac_contexts), if slaac_dad.active() => {}
+            _ = slaac_dad.poll_tick_or_recv(&lease_db, slaac_contexts), if slaac_dad.active() => {}
         }
     }
 }
@@ -1638,7 +1646,7 @@ impl SlaacDad {
     #[cfg_attr(not(feature = "dhcp6"), allow(unused_variables))]
     async fn poll_tick_or_recv(
         &mut self,
-        lease_db: &mut LeaseDb,
+        lease_db: &SharedLeaseDb,
         contexts: &[crate::types::dhcp::DhcpContext],
     ) {
         match self {
@@ -1648,6 +1656,7 @@ impl SlaacDad {
                 tokio::select! {
                     _ = probe_tick.tick() => {
                         let id = *ping_id;
+                        let mut lease_db = lease_db.lock().await;
                         lease_db.tick_slaac(std::time::SystemTime::now(), contexts, id, |dest, packet| {
                             icmp6.send_echo_sync(dest, packet)
                         });
@@ -1655,6 +1664,7 @@ impl SlaacDad {
                     r = icmp6.recv(buf) => {
                         match r {
                             Ok((n, sender)) => {
+                                let mut lease_db = lease_db.lock().await;
                                 lease_db.confirm_slaac_ping(sender, &buf[..n], *ping_id, "", false);
                             }
                             Err(e) => debug!("SLAAC DAD probe ICMPv6 recv error: {e}"),
@@ -3378,7 +3388,7 @@ mod tests {
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, LeaseDb::new(), shutdown_rx, Box::new(NullProbe)));
+        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())), shutdown_rx, Box::new(NullProbe)));
 
         let mut pkt = base_packet();
         pkt.options = vec![
@@ -3800,7 +3810,7 @@ mod tests {
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, LeaseDb::new(), shutdown_rx, Box::new(NullProbe)));
+        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())), shutdown_rx, Box::new(NullProbe)));
 
         let pkt = base_packet();
         let wire = packet_to_wire(&pkt);
@@ -3838,7 +3848,7 @@ mod tests {
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, LeaseDb::new(), shutdown_rx, Box::new(NullProbe)));
+        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())), shutdown_rx, Box::new(NullProbe)));
 
         let pkt = base_packet();
         let wire = packet_to_wire(&pkt);
@@ -3882,7 +3892,7 @@ mod tests {
         }];
         let opts = DhcpLoopOptions { reply_port_override: Some(receiver_addr.port()), ..Default::default() };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, LeaseDb::new(), shutdown_rx, Box::new(NullProbe)));
+        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())), shutdown_rx, Box::new(NullProbe)));
 
         let mut pkt = leasequery_packet(Ipv4Addr::new(10, 0, 0, 150));
         pkt.giaddr = Ipv4Addr::new(203, 0, 113, 9);
@@ -3919,7 +3929,7 @@ mod tests {
         }];
         let opts = DhcpLoopOptions { reply_port_override: Some(receiver_addr.port()), ..Default::default() };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, LeaseDb::new(), shutdown_rx, Box::new(NullProbe)));
+        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())), shutdown_rx, Box::new(NullProbe)));
 
         // ciaddr left UNSPECIFIED: with giaddr also UNSPECIFIED after the
         // sentinel is consumed, `loop_reply_dest` falls back to the packet's
@@ -3972,7 +3982,7 @@ mod tests {
             ..Default::default()
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let loop_task = tokio::spawn(run_dhcp_loop(relay_sock.clone(), cfg, opts, LeaseDb::new(), shutdown_rx, Box::new(NullProbe)));
+        let loop_task = tokio::spawn(run_dhcp_loop(relay_sock.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())), shutdown_rx, Box::new(NullProbe)));
 
         let pkt = base_packet();
         let wire = packet_to_wire(&pkt);
@@ -4024,7 +4034,7 @@ mod tests {
             ..Default::default()
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let loop_task = tokio::spawn(run_dhcp_loop(relay_sock.clone(), cfg, opts, LeaseDb::new(), shutdown_rx, Box::new(NullProbe)));
+        let loop_task = tokio::spawn(run_dhcp_loop(relay_sock.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())), shutdown_rx, Box::new(NullProbe)));
 
         // The upstream server's OFFER, addressed back to the relay (giaddr set,
         // ciaddr pointed at our test "client" receiver so delivery doesn't need
@@ -4072,7 +4082,7 @@ mod tests {
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, LeaseDb::new(), shutdown_rx, Box::new(NullProbe)));
+        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())), shutdown_rx, Box::new(NullProbe)));
 
         let pkt = base_packet();
         let wire = packet_to_wire(&pkt);
