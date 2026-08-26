@@ -1618,6 +1618,370 @@ fn spawn_inotify_watch_task(
     })
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// run_main_loop_with's per-section setup/spawn helpers
+//
+// Each of these corresponds to one `// ── section ──` marker that used to be
+// inlined in `run_main_loop_with`'s body. A helper that can fail logs its own
+// error (matching what the inline block used to do) and returns `Err(())`;
+// the cross-cutting "abort every task spawned so far" cascade on a fatal
+// startup error stays inline in `run_main_loop_with` itself, since which
+// tasks exist to abort differs at every call site and is exactly the
+// sequential orchestration that function exists to do.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Everything [`resolve_run_config`] gathers before `run_main_loop_with`
+/// starts spawning anything.
+struct InitialRunConfig {
+    fwd_config: crate::forward::ForwardConfig,
+    #[cfg(feature = "dhcp")]
+    dhcp_runtime: Option<DhcpDaemonRuntime>,
+    arp_state: crate::arp::SharedArpState,
+    #[cfg(feature = "tftp")]
+    tftp_config: crate::tftp::TftpConfig,
+}
+
+/// Snapshot the daemon config needed before spawning anything: the
+/// forwarding engine's config, the DHCPv4 runtime (if a `dhcp-range` is
+/// configured), the shared ARP cache, and the TFTP config.
+async fn resolve_run_config(daemon_handle: &DaemonHandle) -> InitialRunConfig {
+    let d = daemon_handle.read().await;
+    InitialRunConfig {
+        fwd_config: daemon_forward_config(&d),
+        #[cfg(feature = "dhcp")]
+        dhcp_runtime: daemon_dhcp_runtime(&d),
+        // Shared (not copied) so a kernel refresh triggered by the forwarding
+        // loop's MAC resolution is visible to DHCPv6's `get_client_mac` too —
+        // see `Daemon::arp_state`.
+        arp_state: d.arp_state.clone(),
+        #[cfg(feature = "tftp")]
+        tftp_config: daemon_tftp_config(&d),
+    }
+}
+
+/// Open (or create/reopen) the `--dump-file` pcap file, mirroring
+/// `dump_init()` being called once from `main()` (`dnsmasq.c:450`). Returns
+/// `Ok(None)` when no dump file is configured. A failure here is fatal,
+/// matching upstream's `die()` on the same paths.
+#[cfg(feature = "dump")]
+async fn init_dump_if_configured(daemon_handle: &DaemonHandle) -> Result<Option<crate::dump::DumpHandle>, ()> {
+    let (dump_file, edns_pktsz, dump_mask) = {
+        let d = daemon_handle.read().await;
+        (d.dump_file.clone(), d.edns_pktsz, d.dump_mask)
+    };
+    let Some(path) = dump_file else { return Ok(None) };
+    match crate::dump::DumpHandle::init(&path, edns_pktsz, dump_mask) {
+        Ok(handle) => Ok(Some(handle)),
+        Err(e) => {
+            tracing::error!("cannot open dump file {path}: {e}");
+            Err(())
+        }
+    }
+}
+
+/// Everything [`prepare_listeners`] adopts out of [`Listeners`]: the DNS
+/// sockets wrapped as tokio [`DnsListener`](crate::forward::DnsListener)s
+/// ready for the forwarding task, plus the raw pieces every other
+/// subsystem's own spawn step still needs to adopt for itself.
+struct PreparedListeners {
+    dns_listeners: Vec<crate::forward::DnsListener>,
+    arrival_filter: Option<crate::network::ArrivalFilter>,
+    #[cfg(feature = "dhcp")]
+    prebound_dhcp: Option<std::net::UdpSocket>,
+    #[cfg(feature = "dhcp6")]
+    prebound_dhcp6: Option<std::net::UdpSocket>,
+    #[cfg(feature = "tftp")]
+    bound_tftp: Vec<BoundTftpSocket>,
+}
+
+/// Adopt sockets bound before the fork, or bind them now, and wrap the DNS
+/// sockets ready for the forwarding task.
+///
+/// `main` binds while still privileged and hands them over; the in-process
+/// callers get here with `None` and go through the very same code path, so
+/// there is exactly one place that decides what the daemon listens on.
+async fn prepare_listeners(
+    daemon_handle: &DaemonHandle,
+    listeners: Option<Listeners>,
+) -> Result<PreparedListeners, ()> {
+    let mut listeners = match listeners {
+        Some(l) => l,
+        None => {
+            let d = daemon_handle.read().await;
+            match bind_listeners(&d) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!("failed to bind DNS listening sockets: {e}");
+                    return Err(());
+                }
+            }
+        }
+    };
+
+    #[cfg(feature = "dhcp")]
+    let prebound_dhcp = listeners.dhcp.take();
+    #[cfg(feature = "dhcp6")]
+    let prebound_dhcp6 = listeners.dhcp6.take();
+    #[cfg(feature = "tftp")]
+    let bound_tftp = std::mem::take(&mut listeners.tftp);
+    let bound_dns = std::mem::take(&mut listeners.dns);
+    let arrival_filter = listeners.arrival_filter.take();
+
+    let mut dns_listeners = Vec::with_capacity(bound_dns.len());
+    for bound in bound_dns {
+        let addr = bound.addr;
+        let sock = match tokio::net::UdpSocket::from_std(bound.sock) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("failed to adopt the DNS socket bound on {addr}: {e}");
+                return Err(());
+            }
+        };
+        tracing::info!("listening for DNS queries on {addr}");
+        dns_listeners.push(crate::forward::DnsListener { sock: std::sync::Arc::new(sock), check_dst: bound.check_dst });
+    }
+    if dns_listeners.is_empty() {
+        tracing::error!("no DNS listening sockets were bound; check --interface/--listen-address");
+        return Err(());
+    }
+
+    Ok(PreparedListeners {
+        dns_listeners,
+        arrival_filter,
+        #[cfg(feature = "dhcp")]
+        prebound_dhcp,
+        #[cfg(feature = "dhcp6")]
+        prebound_dhcp6,
+        #[cfg(feature = "tftp")]
+        bound_tftp,
+    })
+}
+
+/// Spawn [`crate::dbus::run_dbus_task`] if `--enable-dbus` is set.
+///
+/// Mirrors `dbus_init()` being called once at startup (`dnsmasq.c:461`); the
+/// retry-while-bus-not-up-yet behavior (`dnsmasq.c:1263`) lives inside
+/// `run_dbus_task` itself — see its doc comment for why that's a spawned
+/// async task rather than a per-tick poll here.
+#[cfg(feature = "dbus")]
+async fn spawn_dbus_task(
+    daemon_handle: &DaemonHandle,
+    cache: crate::cache::SharedDnsCache,
+) -> Option<tokio::task::JoinHandle<()>> {
+    use std::sync::Arc;
+
+    let opt_dbus = {
+        let d = daemon_handle.read().await;
+        d.option_bool(crate::types::constants::OPT_DBUS)
+    };
+    if !opt_dbus {
+        return None;
+    }
+    let d = daemon_handle.read().await;
+    let dbus_name = d.dbus_name.clone().unwrap_or_else(|| crate::dbus::DNSMASQ_DBUS_INTERFACE.to_string());
+    #[cfg(feature = "dhcp")]
+    let lease_file = d.lease_file.clone();
+    drop(d);
+    let ctx = crate::dbus::DbusContext {
+        daemon: daemon_handle.clone(),
+        cache,
+        #[cfg(feature = "dhcp")]
+        leases: Arc::new(tokio::sync::Mutex::new(crate::lease::LeaseDb::new())),
+        #[cfg(feature = "dhcp")]
+        lease_file,
+        dbus_name,
+    };
+    Some(tokio::spawn(crate::dbus::run_dbus_task(ctx)))
+}
+
+/// Spawn [`crate::ubus::run_ubus_task`] if `--ubus` is set.
+///
+/// Mirrors upstream calling `ubus_init()` once at startup and then draining
+/// events via `set_ubus_listeners()`/`check_ubus_listeners()` from the main
+/// `poll()` loop (dnsmasq.c) — collapsed into one spawned task since this
+/// codebase has no raw `poll()` loop to hook a listener into; see
+/// `ubus::run_ubus_task`'s doc comment.
+#[cfg(feature = "ubus")]
+async fn spawn_ubus_task(daemon_handle: &DaemonHandle) -> Option<tokio::task::JoinHandle<()>> {
+    let opt_ubus = {
+        let d = daemon_handle.read().await;
+        d.option_bool(crate::types::constants::OPT_UBUS)
+    };
+    if !opt_ubus {
+        return None;
+    }
+    let ctx = crate::ubus::UbusContext { daemon: daemon_handle.clone() };
+    Some(tokio::spawn(crate::ubus::run_ubus_task(ctx)))
+}
+
+/// Adopt the TFTP sockets bound before the fork (if any) and spawn
+/// [`crate::tftp::run_tftp_loop`] over them.
+#[cfg(feature = "tftp")]
+async fn spawn_tftp_task(
+    bound_tftp: Vec<BoundTftpSocket>,
+    tftp_config: crate::tftp::TftpConfig,
+) -> Result<Option<tokio::task::JoinHandle<()>>, ()> {
+    if bound_tftp.is_empty() {
+        return Ok(None);
+    }
+    let mut tftp_listeners = Vec::with_capacity(bound_tftp.len());
+    for bound in bound_tftp {
+        let addr = bound.addr;
+        let sock = match tokio::net::UdpSocket::from_std(bound.sock) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("failed to adopt the TFTP socket bound on {addr}: {e}");
+                return Err(());
+            }
+        };
+        tracing::info!("listening for TFTP requests on {addr}");
+        tftp_listeners.push(crate::tftp::TftpListenerHandle {
+            sock: std::sync::Arc::new(sock),
+            addr,
+            iface: bound.iface,
+            mtu: bound.mtu,
+        });
+    }
+    Ok(Some(tokio::spawn(async move {
+        if let Err(e) = crate::tftp::run_tftp_loop(tftp_listeners, tftp_config).await {
+            tracing::error!("tftp loop exited: {e}");
+        }
+    })))
+}
+
+/// Adopt or bind the DHCPv4 socket and spawn [`run_dhcp_loop`] over it.
+///
+/// `slaac_contexts` is DHCPv6's "current" RA-name context chain, folded in so
+/// the v4 loop can recompute SLAAC addresses (`slaac_add_addrs`) for the
+/// leases it actually commits — see
+/// [`crate::dhcp::DhcpLoopOptions::slaac_contexts`]. Empty when DHCPv6 isn't
+/// running.
+#[cfg(feature = "dhcp")]
+async fn spawn_dhcp_task(
+    mut dhcp_runtime: DhcpDaemonRuntime,
+    prebound_dhcp: Option<std::net::UdpSocket>,
+    #[cfg_attr(not(feature = "dhcp6"), allow(unused_variables))]
+    slaac_contexts: Vec<crate::types::dhcp::DhcpContext>,
+) -> Result<(tokio::task::JoinHandle<()>, tokio::sync::watch::Sender<bool>), ()> {
+    use std::sync::Arc;
+    use crate::dhcp::run_dhcp_loop;
+
+    #[cfg(feature = "dhcp6")]
+    {
+        dhcp_runtime.loop_opts.slaac_contexts = slaac_contexts;
+    }
+
+    let bind_addr = dhcp_runtime.bind_addr;
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    let already_bound = prebound_dhcp.is_some();
+    let dhcp_sock = match adopt_or_bind(prebound_dhcp, &bind_addr.to_string()).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            tracing::error!("failed to bind DHCP socket on {bind_addr}: {e}");
+            return Err(());
+        }
+    };
+    tracing::info!("listening for DHCP packets on {bind_addr}");
+    // A pre-bound socket already went through `bind_listeners`, which does
+    // the SO_BINDTODEVICE while the process is still privileged.
+    #[cfg(target_os = "linux")]
+    if !already_bound {
+        if let Some(device) = dhcp_runtime.bind_interface.as_deref() {
+            if let Err(e) = bind_dhcp_socket_to_device(dhcp_sock.as_ref(), device) {
+                tracing::error!("failed to bind DHCP socket to interface {device}: {e}");
+                return Err(());
+            }
+        }
+    }
+    let lease_db = match dhcp_runtime.server.lease_file.as_deref() {
+        Some(path) => match crate::lease::LeaseDb::load_from_file(path) {
+            Ok(db) => {
+                tracing::info!("using DHCP lease file {path} ({} leases)", db.count());
+                db
+            }
+            Err(_) => crate::lease::LeaseDb::new(),
+        },
+        None => crate::lease::LeaseDb::new(),
+    };
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // PING_WAIT (config.h) — per-candidate ICMP echo timeout.
+    let probe: Box<dyn crate::dhcp::AddressProbe + Send + Sync> = Box::new(IcmpPinger::new(3000));
+    let task = tokio::spawn(async move {
+        if let Err(e) = run_dhcp_loop(dhcp_sock, dhcp_runtime.server, dhcp_runtime.loop_opts, lease_db, shutdown_rx, probe).await {
+            tracing::error!("dhcp loop exited: {e}");
+        }
+    });
+    Ok((task, shutdown_tx))
+}
+
+/// Adopt or bind the DHCPv6 socket, join the DHCPv6 multicast groups on every
+/// live interface, and spawn [`crate::dhcp6::run_dhcp6_loop`] over it.
+#[cfg(feature = "dhcp6")]
+async fn spawn_dhcp6_task(
+    rt: Dhcp6DaemonRuntime,
+    prebound_dhcp6: Option<std::net::UdpSocket>,
+) -> Result<(tokio::task::JoinHandle<()>, tokio::sync::watch::Sender<bool>), ()> {
+    let dhcp6_sock = match adopt_or_bind_dhcp6(prebound_dhcp6, rt.bind_addr).await {
+        Ok(s) => std::sync::Arc::new(s),
+        Err(e) => {
+            tracing::error!("failed to bind DHCPv6 socket on {}: {e}", rt.bind_addr);
+            return Err(());
+        }
+    };
+    tracing::info!("listening for DHCPv6 packets on {}", rt.bind_addr);
+    // A wildcard bind alone never receives multicast SOLICITs — real
+    // clients always multicast their first message, since they have no
+    // unicast address to send to yet. Best-effort: a sandboxed
+    // environment without the right capability, or an interface that
+    // can't do multicast, logs and keeps the rest of the daemon running
+    // rather than aborting startup (see `join_dhcp6_multicast_all_interfaces`).
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        crate::network::join_dhcp6_multicast_all_interfaces(dhcp6_sock.as_raw_fd());
+    }
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // Kept in-memory only — see `run_dhcp6_loop`'s doc comment on why this
+    // doesn't share the v4 loop's lease file.
+    let task = tokio::spawn(async move {
+        if let Err(e) = crate::dhcp6::run_dhcp6_loop(
+            dhcp6_sock, rt.duid, rt.contexts, rt.configs,
+            crate::lease::LeaseDb::new(), rt.authoritative, shutdown_rx, None,
+        ).await {
+            tracing::error!("dhcp6 loop exited: {e}");
+        }
+    });
+    Ok((task, shutdown_tx))
+}
+
+/// Create the raw ICMPv6 socket and spawn [`run_radv_loop`].
+///
+/// `ra_init()`'s raw ICMPv6 socket failure is fatal upstream (`die()`);
+/// matched here rather than degrading gracefully like `IcmpPinger` does,
+/// since `--enable-ra`/a `ra-only` `dhcp-range` is an explicit request for RA
+/// service the daemon can't silently skip.
+#[cfg(feature = "dhcp6")]
+async fn spawn_radv_task(
+    config: RadvConfig,
+) -> Result<(tokio::task::JoinHandle<()>, tokio::sync::watch::Sender<bool>), ()> {
+    let want_echo_reply = config.contexts.iter().any(|c| c.flags.contains(crate::types::dhcp::ContextFlags::RA_NAME));
+    let socket = match RadvSocket::new(want_echo_reply) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("cannot create ICMPv6 socket for Router Advertisements: {e}");
+            return Err(());
+        }
+    };
+    tracing::info!("sending Router Advertisements");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move {
+        if let Err(e) = run_radv_loop(socket, config, shutdown_rx).await {
+            tracing::error!("radv loop exited: {e}");
+        }
+    });
+    Ok((task, shutdown_tx))
+}
+
 /// Run the main daemon event loop, binding its own sockets.
 ///
 /// This function:
@@ -1656,34 +2020,20 @@ pub async fn run_main_loop_with(
     listeners: Option<Listeners>,
     cache: crate::cache::SharedDnsCache,
 ) -> RunResult {
-    use std::sync::Arc;
-    #[cfg(feature = "dhcp")]
-    use tokio::sync::watch;
     use tokio::signal::unix::{signal, SignalKind};
     use tracing::{error, info};
 
-    use crate::forward::{DnsListener, run_forward_loop_on};
-    #[cfg(feature = "dhcp")]
-    use crate::dhcp::{DhcpLoopOptions, run_dhcp_loop};
+    use crate::forward::run_forward_loop_on;
 
     // ── Resolve configuration ────────────────────────────────────────────────
-    let (mut fwd_config, dhcp_runtime, arp_state, tftp_config) = {
-        let d = daemon_handle.read().await;
-        let fwd_config = daemon_forward_config(&d);
-        // Shared (not copied) so a kernel refresh triggered by the forwarding
-        // loop's MAC resolution is visible to DHCPv6's `get_client_mac` too —
-        // see `Daemon::arp_state`.
-        let arp_state = d.arp_state.clone();
+    let InitialRunConfig {
+        mut fwd_config,
         #[cfg(feature = "dhcp")]
-        let dhcp_runtime = daemon_dhcp_runtime(&d);
-        #[cfg(not(feature = "dhcp"))]
-        let dhcp_runtime = ();
+        dhcp_runtime,
+        arp_state,
         #[cfg(feature = "tftp")]
-        let tftp_config = daemon_tftp_config(&d);
-        #[cfg(not(feature = "tftp"))]
-        let tftp_config = ();
-        (fwd_config, dhcp_runtime, arp_state, tftp_config)
-    };
+        tftp_config,
+    } = resolve_run_config(&daemon_handle).await;
 
     // `--dns-loop-detect`: send the first round of loop probes once at
     // startup, mirroring `if (daemon->port != 0) check_servers(0);` right
@@ -1696,24 +2046,12 @@ pub async fn run_main_loop_with(
         crate::loop_detect::send_probes(&mut fwd_config.loop_servers).await;
     }
 
-    // `--dump-file`: open (or create/reopen) the pcap dump once at startup,
-    // mirroring `dump_init()` being called once from `main()` (`dnsmasq.c:450`).
+    // `--dump-file`: open (or create/reopen) the pcap dump once at startup.
     // A failure here is fatal, matching upstream's `die()` on the same paths.
     #[cfg(feature = "dump")]
-    {
-        let (dump_file, edns_pktsz, dump_mask) = {
-            let d = daemon_handle.read().await;
-            (d.dump_file.clone(), d.edns_pktsz, d.dump_mask)
-        };
-        if let Some(path) = dump_file {
-            match crate::dump::DumpHandle::init(&path, edns_pktsz, dump_mask) {
-                Ok(handle) => fwd_config.dump = Some(handle),
-                Err(e) => {
-                    error!("cannot open dump file {path}: {e}");
-                    return RunResult::IoError;
-                }
-            }
-        }
+    match init_dump_if_configured(&daemon_handle).await {
+        Ok(dump) => fwd_config.dump = dump,
+        Err(()) => return RunResult::IoError,
     }
 
     // DUID generation mutates `daemon.duid`, so this needs a write lock —
@@ -1748,83 +2086,23 @@ pub async fn run_main_loop_with(
     };
 
     // ── Adopt sockets bound before the fork, or bind them now ────────────────
-    //
-    // `main` binds while still privileged and hands them over; the in-process
-    // callers get here with `None` and go through the very same code path, so
-    // there is exactly one place that decides what the daemon listens on.
-    let mut listeners = match listeners {
-        Some(l) => l,
-        None => {
-            let d = daemon_handle.read().await;
-            match bind_listeners(&d) {
-                Ok(l) => l,
-                Err(e) => {
-                    error!("failed to bind DNS listening sockets: {e}");
-                    return RunResult::IoError;
-                }
-            }
-        }
+    let PreparedListeners {
+        dns_listeners,
+        arrival_filter,
+        #[cfg(feature = "dhcp")]
+        prebound_dhcp,
+        #[cfg(feature = "dhcp6")]
+        prebound_dhcp6,
+        #[cfg(feature = "tftp")]
+        bound_tftp,
+    } = match prepare_listeners(&daemon_handle, listeners).await {
+        Ok(p) => p,
+        Err(()) => return RunResult::IoError,
     };
-
-    #[cfg(feature = "dhcp")]
-    let prebound_dhcp = listeners.dhcp.take();
-    #[cfg(feature = "dhcp6")]
-    let prebound_dhcp6 = listeners.dhcp6.take();
-    #[cfg(feature = "tftp")]
-    let bound_tftp = std::mem::take(&mut listeners.tftp);
-    let bound_dns = std::mem::take(&mut listeners.dns);
-    let arrival_filter = listeners.arrival_filter.take();
-
-    let mut dns_listeners = Vec::with_capacity(bound_dns.len());
-    for bound in bound_dns {
-        let addr = bound.addr;
-        let sock = match tokio::net::UdpSocket::from_std(bound.sock) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("failed to adopt the DNS socket bound on {addr}: {e}");
-                return RunResult::IoError;
-            }
-        };
-        info!("listening for DNS queries on {addr}");
-        dns_listeners.push(DnsListener { sock: Arc::new(sock), check_dst: bound.check_dst });
-    }
-    if dns_listeners.is_empty() {
-        error!("no DNS listening sockets were bound; check --interface/--listen-address");
-        return RunResult::IoError;
-    }
 
     // ── D-Bus (`--enable-dbus`) ───────────────────────────────────────────────
-    //
-    // Mirrors `dbus_init()` being called once at startup (`dnsmasq.c:461`);
-    // the retry-while-bus-not-up-yet behavior (`dnsmasq.c:1263`) lives inside
-    // `run_dbus_task` itself — see its doc comment for why that's a spawned
-    // async task rather than a per-tick poll here.
     #[cfg(feature = "dbus")]
-    let dbus_task = {
-        let opt_dbus = {
-            let d = daemon_handle.read().await;
-            d.option_bool(crate::types::constants::OPT_DBUS)
-        };
-        if opt_dbus {
-            let d = daemon_handle.read().await;
-            let dbus_name = d.dbus_name.clone().unwrap_or_else(|| crate::dbus::DNSMASQ_DBUS_INTERFACE.to_string());
-            #[cfg(feature = "dhcp")]
-            let lease_file = d.lease_file.clone();
-            drop(d);
-            let ctx = crate::dbus::DbusContext {
-                daemon: daemon_handle.clone(),
-                cache: cache.clone(),
-                #[cfg(feature = "dhcp")]
-                leases: Arc::new(tokio::sync::Mutex::new(crate::lease::LeaseDb::new())),
-                #[cfg(feature = "dhcp")]
-                lease_file,
-                dbus_name,
-            };
-            Some(tokio::spawn(crate::dbus::run_dbus_task(ctx)))
-        } else {
-            None
-        }
-    };
+    let dbus_task = spawn_dbus_task(&daemon_handle, cache.clone()).await;
 
     // ── inotify: dynamic-dir initial scan + watch task ───────────────────────
     //
@@ -1843,25 +2121,8 @@ pub async fn run_main_loop_with(
     let inotify_task = spawn_inotify_watch_task(daemon_handle.clone(), cache.clone());
 
     // ── UBus (`--ubus`) ───────────────────────────────────────────────────────
-    //
-    // Mirrors upstream calling `ubus_init()` once at startup and then
-    // draining events via `set_ubus_listeners()`/`check_ubus_listeners()`
-    // from the main `poll()` loop (dnsmasq.c) — collapsed into one spawned
-    // task since this codebase has no raw `poll()` loop to hook a listener
-    // into; see `ubus::run_ubus_task`'s doc comment.
     #[cfg(feature = "ubus")]
-    let ubus_task = {
-        let opt_ubus = {
-            let d = daemon_handle.read().await;
-            d.option_bool(crate::types::constants::OPT_UBUS)
-        };
-        if opt_ubus {
-            let ctx = crate::ubus::UbusContext { daemon: daemon_handle.clone() };
-            Some(tokio::spawn(crate::ubus::run_ubus_task(ctx)))
-        } else {
-            None
-        }
-    };
+    let ubus_task = spawn_ubus_task(&daemon_handle).await;
 
     // ── Spawn the forwarding engine ──────────────────────────────────────────
     let arp_housekeeping_state = arp_state.clone();
@@ -1883,71 +2144,30 @@ pub async fn run_main_loop_with(
 
     // ── Spawn the TFTP server ─────────────────────────────────────────────────
     #[cfg(feature = "tftp")]
-    let tftp_task = if bound_tftp.is_empty() {
-        None
-    } else {
-        let mut tftp_listeners = Vec::with_capacity(bound_tftp.len());
-        for bound in bound_tftp {
-            let addr = bound.addr;
-            let sock = match tokio::net::UdpSocket::from_std(bound.sock) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("failed to adopt the TFTP socket bound on {addr}: {e}");
-                    fwd_task.abort();
-                    arp_task.abort();
-                    return RunResult::IoError;
-                }
-            };
-            info!("listening for TFTP requests on {addr}");
-            tftp_listeners.push(crate::tftp::TftpListenerHandle {
-                sock: Arc::new(sock),
-                addr,
-                iface: bound.iface,
-                mtu: bound.mtu,
-            });
+    let tftp_task = match spawn_tftp_task(bound_tftp, tftp_config).await {
+        Ok(t) => t,
+        Err(()) => {
+            fwd_task.abort();
+            arp_task.abort();
+            return RunResult::IoError;
         }
-        Some(tokio::spawn(async move {
-            if let Err(e) = crate::tftp::run_tftp_loop(tftp_listeners, tftp_config).await {
-                error!("tftp loop exited: {e}");
-            }
-        }))
     };
 
     #[cfg(feature = "dhcp")]
-    let (dhcp_task, dhcp_shutdown_tx) = if let Some(mut dhcp_runtime) = dhcp_runtime {
-        // Feed the DHCPv6 "current" RA-name context chain to the DHCPv4 loop
-        // so it can recompute SLAAC addresses (`slaac_add_addrs`) for the
-        // leases it actually commits — see `DhcpLoopOptions::slaac_contexts`.
-        // `dhcp6_runtime` is still `Some` here (its contexts aren't moved
-        // into `run_dhcp6_loop` until the block below), so this is the last
-        // point that can clone them.
-        #[cfg(feature = "dhcp6")]
-        {
-            dhcp_runtime.loop_opts.slaac_contexts =
-                dhcp6_runtime.as_ref().map(|rt| rt.contexts.clone()).unwrap_or_default();
-        }
-        let bind_addr = dhcp_runtime.bind_addr;
-        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
-        let already_bound = prebound_dhcp.is_some();
-        let dhcp_sock = match adopt_or_bind(prebound_dhcp, &bind_addr.to_string()).await {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                error!("failed to bind DHCP socket on {bind_addr}: {e}");
-                fwd_task.abort();
-                arp_task.abort();
-                #[cfg(feature = "tftp")]
-                if let Some(t) = tftp_task.as_ref() { t.abort(); }
-                return RunResult::IoError;
-            }
-        };
-        info!("listening for DHCP packets on {bind_addr}");
-        // A pre-bound socket already went through `bind_listeners`, which does
-        // the SO_BINDTODEVICE while the process is still privileged.
-        #[cfg(target_os = "linux")]
-        if !already_bound {
-            if let Some(device) = dhcp_runtime.bind_interface.as_deref() {
-                if let Err(e) = bind_dhcp_socket_to_device(dhcp_sock.as_ref(), device) {
-                    error!("failed to bind DHCP socket to interface {device}: {e}");
+    let (dhcp_task, dhcp_shutdown_tx) = match dhcp_runtime {
+        Some(dhcp_runtime) => {
+            // Feed the DHCPv6 "current" RA-name context chain to the DHCPv4
+            // loop so it can recompute SLAAC addresses for the leases it
+            // actually commits. `dhcp6_runtime` is still `Some` here (its
+            // contexts aren't moved into `run_dhcp6_loop` until the block
+            // below), so this is the last point that can clone them.
+            #[cfg(feature = "dhcp6")]
+            let slaac_contexts = dhcp6_runtime.as_ref().map(|rt| rt.contexts.clone()).unwrap_or_default();
+            #[cfg(not(feature = "dhcp6"))]
+            let slaac_contexts: Vec<crate::types::dhcp::DhcpContext> = Vec::new();
+            match spawn_dhcp_task(dhcp_runtime, prebound_dhcp, slaac_contexts).await {
+                Ok((task, tx)) => (Some(task), Some(tx)),
+                Err(()) => {
                     fwd_task.abort();
                     arp_task.abort();
                     #[cfg(feature = "tftp")]
@@ -1956,35 +2176,14 @@ pub async fn run_main_loop_with(
                 }
             }
         }
-        let lease_db = match dhcp_runtime.server.lease_file.as_deref() {
-            Some(path) => match crate::lease::LeaseDb::load_from_file(path) {
-                Ok(db) => {
-                    info!("using DHCP lease file {path} ({} leases)", db.count());
-                    db
-                }
-                Err(_) => crate::lease::LeaseDb::new(),
-            },
-            None => crate::lease::LeaseDb::new(),
-        };
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        // PING_WAIT (config.h) — per-candidate ICMP echo timeout.
-        let probe: Box<dyn crate::dhcp::AddressProbe + Send + Sync> = Box::new(IcmpPinger::new(3000));
-        let task = tokio::spawn(async move {
-            if let Err(e) = run_dhcp_loop(dhcp_sock, dhcp_runtime.server, dhcp_runtime.loop_opts, lease_db, shutdown_rx, probe).await {
-                error!("dhcp loop exited: {e}");
-            }
-        });
-        (Some(task), Some(shutdown_tx))
-    } else {
-        (None, None)
+        None => (None, None),
     };
 
     #[cfg(feature = "dhcp6")]
-    let (dhcp6_task, dhcp6_shutdown_tx) = if let Some(rt) = dhcp6_runtime {
-        let dhcp6_sock = match adopt_or_bind_dhcp6(prebound_dhcp6, rt.bind_addr).await {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                error!("failed to bind DHCPv6 socket on {}: {e}", rt.bind_addr);
+    let (dhcp6_task, dhcp6_shutdown_tx) = match dhcp6_runtime {
+        Some(rt) => match spawn_dhcp6_task(rt, prebound_dhcp6).await {
+            Ok((task, tx)) => (Some(task), Some(tx)),
+            Err(()) => {
                 fwd_task.abort();
                 arp_task.abort();
                 #[cfg(feature = "tftp")]
@@ -2000,52 +2199,19 @@ pub async fn run_main_loop_with(
                 }
                 return RunResult::IoError;
             }
-        };
-        info!("listening for DHCPv6 packets on {}", rt.bind_addr);
-        // A wildcard bind alone never receives multicast SOLICITs — real
-        // clients always multicast their first message, since they have no
-        // unicast address to send to yet. Best-effort: a sandboxed
-        // environment without the right capability, or an interface that
-        // can't do multicast, logs and keeps the rest of the daemon running
-        // rather than aborting startup (see `join_dhcp6_multicast_all_interfaces`).
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            crate::network::join_dhcp6_multicast_all_interfaces(dhcp6_sock.as_raw_fd());
-        }
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        // Kept in-memory only — see `run_dhcp6_loop`'s doc comment on why this
-        // doesn't share the v4 loop's lease file.
-        let task = tokio::spawn(async move {
-            if let Err(e) = crate::dhcp6::run_dhcp6_loop(
-                dhcp6_sock, rt.duid, rt.contexts, rt.configs,
-                crate::lease::LeaseDb::new(), rt.authoritative, shutdown_rx, None,
-            ).await {
-                error!("dhcp6 loop exited: {e}");
-            }
-        });
-        (Some(task), Some(shutdown_tx))
-    } else {
-        (None, None)
+        },
+        None => (None, None),
     };
 
     // ── Netlink address-change watcher ───────────────────────────────────────
     let netlink_task = spawn_netlink_watch_task();
 
     // ── Router Advertisements ────────────────────────────────────────────────
-    //
-    // `ra_init()`'s raw ICMPv6 socket failure is fatal upstream (`die()`);
-    // matched here rather than degrading gracefully like `IcmpPinger` does,
-    // since `--enable-ra`/a `ra-only` `dhcp-range` is an explicit request for
-    // RA service the daemon can't silently skip — the same convention this
-    // function already applies to a failed DHCPv6 socket bind above.
     #[cfg(feature = "dhcp6")]
-    let (radv_task, radv_shutdown_tx) = if let Some(cfg) = radv_config {
-        let want_echo_reply = cfg.contexts.iter().any(|c| c.flags.contains(crate::types::dhcp::ContextFlags::RA_NAME));
-        let socket = match RadvSocket::new(want_echo_reply) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("cannot create ICMPv6 socket for Router Advertisements: {e}");
+    let (radv_task, radv_shutdown_tx) = match radv_config {
+        Some(cfg) => match spawn_radv_task(cfg).await {
+            Ok((task, tx)) => (Some(task), Some(tx)),
+            Err(()) => {
                 fwd_task.abort();
                 #[cfg(feature = "dhcp")]
                 {
@@ -2064,20 +2230,8 @@ pub async fn run_main_loop_with(
                 }
                 return RunResult::IoError;
             }
-        };
-        info!("sending Router Advertisements");
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let task = tokio::spawn(async move {
-            if let Err(e) = run_radv_loop(
-                socket, cfg.contexts, cfg.ra_interfaces, cfg.dhcp_except, cfg.bridges,
-                cfg.opt_ra, cfg.is_dns_server, cfg.quiet_ra, cfg.iface_check, shutdown_rx,
-            ).await {
-                error!("radv loop exited: {e}");
-            }
-        });
-        (Some(task), Some(shutdown_tx))
-    } else {
-        (None, None)
+        },
+        None => (None, None),
     };
 
     // ── Signal handling ──────────────────────────────────────────────────────
@@ -2966,23 +3120,20 @@ fn build_ra_packet(
     socket: &RadvSocket,
     if_index: u32,
     iface_name: &str,
-    contexts: &mut Vec<crate::types::dhcp::DhcpContext>,
-    ra_interfaces: &[crate::types::dhcp::RaInterface],
-    opt_ra: bool,
-    is_dns_server: bool,
+    config: &mut RadvConfig,
 ) -> Option<Vec<u8>> {
     let live_addrs = crate::network::enumerate_live_addrs6().unwrap_or_default();
     let params = crate::radv::RaBuildParams {
         now: radv_now_secs(),
         if_index,
         iface_name,
-        opt_ra,
-        is_dns_server,
+        opt_ra: config.opt_ra,
+        is_dns_server: config.is_dns_server,
         hop_limit: socket.hop_limit.clamp(0, 255) as u8,
-        mtu: resolve_ra_mtu(ra_interfaces, iface_name),
+        mtu: resolve_ra_mtu(&config.ra_interfaces, iface_name),
         mac: None,
     };
-    crate::radv::build_ra_for_interface(&params, &live_addrs, contexts, ra_interfaces)
+    crate::radv::build_ra_for_interface(&params, &live_addrs, &mut config.contexts, &config.ra_interfaces)
         .map(|ra| crate::radv::build_ra(&ra))
 }
 
@@ -2993,28 +3144,27 @@ fn build_ra_packet(
 /// alias lookup, handled separately in [`run_radv_loop`]'s RS branch since it
 /// picks the *source* interface's bridge, not the destination's).
 #[cfg(feature = "dhcp6")]
-#[allow(clippy::too_many_arguments)]
 fn send_ra_with_aliases(
     socket: &RadvSocket,
     if_index: u32,
     iface_name: &str,
-    contexts: &mut Vec<crate::types::dhcp::DhcpContext>,
-    ra_interfaces: &[crate::types::dhcp::RaInterface],
-    bridges: &[crate::types::daemon::DhcpBridge],
+    config: &mut RadvConfig,
     live_ifaces: &[crate::radv::LiveIface6],
-    opt_ra: bool,
-    is_dns_server: bool,
 ) {
-    if let Some(packet) = build_ra_packet(socket, if_index, iface_name, contexts, ra_interfaces, opt_ra, is_dns_server) {
+    if let Some(packet) = build_ra_packet(socket, if_index, iface_name, config) {
         if let Err(e) = socket.send(if_index, None, &packet) {
             tracing::warn!("failed to send RA on {iface_name}: {e}");
         }
     }
 
     let live_pairs: Vec<(String, u32)> = live_ifaces.iter().map(|f| (f.name.clone(), f.if_index)).collect();
-    for bridge in bridges.iter().filter(|b| crate::network::nametoindex(&b.iface) == if_index) {
+    let matching_bridges: Vec<_> = config.bridges.iter()
+        .filter(|b| crate::network::nametoindex(&b.iface) == if_index)
+        .cloned()
+        .collect();
+    for bridge in &matching_bridges {
         for (alias_name, alias_idx) in crate::radv::bridge_alias_targets(bridge, &live_pairs) {
-            if let Some(packet) = build_ra_packet(socket, if_index, iface_name, contexts, ra_interfaces, opt_ra, is_dns_server) {
+            if let Some(packet) = build_ra_packet(socket, if_index, iface_name, config) {
                 if let Err(e) = socket.send(*alias_idx, None, &packet) {
                     tracing::warn!("failed to send bridged RA on {alias_name} (alias of {iface_name}): {e}");
                 }
@@ -3041,20 +3191,12 @@ fn ra_reply_dest(is_bridge_alias: bool, solicitor: Option<std::net::Ipv6Addr>) -
 ///
 /// Port of `icmp6_packet()` (radv.c:141-255).
 #[cfg(feature = "dhcp6")]
-#[allow(clippy::too_many_arguments)]
 fn handle_icmp6_packet(
     socket: &RadvSocket,
     data: &[u8],
     if_index: u32,
     src: std::net::SocketAddr,
-    contexts: &mut Vec<crate::types::dhcp::DhcpContext>,
-    ra_interfaces: &[crate::types::dhcp::RaInterface],
-    bridges: &[crate::types::daemon::DhcpBridge],
-    dhcp_except: &[crate::types::network::Iname],
-    iface_check: &crate::network::IfaceCheckConfig,
-    opt_ra: bool,
-    is_dns_server: bool,
-    quiet_ra: bool,
+    config: &mut RadvConfig,
 ) {
     if data.len() < 8 || data[1] != 0 {
         return;
@@ -3065,10 +3207,10 @@ fn handle_icmp6_packet(
 
     let Some(name) = crate::network::indextoname(if_index) else { return };
     // radv.c:178 — `--interface`/`--except-interface`/`--listen-address`.
-    if !crate::network::iface_check_name(&name, iface_check) {
+    if !crate::network::iface_check_name(&name, &config.iface_check) {
         return;
     }
-    if crate::radv::blocked_by_dhcp_except(&name, dhcp_except) {
+    if crate::radv::blocked_by_dhcp_except(&name, &config.dhcp_except) {
         return;
     }
 
@@ -3079,7 +3221,7 @@ fn handle_icmp6_packet(
         Ok(mac) => mac,
         Err(_) => return, // malformed option — upstream bails out here too
     };
-    if !quiet_ra {
+    if !config.quiet_ra {
         let mac = mac.as_deref().map(crate::util::print_mac).unwrap_or_default();
         tracing::info!("RTR-SOLICIT({name}) {mac}");
     }
@@ -3095,7 +3237,8 @@ fn handle_icmp6_packet(
     // currently present) is skipped in favour of the next bridge, not treated
     // as a match that silently drops the RS — falling through to the direct
     // reply below if no bridge ends up claiming it.
-    for bridge in bridges {
+    let bridges = config.bridges.clone();
+    for bridge in &bridges {
         let bridge_idx = crate::network::nametoindex(&bridge.iface);
         if bridge_idx == 0 {
             continue;
@@ -3103,7 +3246,7 @@ fn handle_icmp6_packet(
         if !bridge.aliases.iter().any(|a| crate::util::wildcard_matchn(a, &name, libc::IF_NAMESIZE)) {
             continue;
         }
-        if let Some(packet) = build_ra_packet(socket, bridge_idx, &bridge.iface, contexts, ra_interfaces, opt_ra, is_dns_server) {
+        if let Some(packet) = build_ra_packet(socket, bridge_idx, &bridge.iface, config) {
             if let Err(e) = socket.send(if_index, ra_reply_dest(true, dest), &packet) {
                 tracing::warn!("failed to send bridged RA reply on {name}: {e}");
             }
@@ -3111,7 +3254,7 @@ fn handle_icmp6_packet(
         return;
     }
 
-    if let Some(packet) = build_ra_packet(socket, if_index, &name, contexts, ra_interfaces, opt_ra, is_dns_server) {
+    if let Some(packet) = build_ra_packet(socket, if_index, &name, config) {
         if let Err(e) = socket.send(if_index, ra_reply_dest(false, dest), &packet) {
             tracing::warn!("failed to send RA reply on {name}: {e}");
         }
@@ -3125,22 +3268,14 @@ fn handle_icmp6_packet(
 /// (radv.c:141-255, 789-897), run here as one `tokio::select!` loop instead
 /// of upstream's shared `select()`-based main loop.
 #[cfg(feature = "dhcp6")]
-#[allow(clippy::too_many_arguments)]
 pub async fn run_radv_loop(
     socket: RadvSocket,
-    mut contexts: Vec<crate::types::dhcp::DhcpContext>,
-    ra_interfaces: Vec<crate::types::dhcp::RaInterface>,
-    dhcp_except: Vec<crate::types::network::Iname>,
-    bridges: Vec<crate::types::daemon::DhcpBridge>,
-    opt_ra: bool,
-    is_dns_server: bool,
-    quiet_ra: bool,
-    iface_check: crate::network::IfaceCheckConfig,
+    mut config: RadvConfig,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     use tokio::io::unix::AsyncFd;
 
-    crate::radv::ra_start_unsolicited_all(&mut contexts, radv_now_secs(), crate::util::rand16);
+    crate::radv::ra_start_unsolicited_all(&mut config.contexts, radv_now_secs(), crate::util::rand16);
 
     let async_fd = AsyncFd::new(socket)?;
     let mut deadline = tokio::time::Instant::now();
@@ -3159,15 +3294,12 @@ pub async fn run_radv_loop(
                 let live_ifaces = enumerate_live_ifaces6();
                 let now = radv_now_secs();
                 let (targets, next) = crate::radv::periodic_ra(
-                    now, &mut contexts, &live_ifaces, &ra_interfaces, &dhcp_except,
+                    now, &mut config.contexts, &live_ifaces, &config.ra_interfaces, &config.dhcp_except,
                     crate::util::rand16, crate::network::indextoname,
-                    |name| crate::network::iface_check_name(name, &iface_check),
+                    |name| crate::network::iface_check_name(name, &config.iface_check),
                 );
                 for target in &targets {
-                    send_ra_with_aliases(
-                        async_fd.get_ref(), target.if_index, &target.name, &mut contexts,
-                        &ra_interfaces, &bridges, &live_ifaces, opt_ra, is_dns_server,
-                    );
+                    send_ra_with_aliases(async_fd.get_ref(), target.if_index, &target.name, &mut config, &live_ifaces);
                 }
                 deadline = tokio::time::Instant::now() + match next {
                     Some(n) => Duration::from_secs(n.saturating_sub(now).max(1)),
@@ -3182,11 +3314,7 @@ pub async fn run_radv_loop(
                 let result = guard.get_inner().recv(&mut recv_buf);
                 guard.clear_ready();
                 if let Ok(meta) = result {
-                    handle_icmp6_packet(
-                        async_fd.get_ref(), &recv_buf[..meta.len], meta.if_index, meta.src,
-                        &mut contexts, &ra_interfaces, &bridges, &dhcp_except, &iface_check,
-                        opt_ra, is_dns_server, quiet_ra,
-                    );
+                    handle_icmp6_packet(async_fd.get_ref(), &recv_buf[..meta.len], meta.if_index, meta.src, &mut config);
                 }
             }
         }
@@ -5317,10 +5445,17 @@ mod tests {
         };
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let task = tokio::spawn(run_radv_loop(
-            socket, vec![ctx], vec![], vec![], vec![], false, false, false,
-            crate::network::IfaceCheckConfig::default(), shutdown_rx,
-        ));
+        let config = RadvConfig {
+            contexts: vec![ctx],
+            ra_interfaces: vec![],
+            dhcp_except: vec![],
+            bridges: vec![],
+            opt_ra: false,
+            is_dns_server: false,
+            quiet_ra: false,
+            iface_check: crate::network::IfaceCheckConfig::default(),
+        };
+        let task = tokio::spawn(run_radv_loop(socket, config, shutdown_rx));
 
         // `ra_start_unsolicited_all` schedules within 0-5s; give it a moment
         // to fire, then shut the loop down cleanly either way.

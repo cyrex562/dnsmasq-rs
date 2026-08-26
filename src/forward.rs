@@ -2612,6 +2612,289 @@ fn set_rcode(pkt: &mut [u8], rcode: u8) {
     }
 }
 
+/// Handle one readable-listener event: read the datagram, apply per-datagram
+/// arrival filtering, and locally answer or forward it.
+///
+/// Extracted from the "Incoming client query" arm of `run_forward_loop_on`'s
+/// `select!` loop so it can be unit-tested without a real socket and so the
+/// loop body itself stays legible. Returns `Err` only for a socket error
+/// serious enough to abort the whole forwarding loop (the same
+/// `Err(e) => return Err(e)` path this arm always had); anything that should
+/// merely skip this datagram (arrival-filter reject, loop-probe, spurious
+/// `WouldBlock`) returns `Ok(())` instead of `continue`-ing an outer loop.
+async fn handle_incoming_query(
+    listeners:  &[DnsListener],
+    idx:        usize,
+    filter:     &mut Option<crate::network::ArrivalFilter>,
+    engine:     &mut ForwardEngine,
+    cache:      &SharedDnsCache,
+    local:      &LocalData,
+    client_buf: &mut [u8],
+) -> std::io::Result<()> {
+    let listener = &listeners[idx];
+    let meta = match recv_datagram(listener, client_buf) {
+        Ok(meta) => meta,
+        // `poll_recv_ready` can produce a spurious wake-up; another
+        // reader is not possible here, but the kernel may still say
+        // "would block".
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    // Re-apply the interface config per datagram: the address a
+    // socket is bound to does not constrain which interface a
+    // datagram for it arrived on.
+    if listener.check_dst {
+        if let Some(f) = filter.as_mut() {
+            if !f.accepts(meta.if_index, meta.dest) {
+                return Ok(());
+            }
+        }
+    }
+    let (len, src) = (meta.len, meta.src);
+    let pkt = &client_buf[..len];
+    // The local address the query arrived on: `IP_PKTINFO` gives
+    // it per-datagram in wildcard mode; an address-bound listener
+    // has no need of that control message, so its own bound
+    // address is the answer (`forward.c:2388-2393`).
+    let dest = meta.dest.or_else(|| listener.sock.local_addr().ok().map(|a| a.ip()));
+    // Only forward DNS queries (QR bit == 0).
+    if pkt.len() >= 12 && pkt[2] & 0x80 == 0 {
+        // `--dump-file`/`--dump-mask`: record the client query,
+        // mirroring `dump_packet_udp(DUMP_QUERY, ...)` at
+        // `forward.c:1818`.
+        #[cfg(feature = "dump")]
+        if let Some(dump) = &engine.config.dump {
+            let local = dest.map(|ip| SocketAddr::new(ip, engine.config.port));
+            dump.dump_packet_udp(
+                crate::types::constants::DUMP_QUERY,
+                pkt,
+                Some(src),
+                local,
+                crate::dump::DumpFallback::None,
+            );
+        }
+        // `log_query` gets called for every query C reads, before it
+        // is known whether the answer will be local or forwarded
+        // (`forward.c:1826-1834`).
+        if let Some(line) = incoming_query_log_line(&local.log_opts, pkt, src) {
+            crate::log::my_syslog(crate::log::LOG_INFO, &line);
+        }
+        // `--dns-loop-detect`: a query that is one of our own loop
+        // probes coming back marks the offending upstream server
+        // and is dropped outright — no reply, no forwarding, no
+        // local-data lookup (`detect_loop()` returning 1 makes
+        // `udp_request()` `return;` immediately, `forward.c:1862-1863`).
+        #[cfg(feature = "loop")]
+        let is_loop_probe = engine.config.loop_detect
+            && crate::rfc1035::extract_request(pkt).is_some_and(|(name, rtype)| {
+                crate::loop_detect::detect_loop(&name, rtype as u16, &mut engine.loop_servers)
+            });
+        #[cfg(not(feature = "loop"))]
+        let is_loop_probe = false;
+
+        if is_loop_probe {
+            return Ok(());
+        }
+        // `--connmark-allowlist-enable`: a query whose connection
+        // mark is not allow-listed gets REFUSED here, before it
+        // ever reaches local-data lookup or forwarding — this
+        // gates the whole `answer_request`/forward decision, not
+        // just the forwarding half (`forward.c:1905-1918`).
+        let admitted = if engine.config.cmark_alst_en {
+            let qname = query_name_lower(pkt);
+            #[cfg(feature = "conntrack")]
+            let mark_lookup = dest.and_then(|d| {
+                crate::conntrack::get_incoming_mark(src, d, /* istcp: */ false, engine.config.port)
+            });
+            #[cfg(not(feature = "conntrack"))]
+            let mark_lookup: Option<u32> = None;
+
+            let allowed = mark_admits_query(&engine.config, mark_lookup, &qname);
+            #[cfg(all(feature = "conntrack", feature = "ubus"))]
+            if !allowed {
+                if let Some(mark) = mark_lookup {
+                    crate::ubus::ubus_event_bcast_connmark_allowlist_refused(mark, &qname);
+                }
+            }
+            allowed
+        } else {
+            true
+        };
+
+        if !admitted {
+            if let Some(wire) = make_refused_answer(pkt, engine.config.local.edns_pktsz) {
+                #[cfg(feature = "dump")]
+                dump_reply(&engine.config.dump, &wire, dest, engine.config.port, src);
+                let _ = listener.sock.send_to(&wire, src).await;
+            }
+        } else {
+            // Local data and cache first — exactly as upstream does.
+            // The lock is dropped before `send_to` so a slow client
+            // send can't hold up a concurrent SIGHUP reload (or vice
+            // versa) — only the lookup itself needs the cache.
+            let local_wire = {
+                let mut cache = cache.lock().await;
+                answer_locally(pkt, &mut cache, local)
+            };
+            if let Some(wire) = local_wire {
+                #[cfg(feature = "dump")]
+                dump_reply(&engine.config.dump, &wire, dest, engine.config.port, src);
+                let _ = listener.sock.send_to(&wire, src).await;
+                inc_metric(Metric::DnsLocalAnswered);
+            } else {
+                match engine.forward_query(pkt, src, idx, dest).await {
+                    // The query table (or the duplicate-client budget)
+                    // is full, or the question could not be read.  C
+                    // answers REFUSED rather than dropping, so the
+                    // client fails fast instead of timing out
+                    // (`forward.c:337-343`, `forward.c:369`,
+                    // `domain-match.c:430`).  `make_refused_answer`
+                    // returning `None` is C's `make_local_answer()`
+                    // bailing out on an unwalkable question section, in
+                    // which case nothing is sent.
+                    ForwardOutcome::Refused => {
+                        if let Some(wire) =
+                            make_refused_answer(pkt, engine.config.local.edns_pktsz)
+                        {
+                            #[cfg(feature = "dump")]
+                            dump_reply(&engine.config.dump, &wire, dest, engine.config.port, src);
+                            let _ = listener.sock.send_to(&wire, src).await;
+                        }
+                    }
+                    ForwardOutcome::Forwarded(_)
+                    | ForwardOutcome::Duplicate
+                    | ForwardOutcome::Dropped => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Handle one readable-upstream-socket event: read the reply datagram,
+/// validate it against the outstanding query table, and relay it to every
+/// waiting client.
+///
+/// Extracted from the "Upstream reply" arm of `run_forward_loop_on`'s
+/// `select!` loop for the same reasons as [`handle_incoming_query`]. Nothing
+/// here can abort the outer loop — a malformed or unmatched reply is simply
+/// ignored, same as the arm's `continue` paths were.
+async fn handle_upstream_reply(
+    listeners:      &[DnsListener],
+    pos:            usize,
+    upstream_socks: &[(usize, Arc<tokio::net::UdpSocket>)],
+    engine:         &mut ForwardEngine,
+    cache:          &SharedDnsCache,
+    upstream_buf:   &mut [u8],
+) {
+    // The pool slot — not the position in this pass's snapshot — is
+    // the identity a query records in its `rfds`, and is what the
+    // reply has to match.
+    let (arrived_on, sock) = &upstream_socks[pos];
+    let (len, upstream_addr) = match sock.try_recv_from(upstream_buf) {
+        Ok(v)  => v,
+        Err(_) => return,
+    };
+    let mut pkt = upstream_buf[..len].to_vec();
+
+    // Nothing may act on this datagram until it has proved it
+    // answers an outstanding query, from the server that query
+    // went to.  A failed check leaves the query in flight so the
+    // genuine answer can still be accepted.
+    let (targets, flags) =
+        match engine.accept_reply(&pkt, upstream_addr, *arrived_on).await {
+            ReplyAction::Deliver { targets, flags } => (targets, flags),
+            ReplyAction::Retried | ReplyAction::Ignore => return,
+        };
+
+    // Everything C's `process_reply()` does to an accepted answer
+    // before it is handed to the waiting clients: EDNS0 fix-up,
+    // rebind and bogus-wildcard blocking, caching, RR filtering,
+    // the DNSSEC strip and the EDE option (`forward.c:696-889`).
+    //
+    // `query_source` is the *primary* client's address (`targets[0]`,
+    // C's `frec->frec_src.source`) — what `check_source()` recomputes
+    // the expected ECS option against (`forward.c:1431`).
+    let deliver = {
+        let mut cache = cache.lock().await;
+        let ctx = ReplyContext {
+            query_source: targets.first().map(|t| t.client.ip()),
+            ..ReplyContext::from_flags(flags)
+        };
+        process_reply(&mut pkt, &mut cache, Instant::now(), &engine.config, ctx)
+    };
+    if !deliver {
+        return;
+    }
+
+    // One upstream answer, one reply per waiting client, each under
+    // the ID that client used (`forward.c:1435-1440`).
+    //
+    // Parsed once, outside the per-client loop, purely for
+    // `report_addresses` (`forward.c:1439-1444`) — the answer
+    // section is identical for every target, only the wire
+    // transaction ID changes per client below.
+    #[cfg(all(feature = "conntrack", feature = "ubus"))]
+    let parsed_for_report = if engine.config.cmark_alst_en {
+        crate::rfc1035::DnsPacket::parse(&pkt).ok()
+    } else {
+        None
+    };
+    for target in targets {
+        let listener_idx = if target.listener < listeners.len() {
+            target.listener
+        } else {
+            0
+        };
+        patch_id(&mut pkt, target.orig_id);
+
+        // `--connmark-allowlist-enable`: look up this client
+        // connection's firewall mark and, if allow-listed,
+        // broadcast the resolved names via ubus
+        // (`forward.c:1439-1444`).
+        #[cfg(all(feature = "conntrack", feature = "ubus"))]
+        if engine.config.cmark_alst_en {
+            if let (Some(dest), Some(parsed)) = (target.dest, parsed_for_report.as_ref()) {
+                if let Some(mark) = crate::conntrack::get_incoming_mark(
+                    target.client,
+                    dest,
+                    /* istcp: */ false,
+                    engine.config.port,
+                ) {
+                    if mark & engine.config.allowlist_mask != 0 {
+                        for reported in crate::rfc1035::report_addresses(
+                            parsed,
+                            mark,
+                            &engine.config.allowlists,
+                            engine.config.allowlist_mask,
+                        ) {
+                            crate::ubus::ubus_event_bcast_connmark_allowlist_resolved(
+                                mark,
+                                &reported.name,
+                                &reported.resolved,
+                                reported.ttl,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        #[cfg(feature = "dump")]
+        if let Some(dump) = &engine.config.dump {
+            let local = listeners[listener_idx].sock.local_addr().ok();
+            dump.dump_packet_udp(
+                crate::types::constants::DUMP_REPLY,
+                &pkt,
+                local,
+                Some(target.client),
+                crate::dump::DumpFallback::None,
+            );
+        }
+        let _ = listeners[listener_idx].sock.send_to(&pkt, target.client).await;
+    }
+}
+
 /// Run the DNS UDP forwarding event loop over a set of bound listeners.
 ///
 /// `filter` is consulted for datagrams arriving on any listener whose
@@ -2659,143 +2942,7 @@ pub async fn run_forward_loop_on(
             (idx, ready) = next_readable(&listeners, scan_from) => {
                 ready?;
                 scan_from = (idx + 1) % listeners.len();
-                let listener = &listeners[idx];
-                let meta = match recv_datagram(listener, &mut client_buf) {
-                    Ok(meta) => meta,
-                    // `poll_recv_ready` can produce a spurious wake-up; another
-                    // reader is not possible here, but the kernel may still say
-                    // "would block".
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                    Err(e) => return Err(e),
-                };
-                // Re-apply the interface config per datagram: the address a
-                // socket is bound to does not constrain which interface a
-                // datagram for it arrived on.
-                if listener.check_dst {
-                    if let Some(f) = filter.as_mut() {
-                        if !f.accepts(meta.if_index, meta.dest) {
-                            continue;
-                        }
-                    }
-                }
-                let (len, src) = (meta.len, meta.src);
-                let pkt = &client_buf[..len];
-                // The local address the query arrived on: `IP_PKTINFO` gives
-                // it per-datagram in wildcard mode; an address-bound listener
-                // has no need of that control message, so its own bound
-                // address is the answer (`forward.c:2388-2393`).
-                let dest = meta.dest.or_else(|| listener.sock.local_addr().ok().map(|a| a.ip()));
-                // Only forward DNS queries (QR bit == 0).
-                if pkt.len() >= 12 && pkt[2] & 0x80 == 0 {
-                    // `--dump-file`/`--dump-mask`: record the client query,
-                    // mirroring `dump_packet_udp(DUMP_QUERY, ...)` at
-                    // `forward.c:1818`.
-                    #[cfg(feature = "dump")]
-                    if let Some(dump) = &engine.config.dump {
-                        let local = dest.map(|ip| SocketAddr::new(ip, engine.config.port));
-                        dump.dump_packet_udp(
-                            crate::types::constants::DUMP_QUERY,
-                            pkt,
-                            Some(src),
-                            local,
-                            crate::dump::DumpFallback::None,
-                        );
-                    }
-                    // `log_query` gets called for every query C reads, before it
-                    // is known whether the answer will be local or forwarded
-                    // (`forward.c:1826-1834`).
-                    if let Some(line) = incoming_query_log_line(&local.log_opts, pkt, src) {
-                        crate::log::my_syslog(crate::log::LOG_INFO, &line);
-                    }
-                    // `--dns-loop-detect`: a query that is one of our own loop
-                    // probes coming back marks the offending upstream server
-                    // and is dropped outright — no reply, no forwarding, no
-                    // local-data lookup (`detect_loop()` returning 1 makes
-                    // `udp_request()` `return;` immediately, `forward.c:1862-1863`).
-                    #[cfg(feature = "loop")]
-                    let is_loop_probe = engine.config.loop_detect
-                        && crate::rfc1035::extract_request(pkt).is_some_and(|(name, rtype)| {
-                            crate::loop_detect::detect_loop(&name, rtype as u16, &mut engine.loop_servers)
-                        });
-                    #[cfg(not(feature = "loop"))]
-                    let is_loop_probe = false;
-
-                    if is_loop_probe {
-                        continue;
-                    }
-                    // `--connmark-allowlist-enable`: a query whose connection
-                    // mark is not allow-listed gets REFUSED here, before it
-                    // ever reaches local-data lookup or forwarding — this
-                    // gates the whole `answer_request`/forward decision, not
-                    // just the forwarding half (`forward.c:1905-1918`).
-                    let admitted = if engine.config.cmark_alst_en {
-                        let qname = query_name_lower(pkt);
-                        #[cfg(feature = "conntrack")]
-                        let mark_lookup = dest.and_then(|d| {
-                            crate::conntrack::get_incoming_mark(src, d, /* istcp: */ false, engine.config.port)
-                        });
-                        #[cfg(not(feature = "conntrack"))]
-                        let mark_lookup: Option<u32> = None;
-
-                        let allowed = mark_admits_query(&engine.config, mark_lookup, &qname);
-                        #[cfg(all(feature = "conntrack", feature = "ubus"))]
-                        if !allowed {
-                            if let Some(mark) = mark_lookup {
-                                crate::ubus::ubus_event_bcast_connmark_allowlist_refused(mark, &qname);
-                            }
-                        }
-                        allowed
-                    } else {
-                        true
-                    };
-
-                    if !admitted {
-                        if let Some(wire) = make_refused_answer(pkt, engine.config.local.edns_pktsz) {
-                            #[cfg(feature = "dump")]
-                            dump_reply(&engine.config.dump, &wire, dest, engine.config.port, src);
-                            let _ = listener.sock.send_to(&wire, src).await;
-                        }
-                    } else {
-                        // Local data and cache first — exactly as upstream does.
-                        // The lock is dropped before `send_to` so a slow client
-                        // send can't hold up a concurrent SIGHUP reload (or vice
-                        // versa) — only the lookup itself needs the cache.
-                        let local_wire = {
-                            let mut cache = cache.lock().await;
-                            answer_locally(pkt, &mut cache, &local)
-                        };
-                        if let Some(wire) = local_wire {
-                            #[cfg(feature = "dump")]
-                            dump_reply(&engine.config.dump, &wire, dest, engine.config.port, src);
-                            let _ = listener.sock.send_to(&wire, src).await;
-                            inc_metric(Metric::DnsLocalAnswered);
-                        } else {
-                            match engine.forward_query(pkt, src, idx, dest).await {
-                                // The query table (or the duplicate-client budget)
-                                // is full, or the question could not be read.  C
-                                // answers REFUSED rather than dropping, so the
-                                // client fails fast instead of timing out
-                                // (`forward.c:337-343`, `forward.c:369`,
-                                // `domain-match.c:430`).  `make_refused_answer`
-                                // returning `None` is C's `make_local_answer()`
-                                // bailing out on an unwalkable question section, in
-                                // which case nothing is sent.
-                                ForwardOutcome::Refused => {
-                                    if let Some(wire) =
-                                        make_refused_answer(pkt, engine.config.local.edns_pktsz)
-                                    {
-                                        #[cfg(feature = "dump")]
-                                        dump_reply(&engine.config.dump, &wire, dest, engine.config.port, src);
-                                        let _ = listener.sock.send_to(&wire, src).await;
-                                    }
-                                }
-                                ForwardOutcome::Forwarded(_)
-                                | ForwardOutcome::Duplicate
-                                | ForwardOutcome::Dropped => {}
-                            }
-                        }
-                    }
-                }
+                handle_incoming_query(&listeners, idx, &mut filter, &mut engine, &cache, &local, &mut client_buf).await?;
             }
             // ── Upstream reply ────────────────────────────────────────────────
             (pos, ready) = next_upstream_readable(&upstream_socks, upstream_scan_from),
@@ -2804,143 +2951,54 @@ pub async fn run_forward_loop_on(
                 // One sick outbound socket must not take the whole resolver
                 // down; the query it belongs to will simply time out.
                 if ready.is_err() { continue }
-                // The pool slot — not the position in this pass's snapshot — is
-                // the identity a query records in its `rfds`, and is what the
-                // reply has to match.
-                let (arrived_on, sock) = &upstream_socks[pos];
-                let (len, upstream_addr) = match sock.try_recv_from(&mut upstream_buf) {
-                    Ok(v)  => v,
-                    Err(_) => continue,
-                };
-                let mut pkt = upstream_buf[..len].to_vec();
-
-                // Nothing may act on this datagram until it has proved it
-                // answers an outstanding query, from the server that query
-                // went to.  A failed check leaves the query in flight so the
-                // genuine answer can still be accepted.
-                let (targets, flags) =
-                    match engine.accept_reply(&pkt, upstream_addr, *arrived_on).await {
-                        ReplyAction::Deliver { targets, flags } => (targets, flags),
-                        ReplyAction::Retried | ReplyAction::Ignore => continue,
-                    };
-
-                // Everything C's `process_reply()` does to an accepted answer
-                // before it is handed to the waiting clients: EDNS0 fix-up,
-                // rebind and bogus-wildcard blocking, caching, RR filtering,
-                // the DNSSEC strip and the EDE option (`forward.c:696-889`).
-                //
-                // `query_source` is the *primary* client's address (`targets[0]`,
-                // C's `frec->frec_src.source`) — what `check_source()` recomputes
-                // the expected ECS option against (`forward.c:1431`).
-                let deliver = {
-                    let mut cache = cache.lock().await;
-                    let ctx = ReplyContext {
-                        query_source: targets.first().map(|t| t.client.ip()),
-                        ..ReplyContext::from_flags(flags)
-                    };
-                    process_reply(&mut pkt, &mut cache, Instant::now(), &engine.config, ctx)
-                };
-                if !deliver {
-                    continue;
-                }
-
-                // One upstream answer, one reply per waiting client, each under
-                // the ID that client used (`forward.c:1435-1440`).
-                //
-                // Parsed once, outside the per-client loop, purely for
-                // `report_addresses` (`forward.c:1439-1444`) — the answer
-                // section is identical for every target, only the wire
-                // transaction ID changes per client below.
-                #[cfg(all(feature = "conntrack", feature = "ubus"))]
-                let parsed_for_report = if engine.config.cmark_alst_en {
-                    crate::rfc1035::DnsPacket::parse(&pkt).ok()
-                } else {
-                    None
-                };
-                for target in targets {
-                    let listener_idx = if target.listener < listeners.len() {
-                        target.listener
-                    } else {
-                        0
-                    };
-                    patch_id(&mut pkt, target.orig_id);
-
-                    // `--connmark-allowlist-enable`: look up this client
-                    // connection's firewall mark and, if allow-listed,
-                    // broadcast the resolved names via ubus
-                    // (`forward.c:1439-1444`).
-                    #[cfg(all(feature = "conntrack", feature = "ubus"))]
-                    if engine.config.cmark_alst_en {
-                        if let (Some(dest), Some(parsed)) = (target.dest, parsed_for_report.as_ref()) {
-                            if let Some(mark) = crate::conntrack::get_incoming_mark(
-                                target.client,
-                                dest,
-                                /* istcp: */ false,
-                                engine.config.port,
-                            ) {
-                                if mark & engine.config.allowlist_mask != 0 {
-                                    for reported in crate::rfc1035::report_addresses(
-                                        parsed,
-                                        mark,
-                                        &engine.config.allowlists,
-                                        engine.config.allowlist_mask,
-                                    ) {
-                                        crate::ubus::ubus_event_bcast_connmark_allowlist_resolved(
-                                            mark,
-                                            &reported.name,
-                                            &reported.resolved,
-                                            reported.ttl,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    #[cfg(feature = "dump")]
-                    if let Some(dump) = &engine.config.dump {
-                        let local = listeners[listener_idx].sock.local_addr().ok();
-                        dump.dump_packet_udp(
-                            crate::types::constants::DUMP_REPLY,
-                            &pkt,
-                            local,
-                            Some(target.client),
-                            crate::dump::DumpFallback::None,
-                        );
-                    }
-                    let _ = listeners[listener_idx].sock.send_to(&pkt, target.client).await;
-                }
+                handle_upstream_reply(&listeners, pos, &upstream_socks, &mut engine, &cache, &mut upstream_buf).await;
             }
             // ── Periodic expiry cleanup ───────────────────────────────────────
             _ = ticker.tick() => {
-                let _expired = engine.expire_queries();
-                // Drain any backlog in the syslog queue (log.c's
-                // `check_log_writer`, normally driven by `POLLOUT`
-                // readiness on the log fd; see `src/log.rs` for why a
-                // periodic drain is the substitute here).
-                crate::log::check_log_writer(true);
-
-                // `--bind-dynamic`: bind a listener for every interface address
-                // that appeared since the last pass, and release the listener
-                // for every one that disappeared (network.c:854-880's
-                // OPT_CLEVERBIND branch of `enumerate_interfaces()`). A no-op
-                // under plain `--bind-interfaces` or the default wildcard mode.
-                if let Some(f) = filter.as_mut() {
-                    let (added, removed) = f.refresh_dynamic(port);
-                    if !added.is_empty() || !removed.is_empty() {
-                        apply_dynamic_listener_diff(&mut listeners, added, removed);
-                        if listeners.is_empty() {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                "no DNS listening sockets remain after --bind-dynamic reconciliation",
-                            ));
-                        }
-                        scan_from = scan_from % listeners.len();
-                    }
-                }
+                run_periodic_cleanup(&mut engine, &mut filter, &mut listeners, &mut scan_from, port)?;
             }
         }
     }
+}
+
+/// Expire timed-out queries, drain the syslog backlog, and reconcile
+/// `--bind-dynamic` listeners.
+///
+/// Extracted from the "Periodic expiry cleanup" arm of `run_forward_loop_on`'s
+/// `select!` loop for the same reasons as [`handle_incoming_query`].
+fn run_periodic_cleanup(
+    engine:    &mut ForwardEngine,
+    filter:    &mut Option<crate::network::ArrivalFilter>,
+    listeners: &mut Vec<DnsListener>,
+    scan_from: &mut usize,
+    port:      u16,
+) -> std::io::Result<()> {
+    let _expired = engine.expire_queries();
+    // Drain any backlog in the syslog queue (log.c's
+    // `check_log_writer`, normally driven by `POLLOUT`
+    // readiness on the log fd; see `src/log.rs` for why a
+    // periodic drain is the substitute here).
+    crate::log::check_log_writer(true);
+
+    // `--bind-dynamic`: bind a listener for every interface address
+    // that appeared since the last pass, and release the listener
+    // for every one that disappeared (network.c:854-880's
+    // OPT_CLEVERBIND branch of `enumerate_interfaces()`). A no-op
+    // under plain `--bind-interfaces` or the default wildcard mode.
+    if let Some(f) = filter.as_mut() {
+        let (added, removed) = f.refresh_dynamic(port);
+        if !added.is_empty() || !removed.is_empty() {
+            apply_dynamic_listener_diff(listeners, added, removed);
+            if listeners.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "no DNS listening sockets remain after --bind-dynamic reconciliation",
+                ));
+            }
+            *scan_from %= listeners.len();
+        }
+    }
+    Ok(())
 }
 
 /// Record a reply sent to a client, mirroring `dump_packet_udp(DUMP_REPLY,
