@@ -13,6 +13,8 @@ pub enum DnsmasqError {
     PrivilegeDrop(String),
     #[error("pid file error: {0}")]
     PidFile(String),
+    #[error("log file error: {0}")]
+    LogFile(String),
     #[error("daemonize failed: {0}")]
     Daemonize(String),
     #[error("bind error on {0}: {1}")]
@@ -56,6 +58,12 @@ mod tests {
     fn display_pid_file() {
         let e = DnsmasqError::PidFile("cannot write".into());
         assert_eq!(e.to_string(), "pid file error: cannot write");
+    }
+
+    #[test]
+    fn display_log_file() {
+        let e = DnsmasqError::LogFile("failed to open log file /var/log/x: denied".into());
+        assert_eq!(e.to_string(), "log file error: failed to open log file /var/log/x: denied");
     }
 
     #[test]

@@ -116,7 +116,7 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-fn start() -> Result<(), Box<dyn std::error::Error>> {
+fn start() -> Result<(), error::DnsmasqError> {
     use clap::Parser as _;
     use tracing::info;
 
@@ -157,7 +157,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
     };
     if let Err(e) = log::log_start(log_path, log_fac, debug, log_debug, daemon.max_logs) {
         let target = daemon.log_file.as_deref().unwrap_or("");
-        return Err(format!("failed to open log file {target}: {e}").into());
+        return Err(error::DnsmasqError::LogFile(format!("failed to open log file {target}: {e}")));
     }
     if let Some(conf_path) = conf_loaded {
         info!("loaded config from {conf_path}");
