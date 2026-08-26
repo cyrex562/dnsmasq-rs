@@ -17,7 +17,7 @@ use crate::domain_match::{add_update_server, cleanup_servers, mark_servers};
 use crate::dns_protocol::RrType;
 use crate::option::new_server;
 use crate::types::addr::MySockAddr;
-use crate::types::constants::{OPT_BOGUSPRIV, OPT_FILTER, OPT_LOCALISE};
+use crate::types::constants::{DaemonOption, OPT_BOGUSPRIV, OPT_FILTER, OPT_LOCALISE};
 use crate::types::daemon::Daemon;
 use crate::types::dns_records::RrList;
 use crate::types::server::ServFlags;
@@ -77,7 +77,7 @@ pub fn get_version() -> &'static str {
 /// Set or clear a plain option bit — the shared body of `dbus_set_bool()`
 /// (`dbus.c:505-519`) used by `SetFilterWin2KOption`, `SetLocaliseQueriesOption`,
 /// and `SetBogusPrivOption`.
-pub fn apply_bool_option(daemon: &mut Daemon, opt: usize, enabled: bool) {
+pub fn apply_bool_option(daemon: &mut Daemon, opt: DaemonOption, enabled: bool) {
     if enabled {
         daemon.set_option(opt);
     } else {

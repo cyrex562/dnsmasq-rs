@@ -374,19 +374,22 @@ pub struct Daemon {
 
 impl Daemon {
     /// Test whether an option bit is set.
-    pub fn option_bool(&self, opt: usize) -> bool {
+    pub fn option_bool(&self, opt: DaemonOption) -> bool {
+        let opt = opt as usize;
         let bits = u32::BITS as usize;
         self.options[opt / bits] & (1u32 << (opt % bits)) != 0
     }
 
     /// Set an option bit.
-    pub fn set_option(&mut self, opt: usize) {
+    pub fn set_option(&mut self, opt: DaemonOption) {
+        let opt = opt as usize;
         let bits = u32::BITS as usize;
         self.options[opt / bits] |= 1u32 << (opt % bits);
     }
 
     /// Clear an option bit.
-    pub fn clear_option(&mut self, opt: usize) {
+    pub fn clear_option(&mut self, opt: DaemonOption) {
+        let opt = opt as usize;
         let bits = u32::BITS as usize;
         self.options[opt / bits] &= !(1u32 << (opt % bits));
     }
