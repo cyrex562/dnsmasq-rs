@@ -197,6 +197,14 @@ fn start() -> Result<(), error::DnsmasqError> {
         return convert_legacy_config_to_yaml(input, output);
     }
 
+    #[cfg(feature = "web-api")]
+    if let Some(token_file) = &args.web_api_create_token {
+        let label = args.web_api_token_label.as_deref().unwrap_or("");
+        let token = web_api::create_token(token_file, label)?;
+        println!("{token}");
+        return Ok(());
+    }
+
     let mut lines = Vec::new();
     let conf_loaded = match args.conf_file {
         Some(ref conf_path) => {

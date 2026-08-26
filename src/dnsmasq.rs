@@ -1817,15 +1817,25 @@ async fn spawn_ubus_task(daemon_handle: &DaemonHandle) -> Option<tokio::task::Jo
 /// Spawn [`crate::web_api::serve_on`] if `--web-api-listen` is set.
 ///
 /// No upstream counterpart — new management surface for this port
-/// (issue #165). Logs its own bind failure and returns `Err(())`, matching
-/// every other fallible spawn helper's convention.
+/// (issues #165/#166). Requires a token file (`--web-api-token-file`)
+/// whenever `--web-api-listen` is set — refuses to start the API rather than
+/// serve it unauthenticated. Logs its own bind/config failure and returns
+/// `Err(())`, matching every other fallible spawn helper's convention.
 #[cfg(feature = "web-api")]
 async fn spawn_web_api_task(
     listen: Option<std::net::SocketAddr>,
+    token_file: Option<String>,
     daemon_handle: &DaemonHandle,
     cache: crate::cache::SharedDnsCache,
 ) -> Result<Option<tokio::task::JoinHandle<()>>, ()> {
     let Some(addr) = listen else { return Ok(None) };
+    let Some(token_file) = token_file else {
+        tracing::error!(
+            "--web-api-listen is set but --web-api-token-file is not — refusing to serve the \
+             web API without a token store to authenticate against"
+        );
+        return Err(());
+    };
 
     // Bind synchronously before spawning, so a bad address is a startup
     // error rather than a silently-dead background task — matching how
@@ -1839,15 +1849,16 @@ async fn spawn_web_api_task(
     };
     if !addr.ip().is_loopback() {
         tracing::warn!(
-            "web API listening on {addr}, which is not a loopback address — every route is \
-             read-only for now, but there is no authentication in front of them yet (see issue #166)"
+            "web API listening on {addr}, which is not a loopback address — every route \
+             requires a valid bearer token, but consider whether this host should be reachable \
+             from beyond loopback at all"
         );
     }
     tracing::info!("web API listening on {addr}");
 
     let daemon = daemon_handle.clone();
     Ok(Some(tokio::spawn(async move {
-        if let Err(e) = crate::web_api::serve_on(listener, daemon, cache).await {
+        if let Err(e) = crate::web_api::serve_on(listener, daemon, cache, token_file).await {
             tracing::error!("web API server exited: {e}");
         }
     })))
@@ -2281,8 +2292,11 @@ pub async fn run_main_loop_with(
     // ── Web API (`--web-api-listen`) ──────────────────────────────────────────
     #[cfg(feature = "web-api")]
     let web_api_task = {
-        let listen = daemon_handle.read().await.web_api_listen;
-        match spawn_web_api_task(listen, &daemon_handle, web_api_cache).await {
+        let (listen, token_file) = {
+            let d = daemon_handle.read().await;
+            (d.web_api_listen, d.web_api_token_file.clone())
+        };
+        match spawn_web_api_task(listen, token_file, &daemon_handle, web_api_cache).await {
             Ok(t) => t,
             Err(()) => {
                 fwd_task.abort();

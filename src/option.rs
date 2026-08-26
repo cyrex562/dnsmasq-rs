@@ -211,11 +211,31 @@ pub struct CliArgs {
     #[arg(long = "pid-file", value_name = "FILE")]
     pub pid_file: Option<String>,
 
-    /// Listen address for the read-only HTTP status/diagnostics API
-    /// (`web-api` feature). Not listening at all unless set.
+    /// Listen address for the HTTP status/diagnostics/control API
+    /// (`web-api` feature). Not listening at all unless set. Requires
+    /// `--web-api-token-file` too.
     #[cfg(feature = "web-api")]
     #[arg(long = "web-api-listen", value_name = "ADDR:PORT")]
     pub web_api_listen: Option<String>,
+
+    /// Bearer-token store for the web API (`web-api` feature): a file of
+    /// SHA-256 hashes, one per line, written by `--web-api-create-token`.
+    #[cfg(feature = "web-api")]
+    #[arg(long = "web-api-token-file", value_name = "FILE")]
+    pub web_api_token_file: Option<String>,
+
+    /// Mint a new web API bearer token, append its hash to the given file,
+    /// print the raw token once, and exit without starting the daemon
+    /// (`web-api` feature).
+    #[cfg(feature = "web-api")]
+    #[arg(long = "web-api-create-token", value_name = "FILE")]
+    pub web_api_create_token: Option<String>,
+
+    /// Optional free-text label recorded alongside a token minted by
+    /// `--web-api-create-token` (e.g. who/what it's for).
+    #[cfg(feature = "web-api")]
+    #[arg(long = "web-api-token-label", value_name = "LABEL", requires = "web_api_create_token")]
+    pub web_api_token_label: Option<String>,
 
     /// Log to this file/facility.
     #[arg(long = "log-facility", value_name = "TARGET")]
@@ -379,6 +399,8 @@ pub fn config_lines_from_cli(args: &CliArgs) -> Vec<ConfigLine> {
     value!(pid_file, "pid-file");
     #[cfg(feature = "web-api")]
     value!(web_api_listen, "web-api-listen");
+    #[cfg(feature = "web-api")]
+    value!(web_api_token_file, "web-api-token-file");
     value!(log_facility, "log-facility");
     value!(log_async, "log-async");
     value!(servers_file, "servers-file");
@@ -1062,6 +1084,14 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
                 v.parse::<std::net::SocketAddr>()
                     .map_err(|e| invalid_value_for(cl, key, v, &format!("expected an address:port pair: {e}")))?,
             );
+        }
+
+        // No upstream counterpart — new management surface for this port
+        // (issue #166), not a C directive.
+        #[cfg(feature = "web-api")]
+        "web-api-token-file" => {
+            let v = require_value("web-api-token-file")?;
+            daemon.web_api_token_file = Some(v.to_string());
         }
 
         "log-facility" => {

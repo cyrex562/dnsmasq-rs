@@ -161,9 +161,14 @@ pub struct Daemon {
     pub domain_suffix:   Option<String>,
     pub runfile:         Option<String>,
     /// `--web-api-listen` (`web-api` feature). `None` (the default) means
-    /// the read-only HTTP status/diagnostics API does not listen at all.
+    /// the HTTP status/diagnostics/control API does not listen at all.
     #[cfg(feature = "web-api")]
     pub web_api_listen:  Option<std::net::SocketAddr>,
+    /// `--web-api-token-file` (`web-api` feature). Required whenever
+    /// `web_api_listen` is set — the API refuses to start without a token
+    /// store to check bearer tokens against (see `crate::web_api`).
+    #[cfg(feature = "web-api")]
+    pub web_api_token_file: Option<String>,
     pub lease_change_command: Option<String>,
     pub lease_file:      Option<String>,
     pub dns_client_id:   Option<String>,
@@ -473,6 +478,8 @@ impl Default for Daemon {
             runfile: None,
             #[cfg(feature = "web-api")]
             web_api_listen: None,
+            #[cfg(feature = "web-api")]
+            web_api_token_file: None,
             lease_change_command: None,
             lease_file: None,
             dns_client_id: None,
