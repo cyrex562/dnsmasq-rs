@@ -115,6 +115,21 @@ pub struct LogConfig {
     log_file:        Option<std::fs::File>,
     /// True when output goes to a file rather than the syslog socket.
     pub log_to_file: bool,
+    /// `--log-facility=stdout` (dnsmasq-rs extension — upstream has no
+    /// stdout logging concept): `tracing` output goes to stdout instead of
+    /// the default stderr, and real syslog delivery is bypassed the same
+    /// way a file destination bypasses it.
+    pub log_to_stdout: bool,
+    /// `--log-facility=-`: explicit stderr, matching upstream's
+    /// `dup(STDERR_FILENO)` (`log.c:75-79`). Distinct from the *default*
+    /// no-destination-configured case, which also lands on stderr via
+    /// [`LogSink`]'s fallback but — unlike this explicit choice — does not
+    /// bypass real syslog delivery.
+    pub log_explicit_stderr: bool,
+    /// `--log-facility=journald` (`journald` feature; dnsmasq-rs extension).
+    /// `Some(_)` once connected.
+    #[cfg(feature = "journald")]
+    journald: Option<JournaldClient>,
     /// Whether MS_DEBUG messages are printed (mirrors `OPT_LOG_DEBUG`).
     pub log_debug:   bool,
     /// Number of log entries dropped because the queue was full.
@@ -131,6 +146,8 @@ impl std::fmt::Debug for LogConfig {
             .field("log_fac",     &self.log_fac)
             .field("echo_stderr", &self.echo_stderr)
             .field("log_to_file", &self.log_to_file)
+            .field("log_to_stdout", &self.log_to_stdout)
+            .field("log_explicit_stderr", &self.log_explicit_stderr)
             .field("log_debug",   &self.log_debug)
             .field("entries_lost",&self.entries_lost)
             .finish()
@@ -144,6 +161,10 @@ impl Default for LogConfig {
             echo_stderr: false,
             log_file:    None,
             log_to_file: false,
+            log_to_stdout: false,
+            log_explicit_stderr: false,
+            #[cfg(feature = "journald")]
+            journald: None,
             log_debug:   false,
             entries_lost: 0,
             // `log_fd == -1` "in case we die() before log_start()" (log.c:39):
@@ -152,6 +173,27 @@ impl Default for LogConfig {
             syslog: SyslogQueue::new(DEFAULT_SYSLOG_PATH, 5),
         }
     }
+}
+
+/// Where `log_start` should route `tracing`/`my_syslog` output, resolved by
+/// the caller (`main.rs`) from `--log-facility=<value>`'s parsed string —
+/// keeping the "what does this string mean" decision in one place rather
+/// than smuggling sentinel strings (`-`, `stdout`, `journald`) through
+/// `log.rs`'s own API.
+pub enum LogTarget {
+    /// No `--log-facility` given: `tracing` output falls back to stderr
+    /// (see [`LogSink`]), but real syslog delivery still happens too —
+    /// today's existing default behavior, unchanged.
+    Default,
+    /// `--log-facility=<path>`.
+    File(std::path::PathBuf),
+    /// `--log-facility=-`.
+    Stderr,
+    /// `--log-facility=stdout` (dnsmasq-rs extension).
+    Stdout,
+    /// `--log-facility=journald` (dnsmasq-rs extension, `journald` feature).
+    #[cfg(feature = "journald")]
+    Journald,
 }
 
 /// Global log configuration, set once by `log_start`.
@@ -227,6 +269,21 @@ impl Write for LogSink {
                 file.write_all(buf)?;
                 return Ok(buf.len());
             }
+            if cfg.log_to_stdout {
+                return std::io::stdout().write(buf);
+            }
+            #[cfg(feature = "journald")]
+            if let Some(ref journald) = cfg.journald {
+                // `tracing_subscriber::fmt()` formats one line per write,
+                // including the trailing newline; journald's `MESSAGE`
+                // field is the line's text, without it. No structured
+                // level is available at this layer (unlike `my_syslog`,
+                // which knows its exact priority) — LOG_INFO is a
+                // reasonable default for ordinary operational diagnostics.
+                let text = String::from_utf8_lossy(buf);
+                let _ = journald.submit(LOG_INFO, text.trim_end_matches('\n'));
+                return Ok(buf.len());
+            }
         }
         std::io::stderr().write(buf)
     }
@@ -235,6 +292,13 @@ impl Write for LogSink {
         if let Ok(mut cfg) = log_state().lock() {
             if let Some(ref mut file) = cfg.log_file {
                 return file.flush();
+            }
+            if cfg.log_to_stdout {
+                return std::io::stdout().flush();
+            }
+            #[cfg(feature = "journald")]
+            if cfg.journald.is_some() {
+                return Ok(());
             }
         }
         std::io::stderr().flush()
@@ -591,6 +655,78 @@ fn blocking_syslog_fallback(level: u32, log_fac: u32, message: &str) {
     }
 }
 
+// ── journald client (no upstream counterpart; dnsmasq-rs extension) ───────────
+
+/// A minimal client for journald's native protocol: a connected
+/// `AF_UNIX SOCK_DGRAM` to `/run/systemd/journal/socket`, sending
+/// newline-separated `KEY=value` fields per datagram (`sd_journal_send(3)`'s
+/// wire format). Hand-rolled rather than depending on `tracing-journald`, so
+/// there's one dependency-free logging-integration pattern in this codebase
+/// rather than two (mirrors [`SyslogQueue`]'s own hand-rolled `/dev/log`
+/// client).
+///
+/// Deliberately does not implement journald's memfd/`SCM_RIGHTS` fallback
+/// for messages too large for a single datagram (journald's own practical
+/// limit is in the hundreds of KB) — a dnsmasq-rs log line is never
+/// realistically that large, and this is a known, documented limit rather
+/// than a silent truncation: [`JournaldClient::submit`] simply returns the
+/// `EMSGSIZE` error up to its caller, who logs it once via
+/// `blocking_syslog_fallback`-style degradation rather than panicking.
+#[cfg(feature = "journald")]
+struct JournaldClient {
+    sock: UnixDatagram,
+}
+
+#[cfg(feature = "journald")]
+impl JournaldClient {
+    const SOCKET_PATH: &'static str = "/run/systemd/journal/socket";
+
+    fn connect() -> std::io::Result<Self> {
+        Self::connect_to(Self::SOCKET_PATH)
+    }
+
+    /// Split out from [`Self::connect`] so tests can point this at a
+    /// throwaway `UnixDatagram` instead of the real, host-dependent
+    /// `/run/systemd/journal/socket` — mirroring how [`SyslogQueue::new`]
+    /// takes its socket path as a parameter for the same reason.
+    fn connect_to(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        let sock = UnixDatagram::unbound()?;
+        sock.connect(path)?;
+        Ok(Self { sock })
+    }
+
+    /// Append one journald field. Values containing a newline use the
+    /// binary framing journald requires (`KEY\n<8-byte LE length><value>\n`);
+    /// everything else uses the plain `KEY=value\n` text framing.
+    fn push_field(buf: &mut Vec<u8>, key: &str, value: &str) {
+        if value.contains('\n') {
+            buf.extend_from_slice(key.as_bytes());
+            buf.push(b'\n');
+            buf.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            buf.extend_from_slice(value.as_bytes());
+            buf.push(b'\n');
+        } else {
+            buf.extend_from_slice(key.as_bytes());
+            buf.push(b'=');
+            buf.extend_from_slice(value.as_bytes());
+            buf.push(b'\n');
+        }
+    }
+
+    /// Send one journal entry. `priority` is a syslog level (0-7, `LOG_*`
+    /// from this module), mapped straight across to journald's own
+    /// `PRIORITY` field, which uses the same 0-7 scale.
+    fn submit(&self, priority: u32, message: &str) -> std::io::Result<()> {
+        let mut buf = Vec::with_capacity(message.len() + 64);
+        Self::push_field(&mut buf, "MESSAGE", message);
+        Self::push_field(&mut buf, "PRIORITY", &(priority & LOG_PRIMASK).to_string());
+        Self::push_field(&mut buf, "SYSLOG_IDENTIFIER", "dnsmasq-rs");
+        Self::push_field(&mut buf, "SYSLOG_PID", &std::process::id().to_string());
+        self.sock.send(&buf)?;
+        Ok(())
+    }
+}
+
 // ── Initialisation ────────────────────────────────────────────────────────────
 
 /// Initialise the logging subsystem.
@@ -608,26 +744,36 @@ fn blocking_syslog_fallback(level: u32, log_fac: u32, message: &str) {
 ///
 /// Returns `Ok(())` on success, or an IO error if the log file cannot be opened.
 pub fn log_start(
-    log_file:    Option<&std::path::Path>,
+    target:      LogTarget,
     log_fac:     Option<u32>,
     echo_stderr: bool,
     log_debug:   bool,
     max_logs:    i32,
 ) -> std::io::Result<()> {
-    // Open the file *before* installing the subscriber, so that a bad
-    // `log-facility` path is reported to the caller instead of being swallowed
-    // by the first log line.
-    let file = match log_file {
-        Some(p) => {
-            let f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .append(true)
-                .open(p)?;
-            Some(f)
+    // Resolve the destination *before* installing the subscriber, so that a
+    // bad `log-facility` path (or an unreachable journald socket) is
+    // reported to the caller instead of being swallowed by the first log
+    // line.
+    let mut file = None;
+    let mut to_stdout = false;
+    let mut explicit_stderr = false;
+    #[cfg(feature = "journald")]
+    let mut journald = None;
+    match target {
+        LogTarget::Default => {}
+        LogTarget::File(path) => {
+            file = Some(
+                std::fs::OpenOptions::new().write(true).create(true).append(true).open(&path)?,
+            );
         }
-        None => None,
-    };
+        LogTarget::Stderr => explicit_stderr = true,
+        LogTarget::Stdout => to_stdout = true,
+        #[cfg(feature = "journald")]
+        LogTarget::Journald => journald = Some(JournaldClient::connect()?),
+    }
+    let is_default = file.is_none() && !to_stdout && !explicit_stderr;
+    #[cfg(feature = "journald")]
+    let is_default = is_default && journald.is_none();
 
     let state = log_state();
     if let Ok(mut cfg) = state.lock() {
@@ -635,10 +781,16 @@ pub fn log_start(
         cfg.echo_stderr = echo_stderr;
         cfg.log_to_file = file.is_some();
         cfg.log_file    = file;
+        cfg.log_to_stdout = to_stdout;
+        cfg.log_explicit_stderr = explicit_stderr;
+        #[cfg(feature = "journald")]
+        {
+            cfg.journald = journald;
+        }
         cfg.log_debug   = log_debug;
         cfg.entries_lost = 0;
         cfg.syslog = SyslogQueue::new(DEFAULT_SYSLOG_PATH, max_logs);
-        if !cfg.log_to_file {
+        if is_default {
             cfg.syslog.reopen();
         }
     }
@@ -760,13 +912,25 @@ pub fn my_syslog(priority: u32, message: &str) {
     // Also write to the log file — unless the tracing sink is already writing
     // there, in which case the record above has been delivered and a second
     // copy would duplicate every line.
-    let mut log_to_file = false;
+    let mut bypass_real_syslog = false;
     let state = log_state();
     if let Ok(mut cfg) = state.lock() {
-        log_to_file = cfg.log_to_file;
-        // With no log file the sink is stderr, so the record above already
-        // landed there and echoing would print every line twice.
-        let sink_is_stderr = sink_installed() && cfg.log_file.is_none();
+        // An explicit non-default destination (file, stdout, explicit
+        // stderr, or journald) replaces real syslog delivery entirely,
+        // matching upstream's single-`log_fd` model — only the *default*
+        // (nothing configured) case delivers to both stderr (via the
+        // tracing record above) and the real `/dev/log` socket below.
+        #[cfg(feature = "journald")]
+        let journald_active = cfg.journald.is_some();
+        #[cfg(not(feature = "journald"))]
+        let journald_active = false;
+        bypass_real_syslog =
+            cfg.log_to_file || cfg.log_to_stdout || cfg.log_explicit_stderr || journald_active;
+        // With no log file/stdout/journald destination the sink is stderr,
+        // so the record above already landed there and echoing would print
+        // every line twice.
+        let sink_is_stderr =
+            sink_installed() && cfg.log_file.is_none() && !cfg.log_to_stdout && !journald_active;
         if cfg.echo_stderr && !sink_is_stderr {
             eprintln!("dnsmasq{}: {}", tag, message);
         }
@@ -778,10 +942,10 @@ pub fn my_syslog(priority: u32, message: &str) {
     }
 
     // Real syslog delivery: upstream always queues through exactly one
-    // `log_fd`, a file or `/dev/log`, never both. The file case is handled
-    // above via the tracing/file sink; the no-file (default) case reaches
-    // the actual syslog socket here.
-    if !log_to_file {
+    // `log_fd`, a file or `/dev/log`, never both. The file/stdout/stderr/
+    // journald cases are handled above via the tracing sink; the default
+    // (nothing configured) case reaches the actual syslog socket here.
+    if !bypass_real_syslog {
         deliver_to_syslog(level, LogHandle::current().facility(), tag, message);
     }
 }
@@ -1014,7 +1178,7 @@ mod tests {
     #[test]
     fn log_start_no_file_succeeds() {
         // Should succeed even if called multiple times (try_init is idempotent)
-        let _ = log_start(None, None, false, false, 5);
+        let _ = log_start(LogTarget::Default, None, false, false, 5);
     }
 
     #[test]
@@ -1185,5 +1349,58 @@ mod tests {
             my_syslog(LOG_INFO, "unreachable syslog burst");
         }
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    // ── journald client (feature-gated; no upstream counterpart) ──────────────
+
+    #[cfg(feature = "journald")]
+    #[test]
+    fn journald_push_field_plain_value_uses_text_framing() {
+        let mut buf = Vec::new();
+        JournaldClient::push_field(&mut buf, "MESSAGE", "lease acquired");
+        assert_eq!(buf, b"MESSAGE=lease acquired\n");
+    }
+
+    #[cfg(feature = "journald")]
+    #[test]
+    fn journald_push_field_multiline_value_uses_binary_framing() {
+        let mut buf = Vec::new();
+        JournaldClient::push_field(&mut buf, "MESSAGE", "line one\nline two");
+        let mut expected = b"MESSAGE\n".to_vec();
+        expected.extend_from_slice(&("line one\nline two".len() as u64).to_le_bytes());
+        expected.extend_from_slice(b"line one\nline two");
+        expected.push(b'\n');
+        assert_eq!(buf, expected);
+    }
+
+    /// End-to-end against a throwaway datagram socket standing in for
+    /// `/run/systemd/journal/socket` — mirrors
+    /// `write_queue_delivers_to_a_listening_unix_socket`'s pattern for the
+    /// real `/dev/log` client, so this doesn't depend on the test host
+    /// actually running systemd-journald.
+    #[cfg(feature = "journald")]
+    #[test]
+    fn journald_submit_sends_expected_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.sock");
+        let listener = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+        listener.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+        let client = JournaldClient::connect_to(&path).unwrap();
+        client.submit(LOG_WARNING, "disk almost full").unwrap();
+
+        let mut buf = [0u8; 512];
+        let n = listener.recv(&mut buf).unwrap();
+        let payload = String::from_utf8_lossy(&buf[..n]);
+        assert!(payload.contains("MESSAGE=disk almost full\n"));
+        assert!(payload.contains(&format!("PRIORITY={}\n", LOG_WARNING)));
+        assert!(payload.contains("SYSLOG_IDENTIFIER=dnsmasq-rs\n"));
+        assert!(payload.contains(&format!("SYSLOG_PID={}\n", std::process::id())));
+    }
+
+    #[cfg(feature = "journald")]
+    #[test]
+    fn journald_connect_to_missing_socket_fails() {
+        assert!(JournaldClient::connect_to("/nonexistent/definitely/not/a/journal.sock").is_err());
     }
 }

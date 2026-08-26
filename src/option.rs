@@ -1096,10 +1096,27 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
 
         "log-facility" => {
             // `option.c:2279-2298`: a value containing `/` or exactly `-` is
-            // a file path; anything else is looked up as a facility name
-            // (`daemon`, `local0`, ...) and rejected if it isn't one.
+            // a file path (`-` meaning stderr, resolved in `main.rs`);
+            // anything else is looked up as a facility name (`daemon`,
+            // `local0`, ...) and rejected if it isn't one.
+            //
+            // `stdout` and `journald` are dnsmasq-rs extensions (no upstream
+            // counterpart) accepted here the same way as `-`, again resolved
+            // to an actual destination in `main.rs`. `journald` is rejected
+            // as an unknown facility when the `journald` feature isn't
+            // compiled in, rather than silently falling back to something
+            // else.
             let v = require_value("log-facility")?;
-            if v.contains('/') || v == "-" {
+            if v == "journald" {
+                #[cfg(feature = "journald")]
+                {
+                    daemon.log_file = Some(v.to_string());
+                }
+                #[cfg(not(feature = "journald"))]
+                {
+                    return Err(invalid(v, "journald logging requires the 'journald' feature"));
+                }
+            } else if v.contains('/') || v == "-" || v == "stdout" {
                 daemon.log_file = Some(v.to_string());
             } else {
                 match crate::log::facility_by_name(v) {
@@ -8317,6 +8334,47 @@ mod tests {
     fn log_facility_unknown_name_is_rejected() {
         let mut d = Daemon::default();
         let lines = parse_config_text("log-facility=not-a-facility", "test.conf").unwrap();
+        let err = apply_config(&mut d, &lines).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "log-facility"));
+    }
+
+    /// `-` is stored in `log_file` as-is (`main.rs` resolves it to
+    /// `LogTarget::Stderr`) rather than being treated like a real path or a
+    /// facility name — matching upstream's `strcmp(arg, "-") == 0` special
+    /// case (`option.c:2281`).
+    #[test]
+    fn log_facility_dash_sets_log_file_to_dash() {
+        let resolved =
+            resolve_config(&parse_config_text("log-facility=-", "test.conf").unwrap()).unwrap();
+        assert_eq!(resolved.daemon.log_file.as_deref(), Some("-"));
+        assert_eq!(resolved.daemon.log_fac, None);
+    }
+
+    /// `stdout` is a dnsmasq-rs extension (no upstream counterpart) accepted
+    /// the same way as `-`.
+    #[test]
+    fn log_facility_stdout_sets_log_file_to_stdout() {
+        let resolved =
+            resolve_config(&parse_config_text("log-facility=stdout", "test.conf").unwrap()).unwrap();
+        assert_eq!(resolved.daemon.log_file.as_deref(), Some("stdout"));
+        assert_eq!(resolved.daemon.log_fac, None);
+    }
+
+    #[cfg(feature = "journald")]
+    #[test]
+    fn log_facility_journald_sets_log_file_to_journald() {
+        let resolved =
+            resolve_config(&parse_config_text("log-facility=journald", "test.conf").unwrap()).unwrap();
+        assert_eq!(resolved.daemon.log_file.as_deref(), Some("journald"));
+    }
+
+    /// Without the `journald` feature compiled in, the keyword must be a
+    /// clear config error, not a silent fallback to some other destination.
+    #[cfg(not(feature = "journald"))]
+    #[test]
+    fn log_facility_journald_without_feature_is_rejected() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("log-facility=journald", "test.conf").unwrap();
         let err = apply_config(&mut d, &lines).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "log-facility"));
     }

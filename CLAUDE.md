@@ -136,7 +136,7 @@ Integration tests in `tests/` import through the library (`dnsmasq_rs::*`), so t
 
 Cargo features mirror upstream's compile-time `HAVE_*` defines. Defaults: `dhcp dhcp6 dnssec auth tftp loop inotify dump`. `dhcp6` implies `dhcp`. Non-default: `conntrack`, `dbus` (pulls `zbus`), `ubus`, `ipset`, `nftset`. There is no `bpf` feature — `src/bpf.rs` was speculative classic-BPF filter code with no upstream counterpart and no caller; it was removed (see `tasks.md` P5). Upstream `bpf.c` is BSD/Solaris-only routing-socket code with no Linux relevance; its Linux analog is `netlink.rs`.
 
-`legacy-config` (default-on) and `yaml-config` (default-off, pulls `serde`/`serde_norway`) are dnsmasq-rs-specific, with no upstream `HAVE_*` counterpart — see "Config file formats" below.
+`legacy-config` (default-on) and `yaml-config` (default-off, pulls `serde`/`serde_norway`) are dnsmasq-rs-specific, with no upstream `HAVE_*` counterpart — see "Config file formats" below. `web-api`/`web-ui`/`journald` are likewise dnsmasq-rs-specific (see the module map below); `journald` gates a hand-rolled native journald client (`--log-facility=journald`, `src/log.rs`) with no new dependency.
 
 Gates apply both to `pub mod` declarations (in *both* `lib.rs` and `main.rs`) and inside modules. Gate leakage is a live bug class — see the `--no-default-features` failure above.
 

@@ -639,10 +639,31 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     ticker rather than to `POLLOUT` fd-readiness (no generic poll-registration exists to
     hook into); since every write is already non-blocking this costs at most one tick of
     latency, never correctness. Still not ported: `fchown`-ing a log file to the run user,
-    `log-facility=-` duplicating `STDERR_FILENO` instead of being treated as a filename
-    named `-`, and the Android/Solaris branches (`__android_log_vprint`, the
-    `HAVE_SOLARIS_NETWORK` no-socket path) — all deliberately out of scope for a
-    Linux-only port.
+    and the Android/Solaris branches (`__android_log_vprint`, the `HAVE_SOLARIS_NETWORK`
+    no-socket path) — all deliberately out of scope for a Linux-only port.
+
+    **Issue #172 (2026-08-26):** `log-facility=-` now correctly duplicates `STDERR_FILENO`
+    (`LogTarget::Stderr` in `src/log.rs`, resolved from the CLI/config string in `main.rs`)
+    instead of the previous bug where it opened a literal file named `-` in the cwd.
+    Two dnsmasq-rs extensions with no upstream counterpart were added alongside it, both
+    via the same `--log-facility=<value>` directive: `stdout` (for containers/services that
+    capture stdout rather than stderr) and `journald` (`journald` Cargo feature, off by
+    default, Linux-only) — a hand-rolled native journald client (`JournaldClient` in
+    `src/log.rs`: a connected `AF_UNIX SOCK_DGRAM` to `/run/systemd/journal/socket`, sending
+    `KEY=value`/binary-framed fields per `sd_journal_send(3)`'s wire format), deliberately
+    without the memfd/`SCM_RIGHTS` large-message fallback (a dnsmasq-rs log line is never
+    realistically large enough to need it — an oversized message just returns `EMSGSIZE` to
+    the caller rather than silently truncating). All three destinations (explicit stderr,
+    stdout, journald) now correctly bypass real `/dev/log` syslog delivery in `my_syslog`,
+    matching upstream's single-`log_fd` model — previously only a real log *file* did this;
+    the *default* (nothing configured) case is unchanged and still delivers to both stderr
+    (via the `tracing` sink's fallback) and real syslog. Verified live against a real
+    systemd-journald: `--log-facility=journald --log-queries` produces zero stdout/stderr
+    output and full structured entries (`MESSAGE`/`PRIORITY`/`SYSLOG_IDENTIFIER`/
+    `SYSLOG_PID`) queryable via `journalctl SYSLOG_IDENTIFIER=dnsmasq-rs`, for both ordinary
+    `tracing` diagnostics and `my_syslog`-ported DHCP/DNS event lines (e.g. `--log-queries`).
+    This is the logging half of #127 ("logs/metrics"), split out as #172; the Prometheus
+    metrics half is #173.
   - `my_syslog` output now passes through the `tracing` `EnvFilter`, so `RUST_LOG` can
     suppress records upstream would always write. Upstream filters only on `MS_DEBUG`.
     This is additive, not a replacement: the real `/dev/log` delivery above happens

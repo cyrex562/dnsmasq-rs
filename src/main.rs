@@ -227,7 +227,18 @@ fn start() -> Result<(), error::DnsmasqError> {
     //
     // `echo_stderr` follows `option_bool(OPT_DEBUG)` (log.c), so `-d` keeps
     // talking to the terminal even when `log-facility` points at a file.
-    let log_path = daemon.log_file.as_deref().map(std::path::Path::new);
+    // `-`/`stdout`/`journald` are sentinel keywords `option.rs` accepts
+    // alongside a real path (see its `"log-facility"` arm) — resolved into a
+    // `LogTarget` here, in one place, rather than letting `log.rs` itself
+    // know about the string encoding.
+    let log_target = match daemon.log_file.as_deref() {
+        None => log::LogTarget::Default,
+        Some("-") => log::LogTarget::Stderr,
+        Some("stdout") => log::LogTarget::Stdout,
+        #[cfg(feature = "journald")]
+        Some("journald") => log::LogTarget::Journald,
+        Some(path) => log::LogTarget::File(std::path::PathBuf::from(path)),
+    };
     let log_debug = daemon.option_bool(types::constants::OPT_LOG_DEBUG);
     // `daemon->log_fac != -1` wins; otherwise `-d` defaults to `LOG_LOCAL0`
     // and everything else defaults to `LOG_DAEMON` inside `log_start`
@@ -239,7 +250,7 @@ fn start() -> Result<(), error::DnsmasqError> {
     } else {
         None
     };
-    if let Err(e) = log::log_start(log_path, log_fac, debug, log_debug, daemon.max_logs) {
+    if let Err(e) = log::log_start(log_target, log_fac, debug, log_debug, daemon.max_logs) {
         let target = daemon.log_file.as_deref().unwrap_or("");
         return Err(error::DnsmasqError::LogFile(format!("failed to open log file {target}: {e}")));
     }

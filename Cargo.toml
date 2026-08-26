@@ -30,6 +30,10 @@ yaml-config = ["dep:serde", "dep:serde_norway"]
 web-api = ["dep:axum", "dep:serde", "dep:serde_json", "dep:tower"]
 # Self-hosted server-rendered web UI (htmx) layered on web-api. See #167.
 web-ui = ["web-api"]
+# `--log-facility=journald`: a hand-rolled native journald client (no
+# tracing-journald dependency, to keep one logging-integration pattern).
+# Linux-only. Off by default. See issue #172.
+journald = []
 
 [lib]
 name = "dnsmasq_rs"
