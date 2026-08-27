@@ -4839,9 +4839,21 @@ fn ipv4_broadcast(start: Ipv4Addr, netmask: Ipv4Addr) -> Ipv4Addr {
     Ipv4Addr::from(u32::from(start) | !u32::from(netmask))
 }
 
+/// Whether a `dhcp-host` field should be parsed as a hardware address,
+/// netid, or binary CLID rather than a hostname/lease-time/etc.
+///
+/// Port of the dispatch condition in `option.c`'s `--dhcp-host` case:
+/// `if (strchr(arg, ':'))`. Upstream's own `01-`-style hardware-type prefix
+/// (parsed inside `parse_hex()`/[`parse_mac_type_prefix`] once already
+/// inside this branch) is only ever written with a colon-separated MAC
+/// after it, so checking for `':'` alone is exactly what upstream checks —
+/// unlike a `'-'` or `'*'` check, which would also misroute an ordinary
+/// hyphenated hostname (e.g. `my-printer`) into hardware-address parsing,
+/// where it fails with a MAC-specific error instead of ever being tried as
+/// a hostname (issue #181).
 #[cfg(feature = "dhcp")]
 fn looks_like_mac_pattern(value: &str) -> bool {
-    value.contains(':') || value.contains('-') || value.contains('*')
+    value.contains(':')
 }
 
 
@@ -7719,6 +7731,45 @@ mod tests {
             assert_eq!(cfg.hostname.as_deref(), Some("printer"));
             assert_eq!(cfg.hwaddrs.len(), 1);
             assert_eq!(&cfg.hwaddrs[0].hwaddr[..6], &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        }
+    }
+
+    /// Issue #181: `looks_like_mac_pattern` used to also fire on any hyphen
+    /// or `*`, so an ordinary hyphenated hostname was misrouted into
+    /// hardware-address parsing and failed with a MAC-specific error
+    /// instead of ever reaching the hostname branch.
+    #[test]
+    fn apply_dhcp_host_hyphenated_hostname() {
+        let mut d = Daemon::default();
+        let lines =
+            parse_config_text("dhcp-host=aa:bb:cc:dd:ee:ff,192.168.0.20,my-printer", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        #[cfg(feature = "dhcp")]
+        {
+            assert_eq!(d.dhcp_conf.len(), 1);
+            let cfg = &d.dhcp_conf[0];
+            assert_eq!(cfg.addr, "192.168.0.20".parse::<Ipv4Addr>().unwrap());
+            assert_eq!(cfg.hostname.as_deref(), Some("my-printer"));
+            assert_eq!(cfg.hwaddrs.len(), 1);
+            assert_eq!(&cfg.hwaddrs[0].hwaddr[..6], &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        }
+    }
+
+    /// A hostname-only `dhcp-host` field with a hyphen and no hardware
+    /// address at all must also reach the hostname branch (issue #181) --
+    /// not just the MAC-plus-hostname case above.
+    #[test]
+    fn apply_dhcp_host_hyphenated_hostname_only() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("dhcp-host=office-laptop,192.168.0.21", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        #[cfg(feature = "dhcp")]
+        {
+            assert_eq!(d.dhcp_conf.len(), 1);
+            let cfg = &d.dhcp_conf[0];
+            assert_eq!(cfg.addr, "192.168.0.21".parse::<Ipv4Addr>().unwrap());
+            assert_eq!(cfg.hostname.as_deref(), Some("office-laptop"));
+            assert!(cfg.hwaddrs.is_empty());
         }
     }
 

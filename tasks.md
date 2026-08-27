@@ -234,11 +234,30 @@ Reference material:
   already-*issued* leases' hostname/etc. when static config changes — #175 only affects
   future dispatches.
 
-  Also discovered and filed separately (issue #181, not fixed here — out of scope):
-  `looks_like_mac_pattern`'s `value.contains('-')` check misclassifies any hyphenated
-  hostname (e.g. `my-printer`) as a MAC-pattern candidate, so `dhcp-host=<mac>,<ip>,
-  my-printer` fails with "invalid hardware type prefix" — reproduces identically through
-  the plain `dhcp-host=` directive, unrelated to the new bank-file reader that surfaced it.
+  Also discovered and filed separately (issue #181, fixed below): `looks_like_mac_pattern`'s
+  `value.contains('-')` check misclassifies any hyphenated hostname (e.g. `my-printer`) as
+  a MAC-pattern candidate, so `dhcp-host=<mac>,<ip>,my-printer` fails with "invalid hardware
+  type prefix" — reproduces identically through the plain `dhcp-host=` directive, unrelated
+  to the new bank-file reader that surfaced it.
+
+  **Issue #181 (2026-08-27):** Fixed. Cloned upstream (`http://thekelleys.org.uk/git/dnsmasq.git`,
+  no longer vendored in this repo per issue #169) to check the real dispatch condition rather
+  than guess: `option.c`'s `--dhcp-host` case only enters hardware-address/netid/CLID parsing
+  when the field contains a colon (`if (strchr(arg, ':'))`) — there is no top-level hyphen or
+  `*` check at all; the `01-`-style hardware-type prefix is only ever recognized *inside* that
+  branch (by `parse_hex()`, ported as [`parse_mac_type_prefix`]), always followed by a
+  colon-separated MAC. So `looks_like_mac_pattern`'s `'-'`/`'*'` checks were never faithful to
+  upstream in the first place, not just missing a fallback — fixed by tightening it to exactly
+  `value.contains(':')`, matching upstream's dispatch precisely. Confirmed no test relied on a
+  hyphen-only or `*`-only token reaching the MAC branch without a colon (grepped every
+  `dhcp-host=` test fixture in `option.rs`), and that the second directive the issue asked to
+  check, `dhcp-mac=tag,mac-address`, is unaffected — its second field is unconditionally parsed
+  as a MAC by directive definition (no fallback-to-hostname ambiguity to misroute). Added two
+  regression tests: a MAC-plus-hyphenated-hostname case and a hostname-only (no hardware
+  address at all) hyphenated case. Live-verified: a conf file with both
+  `dhcp-host=aa:bb:cc:dd:ee:ff,192.168.99.20,my-printer` and
+  `dhcp-host=office-laptop,192.168.99.21` now loads past config resolution (previously aborted
+  immediately with "invalid hardware type prefix").
 
   **Issue #179 (2026-08-27):** Closed the gap #175 left open — `run_dhcp_loop` took
   `DhcpServerConfig` by value, so `reread_dhcp`'s `daemon.dhcp_conf`/`dhcp_opts` updates
