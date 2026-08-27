@@ -217,7 +217,8 @@ fn start() -> Result<(), error::DnsmasqError> {
     };
     lines.extend(option::config_lines_from_cli(&args));
 
-    let daemon = option::resolve_config(&lines)?.into_daemon();
+    let mut daemon = option::resolve_config(&lines)?.into_daemon();
+    daemon.conf_file = conf_loaded.clone();
     let debug = daemon.option_bool(OPT_DEBUG);
 
     // Open the log before anything worth logging happens.  Upstream calls

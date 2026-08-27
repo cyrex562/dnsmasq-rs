@@ -160,6 +160,20 @@ pub struct Daemon {
     pub secondary_forward_servers: Vec<String>,
     pub domain_suffix:   Option<String>,
     pub runfile:         Option<String>,
+    /// The top-level `--conf-file` path, retained past startup so it can be
+    /// watched for changes (`inotify` feature, issue #176) — no upstream
+    /// counterpart; upstream doesn't watch its own main config file either.
+    /// `None` when no `--conf-file` was given.
+    pub conf_file:       Option<String>,
+    /// Inotify watch descriptor for `conf_file`'s containing directory
+    /// (`-1` = not watched). Set by `inotify::inotify_dnsmasq_init`.
+    #[cfg(feature = "inotify")]
+    pub conf_file_wd:    i32,
+    /// `conf_file`'s bare filename after symlink resolution — what an
+    /// inotify event actually reports, so a hit can be matched against it
+    /// (mirrors `Resolvc::file`). Set alongside `conf_file_wd`.
+    #[cfg(feature = "inotify")]
+    pub conf_file_watched_name: Option<String>,
     /// `--web-api-listen` (`web-api` feature). `None` (the default) means
     /// the HTTP status/diagnostics/control API does not listen at all.
     #[cfg(feature = "web-api")]
@@ -481,6 +495,11 @@ impl Default for Daemon {
             secondary_forward_servers: vec![],
             domain_suffix: None,
             runfile: None,
+            conf_file: None,
+            #[cfg(feature = "inotify")]
+            conf_file_wd: -1,
+            #[cfg(feature = "inotify")]
+            conf_file_watched_name: None,
             #[cfg(feature = "web-api")]
             web_api_listen: None,
             #[cfg(feature = "web-api")]

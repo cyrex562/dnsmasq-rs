@@ -245,6 +245,33 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   (confirmed against `--no-daemon` for log visibility, matching #174's discovery that `-k`
   alone still redirects stdio to `/dev/null`).
 
+  **Issue #176 (2026-08-27):** `--conf-file` change-watching — a dnsmasq-rs extension with
+  no upstream counterpart (real dnsmasq doesn't watch its own main config file either).
+  `daemon.conf_file: Option<String>` (new field, set in `main.rs` from the same path
+  `--conf-file`/`load_top_level_conf_file` already resolved) survives past startup so it
+  can be watched; `inotify::inotify_dnsmasq_init` now also watches its containing
+  directory (`daemon.conf_file_wd`/`conf_file_watched_name`, mirroring `Resolvc`'s
+  `wd`/`file` pair) — established *before* the existing `port == 0 || OPT_NO_RESOLV` early
+  return, since a conf-file-triggered reload matters for DHCP-only configurations too, not
+  just DNS. `inotify_check` now returns a small `InotifyHits { resolv, conf_file }` (was a
+  bare `bool`) so `watch_inotify_changes` can gate each independently: a conf-file hit
+  forces the same `clear_cache_and_reload` a resolv hit does, honoring `--no-poll` like
+  every other reactive watch in this module, but — unlike `should_force_resolv_reload` —
+  *not* gated on `daemon.port != 0`, since it also drives the DHCP-side reread from #175.
+  Per the confirmed design, this deliberately does **not** re-parse the conf-file's
+  directives: a changed `dhcp-range`/`port`/etc. still has no effect until a real restart,
+  exactly as an explicit SIGHUP wouldn't touch those either — this issue only removes the
+  need to manually send that SIGHUP/API call for whatever `clear_cache_and_reload`/
+  `reread_dhcp` already reload (hosts/resolv-servers/DHCP hosts-options-ethers/cache).
+
+  Verified live: editing a running daemon's `--conf-file` on disk (no SIGHUP, no API call)
+  produces a spontaneous "flushing cache and reloading" log line; with `--no-poll` set, the
+  same edit produces no reload, while an explicit SIGHUP still works normally. 10 new
+  `inotify::tests::*` cover watch establishment (including independence from
+  `port == 0`/`--no-resolv`, the key difference from the resolv-file watch),
+  `--no-poll` gating, hit detection against a real inotify fd and temp directory, and that
+  an unrelated file in the same directory doesn't false-positive.
+
 - [x] Wire the DNS answer cache into the live forward path.
   `run_forward_loop_on` now calls `forward::cache_upstream_reply` → `cache::cache_reply` →
   `rfc1035::extract_addresses` for every accepted, non-truncated upstream reply, mirroring

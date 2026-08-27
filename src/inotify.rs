@@ -215,6 +215,20 @@ pub fn inotify_dnsmasq_init(daemon: &mut Daemon) -> std::io::Result<()> {
     let fd = open_inotify()?;
     daemon.inotify_fd = Some(fd);
 
+    // `--conf-file` watch (issue #176; no upstream counterpart — real
+    // dnsmasq doesn't watch its own main config file either). Independent
+    // of `--no-resolv`/`port == 0` below, which only gate resolv-file
+    // watching; gated on `--no-poll` like every other reactive-reload
+    // watch in this module.
+    if !daemon.option_bool(OPT_NO_POLL) {
+        if let Some(path) = daemon.conf_file.clone() {
+            let resolved = resolve_symlink_chain(&path)?;
+            let (dir, file) = split_dir_file(&resolved);
+            daemon.conf_file_wd = add_watch(fd, &dir, mask::IN_CLOSE_WRITE | mask::IN_MOVED_TO)?;
+            daemon.conf_file_watched_name = Some(file);
+        }
+    }
+
     if daemon.port == 0 || daemon.option_bool(OPT_NO_RESOLV) {
         return Ok(());
     }
@@ -337,19 +351,29 @@ pub fn set_dynamic_inotify(daemon: &mut Daemon, cache: &mut DnsCache) {
     }
 }
 
+/// What [`inotify_check`] observed this pass, left for the caller to decide
+/// what (if anything) to do about it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct InotifyHits {
+    /// A watched resolv-file changed (upstream's `hit`).
+    pub resolv: bool,
+    /// The watched `--conf-file` changed (issue #176; no upstream
+    /// counterpart).
+    pub conf_file: bool,
+}
+
 /// Drain and dispatch pending inotify events.
 ///
 /// Mirrors `inotify_check()` (`inotify.c:265-370`) minus the DHCP cascade
 /// (`dhcp_update_configs`/`lease_update_*`), which has no equivalent in this
-/// port (see the module doc). Returns `true` if a watched resolv-file
-/// changed (upstream's `hit`), leaving the decision of whether to force a
-/// resolv reload to the caller.
-pub fn inotify_check(daemon: &mut Daemon, cache: &mut DnsCache) -> bool {
+/// port (see the module doc). Returns which watches fired this pass,
+/// leaving the decision of whether to force a reload to the caller.
+pub fn inotify_check(daemon: &mut Daemon, cache: &mut DnsCache) -> InotifyHits {
     let Some(fd) = daemon.inotify_fd else {
-        return false;
+        return InotifyHits::default();
     };
 
-    let mut hit = false;
+    let mut hits = InotifyHits::default();
     let mut buf = [0u8; 4096];
 
     loop {
@@ -385,7 +409,11 @@ pub fn inotify_check(daemon: &mut Daemon, cache: &mut DnsCache) -> bool {
                 .iter()
                 .any(|r| r.wd == wd && r.file.as_deref() == Some(name.as_str()))
             {
-                hit = true;
+                hits.resolv = true;
+            }
+
+            if daemon.conf_file_wd == wd && daemon.conf_file_watched_name.as_deref() == Some(name.as_str()) {
+                hits.conf_file = true;
             }
 
             for dd in daemon.dynamic_dirs.iter_mut() {
@@ -422,7 +450,7 @@ pub fn inotify_check(daemon: &mut Daemon, cache: &mut DnsCache) -> bool {
         }
     }
 
-    hit
+    hits
 }
 
 /// Whether a resolv-file inotify hit should force a resolv reload.
@@ -436,12 +464,27 @@ fn should_force_resolv_reload(daemon: &Daemon, hit: bool) -> bool {
     hit && daemon.port != 0 && !daemon.option_bool(OPT_NO_POLL)
 }
 
+/// Whether a `--conf-file` inotify hit should force a reload (issue #176).
+///
+/// Unlike [`should_force_resolv_reload`], not gated on `daemon.port != 0` —
+/// the reload this triggers (`clear_cache_and_reload`, including its DHCP
+/// hosts/options/ethers re-read) matters for DHCP-only configurations too,
+/// not just when DNS is serving. Still honors `--no-poll`, consistent with
+/// every other reactive-reload watch in this module.
+fn should_force_conf_reload(daemon: &Daemon, hit: bool) -> bool {
+    hit && !daemon.option_bool(OPT_NO_POLL)
+}
+
 /// Await inotify readiness and dispatch events as they arrive, forcing a
-/// resolv-file reload when a resolv watch fires (see
-/// [`should_force_resolv_reload`]). `AH_HOSTS` dynamic-directory updates are
-/// applied unconditionally inside `inotify_check` regardless of
-/// `--no-poll`, matching upstream, since that flag only ever gated
-/// resolv-file polling.
+/// full reload (`clear_cache_and_reload` — cache/hosts/resolv-servers/DHCP
+/// hosts-options-ethers) when a resolv watch fires (see
+/// [`should_force_resolv_reload`]) or the watched `--conf-file` changes
+/// (see [`should_force_conf_reload`]; issue #176 — no upstream counterpart,
+/// and deliberately does not re-parse the conf-file's directives, just
+/// re-triggers the same reload an explicit SIGHUP would). `AH_HOSTS`
+/// dynamic-directory updates are applied unconditionally inside
+/// `inotify_check` regardless of `--no-poll`, matching upstream, since that
+/// flag only ever gated resolv-file polling.
 ///
 /// Returns immediately (without erroring) if no inotify fd was ever opened
 /// (`inotify_dnsmasq_init` never ran or failed) — mirrors
@@ -464,7 +507,7 @@ pub async fn watch_inotify_changes(
     loop {
         let mut guard = async_fd.readable().await?;
 
-        let hit = {
+        let hits = {
             let mut d = daemon_handle.write().await;
             let mut c = cache.lock().await;
             inotify_check(&mut d, &mut c)
@@ -473,7 +516,7 @@ pub async fn watch_inotify_changes(
 
         let should_reload = {
             let d = daemon_handle.read().await;
-            should_force_resolv_reload(&d, hit)
+            should_force_resolv_reload(&d, hits.resolv) || should_force_conf_reload(&d, hits.conf_file)
         };
         if should_reload {
             crate::dnsmasq::clear_cache_and_reload(&daemon_handle, &cache, &fwd_config).await;
@@ -676,6 +719,125 @@ mod tests {
         assert_eq!(daemon.resolv_files[0].wd, -1);
     }
 
+    // ── `--conf-file` watch (issue #176) ─────────────────────────────────
+
+    #[test]
+    fn inotify_dnsmasq_init_sets_wd_and_name_on_conf_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dnsmasq.conf");
+        std::fs::write(&path, "port=5353\n").unwrap();
+
+        let mut daemon = Daemon { port: 53, conf_file: Some(path.to_str().unwrap().to_string()), ..Daemon::default() };
+        inotify_dnsmasq_init(&mut daemon).unwrap();
+        let _guard = FdGuard(daemon.inotify_fd.unwrap_or(-1));
+
+        assert!(daemon.conf_file_wd >= 0);
+        assert_eq!(daemon.conf_file_watched_name.as_deref(), Some("dnsmasq.conf"));
+    }
+
+    #[test]
+    fn inotify_dnsmasq_init_skips_conf_file_watch_when_not_configured() {
+        let mut daemon = Daemon { port: 53, ..Daemon::default() };
+        inotify_dnsmasq_init(&mut daemon).unwrap();
+        let _guard = FdGuard(daemon.inotify_fd.unwrap_or(-1));
+
+        assert_eq!(daemon.conf_file_wd, -1);
+        assert_eq!(daemon.conf_file_watched_name, None);
+    }
+
+    #[test]
+    fn inotify_dnsmasq_init_skips_conf_file_watch_when_no_poll_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dnsmasq.conf");
+        std::fs::write(&path, "port=5353\n").unwrap();
+
+        let mut daemon = Daemon { port: 53, conf_file: Some(path.to_str().unwrap().to_string()), ..Daemon::default() };
+        daemon.set_option(OPT_NO_POLL);
+        inotify_dnsmasq_init(&mut daemon).unwrap();
+        let _guard = FdGuard(daemon.inotify_fd.unwrap_or(-1));
+
+        assert_eq!(daemon.conf_file_wd, -1);
+    }
+
+    /// Unlike the resolv-file watch, the `--conf-file` watch must be
+    /// established even when `port == 0` (DNS not serving) or
+    /// `--no-resolv` is set — a DHCP-only daemon still benefits from a
+    /// conf-file-triggered reload (`reread_dhcp` et al.).
+    #[test]
+    fn inotify_dnsmasq_init_watches_conf_file_even_when_port_zero_and_no_resolv() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dnsmasq.conf");
+        std::fs::write(&path, "dhcp-range=192.168.0.10,192.168.0.100\n").unwrap();
+
+        let mut daemon = Daemon { port: 0, conf_file: Some(path.to_str().unwrap().to_string()), ..Daemon::default() };
+        daemon.set_option(OPT_NO_RESOLV);
+        inotify_dnsmasq_init(&mut daemon).unwrap();
+        let _guard = FdGuard(daemon.inotify_fd.unwrap_or(-1));
+
+        assert!(daemon.conf_file_wd >= 0);
+    }
+
+    #[test]
+    fn inotify_check_reports_hit_for_watched_conf_file_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dnsmasq.conf");
+        std::fs::write(&path, "port=5353\n").unwrap();
+
+        let mut daemon = Daemon { port: 53, conf_file: Some(path.to_str().unwrap().to_string()), ..Daemon::default() };
+        inotify_dnsmasq_init(&mut daemon).unwrap();
+        let _guard = FdGuard(daemon.inotify_fd.unwrap_or(-1));
+        let mut cache = DnsCache::new(1000);
+
+        std::fs::write(&path, "port=5354\n").unwrap();
+
+        let hits = inotify_check(&mut daemon, &mut cache);
+        assert!(hits.conf_file);
+        assert!(!hits.resolv);
+    }
+
+    #[test]
+    fn inotify_check_ignores_an_unrelated_file_in_the_same_conf_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dnsmasq.conf");
+        std::fs::write(&path, "port=5353\n").unwrap();
+
+        let mut daemon = Daemon { port: 53, conf_file: Some(path.to_str().unwrap().to_string()), ..Daemon::default() };
+        inotify_dnsmasq_init(&mut daemon).unwrap();
+        let _guard = FdGuard(daemon.inotify_fd.unwrap_or(-1));
+        let mut cache = DnsCache::new(1000);
+
+        std::fs::write(dir.path().join("unrelated.txt"), "not the conf file\n").unwrap();
+
+        assert!(!inotify_check(&mut daemon, &mut cache).conf_file);
+    }
+
+    #[test]
+    fn should_force_conf_reload_true_by_default_on_hit() {
+        let daemon = Daemon::default();
+        assert!(should_force_conf_reload(&daemon, true));
+    }
+
+    #[test]
+    fn should_force_conf_reload_false_without_a_hit() {
+        let daemon = Daemon::default();
+        assert!(!should_force_conf_reload(&daemon, false));
+    }
+
+    #[test]
+    fn should_force_conf_reload_false_when_no_poll_set() {
+        let mut daemon = Daemon::default();
+        daemon.set_option(OPT_NO_POLL);
+        assert!(!should_force_conf_reload(&daemon, true));
+    }
+
+    /// The key difference from `should_force_resolv_reload`: a conf-file
+    /// hit still forces a reload even when `port == 0`.
+    #[test]
+    fn should_force_conf_reload_true_even_when_port_zero() {
+        let daemon = Daemon { port: 0, ..Daemon::default() };
+        assert!(should_force_conf_reload(&daemon, true));
+    }
+
     // ── set_dynamic_inotify ──────────────────────────────────────────────
 
     fn make_hosts_dyndir(dname: &str) -> DynDir {
@@ -875,7 +1037,7 @@ mod tests {
 
         std::fs::write(&path, "nameserver 8.8.8.8\n").unwrap();
 
-        assert!(inotify_check(&mut daemon, &mut cache));
+        assert!(inotify_check(&mut daemon, &mut cache).resolv);
     }
 
     #[test]
