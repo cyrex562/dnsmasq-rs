@@ -1153,7 +1153,10 @@ async fn sighup_reload_flushes_the_live_forward_cache() {
     let mut daemon = Daemon::default();
     daemon.servers.push(reload_test_server(upstream.addr));
     let daemon_handle = dnsmasq_rs::dnsmasq::init_daemon_with(daemon);
-    dnsmasq_rs::dnsmasq::on_sighup(&daemon_handle, &cache, &fwd_config).await;
+    let dhcp_reload = Arc::new(tokio::sync::Mutex::new(
+        dnsmasq_rs::dnsmasq::DhcpReloadConfig::default(),
+    ));
+    dnsmasq_rs::dnsmasq::on_sighup(&daemon_handle, &cache, &fwd_config, &dhcp_reload).await;
 
     assert!(ask(server.addr, &query_wire("reload.test", 1, 3)).await.is_some());
     assert_eq!(

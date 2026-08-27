@@ -37,6 +37,8 @@ pub(crate) struct AppState {
     /// Shared with the live forward loop so `/api/v1/reload` actually takes
     /// effect on query answering, not just `Daemon` state (issue #174).
     pub(crate) fwd_config: crate::forward::SharedForwardConfig,
+    /// Same as `fwd_config`, for the DHCP side (issue #179).
+    pub(crate) dhcp_reload: crate::dnsmasq::SharedDhcpReloadConfig,
     pub(crate) started_at: Instant,
     pub(crate) token_file: String,
     /// `None` when DHCP isn't configured/running; `/api/v1/leases` then
@@ -91,6 +93,7 @@ pub async fn serve_on(
     daemon: DaemonHandle,
     cache: SharedDnsCache,
     fwd_config: crate::forward::SharedForwardConfig,
+    dhcp_reload: crate::dnsmasq::SharedDhcpReloadConfig,
     token_file: String,
     #[cfg(feature = "dhcp")] leases: Option<crate::dhcp::SharedLeaseDb>,
 ) -> std::io::Result<()> {
@@ -98,6 +101,7 @@ pub async fn serve_on(
         daemon,
         cache,
         fwd_config,
+        dhcp_reload,
         started_at: Instant::now(),
         token_file,
         #[cfg(feature = "dhcp")]
@@ -277,7 +281,7 @@ async fn config_summary(State(state): State<AppState>) -> Json<ConfigSummaryResp
 /// this is the first mutating route, and deliberately reuses the
 /// already-tested reload path rather than a new one.
 async fn reload(State(state): State<AppState>) -> StatusCode {
-    crate::dnsmasq::on_sighup(&state.daemon, &state.cache, &state.fwd_config).await;
+    crate::dnsmasq::on_sighup(&state.daemon, &state.cache, &state.fwd_config, &state.dhcp_reload).await;
     StatusCode::NO_CONTENT
 }
 
@@ -327,6 +331,7 @@ mod tests {
             daemon: crate::dnsmasq::init_daemon_with(crate::types::daemon::Daemon::default()),
             cache: std::sync::Arc::new(tokio::sync::Mutex::new(crate::cache::DnsCache::new(100))),
             fwd_config: std::sync::Arc::new(tokio::sync::Mutex::new(crate::forward::ForwardConfig::default())),
+            dhcp_reload: std::sync::Arc::new(tokio::sync::Mutex::new(crate::dnsmasq::DhcpReloadConfig::default())),
             started_at: Instant::now(),
             token_file: token_file.to_string(),
             #[cfg(feature = "dhcp")]

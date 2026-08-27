@@ -1354,8 +1354,14 @@ pub async fn run_dhcp_loop(
     lease_db: SharedLeaseDb,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     probe: Box<dyn AddressProbe + Send + Sync>,
+    reload: crate::dnsmasq::SharedDhcpReloadConfig,
 ) -> std::io::Result<()> {
     let mut buf = vec![0u8; cfg.max_packet.max(300)];
+    // Picked up on the same 1-second cadence as `forward::run_forward_loop_on`'s
+    // periodic tick (issue #174's pattern, extended to DHCP for #179): a
+    // reload is rare, so a 1-second staleness window is harmless, and this
+    // keeps per-packet dispatch lock-free.
+    let mut reload_ticker = tokio::time::interval(Duration::from_secs(1));
     // Persists across packets so `do_icmp_ping`'s cache/load-limiter
     // (dhcp.c:769-823, ported as `PingCache::check`) actually avoids
     // re-pinging addresses within `PING_CACHE_TIME` of each other.
@@ -1556,6 +1562,15 @@ pub async fn run_dhcp_loop(
                 }
             }
             _ = slaac_dad.poll_tick_or_recv(&lease_db, slaac_contexts), if slaac_dad.active() => {}
+            _ = reload_ticker.tick() => {
+                // Only the reloadable subset is replaced (issue #179) —
+                // everything else in `cfg` (pool bounds, contexts, relay
+                // state, `leasequery_source`, ...) is either startup-only
+                // or per-packet scratch state a reload must not touch.
+                let fresh = reload.lock().await.clone();
+                cfg.configs = fresh.configs;
+                cfg.dhcp_opts = fresh.dhcp_opts;
+            }
         }
     }
 }
@@ -2586,6 +2601,12 @@ mod tests {
         count
     }
 
+    /// A throwaway `SharedDhcpReloadConfig` for tests that don't exercise
+    /// live-reload behavior themselves (issue #179).
+    fn test_reload_config() -> crate::dnsmasq::SharedDhcpReloadConfig {
+        std::sync::Arc::new(tokio::sync::Mutex::new(crate::dnsmasq::DhcpReloadConfig::default()))
+    }
+
     fn default_cfg() -> DhcpServerConfig {
         DhcpServerConfig {
             pool_start: Ipv4Addr::new(10, 0, 0, 100),
@@ -3388,7 +3409,7 @@ mod tests {
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())), shutdown_rx, Box::new(NullProbe)));
+        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())), shutdown_rx, Box::new(NullProbe), test_reload_config()));
 
         let mut pkt = base_packet();
         pkt.options = vec![
@@ -3810,7 +3831,7 @@ mod tests {
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())), shutdown_rx, Box::new(NullProbe)));
+        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())), shutdown_rx, Box::new(NullProbe), test_reload_config()));
 
         let pkt = base_packet();
         let wire = packet_to_wire(&pkt);
@@ -3848,7 +3869,7 @@ mod tests {
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())), shutdown_rx, Box::new(NullProbe)));
+        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())), shutdown_rx, Box::new(NullProbe), test_reload_config()));
 
         let pkt = base_packet();
         let wire = packet_to_wire(&pkt);
@@ -3862,6 +3883,100 @@ mod tests {
         let reply = parse_dhcp_packet(&buf[..len]).expect("loop reply should parse");
         assert_eq!(get_message_type(&reply.options), Some(DhcpMsgType::Offer));
         assert_eq!(reply.yiaddr, Ipv4Addr::new(10, 0, 0, 101));
+
+        shutdown_tx.send(true).unwrap();
+        loop_task.await.unwrap().unwrap();
+    }
+
+    /// Issue #179: `run_dhcp_loop` used to take `DhcpServerConfig` by value,
+    /// so a reload's `dhcp-host` update (`option::reread_dhcp`, wired into
+    /// `Daemon` by issue #175) never reached the *running* loop's dispatch —
+    /// only API/DBus/UBus reads of `Daemon` ever saw it, exactly like
+    /// `daemon.servers` before #174's `SharedForwardConfig` fix. This drives
+    /// the acceptance bar from the issue: a static host mapping added after
+    /// startup must change a live DHCP dispatch's behavior without a restart.
+    #[tokio::test]
+    async fn run_dhcp_loop_picks_up_a_reloaded_static_host_mapping() {
+        use crate::types::dhcp::{ConfigFlags, DhcpConfig, HwaddrConfig};
+
+        let Some(server) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+        let Some(client) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+        let Some(receiver) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+
+        let receiver_addr = receiver.local_addr().unwrap();
+        let server = std::sync::Arc::new(server);
+        let cfg = default_cfg();
+        let opts = DhcpLoopOptions {
+            reply_port_override: Some(receiver_addr.port()),
+            ..Default::default()
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let reload = std::sync::Arc::new(tokio::sync::Mutex::new(crate::dnsmasq::DhcpReloadConfig::default()));
+        let loop_task = tokio::spawn(run_dhcp_loop(
+            server.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())),
+            shutdown_rx, Box::new(NullProbe), reload.clone(),
+        ));
+
+        let ask = |xid: u32| {
+            let mut pkt = base_packet();
+            pkt.xid = xid;
+            packet_to_wire(&pkt)
+        };
+        let recv_offer = || async {
+            let mut buf = [0u8; 512];
+            let (len, _) = tokio::time::timeout(Duration::from_millis(250), receiver.recv_from(&mut buf))
+                .await
+                .expect("timed out waiting for DHCP loop reply")
+                .unwrap();
+            parse_dhcp_packet(&buf[..len]).expect("loop reply should parse")
+        };
+
+        // Before the reload: no static config, so the offer comes from the
+        // dynamic pool (matches `run_dhcp_loop_receives_and_replies`).
+        client.send_to(&ask(1), server.local_addr().unwrap()).await.unwrap();
+        let before = recv_offer().await;
+        assert_eq!(get_message_type(&before.options), Some(DhcpMsgType::Offer));
+        assert_eq!(before.yiaddr, Ipv4Addr::new(10, 0, 0, 101));
+
+        // Push a static host mapping for `base_packet()`'s (all-zero) MAC
+        // into the shared reload handle — exactly what
+        // `dnsmasq::clear_cache_and_reload` does after `reread_dhcp` re-reads
+        // `--dhcp-hostsfile` on a SIGHUP/API/inotify-triggered reload.
+        let static_cfg = DhcpConfig {
+            flags: ConfigFlags::ADDR,
+            clid: None,
+            hostname: None,
+            domain: None,
+            netid: vec![],
+            filter: vec![],
+            addr: Ipv4Addr::new(10, 0, 0, 42),
+            decline_time: None,
+            lease_time: 0,
+            hwaddrs: vec![HwaddrConfig {
+                hwaddr: [0u8; DHCP_CHADDR_MAX],
+                hwaddr_len: 6,
+                hwaddr_type: 1,
+                wildcard_mask: 0,
+            }],
+            #[cfg(feature = "dhcp6")]
+            addr6: vec![],
+        };
+        {
+            let mut guard = reload.lock().await;
+            guard.configs = vec![static_cfg];
+        }
+        // `run_dhcp_loop` only checks for a fresh reload config once per
+        // second (its periodic-tick branch) — see that branch's doc comment.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        client.send_to(&ask(2), server.local_addr().unwrap()).await.unwrap();
+        let after = recv_offer().await;
+        assert_eq!(get_message_type(&after.options), Some(DhcpMsgType::Offer));
+        assert_eq!(
+            after.yiaddr,
+            Ipv4Addr::new(10, 0, 0, 42),
+            "the live loop must offer the reloaded static address, not the dynamic pool"
+        );
 
         shutdown_tx.send(true).unwrap();
         loop_task.await.unwrap().unwrap();
@@ -3892,7 +4007,7 @@ mod tests {
         }];
         let opts = DhcpLoopOptions { reply_port_override: Some(receiver_addr.port()), ..Default::default() };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())), shutdown_rx, Box::new(NullProbe)));
+        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())), shutdown_rx, Box::new(NullProbe), test_reload_config()));
 
         let mut pkt = leasequery_packet(Ipv4Addr::new(10, 0, 0, 150));
         pkt.giaddr = Ipv4Addr::new(203, 0, 113, 9);
@@ -3929,7 +4044,7 @@ mod tests {
         }];
         let opts = DhcpLoopOptions { reply_port_override: Some(receiver_addr.port()), ..Default::default() };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())), shutdown_rx, Box::new(NullProbe)));
+        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())), shutdown_rx, Box::new(NullProbe), test_reload_config()));
 
         // ciaddr left UNSPECIFIED: with giaddr also UNSPECIFIED after the
         // sentinel is consumed, `loop_reply_dest` falls back to the packet's
@@ -3982,7 +4097,7 @@ mod tests {
             ..Default::default()
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let loop_task = tokio::spawn(run_dhcp_loop(relay_sock.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())), shutdown_rx, Box::new(NullProbe)));
+        let loop_task = tokio::spawn(run_dhcp_loop(relay_sock.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())), shutdown_rx, Box::new(NullProbe), test_reload_config()));
 
         let pkt = base_packet();
         let wire = packet_to_wire(&pkt);
@@ -4034,7 +4149,7 @@ mod tests {
             ..Default::default()
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let loop_task = tokio::spawn(run_dhcp_loop(relay_sock.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())), shutdown_rx, Box::new(NullProbe)));
+        let loop_task = tokio::spawn(run_dhcp_loop(relay_sock.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())), shutdown_rx, Box::new(NullProbe), test_reload_config()));
 
         // The upstream server's OFFER, addressed back to the relay (giaddr set,
         // ciaddr pointed at our test "client" receiver so delivery doesn't need
@@ -4082,7 +4197,7 @@ mod tests {
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())), shutdown_rx, Box::new(NullProbe)));
+        let loop_task = tokio::spawn(run_dhcp_loop(server.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())), shutdown_rx, Box::new(NullProbe), test_reload_config()));
 
         let pkt = base_packet();
         let wire = packet_to_wire(&pkt);

@@ -497,6 +497,8 @@ pub struct DbusContext {
     /// actually take effect on query answering, not just `Daemon` state
     /// (issue #174).
     pub fwd_config: crate::forward::SharedForwardConfig,
+    /// Same as `fwd_config`, for the DHCP side (issue #179).
+    pub dhcp_reload: crate::dnsmasq::SharedDhcpReloadConfig,
     #[cfg(feature = "dhcp")]
     pub leases: Arc<tokio::sync::Mutex<crate::lease::LeaseDb>>,
     /// Where to persist DHCP lease changes made through the D-Bus methods
@@ -524,7 +526,7 @@ impl DnsmasqInterface {
     }
 
     async fn clear_cache(&self) {
-        crate::dnsmasq::clear_cache_and_reload(&self.ctx.daemon, &self.ctx.cache, &self.ctx.fwd_config).await;
+        crate::dnsmasq::clear_cache_and_reload(&self.ctx.daemon, &self.ctx.cache, &self.ctx.fwd_config, &self.ctx.dhcp_reload).await;
     }
 
     async fn clear_metrics(&self) {
@@ -661,7 +663,7 @@ impl DnsmasqInterface {
         info!("setting upstream servers from DBus");
         let reload = { self.ctx.daemon.read().await.option_bool(crate::types::constants::OPT_RELOAD) };
         if reload {
-            crate::dnsmasq::clear_cache_and_reload(&self.ctx.daemon, &self.ctx.cache, &self.ctx.fwd_config).await;
+            crate::dnsmasq::clear_cache_and_reload(&self.ctx.daemon, &self.ctx.cache, &self.ctx.fwd_config, &self.ctx.dhcp_reload).await;
         }
     }
 
@@ -1149,6 +1151,7 @@ mod tests {
             daemon: daemon.clone(),
             cache,
             fwd_config: Arc::new(tokio::sync::Mutex::new(crate::forward::ForwardConfig::default())),
+            dhcp_reload: Arc::new(tokio::sync::Mutex::new(crate::dnsmasq::DhcpReloadConfig::default())),
             #[cfg(feature = "dhcp")]
             leases: Arc::new(tokio::sync::Mutex::new(crate::lease::LeaseDb::new())),
             #[cfg(feature = "dhcp")]

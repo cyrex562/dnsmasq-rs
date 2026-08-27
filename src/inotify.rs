@@ -494,6 +494,7 @@ pub async fn watch_inotify_changes(
     daemon_handle: crate::dnsmasq::DaemonHandle,
     cache: crate::cache::SharedDnsCache,
     fwd_config: crate::forward::SharedForwardConfig,
+    dhcp_reload: crate::dnsmasq::SharedDhcpReloadConfig,
 ) -> std::io::Result<()> {
     use std::os::fd::{FromRawFd, OwnedFd};
 
@@ -519,7 +520,7 @@ pub async fn watch_inotify_changes(
             should_force_resolv_reload(&d, hits.resolv) || should_force_conf_reload(&d, hits.conf_file)
         };
         if should_reload {
-            crate::dnsmasq::clear_cache_and_reload(&daemon_handle, &cache, &fwd_config).await;
+            crate::dnsmasq::clear_cache_and_reload(&daemon_handle, &cache, &fwd_config, &dhcp_reload).await;
         }
     }
 }

@@ -239,6 +239,35 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   my-printer` fails with "invalid hardware type prefix" — reproduces identically through
   the plain `dhcp-host=` directive, unrelated to the new bank-file reader that surfaced it.
 
+  **Issue #179 (2026-08-27):** Closed the gap #175 left open — `run_dhcp_loop` took
+  `DhcpServerConfig` by value, so `reread_dhcp`'s `daemon.dhcp_conf`/`dhcp_opts` updates
+  never reached an already-running loop's dispatch, only API/DBus/UBus reads of `Daemon`.
+  Rather than share the whole `DhcpServerConfig` (as `ForwardConfig` is shared whole for
+  #174), only the actually-reloadable subset is shared: a new `dnsmasq::DhcpReloadConfig`
+  (`{ configs, dhcp_opts }`) behind `dnsmasq::SharedDhcpReloadConfig` (`Arc<Mutex<_>>`,
+  same pattern as `SharedForwardConfig`). Everything else in `DhcpServerConfig` — pool
+  bounds, contexts, relay state, and per-packet scratch fields like `leasequery_source`
+  — is either startup-only or runtime-computed state a reload must not touch, so it stays
+  owned directly by `run_dhcp_loop` and is never replaced. `run_dhcp_loop` picks up a
+  fresh snapshot on its own 1-second periodic tick (mirroring `run_forward_loop_on`'s),
+  overwriting only `cfg.configs`/`cfg.dhcp_opts` in place. `clear_cache_and_reload` builds
+  the fresh snapshot via `daemon_dhcp_reload_config` (mirroring `daemon_forward_config`)
+  right alongside its existing `fwd_config` push, so it's threaded through the exact same
+  SIGHUP/`/api/v1/reload`/DBus-`ClearCache`/inotify call sites `SharedForwardConfig`
+  already reaches — no new reload trigger needed. `DhcpReloadConfig`/`SharedDhcpReloadConfig`
+  live in `dnsmasq.rs`, not `dhcp.rs`/`types::dhcp` (both gated on the `dhcp` feature),
+  since every caller of `clear_cache_and_reload`/`on_sighup` needs to hold one
+  unconditionally, the same way they always hold a `SharedForwardConfig`; its two fields
+  are themselves `#[cfg(feature = "dhcp")]`-gated, matching the `Daemon` fields they mirror.
+  Acceptance-bar regression test (`dhcp::tests::run_dhcp_loop_picks_up_a_reloaded_static_host_mapping`):
+  a DHCPDISCOVER gets a dynamic-pool offer, a static host mapping for the same MAC is
+  pushed into the shared handle, and — after the 1-second tick, with no restart — a second
+  DHCPDISCOVER gets the static address instead. A live end-to-end smoke test through the
+  real binary wasn't run for this issue (DHCP's UDP/67 bind needs root, unavailable in this
+  environment); the regression test exercises the identical live-loop mechanism directly
+  over ephemeral test-bound sockets instead. This closes #128's reload-while-running arc —
+  all four sub-issues (#174/#175/#176/#179) are done.
+
   Verified live: `--dhcp-hostsfile` now visibly loads at startup (`read <path>` log line,
   previously never appeared for this directive), a real SIGHUP re-reads an edited file and
   loads new entries, and a malformed line mid-file logs an error and the daemon stays up
