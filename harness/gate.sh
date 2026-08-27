@@ -83,7 +83,7 @@ done
 
 # ── forbidden paths ──────────────────────────────────────────────────────────
 FORBIDDEN=$(git diff --name-only master...HEAD 2>/dev/null \
-  | grep -E '^(harness/|old/)' || true)
+  | grep -E '^(harness/)' || true)
 if [[ -n "$FORBIDDEN" ]]; then
   record "forbidden-paths" false "$(echo "$FORBIDDEN" | tr '\n' ';')"
 else

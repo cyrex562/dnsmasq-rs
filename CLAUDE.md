@@ -14,7 +14,8 @@ Primary references:
   `http://thekelleys.org.uk/git/dnsmasq.git` (or browse
   <https://www.thekelleys.org.uk/dnsmasq/doc.html>) outside the working tree when you
   need to read it; do not re-vendor it into this repository
-- Earlier Rust attempt: `old/` — read-only reference
+- Earlier Rust attempt: removed (`old/`, also contained a vendored copy of upstream's GPL
+  source; see "Licensing" below) — no longer available as a reference
 - Execution tracker: `tasks.md`
 - Sibling agent guidance: `agents.md` (roles/process), `.github/copilot-instructions.md`
 
@@ -27,8 +28,11 @@ not a clean-room reimplementation) and is licensed GPL-3.0-or-later accordingly 
 - Add an MIT/Apache/BSD/etc. license header to a new file, or claim a different license
   for any part of this codebase, without the user's explicit direction.
 - Re-vendor upstream's C source (or any other GPL-incompatible dependency) into this
-  repository. `original_dnsmasq_src/` was removed for this reason (issue #169); read
-  upstream from an external clone instead.
+  repository. `original_dnsmasq_src/` and `old/` (issue #169 — the latter turned out to
+  also contain a full vendored copy of upstream's project root: `Android.mk`, `COPYING`,
+  `Makefile`, `man/`, `po/`, `dbus/`, `bld/`, `logo/`, and `.c`/`.h` sources, mixed in
+  alongside an earlier Rust attempt) were both removed for this reason; read upstream
+  from an external clone instead.
 
 Note that `tasks.md` and `agents.md` describe some blockers that have since been resolved (see "Build and test reality"). Verify a claimed blocker before treating it as current.
 
@@ -169,7 +173,7 @@ Gates apply both to `pub mod` declarations (in *both* `lib.rs` and `main.rs`) an
 - Do not drop upstream behavior because the Rust shape is cleaner. Preserve flag semantics and wire format exactly unless the deviation is documented.
 - Map C unions, pointers, and flags into reviewable Rust forms without losing wire-format or decision logic.
 - Keep unsupported behavior explicit in docs and TODOs, and tracked in `tasks.md`.
-- Do not edit `old/`. Do not re-vendor upstream C source into this repository (see "Licensing" above) — read it from an external clone.
+- Do not re-vendor upstream C source into this repository (see "Licensing" above) — read it from an external clone.
 
 ## Testing strategy
 

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This is an in-progress port of [dnsmasq](https://thekelleys.org.uk/dnsmasq/doc.html) (a C DNS forwarder + DHCP server, ~47k lines across 42 files) to idiomatic, async-safe Rust — a derivative work of dnsmasq's GPLv2/v3-licensed source, licensed GPL-3.0-or-later accordingly (see `NOTICE.md`). The original C source is not vendored in this repo (removed, issue #169); clone `http://thekelleys.org.uk/git/dnsmasq.git` externally for reference rather than re-vendoring it. Skeleton/partial files from a prior attempt live in `old/` — evaluate each one before reusing.
+This is an in-progress port of [dnsmasq](https://thekelleys.org.uk/dnsmasq/doc.html) (a C DNS forwarder + DHCP server, ~47k lines across 42 files) to idiomatic, async-safe Rust — a derivative work of dnsmasq's GPLv2/v3-licensed source, licensed GPL-3.0-or-later accordingly (see `NOTICE.md`). The original C source is not vendored in this repo (removed, issue #169); clone `http://thekelleys.org.uk/git/dnsmasq.git` externally for reference rather than re-vendoring it. Skeleton/partial files from a prior attempt used to live in `old/`, but that directory also turned out to contain a full vendored copy of upstream's GPL project root, so it was removed too (issue #169) — do not re-vendor either.
 
 ## Build & Test Commands
 

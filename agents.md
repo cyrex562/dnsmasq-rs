@@ -9,11 +9,10 @@ Primary references:
 - Upstream C source: not vendored in this repo (removed, issue #169 — this project is a
   derivative work of GPL-licensed dnsmasq; see `NOTICE.md`) — clone
   `http://thekelleys.org.uk/git/dnsmasq.git` externally to read it, do not re-vendor it
-- Earlier Rust attempt: `old/`
+- Earlier Rust attempt: removed (`old/`, also contained a vendored copy of upstream's GPL
+  project root — removed for the same reason, issue #169) — no longer available
 - Central tracker: `tasks.md`
 - Project overview and test expectations: `CLAUDE.md`
-
-The `old/` tree is reference-only.
 
 ## Core Rule
 

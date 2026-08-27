@@ -22,7 +22,7 @@ Rules:
 - Write the test first, watch it fail, then make it pass.
 - Do not accept a config directive as a silent no-op.
 - Keep anything you leave unsupported explicit in `tasks.md`.
-- Do NOT edit `harness/` or `old/`. The gate rejects any diff touching them.
+- Do NOT edit `harness/`. The gate rejects any diff touching it.
 - Do NOT vendor upstream's C source into this repo (removed, issue #169 —
   this project is a derivative work of GPL-licensed dnsmasq; see
   `NOTICE.md`). Read it from an external clone of

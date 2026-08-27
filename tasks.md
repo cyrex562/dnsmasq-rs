@@ -20,9 +20,8 @@ Reference material:
 - Upstream C source: not vendored in this repo (removed, issue #169 — this project is a
   derivative work of GPL-licensed dnsmasq; see `NOTICE.md`). Clone
   `http://thekelleys.org.uk/git/dnsmasq.git` externally to read it.
-- Earlier Rust attempt: `old/`
-
-`old/` is reference-only. Do not treat it as code to edit in place.
+- Earlier Rust attempt: removed (`old/`, also contained a vendored copy of upstream's GPL
+  project root — removed for the same reason, issue #169) — no longer available
 
 ## P0 Parity Blockers
 
@@ -3511,6 +3510,16 @@ Reference material:
     `upstream-file:` metadata pointer) and `harness/gate.sh`'s forbidden-paths check updated
     to match — these were documentation-only pointers already, not code that reads the
     vendored tree, so nothing there was functionally broken, just stale.
+  - Follow-up discovered while doing the above: `old/` (the "earlier Rust attempt"
+    reference directory) turned out to *also* contain a full vendored copy of upstream's
+    GPL project root (`Android.mk`, `COPYING`/`COPYING-v3`, `Makefile`, `FAQ`,
+    `CHANGELOG`, `man/`, `po/`, `dbus/`, `bld/`, `logo/`, plus 43 `.c`/`.h` files under
+    `old/c_src/`), mixed in alongside ~100 `.rs` files from an earlier, more literal port
+    attempt (e.g. a Rust `union AllAddr` mirroring C's union directly, rather than the
+    enum this codebase now uses). Removed entirely, per explicit direction (the earlier
+    Rust attempt is still recoverable from git history if ever needed). `CLAUDE.md`,
+    `agents.md`, `.github/copilot-instructions.md`, `harness/stages/implement.md`, and
+    `harness/gate.sh`'s forbidden-paths check updated to drop references to it.
   - Did NOT decide the bigger strategic question the issue also raised (whether to pursue a
     proprietary or source-available release of the derived core) — that requires actual
     legal counsel and the copyright holder's own business judgment, not something to settle
