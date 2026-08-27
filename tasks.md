@@ -202,6 +202,49 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     unlike upstream's `main()`, which calls `reload_servers()` once before the select
     loop in addition to on every SIGHUP.
 
+  **Issue #175 (2026-08-27):** `--dhcp-hostsfile`/`--dhcp-optsfile` previously did
+  nothing at all beyond recording the configured path — nothing anywhere read the
+  file's contents, at startup or on reload; `option::reread_dhcp` was a stub that only
+  bumped `reload_count`. Now real: a new `option::read_dhcp_bank_file` helper reads
+  each configured file, treating every non-blank, non-comment line as the value
+  portion of a bare `dhcp-host`/`dhcp-option` directive (upstream's `one_file(file,
+  LOPT_BANK)`/`one_file(file, LOPT_OPTS)`, option.c:5624), reusing the existing
+  `parse_dhcp_host`/`parse_dhcp_option` line parsers. A malformed line is logged and
+  skipped rather than aborting the whole file (matching upstream's `hard_opt != 0`
+  branch — `my_syslog(LOG_ERR, ...)` rather than `die()`), so one bad line in a large
+  file can't take down an already-running daemon's reload. `option::reread_dhcp` clears
+  and re-derives only the entries a previous bank-file read produced
+  (`ConfigFlags::BANK`/`DhOptFlags::BANK`, pre-existing but previously-unused flags
+  matching upstream's `CONFIG_BANK`/`DHOPT_BANK`) — entries from direct `dhcp-host=`/
+  `dhcp-option=` directives are left untouched across every reread, matching upstream's
+  `clear_dynamic_conf`/`clear_dhcp_opt` exactly. Wired into `dnsmasq::clear_cache_and_reload`
+  (alongside a separate `--read-ethers` re-run, matching upstream calling both from
+  `clear_cache_and_reload()` rather than nesting one inside the other) and, for the first
+  time, into `dnsmasq::init_daemon_with` too — so these files take effect from the very
+  first DHCP dispatch, not only after the first reload, mirroring upstream's `EVENT_INIT`
+  running the exact same `clear_cache_and_reload()` chain as `EVENT_RELOAD` does.
+
+  This only updates `Daemon` state (`daemon.dhcp_conf`/`daemon.dhcp_opts`) — it does not
+  yet reach an already-running DHCP dispatch loop, since `run_dhcp_loop` still takes its
+  `DhcpServerConfig` (including `configs`/`dhcp_opts`) by value, the exact same staleness
+  bug issue #174 fixed for `ForwardConfig`. Filed as issue #179, deliberately deferred
+  rather than folded into #175 to keep each change reviewable. Also deferred (issue #180):
+  upstream's `dhcp_update_configs()`/`lease_update_from_configs()`, which re-sync
+  already-*issued* leases' hostname/etc. when static config changes — #175 only affects
+  future dispatches.
+
+  Also discovered and filed separately (issue #181, not fixed here — out of scope):
+  `looks_like_mac_pattern`'s `value.contains('-')` check misclassifies any hyphenated
+  hostname (e.g. `my-printer`) as a MAC-pattern candidate, so `dhcp-host=<mac>,<ip>,
+  my-printer` fails with "invalid hardware type prefix" — reproduces identically through
+  the plain `dhcp-host=` directive, unrelated to the new bank-file reader that surfaced it.
+
+  Verified live: `--dhcp-hostsfile` now visibly loads at startup (`read <path>` log line,
+  previously never appeared for this directive), a real SIGHUP re-reads an edited file and
+  loads new entries, and a malformed line mid-file logs an error and the daemon stays up
+  (confirmed against `--no-daemon` for log visibility, matching #174's discovery that `-k`
+  alone still redirects stdio to `/dev/null`).
+
 - [x] Wire the DNS answer cache into the live forward path.
   `run_forward_loop_on` now calls `forward::cache_upstream_reply` → `cache::cache_reply` →
   `rfc1035::extract_addresses` for every accepted, non-truncated upstream reply, mirroring
@@ -1280,9 +1323,9 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     `dnsmasq::tests::clear_cache_and_reload_rescans_hostsdir_entries`. Only `AH_HOSTS`
     directories are rescanned this way; `dhcp-hostsdir`/`dhcp-optsdir` are not, matching
     `set_dynamic_inotify`'s existing scope limits below.
-  - `--servers-file` re-read (`read_servers_file()`) and DHCP reload
-    (`reread_dhcp`/`dhcp_read_ethers`/`lease_update_from_configs`/`rerun_scripts`) are not
-    implemented — SIGHUP is DNS-only for now.
+  - `--servers-file` re-read (`read_servers_file()`) and `lease_update_from_configs`/
+    `rerun_scripts` are not implemented. `reread_dhcp`/`dhcp_read_ethers` reload IS now
+    implemented (issue #175, 2026-08-27) — see the dedicated entry below.
   - See "Reload staleness" below: `daemon.servers` is updated correctly, but the
     already-running forward task's `ForwardConfig` (upstream list, host-records, CNAMEs)
     is still a one-time snapshot, so a resolv-file-driven server-list change only takes
@@ -1327,8 +1370,9 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     (so `inotify_check` recognizes their `wd` rather than erroring) but not scanned or
     read back on change: this port has no `option_read_dynfile` /
     `dhcp_update_configs`/`lease_update_from_configs`/`lease_update_file`/`lease_update_dns`
-    equivalent yet — only whole-config `reread_dhcp` (SIGHUP) exists. Building the
-    per-file DHCP dynfile reader is a separate, larger chunk of work than this issue's
+    equivalent yet — only whole-file `reread_dhcp` (SIGHUP/startup, issue #175) exists,
+    which re-reads `--dhcp-hostsfile`/`--dhcp-optsfile` in full, not per-changed-entry.
+    Building the per-file DHCP dynfile reader is a separate, larger chunk of work than this issue's
     scope (Issue #50 / T3-inotify targeted `inotify.c` itself, not `option.c`'s
     `option_read_dynfile`).
   - No mtime-based polling fallback exists for builds without the `inotify` feature
@@ -1455,9 +1499,7 @@ Both are reference-only. Do not treat either tree as code to edit in place.
   `slaac.rs`/`radv.rs` may cover overlapping ground under different names but that
   hasn't been checked. `rerun_scripts()` (which marks every lease `LEASE_CHANGED` so a
   reload re-fires all hooks) still has no caller outside its own unit tests — wiring it
-  into the SIGHUP/reload path is tracked separately above ("DHCP reload
-  (`reread_dhcp`/.../`rerun_scripts`) are not implemented — SIGHUP is DNS-only for
-  now").
+  into the reload path (alongside `lease_update_from_configs`) is tracked as issue #180.
   Covered by `lease::tests::{write_to_file_uses_tmp_file_and_rename,
   write_to_file_failed_write_leaves_original_untouched, run_lease_scripts_fires_add_for_new_lease,
   run_lease_scripts_fires_old_for_changed_lease, run_lease_scripts_fires_del_for_removed_lease,

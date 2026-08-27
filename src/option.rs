@@ -4884,20 +4884,96 @@ pub fn load_conf_dir(daemon: &mut Daemon, dir: &str) -> Result<(), ConfigError> 
     Ok(())
 }
 
-/// Re-read DHCP configuration files (lease file, hosts files, options).
+/// Read one `--dhcp-hostsfile`/`--dhcp-optsfile` "bank" file: each
+/// non-blank, non-comment line is the value portion of a bare `dhcp-host`/
+/// `dhcp-option` directive (no `dhcp-host=` prefix) — upstream's
+/// `one_file(file, LOPT_BANK)`/`one_file(file, LOPT_OPTS)` (option.c:5624),
+/// via `read_file`'s per-line dispatch (option.c:5468-5613).
 ///
-/// Called on SIGHUP to refresh dynamic DHCP state without restarting.
-/// Mirrors dnsmasq's `reread_dhcp()`.
+/// A malformed line is logged and skipped rather than aborting the whole
+/// file, matching upstream's `hard_opt != 0` branch (`my_syslog(LOG_ERR,
+/// ...)` instead of `die()` — option.c:5601-5606): this path also runs on
+/// every reload of an already-running daemon, where a single bad line must
+/// not take down DHCP entirely. Returns an empty `Vec` (with a warning) if
+/// the file itself can't be read — the caller already knows to treat
+/// "unreadable" as "no entries from this file" rather than a fatal error,
+/// same as `clear_cache_and_reload`'s resolv-file handling.
+#[cfg(feature = "dhcp")]
+fn read_dhcp_bank_file<T>(
+    path: &str,
+    key: &str,
+    parse_line: impl Fn(&str, &ConfigLine) -> Result<T, ConfigError>,
+) -> Vec<T> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("could not read {path}: {e}");
+            return Vec::new();
+        }
+    };
+
+    let mut out = Vec::new();
+    for (i, raw_line) in text.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let cl = ConfigLine { key: key.to_string(), value: Some(line.to_string()), file: path.to_string(), line: i + 1 };
+        match parse_line(line, &cl) {
+            Ok(v) => out.push(v),
+            Err(e) => tracing::error!("{path}:{}: {e}", i + 1),
+        }
+    }
+    tracing::info!("read {path}");
+    out
+}
+
+/// Re-read `--dhcp-hostsfile`/`--dhcp-optsfile` and re-derive `dhcp_conf`/
+/// `dhcp_opts`.
 ///
-/// Currently:
-/// - Clears and re-applies hosts file list from daemon config.
-/// - Returns `Ok(())` when no DHCP config is present (no-op).
+/// Called on reload (SIGHUP/API/DBus/inotify) to refresh dynamic DHCP state
+/// without restarting. Mirrors dnsmasq's `reread_dhcp()` (option.c:5906-5942):
+/// clear only the entries a previous bank-file read produced (`ConfigFlags::BANK`/
+/// `DhOptFlags::BANK`, matching upstream's `CONFIG_BANK`/`DHOPT_BANK` — entries
+/// from direct `dhcp-host=`/`dhcp-option=` directives are untouched), then
+/// re-read every configured `--dhcp-hostsfile`/`--dhcp-optsfile` from scratch.
+///
+/// Does *not* re-run `--read-ethers` — upstream calls that separately from
+/// `clear_cache_and_reload()`, not from inside `reread_dhcp()` itself
+/// (option.c:1817-1819); `dnsmasq::clear_cache_and_reload` does the same
+/// alongside this call.
+///
+/// This only updates `Daemon` state; it does not, by itself, reach an
+/// already-running DHCP dispatch loop — see issue #179 for the
+/// `DhcpServerConfig` live-reload work that closes that gap, mirroring what
+/// issue #174 already did for the DNS forward loop's `ForwardConfig`.
 #[cfg(feature = "dhcp")]
 pub fn reread_dhcp(daemon: &mut Daemon) -> Result<(), ConfigError> {
-    // Re-read addn-hosts files (these may add/update DHCP hostname mappings).
-    // The actual hosts file loading lives in cache.rs; here we just signal
-    // that a reload is needed by touching the reload counter.
-    daemon.reload_count = daemon.reload_count.wrapping_add(1);
+    daemon.dhcp_conf.retain(|c| !c.flags.contains(ConfigFlags::BANK));
+    daemon.dhcp_opts.retain(|o| !o.flags.contains(DhOptFlags::BANK));
+
+    for hf in daemon.dhcp_hosts_file.clone() {
+        if hf.flags.contains(crate::types::network::DynDirFlags::INACTIVE) {
+            continue;
+        }
+        for mut cfg in read_dhcp_bank_file(&hf.fname, "dhcp-host", parse_dhcp_host) {
+            cfg.flags |= ConfigFlags::BANK;
+            daemon.dhcp_conf.push(cfg);
+        }
+    }
+
+    for hf in daemon.dhcp_opts_file.clone() {
+        if hf.flags.contains(crate::types::network::DynDirFlags::INACTIVE) {
+            continue;
+        }
+        for mut opt in read_dhcp_bank_file(&hf.fname, "dhcp-option", |v, cl| {
+            parse_dhcp_option(v, cl, "dhcp-option", DhOptFlags::empty())
+        }) {
+            opt.flags |= DhOptFlags::BANK;
+            daemon.dhcp_opts.push(opt);
+        }
+    }
+
     Ok(())
 }
 
@@ -9189,13 +9265,114 @@ mod tests {
 
     #[test]
     #[cfg(feature = "dhcp")]
-    fn reread_dhcp_increments_reload_count() {
+    fn reread_dhcp_with_no_files_configured_is_a_no_op() {
         let mut d = Daemon::default();
-        assert_eq!(d.reload_count, 0);
         reread_dhcp(&mut d).unwrap();
-        assert_eq!(d.reload_count, 1);
+        assert!(d.dhcp_conf.is_empty());
+        assert!(d.dhcp_opts.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn reread_dhcp_loads_dhcp_hostsfile_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts");
+        std::fs::write(&path, "# a comment\n\n02:00:00:00:00:01,192.168.0.5,myhost\n").unwrap();
+
+        let mut d = Daemon::default();
+        d.dhcp_hosts_file.push(crate::types::network::HostsFile {
+            flags: crate::types::network::DynDirFlags::empty(),
+            fname: path.to_str().unwrap().to_string(),
+            index: 0,
+        });
+
         reread_dhcp(&mut d).unwrap();
-        assert_eq!(d.reload_count, 2);
+
+        assert_eq!(d.dhcp_conf.len(), 1, "the comment and blank line must be skipped");
+        let cfg = &d.dhcp_conf[0];
+        assert!(cfg.flags.contains(ConfigFlags::BANK));
+        assert_eq!(cfg.addr, Ipv4Addr::new(192, 168, 0, 5));
+        assert_eq!(cfg.hostname.as_deref(), Some("myhost"));
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn reread_dhcp_loads_dhcp_optsfile_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opts");
+        std::fs::write(&path, "3,192.168.0.1\n").unwrap();
+
+        let mut d = Daemon::default();
+        d.dhcp_opts_file.push(crate::types::network::HostsFile {
+            flags: crate::types::network::DynDirFlags::empty(),
+            fname: path.to_str().unwrap().to_string(),
+            index: 0,
+        });
+
+        reread_dhcp(&mut d).unwrap();
+
+        assert_eq!(d.dhcp_opts.len(), 1);
+        assert!(d.dhcp_opts[0].flags.contains(DhOptFlags::BANK));
+        assert_eq!(d.dhcp_opts[0].opt, 3);
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn reread_dhcp_skips_a_malformed_line_but_keeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts");
+        std::fs::write(&path, "\n02:00:00:00:00:01,192.168.0.5\n").unwrap();
+
+        let mut d = Daemon::default();
+        d.dhcp_hosts_file.push(crate::types::network::HostsFile {
+            flags: crate::types::network::DynDirFlags::empty(),
+            fname: path.to_str().unwrap().to_string(),
+            index: 0,
+        });
+
+        reread_dhcp(&mut d).unwrap();
+        assert_eq!(d.dhcp_conf.len(), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn reread_dhcp_replaces_bank_entries_without_duplicating_and_leaves_direct_entries_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts");
+        std::fs::write(&path, "02:00:00:00:00:01,192.168.0.5\n").unwrap();
+
+        let mut d = Daemon::default();
+        d.dhcp_hosts_file.push(crate::types::network::HostsFile {
+            flags: crate::types::network::DynDirFlags::empty(),
+            fname: path.to_str().unwrap().to_string(),
+            index: 0,
+        });
+        // A directly-configured entry (e.g. from `dhcp-host=` in the main
+        // conf-file) must survive every reread untouched.
+        let direct = parse_dhcp_host("02:00:00:00:00:02,192.168.0.6", &ConfigLine {
+            key: "dhcp-host".to_string(), value: None, file: "test".to_string(), line: 1,
+        }).unwrap();
+        d.dhcp_conf.push(direct);
+
+        reread_dhcp(&mut d).unwrap();
+        reread_dhcp(&mut d).unwrap();
+
+        assert_eq!(d.dhcp_conf.len(), 2, "one direct entry, one bank entry — no duplication across rereads");
+        assert!(d.dhcp_conf.iter().any(|c| !c.flags.contains(ConfigFlags::BANK) && c.addr == Ipv4Addr::new(192, 168, 0, 6)));
+        assert!(d.dhcp_conf.iter().any(|c| c.flags.contains(ConfigFlags::BANK) && c.addr == Ipv4Addr::new(192, 168, 0, 5)));
+    }
+
+    #[test]
+    #[cfg(feature = "dhcp")]
+    fn reread_dhcp_missing_file_is_non_fatal() {
+        let mut d = Daemon::default();
+        d.dhcp_hosts_file.push(crate::types::network::HostsFile {
+            flags: crate::types::network::DynDirFlags::empty(),
+            fname: "/nonexistent/path/to/dhcp-hosts".to_string(),
+            index: 0,
+        });
+        assert!(reread_dhcp(&mut d).is_ok());
+        assert!(d.dhcp_conf.is_empty());
     }
 
     // ── hide_meta / unhide_meta ──────────────────────────────────────────────

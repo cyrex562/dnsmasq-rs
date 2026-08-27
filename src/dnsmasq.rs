@@ -51,15 +51,20 @@ pub fn init_daemon() -> DaemonHandle {
 
 /// Initialize a shared daemon handle from a resolved daemon configuration.
 ///
-/// Also runs `--read-ethers` (`OPT_ETHERS`) here, mirroring upstream calling
-/// `dhcp_read_ethers()` once at startup (dnsmasq.c) before the main loop
-/// starts serving. Re-running it on SIGHUP — as upstream also does — isn't
-/// wired up yet, tracked in `tasks.md` alongside the rest of the SIGHUP
-/// reload gap noted in `dnsmasq::on_sighup`.
+/// Also reads `--dhcp-hostsfile`/`--dhcp-optsfile` and (with `--read-ethers`)
+/// `/etc/ethers` here, mirroring upstream's `EVENT_INIT` handling — the same
+/// `clear_cache_and_reload()` → `reread_dhcp()` +
+/// `dhcp_read_ethers()` chain (`dnsmasq.c:1546-1548,1817-1819`) that SIGHUP
+/// also runs (see `dnsmasq::clear_cache_and_reload`, issue #175) — so these
+/// files take effect from the very first dispatch, not only after the first
+/// reload.
 pub fn init_daemon_with(mut daemon: Daemon) -> DaemonHandle {
     #[cfg(feature = "dhcp")]
     {
-        use tracing::{error, info};
+        use tracing::{error, info, warn};
+        if let Err(e) = crate::option::reread_dhcp(&mut daemon) {
+            warn!("failed to read DHCP hosts/options files: {e}");
+        }
         if daemon.option_bool(crate::types::constants::OPT_ETHERS) {
             match crate::dhcp::dhcp_read_ethers(&mut daemon.dhcp_conf, crate::dhcp::ETHERS_FILE) {
                 Ok(count) => info!("read {} - {count} addresses", crate::dhcp::ETHERS_FILE),
@@ -2953,6 +2958,26 @@ pub async fn clear_cache_and_reload(
             );
         }
         cleanup_servers(&mut d.servers);
+    }
+
+    // Re-read `--dhcp-hostsfile`/`--dhcp-optsfile` and (if `--read-ethers`)
+    // `/etc/ethers` — upstream's `reread_dhcp()` +
+    // `if (option_bool(OPT_ETHERS)) dhcp_read_ethers();`, both called from
+    // `clear_cache_and_reload()` (`dnsmasq.c:1817-1819`), not nested inside
+    // `reread_dhcp()` itself. Issue #175: this only updates `Daemon` state;
+    // reaching an already-running DHCP dispatch loop needs the
+    // `DhcpServerConfig` live-reload work tracked as issue #179.
+    #[cfg(feature = "dhcp")]
+    {
+        if let Err(e) = crate::option::reread_dhcp(&mut d) {
+            warn!("failed to reread DHCP hosts/options files: {e}");
+        }
+        if d.option_bool(crate::types::constants::OPT_ETHERS) {
+            match crate::dhcp::dhcp_read_ethers(&mut d.dhcp_conf, crate::dhcp::ETHERS_FILE) {
+                Ok(count) => info!("read {} - {count} addresses", crate::dhcp::ETHERS_FILE),
+                Err(err) => warn!("failed to read {}: {err}", crate::dhcp::ETHERS_FILE),
+            }
+        }
     }
 
     // Mark DNS data as dirty so consumers know to refresh.
