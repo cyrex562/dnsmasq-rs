@@ -1,0 +1,60 @@
+# systemd unit template for dnsmasq-rs.
+#
+# Install:
+#   install -m644 contrib/systemd/dnsmasq-rs.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now dnsmasq-rs
+#
+# Adjust ExecStart's binary path and --conf-file below to match where the
+# binary was installed and where your config lives.
+
+[Unit]
+Description=dnsmasq-rs - DNS forwarder and DHCP server
+Documentation=https://github.com/cyrex562/dnsmasq-rs
+After=network.target
+Before=network-online.target nss-lookup.target
+Wants=nss-lookup.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/dnsmasq-rs --keep-in-foreground --conf-file=/etc/dnsmasq-rs.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=1
+
+# dnsmasq-rs binds privileged ports (53, 67) and, when DHCP/DHCPv6/RA is
+# configured, opens raw and netlink sockets — all of which need root, or the
+# capabilities listed below. It then drops to an unprivileged user/group
+# itself once those sockets are open, the same way upstream dnsmasq does, via
+# --user=/--group= (in dnsmasq-rs.conf or on this command line) — so this
+# unit intentionally does not set User=/Group= here and instead starts as
+# root, exactly like upstream dnsmasq's own systemd unit.
+#
+# There is no --test flag yet (dnsmasq-rs doesn't have upstream's
+# config-syntax-check-and-exit mode), so there is no ExecStartPre config
+# check here.
+#
+# By default (no --log-facility given) dnsmasq-rs logs through the same
+# /dev/log syslog socket upstream dnsmasq uses, which systemd-journald
+# forwards into the journal on virtually every modern distro — so
+# `journalctl -u dnsmasq-rs` works out of the box with no extra directives
+# below. If dnsmasq-rs was built with the `journald` cargo feature, add
+# --log-facility=journald to ExecStart above to log directly to the journal
+# via its own native client instead of via syslog forwarding.
+
+# Uncomment to run under systemd's own capability/filesystem sandboxing
+# instead of full root. Only safe if every feature you actually use is
+# compatible with it: DHCP/DHCPv6/RA/ARP need CAP_NET_ADMIN and CAP_NET_RAW,
+# binding ports below 1024 needs CAP_NET_BIND_SERVICE, and --user=/--group=
+# still needs CAP_SETUID/CAP_SETGID to drop from root to them. Widen
+# ReadWritePaths= to cover your --dhcp-leasefile, --log-facility=<file>,
+# --dhcp-script, or --conf-script paths before enabling this.
+#CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SETUID CAP_SETGID
+#AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+#NoNewPrivileges=true
+#ProtectSystem=strict
+#ProtectHome=true
+#ReadWritePaths=/run /var/lib/misc
+
+[Install]
+WantedBy=multi-user.target

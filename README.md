@@ -31,6 +31,12 @@ fn main() {
 }
 ```
 
+## Running as a service
+
+A systemd unit template is provided in [`contrib/systemd/`](contrib/systemd/)
+for running the `dnsmasq-rs` binary as a service on systemd-based Linux
+distributions.
+
 ## Contributing
 
 Contributions are welcome! Please open an issue or submit a pull request on GitHub.
