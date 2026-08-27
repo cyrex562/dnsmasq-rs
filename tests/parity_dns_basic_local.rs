@@ -7,8 +7,8 @@
 //! with **no upstream servers configured**, and asserts the answer set upstream
 //! produces for each of the eight query cases.
 //!
-//! The expectations were derived from `answer_request()` in
-//! `original_dnsmasq_src/dnsmasq-master/src/rfc1035.c`:
+//! The expectations were derived from `answer_request()` in upstream's
+//! `src/rfc1035.c` (not vendored in this repo — see `NOTICE.md`):
 //!
 //! * config CNAMEs are followed before the type-specific lookups, so
 //!   `alias.test A` yields CNAME + A;

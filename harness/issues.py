@@ -6,7 +6,11 @@ references, so the harness can resolve dependencies without knowing issue
 numbers at authoring time.
 """
 
-UPSTREAM = "original_dnsmasq_src/dnsmasq-master/src"
+# Documentation-only pointer, not a path in this repo: upstream's C source
+# isn't vendored here (removed, issue #169 — this project is a derivative
+# work of GPL-licensed dnsmasq; see NOTICE.md). Read it from an external
+# clone of http://thekelleys.org.uk/git/dnsmasq.git.
+UPSTREAM = "dnsmasq/src"
 
 # key, title, tier, risk, model, port_file, upstream_file, gaps[], acceptance[], blocked_by[], extra_labels[]
 ISSUES = [

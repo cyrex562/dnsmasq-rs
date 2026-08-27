@@ -1753,7 +1753,7 @@ mod tests {
     /// Upstream's option loop (`tftp.c:383-411`) has no ceiling on `blksize`
     /// independent of `packet_buff_sz - 4` and the MTU clamp — no
     /// RFC 2348-style hard maximum exists in the C source (confirmed by grep
-    /// across `original_dnsmasq_src/`). A large `--edns-packet-max` can
+    /// across upstream's source tree). A large `--edns-packet-max` can
     /// therefore negotiate a blksize far above RFC 2348's suggested 65464.
     #[test]
     fn options_blksize_has_no_independent_ceiling() {

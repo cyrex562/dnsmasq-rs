@@ -1,10 +1,10 @@
 # systemd unit for dnsmasq-rs
 
 `dnsmasq-rs.service` is a template unit for running `dnsmasq-rs` under
-systemd. There's no upstream dnsmasq counterpart in this repo (dnsmasq's own
-`contrib/systemd/dnsmasq.service` lives in `original_dnsmasq_src/`, read-only
-reference only) — this one is written against `dnsmasq-rs`'s actual CLI
-flags and default behavior, not copied from it.
+systemd. Upstream dnsmasq ships its own `contrib/systemd/dnsmasq.service`
+(not vendored in this repo — see `NOTICE.md`) but this one isn't copied from
+it; it's written from scratch against `dnsmasq-rs`'s actual CLI flags and
+default behavior.
 
 ## Install
 

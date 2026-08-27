@@ -22,8 +22,11 @@ Rules:
 - Write the test first, watch it fail, then make it pass.
 - Do not accept a config directive as a silent no-op.
 - Keep anything you leave unsupported explicit in `tasks.md`.
-- Do NOT edit `harness/`, `original_dnsmasq_src/`, or `old/`. The gate rejects
-  any diff touching them.
+- Do NOT edit `harness/` or `old/`. The gate rejects any diff touching them.
+- Do NOT vendor upstream's C source into this repo (removed, issue #169 —
+  this project is a derivative work of GPL-licensed dnsmasq; see
+  `NOTICE.md`). Read it from an external clone of
+  `http://thekelleys.org.uk/git/dnsmasq.git`.
 - Do NOT run `cargo fmt`. This tree is deliberately not rustfmt-formatted and
   reformatting it would produce a 2873-hunk diff that buries your actual change.
 - `src/lib.rs` and `src/main.rs` each declare the full module tree separately.

@@ -1,6 +1,10 @@
-# dnsmasq
+# dnsmasq-rs
 
-`dnsmasq-rs` is a Rust implementation of the popular DNS forwarder and DHCP server, dnsmasq. This project aims to provide a high-performance, reliable, and easy-to-use DNS and DHCP server for Rust developers.
+`dnsmasq-rs` is a Rust port of [dnsmasq](https://www.thekelleys.org.uk/dnsmasq/),
+the popular DNS forwarder and DHCP/TFTP server, targeting behavioral parity
+with the supported feature set. It is a derivative work of dnsmasq — see
+[`NOTICE.md`](NOTICE.md) for attribution and licensing details — not an
+unrelated reimplementation.
 
 ## Features
 
@@ -11,24 +15,19 @@
 
 ## Installation
 
-To use `dnsmasq-rs`, add it to your `Cargo.toml`:
+Build the binary from source:
 
-```toml
-[dependencies]
-dnsmasq-rs = "0.1.0"
+```sh
+cargo build --release
 ```
 
 ## Usage
 
-Here is a simple example of how to use `dnsmasq-rs`:
+`dnsmasq-rs` is a standalone daemon, invoked the same way as upstream
+`dnsmasq`:
 
-```rust
-use dnsmasq_rs::Dnsmasq;
-
-fn main() {
-    let mut dnsmasq = Dnsmasq::new();
-    dnsmasq.start().expect("Failed to start dnsmasq");
-}
+```sh
+dnsmasq-rs --conf-file=/etc/dnsmasq-rs.conf
 ```
 
 ## Running as a service
@@ -43,4 +42,8 @@ Contributions are welcome! Please open an issue or submit a pull request on GitH
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+This project is licensed under the GNU General Public License, version 3
+or (at your option) any later version. See [`LICENSE`](LICENSE) for the
+full text and [`NOTICE.md`](NOTICE.md) for attribution — `dnsmasq-rs` is a
+derivative work of dnsmasq, Copyright (c) 2000-2025 Simon Kelley, itself
+dual-licensed GPLv2-or-v3.

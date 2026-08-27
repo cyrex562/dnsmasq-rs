@@ -17,10 +17,12 @@ What is true right now:
 
 Reference material:
 
-- Upstream C source: `original_dnsmasq_src/dnsmasq-master/src/`
+- Upstream C source: not vendored in this repo (removed, issue #169 — this project is a
+  derivative work of GPL-licensed dnsmasq; see `NOTICE.md`). Clone
+  `http://thekelleys.org.uk/git/dnsmasq.git` externally to read it.
 - Earlier Rust attempt: `old/`
 
-Both are reference-only. Do not treat either tree as code to edit in place.
+`old/` is reference-only. Do not treat it as code to edit in place.
 
 ## P0 Parity Blockers
 
@@ -3466,6 +3468,54 @@ Both are reference-only. Do not treat either tree as code to edit in place.
     matching upstream option.c:2390-2391.
   - `--dhcp-scriptuser` remains gated only on `feature = "dhcp"`, matching upstream option.c:2876-2878.
   - Verified: `cargo check --no-default-features` now compiles cleanly (was broken with 3 errors before).
+
+- [x] Fix licensing to match reality (issue #169). This project is a port that translates
+  upstream's algorithms/control-flow/wire-format handling (and, where it aids review,
+  its naming) into Rust, not a clean-room reimplementation — a derivative work of
+  GPLv2/v3-licensed dnsmasq under copyright's structure-sequence-organization doctrine,
+  confirmed by comparing e.g. `src/rfc1035.rs`'s function names/order against upstream
+  `rfc1035.c`'s (`extract_name`, `skip_name`, `in_arpa_name_2_addr`, `private_net`/`_6`,
+  `find_soa`, `extract_addresses`, `setup_reply`, `answer_request`, ... — same names, same
+  order). The repo's `LICENSE` claimed MIT with an unfilled `[Your Name]` placeholder,
+  which can't legitimately cover GPL-derived code regardless. Fixed:
+  - `LICENSE` replaced with the full, unmodified GPLv3 text (GPL requires verbatim license
+    text; a project's own name/author/year notice belongs in a separate NOTICE, not edited
+    into the license body).
+  - New `NOTICE.md`: states this port's own copyright (Josh Madden, 2024-2026) and license
+    (GPL-3.0-or-later, exercising upstream's "version 2 or, at your option, version 3"
+    clause), credits dnsmasq's upstream copyright (Simon Kelley, 2000-2025) and its own
+    dual GPLv2/v3 license, links the upstream project, and notes which modules have no
+    upstream counterpart and are original work (`web_api.rs`, `web_ui.rs`, `metrics_api.rs`,
+    `yaml_config.rs`, `parity/`) — though the project as a whole ships under GPLv3-or-later
+    since those modules are compiled together with the ported core.
+  - `Cargo.toml`: added `license = "GPL-3.0-or-later"`.
+  - `README.md`: corrected the license section, the "Rust implementation" framing (now
+    states this is a derivative port, pointing at `NOTICE.md`), and a fabricated
+    `Dnsmasq::new()` library-usage example that never matched the actual binary-oriented
+    CLI (`dnsmasq-rs --conf-file=...`).
+  - Removed `original_dnsmasq_src/` (152 files, upstream's actual GPLv2/v3 C source)
+    entirely from the repo — vendoring it here, alongside a LICENSE claiming MIT, actively
+    misrepresented the project regardless of which relicensing path (if any) is pursued
+    later. `CLAUDE.md`/`agents.md`/`.github/copilot-instructions.md`/`harness/*` updated to
+    point at cloning `http://thekelleys.org.uk/git/dnsmasq.git` externally instead — do not
+    re-vendor it.
+  - `parity/docker/upstream.Dockerfile` (the container that builds the real upstream binary
+    for `./parity/run-major.sh`'s black-box comparison) previously depended on the vendored
+    copy via `COPY original_dnsmasq_src/...`; switched to `git clone --branch v2.93test4
+    --depth 1 http://thekelleys.org.uk/git/dnsmasq.git` at Docker build time instead, pinned
+    to the exact tag this port targets so parity results don't drift with upstream's master.
+    This preserves the parity harness's actual capability — running the real GPL binary
+    unmodified inside an isolated test container for comparison is fine under GPL; the
+    concern was only ever about vendoring its *source* into our own git history.
+  - `harness/issues.py`'s `UPSTREAM` constant (feeds every generated issue's
+    `upstream-file:` metadata pointer) and `harness/gate.sh`'s forbidden-paths check updated
+    to match — these were documentation-only pointers already, not code that reads the
+    vendored tree, so nothing there was functionally broken, just stale.
+  - Did NOT decide the bigger strategic question the issue also raised (whether to pursue a
+    proprietary or source-available release of the derived core) — that requires actual
+    legal counsel and the copyright holder's own business judgment, not something to settle
+    via a repo commit. Staying GPL-3.0-or-later is the safe, no-permission-needed default;
+    revisit if/when that strategic decision is made.
 
 - [ ] Keep `CLAUDE.md` and `agents.md` aligned with actual repo status.
   Done when: they reflect current test reality, parity expectations, and porting priorities without optimistic completion claims.

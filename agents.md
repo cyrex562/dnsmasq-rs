@@ -6,12 +6,14 @@ This repository is a Rust port of the upstream `dnsmasq` binary. The goal is beh
 
 Primary references:
 
-- Upstream C source: `original_dnsmasq_src/dnsmasq-master/src/`
+- Upstream C source: not vendored in this repo (removed, issue #169 — this project is a
+  derivative work of GPL-licensed dnsmasq; see `NOTICE.md`) — clone
+  `http://thekelleys.org.uk/git/dnsmasq.git` externally to read it, do not re-vendor it
 - Earlier Rust attempt: `old/`
 - Central tracker: `tasks.md`
 - Project overview and test expectations: `CLAUDE.md`
 
-The upstream source and `old/` tree are reference-only.
+The `old/` tree is reference-only.
 
 ## Core Rule
 
