@@ -195,13 +195,53 @@ Reference material:
     This is the first of three issues splitting #128 ("reload while running"); DHCP
     static-config reload (`reread_dhcp`) is #175, `--conf-file` change-watching is #176.
     A separate, adjacent finding surfaced during this work but deliberately NOT fixed
-    here (out of scope for #174 — filed as issue #178): `--resolv-file` entries are
-    never read at process startup at all — `daemon.servers` only gets populated from a
-    resolv-file on the *first* reload (SIGHUP/API/inotify), since nothing in
-    `init_daemon_with`/`run_main_loop_with`'s startup sequence calls
+    here (out of scope for #174 — filed as issue #178, fixed below): `--resolv-file`
+    entries were never read at process startup at all — `daemon.servers` only got
+    populated from a resolv-file on the *first* reload (SIGHUP/API/inotify), since
+    nothing in `init_daemon_with`/`run_main_loop_with`'s startup sequence called
     `clear_cache_and_reload`-equivalent resolv-parsing before entering the main loop,
-    unlike upstream's `main()`, which calls `reload_servers()` once before the select
-    loop in addition to on every SIGHUP.
+    unlike upstream's `main()`, which calls `reload_servers()` (via `poll_resolv(1, 0,
+    now)`, or the `EVENT_INIT` handler's own resolv-read when `--no-poll` is set) once
+    before the select loop in addition to on every SIGHUP.
+
+  **Issue #178 (2026-08-27):** Fixed. Cloned upstream to confirm exactly where/how it
+  performs its initial resolv-file read before trusting the issue's own summary of it —
+  worth doing since the real mechanism turned out more layered than expected:
+  upstream's actual `clear_cache_and_reload()` (dnsmasq.c:1838) does *not* read
+  resolv-files at all (only cache flush + DHCP reread); the resolv-file read is a
+  *separate* call, `reload_servers()`, invoked from two different places depending on
+  `--no-poll`: the default (polling) path calls `poll_resolv(1, 0, now)` once,
+  unconditionally, right after start-up finishes (`dnsmasq.c:1102`, before the select
+  loop even starts); the `--no-poll` path instead relies on the `EVENT_INIT` handler's
+  own explicit `if (daemon->resolv_files && option_bool(OPT_NO_POLL)) reload_servers(...)`
+  block, since `EVENT_INIT` is queued unconditionally at the very start of `main()`
+  (`dnsmasq.c:593`, "prime the pipe to load stuff first time") and drained once the event
+  loop starts. Either way, upstream always performs exactly one resolv-file read at
+  genuine startup, gated only on `daemon->port != 0` — confirming the issue's premise.
+  - Extracted the resolv-parsing block that used to live inline in
+    `clear_cache_and_reload` into a standalone `dnsmasq::reload_resolv_servers(daemon:
+    &mut Daemon)`, gated on `daemon.port != 0` (matching both of upstream's real call
+    sites' guard) — same behavior as before, just callable from more than one place.
+  - Called once from `init_daemon_with`, before its existing DHCP-hosts/ethers startup
+    reads, so `daemon.servers` is populated *before* `resolve_run_config`/
+    `daemon_forward_config` build the `ForwardConfig` the forward task actually starts
+    with (confirmed no such call existed anywhere in the startup path before this fix).
+  - Did NOT change this port's existing (pre-#178, unrelated) divergence from upstream's
+    actual multi-file selection semantics: upstream's `poll_resolv` picks only the
+    single *most-recently-modified* configured `--resolv-file` and reads just that one
+    via `reload_servers(fname)`; this port's `reload_resolv_servers` (inherited as-is
+    from the original `clear_cache_and_reload` logic, predating this issue) reads and
+    merges *every* configured `--resolv-file` unconditionally. Noted here rather than
+    silently carried forward without comment — out of scope for #178, which is
+    specifically about the missing startup call, not the multi-file selection algorithm;
+    file a follow-up if upstream's single-latest-file semantics are ever wanted.
+  - Tests: `init_daemon_with_reads_resolv_file_at_startup` (the issue's acceptance bar
+    directly: a `Daemon` with only `resolv_files` set, no `--server=`, has a non-empty,
+    `ServFlags::FROM_RESOLV`-flagged upstream list immediately after `init_daemon_with`,
+    before any reload) and `init_daemon_with_skips_resolv_file_when_port_is_zero`.
+  - Live-verified against the real binary: `--conf-file` with `port=15353` and
+    `resolv-file=<path with "nameserver 8.8.8.8">`, no `--server=`, no SIGHUP ever sent —
+    the very first `dig @127.0.0.1 -p 15353 example.com` resolved successfully.
 
   **Issue #175 (2026-08-27):** `--dhcp-hostsfile`/`--dhcp-optsfile` previously did
   nothing at all beyond recording the configured path — nothing anywhere read the

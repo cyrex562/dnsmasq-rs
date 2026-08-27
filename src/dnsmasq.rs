@@ -51,14 +51,19 @@ pub fn init_daemon() -> DaemonHandle {
 
 /// Initialize a shared daemon handle from a resolved daemon configuration.
 ///
-/// Also reads `--dhcp-hostsfile`/`--dhcp-optsfile` and (with `--read-ethers`)
-/// `/etc/ethers` here, mirroring upstream's `EVENT_INIT` handling — the same
+/// Also reads `--resolv-file` into `daemon.servers` here (issue #178) —
+/// mirroring upstream's unconditional initial `poll_resolv(1, 0, now)` call
+/// right after start-up finishes (`dnsmasq.c:1102`) — and
+/// `--dhcp-hostsfile`/`--dhcp-optsfile`/(with `--read-ethers`) `/etc/ethers`,
+/// mirroring upstream's `EVENT_INIT` handling — the same
 /// `clear_cache_and_reload()` → `reread_dhcp()` +
 /// `dhcp_read_ethers()` chain (`dnsmasq.c:1546-1548,1817-1819`) that SIGHUP
 /// also runs (see `dnsmasq::clear_cache_and_reload`, issue #175) — so these
-/// files take effect from the very first dispatch, not only after the first
-/// reload.
+/// files take effect from the very first dispatch/query, not only after the
+/// first reload.
 pub fn init_daemon_with(mut daemon: Daemon) -> DaemonHandle {
+    reload_resolv_servers(&mut daemon);
+
     #[cfg(feature = "dhcp")]
     {
         use tracing::{error, info, warn};
@@ -771,6 +776,88 @@ pub fn daemon_dhcp_reload_config(daemon: &Daemon) -> DhcpReloadConfig {
 #[cfg(not(feature = "dhcp"))]
 pub fn daemon_dhcp_reload_config(_daemon: &Daemon) -> DhcpReloadConfig {
     DhcpReloadConfig::default()
+}
+
+/// Re-read `--resolv-file`-configured paths into `daemon.servers`, replacing
+/// only the previous `SERV_FROM_RESOLV` entries so explicitly-configured
+/// (`--server=`) servers survive. Port of `reload_servers()` (network.c:1699),
+/// extracted out of [`clear_cache_and_reload`] so [`init_daemon_with`] can
+/// also call it once at startup (issue #178) — a config that relies solely
+/// on `--resolv-file`, with no explicit `--server=`, previously had zero
+/// upstream servers and could forward nothing until the first reload fired,
+/// since nothing before this called the resolv-parsing logic that only ever
+/// ran on SIGHUP/API/DBus/inotify-triggered reload.
+///
+/// A path that fails to read (missing, permission error, mid-rewrite) leaves
+/// the existing server list untouched rather than emptying it — matching
+/// upstream's `reload_servers()`, which `fopen`s and returns early, before
+/// `mark_servers()` touches anything (`network.c:1699-1709`). Callers that
+/// already hold `daemon` async-locked (e.g. `clear_cache_and_reload`) pass
+/// their own `&mut Daemon` guard straight through; this function itself does
+/// no locking.
+pub fn reload_resolv_servers(daemon: &mut Daemon) {
+    use crate::domain_match::{add_update_server, cleanup_servers, mark_servers};
+    use crate::types::addr::MySockAddr;
+    use crate::types::server::ServFlags;
+    use tracing::warn;
+
+    // Matches both of upstream's real resolv-read call sites (`poll_resolv`,
+    // network.c, and the `EVENT_INIT`/`EVENT_RELOAD` handler in
+    // dnsmasq.c:1581-1586) each gating on `daemon->port != 0` — no point
+    // reading upstream servers when DNS forwarding itself is disabled
+    // (`--port=0`, e.g. a DHCP-only configuration).
+    if daemon.port == 0 {
+        return;
+    }
+
+    let resolv_paths: Vec<String> = daemon.resolv_files.iter().map(|r| r.name.clone()).collect();
+
+    let mut any_resolv_read = false;
+    let mut discovered = Vec::new();
+    for path in &resolv_paths {
+        match std::fs::read_to_string(path) {
+            // 53 is the standard nameserver port (`NAMESERVER_PORT` in C);
+            // resolv.conf entries never carry an explicit port.
+            Ok(text) => {
+                any_resolv_read = true;
+                discovered.extend(crate::network::parse_resolv_conf(&text, 53));
+            }
+            Err(e) => warn!("could not read {path}: {e}"),
+        }
+    }
+
+    if !any_resolv_read {
+        return;
+    }
+
+    let query_port = daemon.query_port;
+    // network.c:1711/1766/1774 — mark every existing resolv-derived server,
+    // then let `add_update_server` reuse a marked entry (by domain — always
+    // "" here) instead of rebuilding it, so its query statistics survive an
+    // unchanged address across reload; whatever is still marked afterwards
+    // (an address that dropped out of the file) is swept away.
+    mark_servers(&mut daemon.servers, ServFlags::FROM_RESOLV);
+    for addr in discovered {
+        // network.c:1729-1754 — `source_addr` is the wildcard address in the
+        // *same* family as the server, bound to `--query-port`; scope is
+        // always 0 for the source, only the destination carries it.
+        let (my_addr, source_addr) = match addr {
+            std::net::SocketAddr::V4(v4) => (
+                MySockAddr::V4(v4),
+                MySockAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, query_port)),
+            ),
+            std::net::SocketAddr::V6(v6) => (
+                MySockAddr::V6(v6),
+                MySockAddr::V6(std::net::SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, query_port, 0, 0)),
+            ),
+        };
+        let flags = ServFlags::FROM_RESOLV | if addr.is_ipv6() { ServFlags::ADDR6 } else { ServFlags::ADDR4 };
+        add_update_server(
+            &mut daemon.servers,
+            crate::option::new_server(flags, String::new(), my_addr, source_addr),
+        );
+    }
+    cleanup_servers(&mut daemon.servers);
 }
 
 /// Build the [`ForwardConfig`](crate::forward::ForwardConfig) the forwarding
@@ -2948,15 +3035,14 @@ pub async fn clear_cache_and_reload(
 
     info!("flushing cache and reloading");
 
-    let (hosts_paths, local_ttl, resolv_paths) = {
+    let (hosts_paths, local_ttl) = {
         let d = daemon_handle.read().await;
         let mut hosts_paths = Vec::new();
         if !d.option_bool(OPT_NO_HOSTS) {
             hosts_paths.push("/etc/hosts".to_string());
         }
         hosts_paths.extend(d.addn_hosts.iter().map(|h| h.fname.clone()));
-        let resolv_paths: Vec<String> = d.resolv_files.iter().map(|r| r.name.clone()).collect();
-        (hosts_paths, d.local_ttl, resolv_paths)
+        (hosts_paths, d.local_ttl)
     };
 
     // Flush and rebuild the F_HOSTS entries.
@@ -2981,66 +3067,11 @@ pub async fn clear_cache_and_reload(
         crate::inotify::set_dynamic_inotify(&mut d, &mut c);
     }
 
-    // Re-read resolv-file-style server lists, if any are configured.  A file
-    // that fails to read (temporarily missing, permission change, mid-rewrite)
-    // must leave the existing server list untouched rather than emptying it —
-    // upstream's `reload_servers()` does the equivalent by `fopen`ing and
-    // returning early, before `mark_servers()` touches anything
-    // (`network.c:1699-1709`).
-    let mut any_resolv_read = false;
-    let mut discovered = Vec::new();
-    for path in &resolv_paths {
-        match std::fs::read_to_string(path) {
-            // 53 is the standard nameserver port (`NAMESERVER_PORT` in C);
-            // resolv.conf entries never carry an explicit port.
-            Ok(text) => {
-                any_resolv_read = true;
-                discovered.extend(crate::network::parse_resolv_conf(&text, 53));
-            }
-            Err(e) => warn!("could not read {path}: {e}"),
-        }
-    }
-
     let mut d = daemon_handle.write().await;
-    if any_resolv_read {
-        use crate::domain_match::{add_update_server, cleanup_servers, mark_servers};
-        use crate::types::addr::MySockAddr;
-        use crate::types::server::ServFlags;
-
-        let query_port = d.query_port;
-        // network.c:1711/1766/1774 — mark every existing resolv-derived server,
-        // then let `add_update_server` reuse a marked entry (by domain — always
-        // "" here) instead of rebuilding it, so its query statistics survive an
-        // unchanged address across reload; whatever is still marked afterwards
-        // (an address that dropped out of the file) is swept away.
-        mark_servers(&mut d.servers, ServFlags::FROM_RESOLV);
-        for addr in discovered {
-            // network.c:1729-1754 — `source_addr` is the wildcard address in the
-            // *same* family as the server, bound to `--query-port`; scope is
-            // always 0 for the source, only the destination carries it.
-            let (my_addr, source_addr) = match addr {
-                std::net::SocketAddr::V4(v4) => (
-                    MySockAddr::V4(v4),
-                    MySockAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, query_port)),
-                ),
-                std::net::SocketAddr::V6(v6) => (
-                    MySockAddr::V6(v6),
-                    MySockAddr::V6(std::net::SocketAddrV6::new(
-                        Ipv6Addr::UNSPECIFIED,
-                        query_port,
-                        0,
-                        0,
-                    )),
-                ),
-            };
-            let flags = ServFlags::FROM_RESOLV | if addr.is_ipv6() { ServFlags::ADDR6 } else { ServFlags::ADDR4 };
-            add_update_server(
-                &mut d.servers,
-                crate::option::new_server(flags, String::new(), my_addr, source_addr),
-            );
-        }
-        cleanup_servers(&mut d.servers);
-    }
+    // Re-read resolv-file-style server lists, if any are configured (issue
+    // #178: extracted into `reload_resolv_servers` so `init_daemon_with` can
+    // also call it once at startup).
+    reload_resolv_servers(&mut d);
 
     // Re-read `--dhcp-hostsfile`/`--dhcp-optsfile` and (if `--read-ethers`)
     // `/etc/ethers` — upstream's `reread_dhcp()` +
@@ -5224,6 +5255,79 @@ mod tests {
             "reload must add the resolv-file server, got {:?}",
             d.servers.iter().map(|s| (s.flags, s.addr.clone())).collect::<Vec<_>>(),
         );
+    }
+
+    /// Issue #178: a config relying solely on `--resolv-file` (no explicit
+    /// `--server=`) previously had zero upstream servers and could forward
+    /// nothing until the first reload fired, since nothing before
+    /// `init_daemon_with` returning ever called the resolv-parsing logic —
+    /// it only ever ran on SIGHUP/API/DBus/inotify-triggered reload. This is
+    /// the acceptance bar from the issue: a non-empty upstream list
+    /// immediately after `init_daemon_with`, before any reload.
+    #[tokio::test]
+    async fn init_daemon_with_reads_resolv_file_at_startup() {
+        use crate::types::network::Resolvc;
+        use crate::types::server::ServFlags;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "nameserver 198.51.100.9\n").unwrap();
+
+        let mut daemon = Daemon::default();
+        daemon.resolv_files.push(Resolvc {
+            is_default: false,
+            logged: false,
+            mtime: 0,
+            ino: 0,
+            name: path.to_str().unwrap().to_string(),
+            #[cfg(feature = "inotify")]
+            wd: -1,
+            #[cfg(feature = "inotify")]
+            file: None,
+        });
+
+        let handle = init_daemon_with(daemon);
+
+        let d = handle.read().await;
+        assert!(
+            d.servers.iter().any(|s| {
+                s.flags.contains(ServFlags::FROM_RESOLV)
+                    && SocketAddr::from(s.addr.clone())
+                        == SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)), 53)
+            }),
+            "init_daemon_with must have already read the resolv-file, got {:?}",
+            d.servers.iter().map(|s| (s.flags, s.addr.clone())).collect::<Vec<_>>(),
+        );
+    }
+
+    /// `--port=0` (DNS forwarding disabled) must skip the startup resolv-file
+    /// read too, matching upstream's own `daemon->port != 0` gate on both of
+    /// its real resolv-read call sites (issue #178).
+    #[tokio::test]
+    async fn init_daemon_with_skips_resolv_file_when_port_is_zero() {
+        use crate::types::network::Resolvc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "nameserver 198.51.100.9\n").unwrap();
+
+        let mut daemon = Daemon { port: 0, ..Default::default() };
+        daemon.resolv_files.push(Resolvc {
+            is_default: false,
+            logged: false,
+            mtime: 0,
+            ino: 0,
+            name: path.to_str().unwrap().to_string(),
+            #[cfg(feature = "inotify")]
+            wd: -1,
+            #[cfg(feature = "inotify")]
+            file: None,
+        });
+
+        let handle = init_daemon_with(daemon);
+
+        let d = handle.read().await;
+        assert!(d.servers.is_empty(), "port=0 must skip the resolv-file read entirely");
     }
 
     /// A resolv-file read failure must not wipe the servers a previous,
