@@ -444,6 +444,55 @@ impl LeaseDb {
         }
     }
 
+    /// Re-sync already-issued leases with freshly-reloaded static DHCP
+    /// config: any lease whose client-id/hardware address still matches a
+    /// `dhcp-host` entry that has a configured hostname adopts that entry's
+    /// hostname — so e.g. renaming a host in `--dhcp-hostsfile` and
+    /// reloading takes effect on its current lease immediately, without
+    /// waiting for the client to renew (issue #180).
+    ///
+    /// Port of `lease_update_from_configs()` (lease.c:256-273), minus its
+    /// `host_from_dns()` fallback branch — that branch names a lease with no
+    /// configured hostname *at all* from a reverse `/etc/hosts` lookup, an
+    /// unrelated concern from config-driven resync that would need this
+    /// module to depend on the DNS cache; tracked separately if wanted.
+    /// Skips DHCPv6 leases (`LeaseFlags::TA`/`NA`), matching upstream's own
+    /// guard — upstream only ever calls this from the DHCPv4 reload path.
+    pub fn update_from_configs(&mut self, configs: &[crate::types::dhcp::DhcpConfig]) {
+        use crate::types::dhcp::ConfigFlags;
+
+        let renames: Vec<(Ipv4Addr, String)> = self
+            .leases
+            .values()
+            .filter(|lease| !lease.flags.intersects(LeaseFlags::TA | LeaseFlags::NA))
+            .filter_map(|lease| {
+                let hw_len = lease.hwaddr_len.min(DHCP_CHADDR_MAX);
+                let config = crate::dhcp_common::find_config(
+                    configs,
+                    lease.clid.as_deref(),
+                    Some(&lease.hwaddr[..hw_len]),
+                    lease.hwaddr_type,
+                    None,
+                    &[],
+                )?;
+                if !config.flags.contains(ConfigFlags::NAME) {
+                    return None;
+                }
+                // lease.c:267 — a fixed-address config only renames the
+                // lease it actually issued, not some other lease that
+                // happens to share the same MAC/CLID match.
+                if config.flags.contains(ConfigFlags::ADDR) && config.addr != lease.addr {
+                    return None;
+                }
+                Some((lease.addr, config.hostname.clone()?))
+            })
+            .collect();
+
+        for (addr, hostname) in renames {
+            self.set_hostname(addr, Some(&hostname), true);
+        }
+    }
+
     /// Record the interface a lease is bound to.
     pub fn set_interface(&mut self, addr: Ipv4Addr, interface: i32) {
         if let Some(lease) = Self::get_mut_by_addr(&mut self.leases, &self.addr_index, addr) {
@@ -1455,6 +1504,135 @@ mod tests {
         db.set_hostname(addr, Some("host1"), false);
         assert!(!db.file_dirty);
         assert!(!db.dns_dirty);
+    }
+
+    // ── update_from_configs tests (issue #180) ──
+
+    /// Build a `DhcpConfig` matching hardware address `hw`, with an optional
+    /// hostname and fixed address.
+    fn make_config(
+        hw: [u8; 6],
+        hostname: Option<&str>,
+        addr: Option<Ipv4Addr>,
+    ) -> crate::types::dhcp::DhcpConfig {
+        use crate::types::dhcp::{ConfigFlags, HwaddrConfig};
+
+        let mut hwaddr = [0u8; DHCP_CHADDR_MAX];
+        hwaddr[..6].copy_from_slice(&hw);
+
+        let mut flags = ConfigFlags::empty();
+        if hostname.is_some() {
+            flags.insert(ConfigFlags::NAME);
+        }
+        if addr.is_some() {
+            flags.insert(ConfigFlags::ADDR);
+        }
+
+        crate::types::dhcp::DhcpConfig {
+            flags,
+            clid: None,
+            hostname: hostname.map(str::to_string),
+            domain: None,
+            netid: vec![],
+            filter: vec![],
+            addr: addr.unwrap_or(Ipv4Addr::UNSPECIFIED),
+            decline_time: None,
+            lease_time: 0,
+            hwaddrs: vec![HwaddrConfig { hwaddr, hwaddr_len: 6, hwaddr_type: 1, wildcard_mask: 0 }],
+            #[cfg(feature = "dhcp6")]
+            addr6: vec![],
+        }
+    }
+
+    #[test]
+    fn update_from_configs_renames_lease_to_match_reloaded_hostname() {
+        let mut db = LeaseDb::new();
+        let addr = Ipv4Addr::new(10, 0, 0, 1);
+        let hw = [0x01, 0, 0, 0, 0, 0];
+        db.insert(make_lease(addr, hw, None));
+        assert_eq!(db.find_by_addr(addr).unwrap().hostname.as_deref(), Some("host1"));
+
+        let configs = vec![make_config(hw, Some("renamed-host"), None)];
+        db.update_from_configs(&configs);
+
+        let lease = db.find_by_addr(addr).unwrap();
+        assert_eq!(lease.hostname.as_deref(), Some("renamed-host"));
+        assert!(db.dns_dirty);
+    }
+
+    #[test]
+    fn update_from_configs_leaves_unmatched_lease_alone() {
+        let mut db = LeaseDb::new();
+        let addr = Ipv4Addr::new(10, 0, 0, 1);
+        db.insert(make_lease(addr, [0x01, 0, 0, 0, 0, 0], None));
+
+        // No config matches this lease's hardware address at all.
+        let configs = vec![make_config([0x02, 0, 0, 0, 0, 0], Some("other-host"), None)];
+        db.update_from_configs(&configs);
+
+        assert_eq!(db.find_by_addr(addr).unwrap().hostname.as_deref(), Some("host1"));
+    }
+
+    #[test]
+    fn update_from_configs_skips_config_with_no_hostname() {
+        let mut db = LeaseDb::new();
+        let addr = Ipv4Addr::new(10, 0, 0, 1);
+        let hw = [0x01, 0, 0, 0, 0, 0];
+        db.insert(make_lease(addr, hw, None));
+
+        // Matches by hwaddr, but the config carries no hostname (no
+        // ConfigFlags::NAME) -- nothing to resync from.
+        let configs = vec![make_config(hw, None, None)];
+        db.update_from_configs(&configs);
+
+        assert_eq!(db.find_by_addr(addr).unwrap().hostname.as_deref(), Some("host1"));
+    }
+
+    /// lease.c:267 -- a fixed-address config only renames the lease it
+    /// actually issued, not some other lease matching the same MAC/CLID.
+    #[test]
+    fn update_from_configs_skips_when_config_address_does_not_match_lease() {
+        let mut db = LeaseDb::new();
+        let addr = Ipv4Addr::new(10, 0, 0, 1);
+        let hw = [0x01, 0, 0, 0, 0, 0];
+        db.insert(make_lease(addr, hw, None));
+
+        let configs = vec![make_config(hw, Some("renamed-host"), Some(Ipv4Addr::new(10, 0, 0, 99)))];
+        db.update_from_configs(&configs);
+
+        assert_eq!(db.find_by_addr(addr).unwrap().hostname.as_deref(), Some("host1"));
+    }
+
+    /// A matching config whose fixed address equals the lease's own address
+    /// must still resync -- only a *mismatched* fixed address is excluded.
+    #[test]
+    fn update_from_configs_applies_when_config_address_matches_lease() {
+        let mut db = LeaseDb::new();
+        let addr = Ipv4Addr::new(10, 0, 0, 1);
+        let hw = [0x01, 0, 0, 0, 0, 0];
+        db.insert(make_lease(addr, hw, None));
+
+        let configs = vec![make_config(hw, Some("renamed-host"), Some(addr))];
+        db.update_from_configs(&configs);
+
+        assert_eq!(db.find_by_addr(addr).unwrap().hostname.as_deref(), Some("renamed-host"));
+    }
+
+    #[test]
+    fn update_from_configs_skips_dhcpv6_leases() {
+        use crate::types::dhcp::LeaseFlags;
+
+        let mut db = LeaseDb::new();
+        let addr = Ipv4Addr::new(10, 0, 0, 1);
+        let hw = [0x01, 0, 0, 0, 0, 0];
+        let mut lease = make_lease(addr, hw, None);
+        lease.flags.insert(LeaseFlags::NA);
+        db.insert(lease);
+
+        let configs = vec![make_config(hw, Some("renamed-host"), None)];
+        db.update_from_configs(&configs);
+
+        assert_eq!(db.find_by_addr(addr).unwrap().hostname.as_deref(), Some("host1"));
     }
 
     // ── set_interface tests ──

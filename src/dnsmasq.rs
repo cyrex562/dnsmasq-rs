@@ -733,6 +733,16 @@ pub struct DhcpReloadConfig {
     pub configs:   Vec<crate::types::dhcp::DhcpConfig>,
     #[cfg(feature = "dhcp")]
     pub dhcp_opts: Vec<crate::types::dhcp::DhcpOpt>,
+    /// Bumped by [`clear_cache_and_reload`] every time it pushes a fresh
+    /// snapshot here, unconditionally — a reload *event* occurred, whether
+    /// or not `configs`/`dhcp_opts` actually changed content, matching
+    /// upstream's own `rerun_scripts()` being called unconditionally on
+    /// every `SIGHUP` (`dnsmasq.c:1601`), not just when config content
+    /// differs. `run_dhcp_loop`'s periodic tick compares this against the
+    /// last generation it saw to decide whether *this* tick is the one that
+    /// should also re-fire dhcp-script hooks for every lease (issue #180),
+    /// rather than doing so on every tick regardless.
+    pub generation: u64,
 }
 
 /// Shared handle to [`DhcpReloadConfig`], mirroring
@@ -749,6 +759,12 @@ pub fn daemon_dhcp_reload_config(daemon: &Daemon) -> DhcpReloadConfig {
     DhcpReloadConfig {
         configs:    daemon.dhcp_conf.clone(),
         dhcp_opts:  daemon.dhcp_opts.clone(),
+        // Overwritten by `clear_cache_and_reload`'s own read-modify-write on
+        // every reload; left at 0 here so a fresh startup snapshot (this
+        // function's other caller, `resolve_run_config`) matches
+        // `run_dhcp_loop`'s initial `last_reload_generation` and no reload
+        // is spuriously assumed to have already happened.
+        generation: 0,
     }
 }
 
@@ -3056,10 +3072,12 @@ pub async fn clear_cache_and_reload(
     // `d.dhcp_conf`/`d.dhcp_opts`, just re-read above, would only be visible
     // via the API/DBus/UBus reads of `Daemon`, never to a running
     // `dhcp::run_dhcp_loop`'s dispatch.
-    let fresh_dhcp_reload = daemon_dhcp_reload_config(&d);
+    let mut fresh_dhcp_reload = daemon_dhcp_reload_config(&d);
     drop(d);
     *fwd_config.lock().await = fresh_fwd_config;
-    *dhcp_reload.lock().await = fresh_dhcp_reload;
+    let mut dhcp_reload_guard = dhcp_reload.lock().await;
+    fresh_dhcp_reload.generation = dhcp_reload_guard.generation.wrapping_add(1);
+    *dhcp_reload_guard = fresh_dhcp_reload;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

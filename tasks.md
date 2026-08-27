@@ -229,10 +229,12 @@ Reference material:
   yet reach an already-running DHCP dispatch loop, since `run_dhcp_loop` still takes its
   `DhcpServerConfig` (including `configs`/`dhcp_opts`) by value, the exact same staleness
   bug issue #174 fixed for `ForwardConfig`. Filed as issue #179, deliberately deferred
-  rather than folded into #175 to keep each change reviewable. Also deferred (issue #180):
-  upstream's `dhcp_update_configs()`/`lease_update_from_configs()`, which re-sync
-  already-*issued* leases' hostname/etc. when static config changes — #175 only affects
-  future dispatches.
+  rather than folded into #175 to keep each change reviewable. Also deferred (issue #180,
+  fixed below): upstream's `lease_update_from_configs()`, which re-syncs already-*issued*
+  leases' hostname when static config changes — #175 only affects future dispatches.
+  (Upstream's `dhcp_update_configs()`, called right alongside it, is a different, unrelated
+  feature — deriving a `dhcp-host`'s own address from `/etc/hosts` when the entry has a name
+  but no fixed address — and is not part of #180's scope; still unported if ever wanted.)
 
   Also discovered and filed separately (issue #181, fixed below): `looks_like_mac_pattern`'s
   `value.contains('-')` check misclassifies any hyphenated hostname (e.g. `my-printer`) as
@@ -258,6 +260,53 @@ Reference material:
   `dhcp-host=aa:bb:cc:dd:ee:ff,192.168.99.20,my-printer` and
   `dhcp-host=office-laptop,192.168.99.21` now loads past config resolution (previously aborted
   immediately with "invalid hardware type prefix").
+
+  **Issue #180 (2026-08-27):** Fixed, now that #179 makes it possible. Cloned upstream to
+  read `lease_update_from_configs()`/`rerun_scripts()`'s real implementations (lease.c) rather
+  than guess from the issue's summary:
+  - `LeaseDb::update_from_configs(&mut self, configs: &[DhcpConfig])` (`src/lease.rs`): port
+    of `lease_update_from_configs()` (lease.c:256-273) minus its `host_from_dns()` fallback
+    branch (names a lease with *no* hostname at all from a reverse `/etc/hosts` lookup — an
+    unrelated concern from config-driven resync that would need `lease.rs` to depend on the
+    DNS cache; not part of this issue's scope, noted for a future pass if wanted). For every
+    non-DHCPv6 lease (`LeaseFlags::TA`/`NA` skipped, matching upstream's own guard), finds the
+    matching `dhcp-host` entry by client-id/hwaddr (`dhcp_common::find_config`, hostname/tags
+    unset in the lookup, matching upstream's call exactly) and adopts its hostname via the
+    already-existing `set_hostname(..., auth=true)` if the config has one and either has no
+    fixed address or its fixed address matches the lease's own (lease.c:267's guard against
+    renaming an unrelated lease that happens to share a MAC/CLID match).
+  - Confirmed upstream's *other* call at the same reload site, `dhcp_update_configs()`, is a
+    different, unrelated feature (deriving a `dhcp-host`'s own address from `/etc/hosts` when
+    it has a name but no fixed address) — not part of this issue's actual scope despite being
+    named alongside it in the original issue summary; left unported.
+  - Wired into `dhcp::run_dhcp_loop`'s existing #179 reload tick (`lease_db.update_from_configs
+    (&cfg.configs)` right after `cfg.configs`/`cfg.dhcp_opts` are refreshed) rather than adding
+    new reload-trigger plumbing — every reload path (SIGHUP, `/api/v1/reload`, DBus
+    `ClearCache`, inotify) already funnels into the same `SharedDhcpReloadConfig` handle that
+    tick already reads. Harmless to re-run every tick even when nothing changed, same
+    reasoning as the config-copy step it sits next to.
+  - Also wired `rerun_scripts()` (marks every lease `LEASE_CHANGED`) into the same tick,
+    closing the other half of the "still has no caller" gap already flagged in this file —
+    matching upstream calling it unconditionally on every SIGHUP (`dnsmasq.c:1601`) so a
+    reload always re-announces every current lease's script hook, not just ones whose config
+    actually changed. Unlike the resync step, this is *not* safe to repeat every tick (it
+    would re-fire every dhcp-script hook every second forever), so `DhcpReloadConfig` gained a
+    `generation: u64` counter, bumped unconditionally by `clear_cache_and_reload` on every
+    push (an event, not a content diff — matching upstream's own unconditional-on-SIGHUP
+    semantics). The tick tracks the last generation it saw and only calls `rerun_scripts()`
+    plus an immediate `run_lease_scripts()` (so the reload's re-announcement fires promptly,
+    not only on the next incoming packet, `run_lease_scripts`'s only other call site) when the
+    generation actually advanced. The decision itself is extracted into a pure
+    `should_rerun_scripts(current, last_seen)` function (mirroring `inotify.rs`'s
+    `should_force_resolv_reload`/`should_force_conf_reload` pattern from #176) specifically so
+    it's unit-testable without spinning up the async loop.
+  - Tests: 6 `LeaseDb::update_from_configs` unit tests (rename-on-match, no-op when unmatched/
+    no-hostname-in-config/address-mismatch, applies-when-address-matches, DHCPv6-lease skip),
+    4 `should_rerun_scripts` unit tests, and one full `run_dhcp_loop` integration test
+    (`run_dhcp_loop_resyncs_an_issued_lease_hostname_on_reload`) driving the acceptance bar
+    directly: pre-insert a lease with a hostname, push a renamed `dhcp-host` entry for the same
+    MAC into the shared reload handle, wait one tick, confirm the live lease's hostname changed
+    with no client renewal and no restart.
 
   **Issue #179 (2026-08-27):** Closed the gap #175 left open — `run_dhcp_loop` took
   `DhcpServerConfig` by value, so `reread_dhcp`'s `daemon.dhcp_conf`/`dhcp_opts` updates
@@ -901,10 +950,13 @@ Reference material:
     (already-privilege-dropped) main process rather than the dedicated child — no privilege
     boundary is crossed incorrectly, but a slow/hanging script blocks the DHCP dispatch loop
     the way upstream's async pipe-fed helper is specifically designed to avoid. `lease.rs`'s
-    `rerun_scripts` (lease.rs:480) only flips the per-lease flags `run_lease_scripts` acts on
-    (by design — SIGHUP-triggered "re-announce everything" support); it never calls a script
-    itself. Same "runs inline, not via the persistent helper" gap applies to any future
-    ARP/TFTP call sites.
+    `rerun_scripts` (lease.rs:547) only flips the per-lease flags `run_lease_scripts` acts on
+    — by design, matching upstream's own split between the two functions. As of issue #180
+    (2026-08-27), `run_dhcp_loop`'s reload tick now calls both together once per actual
+    reload (`rerun_scripts()` then `run_lease_scripts()`), so a SIGHUP/API/DBus/inotify
+    reload really does re-announce every current lease's script hook promptly, not just flip
+    flags nothing then reads until the next incoming packet. Same "runs inline, not via the
+    persistent helper" gap applies to any future ARP/TFTP call sites.
   - Lua scripting (`grab_extradata_lua`, `daemon->luascript`, helper.c:136-175,319-498) is
     deliberately out of scope, per the issue.
   - The DHCPv6-specific env vars/argv (`DNSMASQ_IAID`, `DNSMASQ_SERVER_DUID`, the
@@ -1399,9 +1451,10 @@ Reference material:
     `dnsmasq::tests::clear_cache_and_reload_rescans_hostsdir_entries`. Only `AH_HOSTS`
     directories are rescanned this way; `dhcp-hostsdir`/`dhcp-optsdir` are not, matching
     `set_dynamic_inotify`'s existing scope limits below.
-  - `--servers-file` re-read (`read_servers_file()`) and `lease_update_from_configs`/
-    `rerun_scripts` are not implemented. `reread_dhcp`/`dhcp_read_ethers` reload IS now
-    implemented (issue #175, 2026-08-27) — see the dedicated entry below.
+  - `--servers-file` re-read (`read_servers_file()`) is not implemented. `reread_dhcp`/
+    `dhcp_read_ethers` reload IS now implemented (issue #175, 2026-08-27), as is
+    `lease_update_from_configs`/`rerun_scripts` (issue #180, 2026-08-27) — see the dedicated
+    entries below.
   - See "Reload staleness" below: `daemon.servers` is updated correctly, but the
     already-running forward task's `ForwardConfig` (upstream list, host-records, CNAMEs)
     is still a one-time snapshot, so a resolv-file-driven server-list change only takes
@@ -1574,8 +1627,8 @@ Reference material:
   enumeration for the DHCPv6 DUID, DUID generation) and out of scope for this pass;
   `slaac.rs`/`radv.rs` may cover overlapping ground under different names but that
   hasn't been checked. `rerun_scripts()` (which marks every lease `LEASE_CHANGED` so a
-  reload re-fires all hooks) still has no caller outside its own unit tests — wiring it
-  into the reload path (alongside `lease_update_from_configs`) is tracked as issue #180.
+  reload re-fires all hooks) is now wired into the reload path, alongside
+  `lease_update_from_configs` (issue #180, 2026-08-27 — see the dedicated entry below).
   Covered by `lease::tests::{write_to_file_uses_tmp_file_and_rename,
   write_to_file_failed_write_leaves_original_untouched, run_lease_scripts_fires_add_for_new_lease,
   run_lease_scripts_fires_old_for_changed_lease, run_lease_scripts_fires_del_for_removed_lease,

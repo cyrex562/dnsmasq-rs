@@ -746,6 +746,19 @@ fn resolve_iface_broadcast(name: &str) -> Option<Ipv4Addr> {
 // Packet dispatch
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Whether `run_dhcp_loop`'s reload tick should mark every lease
+/// `LEASE_CHANGED` and promptly re-fire dhcp-script hooks for all of them
+/// (issue #180), mirroring upstream calling `rerun_scripts()`
+/// unconditionally on every `SIGHUP` (`dnsmasq.c:1601`) — a reload *event*,
+/// not a content diff of `configs`/`dhcp_opts`. `current`/`last_seen` are
+/// [`crate::dnsmasq::DhcpReloadConfig::generation`] values; extracted as a
+/// pure function (mirroring `inotify::should_force_resolv_reload`'s reason
+/// for existing) so this decision is unit-testable without spinning up the
+/// whole async loop.
+fn should_rerun_scripts(current: u64, last_seen: u64) -> bool {
+    current != last_seen
+}
+
 /// Create-or-renew the lease for a successful REQUEST/ACK, mirroring the
 /// `lease_set_*` calls in `rfc2131.c:1683-1730`. No-ops if the lease store is
 /// already at `max_leases`.
@@ -1362,6 +1375,13 @@ pub async fn run_dhcp_loop(
     // reload is rare, so a 1-second staleness window is harmless, and this
     // keeps per-packet dispatch lock-free.
     let mut reload_ticker = tokio::time::interval(Duration::from_secs(1));
+    // Tracks `DhcpReloadConfig::generation` so the reload tick can tell a
+    // real reload apart from "just another second went by" (issue #180) —
+    // `update_from_configs` is harmless to re-run every tick, but
+    // `rerun_scripts` (unconditionally marking every lease `LEASE_CHANGED`)
+    // is not: doing that every second would re-fire every dhcp-script hook
+    // every second forever, not just on an actual reload.
+    let mut last_reload_generation = 0u64;
     // Persists across packets so `do_icmp_ping`'s cache/load-limiter
     // (dhcp.c:769-823, ported as `PingCache::check`) actually avoids
     // re-pinging addresses within `PING_CACHE_TIME` of each other.
@@ -1570,6 +1590,29 @@ pub async fn run_dhcp_loop(
                 let fresh = reload.lock().await.clone();
                 cfg.configs = fresh.configs;
                 cfg.dhcp_opts = fresh.dhcp_opts;
+                // Re-sync already-issued leases against the freshly-reloaded
+                // static config on the same tick (issue #180) — a lease
+                // whose dhcp-host entry's hostname just changed adopts the
+                // new name immediately, without waiting for the client to
+                // renew. Piggybacks on this existing tick rather than
+                // needing its own reload-trigger plumbing, since every
+                // reload path (SIGHUP, `/api/v1/reload`, DBus `ClearCache`,
+                // inotify) already funnels through the same `reload` handle.
+                // Harmless to repeat every tick even when nothing changed.
+                let mut lease_db_guard = lease_db.lock().await;
+                lease_db_guard.update_from_configs(&cfg.configs);
+
+                // Unlike the above, only run once per actual reload (issue
+                // #180): marks every lease changed and fires dhcp-script
+                // hooks for all of them promptly, rather than only on the
+                // next incoming packet (`run_lease_scripts`'s only other call
+                // site, in the receive arm above).
+                if should_rerun_scripts(fresh.generation, last_reload_generation) {
+                    last_reload_generation = fresh.generation;
+                    lease_db_guard.rerun_scripts();
+                    let command = cfg.lease_change_command.as_deref().filter(|c| !c.is_empty());
+                    lease_db_guard.run_lease_scripts(command, cfg.leasefile_ro, cfg.script_on_renewal);
+                }
             }
         }
     }
@@ -2605,6 +2648,37 @@ mod tests {
     /// live-reload behavior themselves (issue #179).
     fn test_reload_config() -> crate::dnsmasq::SharedDhcpReloadConfig {
         std::sync::Arc::new(tokio::sync::Mutex::new(crate::dnsmasq::DhcpReloadConfig::default()))
+    }
+
+    // ── should_rerun_scripts tests (issue #180) ──
+
+    #[test]
+    fn should_rerun_scripts_false_on_matching_generation() {
+        assert!(!should_rerun_scripts(3, 3));
+    }
+
+    #[test]
+    fn should_rerun_scripts_true_on_new_generation() {
+        assert!(should_rerun_scripts(4, 3));
+    }
+
+    #[test]
+    fn should_rerun_scripts_true_at_startup_if_a_reload_already_happened() {
+        // Generation starts at 0; a reload before the loop's first tick
+        // bumps it to a nonzero value the tick hasn't seen yet.
+        assert!(should_rerun_scripts(1, 0));
+    }
+
+    #[test]
+    fn should_rerun_scripts_false_on_repeated_ticks_with_no_new_reload() {
+        // The exact regression this exists to prevent: without generation
+        // tracking, every tick would look like a fresh reload.
+        let generation = 5;
+        let mut last_seen = 5;
+        for _ in 0..3 {
+            assert!(!should_rerun_scripts(generation, last_seen));
+            last_seen = generation;
+        }
     }
 
     fn default_cfg() -> DhcpServerConfig {
@@ -3976,6 +4050,84 @@ mod tests {
             after.yiaddr,
             Ipv4Addr::new(10, 0, 0, 42),
             "the live loop must offer the reloaded static address, not the dynamic pool"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        loop_task.await.unwrap().unwrap();
+    }
+
+    /// Issue #180: a reload's static-config change must resync an
+    /// already-issued lease's hostname, not just affect future dispatches
+    /// (the scope #175/#179 deliberately stopped at). Piggybacks on the
+    /// same reload tick #179 added, so this only needs to drive that tick
+    /// and inspect `lease_db` directly — the lease's own hostname doesn't
+    /// need to come from a real DISCOVER/REQUEST/ACK exchange, since
+    /// `LeaseDb::update_from_configs` (the mechanism under test) only cares
+    /// about what's already in `lease_db`, however it got there.
+    #[tokio::test]
+    async fn run_dhcp_loop_resyncs_an_issued_lease_hostname_on_reload() {
+        use crate::types::dhcp::{ConfigFlags, HwaddrConfig};
+
+        let Some(server) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+        let server = std::sync::Arc::new(server);
+        let cfg = default_cfg();
+        // No packets are sent or received in this test — it only drives the
+        // periodic reload tick and inspects `lease_db` directly — so the
+        // reply-routing options don't matter here.
+        let opts = DhcpLoopOptions::default();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let hw = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let leased_addr = Ipv4Addr::new(10, 0, 0, 101);
+        let mut hwaddr = [0u8; DHCP_CHADDR_MAX];
+        hwaddr[..6].copy_from_slice(&hw);
+        let lease_db = std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new()));
+        lease_db.lock().await.insert(DhcpLease {
+            hostname: Some("old-name".into()),
+            hwaddr,
+            hwaddr_len: 6,
+            hwaddr_type: 1,
+            addr: leased_addr,
+            ..Default::default()
+        });
+
+        let reload = std::sync::Arc::new(tokio::sync::Mutex::new(crate::dnsmasq::DhcpReloadConfig::default()));
+        let loop_task = tokio::spawn(run_dhcp_loop(
+            server.clone(), cfg, opts, lease_db.clone(), shutdown_rx, Box::new(NullProbe), reload.clone(),
+        ));
+
+        assert_eq!(lease_db.lock().await.find_by_addr(leased_addr).unwrap().hostname.as_deref(), Some("old-name"));
+
+        // Reload with a `dhcp-host` entry for the same MAC under a new name
+        // -- exactly what `dnsmasq::clear_cache_and_reload` pushes into this
+        // same shared handle after `option::reread_dhcp` re-reads a changed
+        // `--dhcp-hostsfile` (issue #175).
+        let renamed_cfg = crate::types::dhcp::DhcpConfig {
+            flags: ConfigFlags::NAME,
+            clid: None,
+            hostname: Some("new-name".into()),
+            domain: None,
+            netid: vec![],
+            filter: vec![],
+            addr: Ipv4Addr::UNSPECIFIED,
+            decline_time: None,
+            lease_time: 0,
+            hwaddrs: vec![HwaddrConfig { hwaddr, hwaddr_len: 6, hwaddr_type: 1, wildcard_mask: 0 }],
+            #[cfg(feature = "dhcp6")]
+            addr6: vec![],
+        };
+        {
+            let mut guard = reload.lock().await;
+            guard.configs = vec![renamed_cfg];
+        }
+        // `run_dhcp_loop` only checks for a fresh reload config once per
+        // second (its periodic-tick branch) — see that branch's doc comment.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        assert_eq!(
+            lease_db.lock().await.find_by_addr(leased_addr).unwrap().hostname.as_deref(),
+            Some("new-name"),
+            "the live loop must resync the issued lease's hostname without the client renewing"
         );
 
         shutdown_tx.send(true).unwrap();
