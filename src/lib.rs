@@ -78,6 +78,8 @@ pub mod helper;
 #[cfg(feature = "inotify")]
 pub mod inotify;
 pub mod zones_d;
+#[cfg(feature = "dhcp")]
+pub mod networks_d;
 #[cfg(feature = "nftset")]
 pub mod nftset;
 #[cfg(feature = "ubus")]
