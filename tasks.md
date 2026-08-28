@@ -469,6 +469,39 @@ Reference material:
   `--no-poll` gating, hit detection against a real inotify fd and temp directory, and that
   an unrelated file in the same directory doesn't false-positive.
 
+  **Issue #182 (2026-08-28):** Implemented, following the architectural design at
+  `docs/superpowers/specs/2026-08-28-networks-d-design.md`. `--networks-dir=<path>` watches a
+  directory of dnsmasq directive-syntax fragment files, restricted to `dhcp-range`,
+  `dhcp-relay`/`dhcp-split-relay`, `dhcp-host`, `dhcp-option`. Unlike issue #177's `zones.d`
+  (which lives on `Daemon` and needed a dedicated merge step plus a separate startup-ordering
+  fix), `networks.d`'s rescan is folded directly into `dnsmasq::daemon_dhcp_reload_config` —
+  the single function issue #179 already made both the startup path and every reload trigger
+  call — so there was no equivalent startup-ordering bug to find or fix here.
+
+  Corrected the original issue's own framing during brainstorming: the "new pool needs a new
+  socket" obstacle only applies to a genuinely new *local* subnet when `--interface=`
+  restricted the DHCP socket bind away from it. A relay-reached pool, or a directly-attached
+  pool on an already-bound (including the common wildcard-bind) interface, needs no new socket
+  at all — `daemon_dhcp_runtime` already binds a single `0.0.0.0:67` socket by default. Relay
+  support was explicitly requested; a live-added non-split-mode relay gets the same
+  `iface_index` fixup `daemon_dhcp_runtime` already applies at startup, now re-run over the
+  combined static+`networks.d` relay list on every `daemon_dhcp_reload_config` call.
+
+  `src/networks_d.rs` is gated `#![cfg(feature = "dhcp")]` for its whole body (unlike
+  `zones_d.rs`, which is ungated) — `NetworksDRecords`'s fields all come from
+  `crate::types::dhcp`, itself gated on that feature. A watched `--networks-dir` change uses
+  the flag-then-react `InotifyHits` pattern (`resolv`/`conf_file`'s pattern), not `zones_dir`'s
+  synchronous inline rescan, because reaching the live DHCP loop requires locking
+  `SharedDhcpReloadConfig` (an async tokio `Mutex`), which `inotify_check` — fully synchronous —
+  has no access to; `watch_inotify_changes` reacts via a new `push_fresh_dhcp_reload_config`,
+  mirroring issue #177's `push_fresh_forward_config`. `run_dhcp_loop`'s existing 1s reload tick
+  (issue #179) now also refreshes `cfg.contexts`/`cfg.relay4` from the shared config, so a
+  `networks.d`-sourced pool or relay reaches live dispatch the same way `configs`/`dhcp_opts`
+  already did. 22 new tests across `src/networks_d.rs`, `src/option.rs`, `src/dnsmasq.rs`,
+  `src/dhcp.rs`, and `src/inotify.rs`; real DHCP socket smoke test not run (no non-interactive
+  root in this environment, same limitation as #179/#180) — `run_dhcp_loop_picks_up_a_reloaded_dhcp_context`
+  exercises the identical live-reload mechanism over an ephemeral test-bound UDP socket instead.
+
 - [x] Wire the DNS answer cache into the live forward path.
   `run_forward_loop_on` now calls `forward::cache_upstream_reply` → `cache::cache_reply` →
   `rfc1035::extract_addresses` for every accepted, non-truncated upstream reply, mirroring

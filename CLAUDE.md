@@ -145,6 +145,7 @@ Integration tests in `tests/` import through the library (`dnsmasq_rs::*`), so t
 | `src/web_ui.rs` | Self-hosted server-rendered web UI (`web-ui` feature, layered on `web-api`) — login + dashboard, htmx for partial updates, vendored `assets/htmx.min.js`, same bearer token as a cookie — no upstream counterpart |
 | `src/metrics_api.rs` | Prometheus-compatible `/metrics` endpoint (`metrics-api` feature, `--metrics-listen`) — standalone from `web-api`/`web-ui`, unauthenticated by design — no upstream counterpart |
 | `src/zones_d.rs` | `--zones-dir` dynamic DNS zone directory: watched via `src/inotify.rs`, aggregated into `Daemon.zones_d`, merged at `dnsmasq::daemon_local_data` (issue #177) — no upstream counterpart |
+| `src/networks_d.rs` | `--networks-dir` dynamic DHCP pool directory: watched via `src/inotify.rs`, merged into `dnsmasq::DhcpReloadConfig` at `daemon_dhcp_reload_config` (issue #182) — no upstream counterpart |
 | `src/dnsmasq.rs`, `src/main.rs` | Daemon init, privilege drop, daemonization, signals, main loop |
 | `src/rfc2131.rs`, `src/dhcp.rs`, `src/lease.rs`, `src/helper.rs` | DHCPv4 |
 | `src/rfc3315.rs`, `src/dhcp6.rs`, `src/radv.rs`, `src/slaac.rs` | DHCPv6 and RA |
