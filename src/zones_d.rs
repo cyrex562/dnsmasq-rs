@@ -42,11 +42,28 @@ impl ZonesDRecords {
 /// (matching upstream-style "one bad file must not corrupt others," but
 /// unlike `option::read_dhcp_bank_file`'s per-line tolerance -- zones.d
 /// deliberately does not partially apply a broken file).
+///
+/// Dispatches by extension the same way `main.rs`'s top-level `--conf-file`
+/// loader does (issue #170): `.yaml`/`.yml` goes to
+/// [`crate::yaml_config::parse_yaml_config_text`] when built with
+/// `yaml-config`, anything else to the legacy `key=value`
+/// [`crate::option::parse_config_text`] -- both produce the identical
+/// `ConfigLine` shape, so `apply_zone_directive` below never needs to know
+/// which format a zone file was written in.
 pub fn parse_zone_file(path: &std::path::Path) -> Result<ZonesDRecords, crate::option::ConfigError> {
     let text = std::fs::read_to_string(path).map_err(|e| {
         crate::option::ConfigError::Io(std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))
     })?;
-    let lines = crate::option::parse_config_text(&text, &path.to_string_lossy())?;
+    let path_str = path.to_string_lossy();
+
+    #[cfg(feature = "yaml-config")]
+    let lines = if crate::yaml_config::is_yaml_path(&path_str) {
+        crate::yaml_config::parse_yaml_config_text(&text, &path_str)?
+    } else {
+        crate::option::parse_config_text(&text, &path_str)?
+    };
+    #[cfg(not(feature = "yaml-config"))]
+    let lines = crate::option::parse_config_text(&text, &path_str)?;
 
     let mut records = ZonesDRecords::default();
     for cl in &lines {
@@ -228,6 +245,29 @@ mod tests {
     fn parse_zone_file_errors_on_unreadable_path() {
         let result = parse_zone_file(std::path::Path::new("/nonexistent/zones-d-test-path.conf"));
         assert!(result.is_err());
+    }
+
+    #[cfg(feature = "yaml-config")]
+    #[test]
+    fn parse_zone_file_loads_a_valid_yaml_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("example.test.yaml");
+        std::fs::write(&path, "host-record: \"yaml.test,10.0.0.9\"\ntxt-record: \"yaml.test,hello\"\n").unwrap();
+
+        let records = parse_zone_file(&path).unwrap();
+
+        assert_eq!(records.host_records.len(), 1);
+        assert_eq!(records.txt_records.len(), 1);
+    }
+
+    #[cfg(feature = "yaml-config")]
+    #[test]
+    fn parse_zone_file_rejects_whole_yaml_file_on_disallowed_directive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.yml");
+        std::fs::write(&path, "host-record: \"yaml.test,10.0.0.9\"\ndhcp-range: \"1.2.3.4,1.2.3.10\"\n").unwrap();
+
+        assert!(parse_zone_file(&path).is_err());
     }
 
     #[test]

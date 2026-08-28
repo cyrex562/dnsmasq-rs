@@ -502,6 +502,25 @@ Reference material:
   root in this environment, same limitation as #179/#180) — `run_dhcp_loop_picks_up_a_reloaded_dhcp_context`
   exercises the identical live-reload mechanism over an ephemeral test-bound UDP socket instead.
 
+  **Issue #170 (2026-08-28):** Closed the remaining gap in "explore DNS zone management" left
+  open by #177. #177 already shipped the requested architecture (a watched directory of
+  independently loadable, dynamically reloadable "zone" files, nginx/BIND/CoreDNS-style), but
+  its design spec explicitly declined the literal format #170 asked for — one YAML file per
+  zone, with DNS records as fields — in favor of reusing dnsmasq-rs's own directive syntax.
+  Closed that gap cheaply by reusing existing infrastructure rather than adding a new format:
+  `zones_d::parse_zone_file` now dispatches by extension (`.yaml`/`.yml` →
+  `yaml_config::parse_yaml_config_text`, gated on the already-existing `yaml-config` feature;
+  anything else → the existing `option::parse_config_text` path), the same dispatch `main.rs`'s
+  `load_top_level_conf_file` already does for the top-level `--conf-file`. No new parsing code:
+  `yaml_config.rs`'s existing flat 1:1 directive-name schema (`host-record: "a.test,1.2.3.4"`)
+  produces the identical `ConfigLine` shape the directive-syntax path does, so
+  `apply_zone_directive` and everything downstream of it needed no changes. 2 new tests
+  (`parse_zone_file_loads_a_valid_yaml_file`, `parse_zone_file_rejects_whole_yaml_file_on_disallowed_directive`),
+  both `#[cfg(feature = "yaml-config")]`-gated. `cargo test --all-features` (2684 passed, 0
+  failed), `cargo test --no-default-features` (same pre-existing unrelated `daemon_startup_integration`
+  failures as before, unaffected by this change), and `cargo clippy --all-features --all-targets`
+  (193 warnings, unchanged from baseline) all verified clean.
+
 - [x] Wire the DNS answer cache into the live forward path.
   `run_forward_loop_on` now calls `forward::cache_upstream_reply` → `cache::cache_reply` →
   `rfc1035::extract_addresses` for every accepted, non-truncated upstream reply, mirroring
