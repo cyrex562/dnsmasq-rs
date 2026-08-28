@@ -37,9 +37,65 @@ impl ZonesDRecords {
     }
 }
 
+/// Parse one zone file into its own aggregate. Whole-file atomic: the
+/// first disallowed directive or parse error aborts the file entirely
+/// (matching upstream-style "one bad file must not corrupt others," but
+/// unlike `option::read_dhcp_bank_file`'s per-line tolerance -- zones.d
+/// deliberately does not partially apply a broken file).
+pub fn parse_zone_file(path: &std::path::Path) -> Result<ZonesDRecords, crate::option::ConfigError> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        crate::option::ConfigError::Io(std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))
+    })?;
+    let lines = crate::option::parse_config_text(&text, &path.to_string_lossy())?;
+
+    let mut records = ZonesDRecords::default();
+    for cl in &lines {
+        crate::option::apply_zone_directive(&mut records, cl)?;
+    }
+    Ok(records)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_zone_file_loads_a_valid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("example.test.conf");
+        std::fs::write(&path, "host-record=zone.test,10.0.0.5\ntxt-record=zone.test,hello\n").unwrap();
+
+        let records = parse_zone_file(&path).unwrap();
+
+        assert_eq!(records.host_records.len(), 1);
+        assert_eq!(records.txt_records.len(), 1);
+    }
+
+    #[test]
+    fn parse_zone_file_rejects_whole_file_on_disallowed_directive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.conf");
+        // The host-record before the bad line must NOT survive -- a bad file
+        // is dropped in full, not partially applied.
+        std::fs::write(&path, "host-record=zone.test,10.0.0.5\ndhcp-range=1.2.3.4,1.2.3.10\n").unwrap();
+
+        assert!(parse_zone_file(&path).is_err());
+    }
+
+    #[test]
+    fn parse_zone_file_rejects_whole_file_on_malformed_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad2.conf");
+        std::fs::write(&path, "host-record=\n").unwrap();
+
+        assert!(parse_zone_file(&path).is_err());
+    }
+
+    #[test]
+    fn parse_zone_file_errors_on_unreadable_path() {
+        let result = parse_zone_file(std::path::Path::new("/nonexistent/zones-d-test-path.conf"));
+        assert!(result.is_err());
+    }
 
     #[test]
     fn extend_merges_every_field() {

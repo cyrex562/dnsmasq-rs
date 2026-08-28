@@ -92,6 +92,8 @@ bitflags::bitflags! {
         const HOSTS    = 1 << 3;
         const DHCP_HST = 1 << 4;
         const DHCP_OPT = 1 << 5;
+        /// `--zones-dir` (issue #177; no upstream `AH_*` counterpart).
+        const ZONES    = 1 << 6;
     }
 }
 

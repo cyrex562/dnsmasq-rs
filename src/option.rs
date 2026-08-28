@@ -1745,6 +1745,12 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             daemon.dynamic_dirs.push(make_dynamic_dir(v, DynDirFlags::DHCP_OPT));
         }
 
+        // ── zones-dir (issue #177; no upstream counterpart) ─────────────────
+        "zones-dir" => {
+            let v = require_value("zones-dir")?;
+            daemon.dynamic_dirs.push(make_dynamic_dir(v, DynDirFlags::ZONES));
+        }
+
         // ── conf-dir (recursive config loading) ────────────────────────────
         "conf-dir" => {
             let v = require_value("conf-dir")?;
@@ -6922,6 +6928,16 @@ mod tests {
         let lines = parse_config_text("dhcp-alternate-port=abc", "test").unwrap();
         let err = apply_config(&mut d, &lines).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidValue(_, ref k, _, _, _) if k == "dhcp-alternate-port"));
+    }
+
+    #[test]
+    fn apply_zones_dir_registers_a_dynamic_dir() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("zones-dir=/etc/dnsmasq-rs/zones.d", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.dynamic_dirs.len(), 1);
+        assert_eq!(d.dynamic_dirs[0].dname, "/etc/dnsmasq-rs/zones.d");
+        assert!(d.dynamic_dirs[0].flags.contains(DynDirFlags::ZONES));
     }
 
     #[test]
