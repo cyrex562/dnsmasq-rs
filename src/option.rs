@@ -2114,7 +2114,8 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Parse a `server=`, `local=`, or `address=` directive.
+/// Build the `Server` entries a `server=`, `local=`, or `address=` directive
+/// produces, without mutating `Daemon` directly.
 ///
 /// Supported grammar (subset of dnsmasq):
 /// - `server=1.2.3.4`
@@ -2123,8 +2124,6 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
 /// - `server=/example.com/example.org/1.2.3.4#53`
 /// - `address=/example.com/1.2.3.4`   (literal address reply)
 /// - `local=/example.com/`            (local-only, no upstream)
-/// Build the `Server` entries a `server=`/`local=`/`address=` directive
-/// produces, without mutating `Daemon` directly.
 ///
 /// Extracted from the old `parse_server_or_address` (which pushed straight
 /// into `daemon.servers`) so `apply_zone_directive`'s `"address"` case
@@ -2256,6 +2255,71 @@ fn build_server_or_address_entries(key: &str, v: &str, cl: &ConfigLine) -> Resul
     }
 
     Ok(entries)
+}
+
+/// Apply one [`ConfigLine`] from a `--zones-dir` file, restricted to the
+/// fixed allowlist of local-DNS-answering directives (issue #177 — see
+/// `docs/superpowers/specs/2026-08-27-zones-d-design.md`). Any other
+/// directive is rejected outright: a zone file must not be able to
+/// reconfigure listening addresses, DHCP, logging, or anything outside
+/// local DNS answer data.
+///
+/// Dispatches to the exact same per-directive parser functions
+/// `apply_line` uses, writing into `target` instead of a live `Daemon`.
+pub fn apply_zone_directive(
+    target: &mut crate::zones_d::ZonesDRecords,
+    cl: &ConfigLine,
+) -> Result<(), ConfigError> {
+    let key = cl.key.as_str();
+    let require_value = |opt: &str| -> Result<&str, ConfigError> {
+        cl.value.as_deref().ok_or_else(|| ConfigError::MissingValue(opt.to_string(), cl.file.clone(), cl.line))
+    };
+
+    match key {
+        "host-record" => {
+            let v = require_value("host-record")?;
+            target.host_records.push(parse_host_record(v, cl)?);
+        }
+        "cname" => {
+            let v = require_value("cname")?;
+            let cnames = parse_cname_records(v, cl, &target.cnames)?;
+            target.cnames.extend(cnames);
+        }
+        "txt-record" => {
+            let v = require_value("txt-record")?;
+            target.txt_records.push(parse_txt_record(v, cl)?);
+        }
+        "srv-host" => {
+            let v = require_value("srv-host")?;
+            target.mx_records.push(parse_srv_host(v, cl)?);
+        }
+        "mx-host" => {
+            let v = require_value("mx-host")?;
+            target.mx_records.push(parse_mx_host(v, cl)?);
+        }
+        "naptr-record" => {
+            let v = require_value("naptr-record")?;
+            target.naptr_records.push(parse_naptr_record(v, cl)?);
+        }
+        "ptr-record" => {
+            let v = require_value("ptr-record")?;
+            target.ptr_records.push(parse_ptr_record(v, cl)?);
+        }
+        "address" => {
+            let v = require_value("address")?;
+            target.address_server_list.extend(build_server_or_address_entries("address", v, cl)?);
+        }
+        _ => {
+            return Err(invalid_value_for(
+                cl,
+                key,
+                cl.value.as_deref().unwrap_or(""),
+                "directive is not allowed in a zones-dir file",
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 pub(crate) fn new_server(flags: ServFlags, domain: String, addr: MySockAddr, source_addr: MySockAddr) -> Server {
@@ -6905,6 +6969,105 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].domain, "example.test");
         assert!(entries[0].flags.contains(crate::types::server::ServFlags::LITERAL_ADDRESS));
+    }
+
+    #[test]
+    fn apply_zone_directive_host_record() {
+        use crate::zones_d::ZonesDRecords;
+        let lines = parse_config_text("host-record=zone.test,10.0.0.5", "test").unwrap();
+        let mut target = ZonesDRecords::default();
+        apply_zone_directive(&mut target, &lines[0]).unwrap();
+        assert_eq!(target.host_records.len(), 1);
+        assert_eq!(target.host_records[0].names, vec!["zone.test".to_string()]);
+    }
+
+    #[test]
+    fn apply_zone_directive_cname() {
+        use crate::zones_d::ZonesDRecords;
+        let lines = parse_config_text("cname=alias.test,target.test", "test").unwrap();
+        let mut target = ZonesDRecords::default();
+        apply_zone_directive(&mut target, &lines[0]).unwrap();
+        assert_eq!(target.cnames.len(), 1);
+        assert_eq!(target.cnames[0].alias, "alias.test");
+    }
+
+    #[test]
+    fn apply_zone_directive_txt_record() {
+        use crate::zones_d::ZonesDRecords;
+        let lines = parse_config_text("txt-record=zone.test,hello", "test").unwrap();
+        let mut target = ZonesDRecords::default();
+        apply_zone_directive(&mut target, &lines[0]).unwrap();
+        assert_eq!(target.txt_records.len(), 1);
+    }
+
+    #[test]
+    fn apply_zone_directive_mx_host_and_srv_host_share_mx_records() {
+        use crate::zones_d::ZonesDRecords;
+        let lines = parse_config_text(
+            "mx-host=zone.test,mail.zone.test,10\nsrv-host=_sip._tcp.zone.test,sip.zone.test,5060",
+            "test",
+        )
+        .unwrap();
+        let mut target = ZonesDRecords::default();
+        apply_zone_directive(&mut target, &lines[0]).unwrap();
+        apply_zone_directive(&mut target, &lines[1]).unwrap();
+        assert_eq!(target.mx_records.len(), 2);
+    }
+
+    #[test]
+    fn apply_zone_directive_naptr_record() {
+        use crate::zones_d::ZonesDRecords;
+        let lines = parse_config_text("naptr-record=zone.test,100,50,s,SIP+D2U,,_sip._udp.zone.test", "test").unwrap();
+        let mut target = ZonesDRecords::default();
+        apply_zone_directive(&mut target, &lines[0]).unwrap();
+        assert_eq!(target.naptr_records.len(), 1);
+    }
+
+    #[test]
+    fn apply_zone_directive_ptr_record() {
+        use crate::zones_d::ZonesDRecords;
+        let lines = parse_config_text("ptr-record=5.0.0.10.in-addr.arpa,zone.test", "test").unwrap();
+        let mut target = ZonesDRecords::default();
+        apply_zone_directive(&mut target, &lines[0]).unwrap();
+        assert_eq!(target.ptr_records.len(), 1);
+    }
+
+    #[test]
+    fn apply_zone_directive_address() {
+        use crate::zones_d::ZonesDRecords;
+        let lines = parse_config_text("address=/zone.test/10.0.0.9", "test").unwrap();
+        let mut target = ZonesDRecords::default();
+        apply_zone_directive(&mut target, &lines[0]).unwrap();
+        assert_eq!(target.address_server_list.len(), 1);
+        assert_eq!(target.address_server_list[0].domain, "zone.test");
+    }
+
+    #[test]
+    fn apply_zone_directive_rejects_disallowed_directive() {
+        use crate::zones_d::ZonesDRecords;
+        let lines = parse_config_text("dhcp-range=192.168.0.10,192.168.0.50", "test").unwrap();
+        let mut target = ZonesDRecords::default();
+        let err = apply_zone_directive(&mut target, &lines[0]).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(..)));
+    }
+
+    #[test]
+    fn apply_zone_directive_rejects_server_directive() {
+        // "server" is deliberately excluded even though "address" (handled by
+        // the same underlying parser) is allowed -- only the literal-address
+        // local-answer form belongs in a zone file.
+        use crate::zones_d::ZonesDRecords;
+        let lines = parse_config_text("server=8.8.8.8", "test").unwrap();
+        let mut target = ZonesDRecords::default();
+        assert!(apply_zone_directive(&mut target, &lines[0]).is_err());
+    }
+
+    #[test]
+    fn apply_zone_directive_propagates_parse_errors() {
+        use crate::zones_d::ZonesDRecords;
+        let lines = parse_config_text("host-record=", "test").unwrap();
+        let mut target = ZonesDRecords::default();
+        assert!(apply_zone_directive(&mut target, &lines[0]).is_err());
     }
 
     #[test]
