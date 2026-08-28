@@ -243,6 +243,65 @@ Reference material:
     `resolv-file=<path with "nameserver 8.8.8.8">`, no `--server=`, no SIGHUP ever sent —
     the very first `dig @127.0.0.1 -p 15353 example.com` resolved successfully.
 
+  **Issue #177 (2026-08-27):** Implemented, following the architectural design at
+  `docs/superpowers/specs/2026-08-27-zones-d-design.md` (brainstormed and approved before
+  implementation, since this is a genuinely new dnsmasq-rs-specific subsystem with no upstream
+  counterpart). `--zones-dir=<path>` (repeatable) watches a directory of dnsmasq
+  directive-syntax fragment files ("zones"), each restricted to a fixed allowlist of
+  local-DNS-answering directives (`host-record`, `cname`, `txt-record`, `srv-host`, `mx-host`,
+  `naptr-record`, `ptr-record`, `address=/domain/ip`). Any directory change triggers a full
+  rescan of every currently-present file across every configured `--zones-dir`, replacing a new
+  `Daemon.zones_d: ZonesDRecords` aggregate wholesale — reusing the existing `inotify.rs`
+  dynamic-directory watch (the same primitive already watching `--hostsdir`) rather than new
+  watch infrastructure, and merging into live query answering at the single existing
+  `dnsmasq::daemon_local_data` function that already rebuilds `LocalData` from `Daemon` on
+  every reload tick (issue #174's plumbing) — no new delivery mechanism needed. One existing
+  function, `parse_server_or_address`, was refactored (behavior-preserving, into
+  `build_server_or_address_entries`) so the `address=` directive's parsing could be reused
+  without mutating `Daemon.servers` directly.
+
+  The DHCP-pool half of the original issue (`networks.d`) was explicitly descoped during
+  brainstorming: a new `dhcp-range` on an unbound interface needs a new listening socket, and
+  this codebase binds all sockets before dropping root privileges at startup, before any
+  reload machinery runs — a fundamentally different, harder problem, left for its own future
+  issue if wanted.
+
+  Design decision worth flagging: a bad zone file is dropped *entirely* from the current
+  rescan (not partially applied), unlike `option::read_dhcp_bank_file`'s per-line tolerance —
+  deliberately chosen so the aggregate always reflects what's actually parseable right now, not
+  a stale/partial mix. `ZonesDRecords` also carries no per-entry provenance flag (unlike
+  `reread_dhcp`'s `ConfigFlags::BANK` pattern) since it's a wholly separate aggregate replaced
+  in full on every rescan, not merged into the same collections as directly-configured entries.
+
+  Tests: unit coverage on `apply_zone_directive` (all 8 directives, disallowed-directive
+  rejection, parse-error propagation), `parse_zone_file` (whole-file-atomic on error),
+  `rescan_zones_dirs` (multi-file aggregation, bad-file isolation, deleted-file removal,
+  dotfile/backup skipping, missing-directory handling), real-kernel-inotify integration tests
+  in `src/inotify.rs` (startup scan, live add/delete via real `inotify(7)`, no cross-talk with
+  resolv/conf-file hits), and a `daemon_local_data` merge test.
+
+  Two real bugs surfaced only during end-to-end verification, after the plan's own unit tests
+  (which check `Daemon`/`daemon_local_data` output directly, not a running query-answering
+  loop) all passed:
+  - **Live-reload gap.** The plan's Task 6 assumed `inotify_check`'s synchronous
+    `daemon.zones_d` rescan was sufficient, reasoning by analogy with `AH_HOSTS` (which mutates
+    the live `DnsCache` directly, so a synchronous update *is* the live update). That analogy
+    doesn't hold for zones.d: its data flows through `LocalData`/`ForwardConfig`, a snapshot
+    only ever refreshed by an explicit push into `SharedForwardConfig` — the exact "reload
+    staleness" trap issue #174 fixed for resolv-file. Without a fix, a zones-dir change made
+    *after* startup updated `Daemon` but never reached the live forward loop. Fixed with a
+    dedicated `push_fresh_forward_config` in `inotify.rs`, called from `watch_inotify_changes`
+    on a `hits.zones_dir` hit — deliberately *not* the full `clear_cache_and_reload` the
+    resolv/conf-file cases use, since a zones-dir is meant to be touched often (automation
+    adding/editing zones) and flushing the entire DNS cache on every touch would be a real,
+    avoidable cost for a feature designed to be lightweight.
+  - **Startup-ordering gap.** `set_dynamic_inotify` (which also does the initial zones.d scan)
+    doesn't run until `run_main_loop_with`, by which point `resolve_run_config` has already
+    snapshotted the `ForwardConfig` the forward loop starts with — too late for a zones-dir
+    present at boot to answer the very first query. Fixed the same way issue #178 fixed the
+    identical problem for `--resolv-file`: an additional `rescan_zones_dirs` call added to
+    `init_daemon_with`, before anything snapshots `ForwardConfig`.
+
   **Issue #175 (2026-08-27):** `--dhcp-hostsfile`/`--dhcp-optsfile` previously did
   nothing at all beyond recording the configured path — nothing anywhere read the
   file's contents, at startup or on reload; `option::reread_dhcp` was a stub that only
