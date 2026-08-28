@@ -1288,7 +1288,7 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
         // Minimal implementation: parse address[#port] and optional /domain/ prefix.
         "server" | "local" | "address" => {
             let v = require_value(key)?;
-            parse_server_or_address(daemon, key, v, cl)?;
+            daemon.servers.extend(build_server_or_address_entries(key, v, cl)?);
         }
 
         // ── rev-server ─────────────────────────────────────────────────────
@@ -2123,12 +2123,15 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
 /// - `server=/example.com/example.org/1.2.3.4#53`
 /// - `address=/example.com/1.2.3.4`   (literal address reply)
 /// - `local=/example.com/`            (local-only, no upstream)
-fn parse_server_or_address(
-    daemon: &mut Daemon,
-    key: &str,
-    v: &str,
-    cl: &ConfigLine,
-) -> Result<(), ConfigError> {
+/// Build the `Server` entries a `server=`/`local=`/`address=` directive
+/// produces, without mutating `Daemon` directly.
+///
+/// Extracted from the old `parse_server_or_address` (which pushed straight
+/// into `daemon.servers`) so `apply_zone_directive`'s `"address"` case
+/// (issue #177) can reuse this exact parsing logic without needing a live
+/// `Daemon` to mutate — a zones.d file's `address=` entries go into
+/// `ZonesDRecords.address_server_list` instead.
+fn build_server_or_address_entries(key: &str, v: &str, cl: &ConfigLine) -> Result<Vec<Server>, ConfigError> {
     let invalid = |val: &str, reason: &str| -> ConfigError { invalid_value_for(cl, key, val, reason) };
 
     // Split optional /domain/ prefix from the address part.
@@ -2162,6 +2165,8 @@ fn parse_server_or_address(
         (vec![], v)
     };
 
+    let mut entries = Vec::new();
+
     // Empty address ("server=/domain/", "local=/domain/", "address=/domain/")
     // means "never forward, answer locally" (option.c:3060-3110: `if (!arg ||
     // !*arg) flags = SERV_LITERAL_ADDRESS;`) — create a literal, address-less
@@ -2169,7 +2174,7 @@ fn parse_server_or_address(
     if addr_part.is_empty() {
         let dummy_addr = MySockAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0));
         if domains.is_empty() {
-            daemon.servers.push(new_server(
+            entries.push(new_server(
                 ServFlags::LITERAL_ADDRESS,
                 String::new(),
                 dummy_addr.clone(),
@@ -2177,7 +2182,7 @@ fn parse_server_or_address(
             ));
         } else {
             for domain in domains {
-                daemon.servers.push(new_server(
+                entries.push(new_server(
                     ServFlags::LITERAL_ADDRESS,
                     domain,
                     dummy_addr.clone(),
@@ -2185,7 +2190,7 @@ fn parse_server_or_address(
                 ));
             }
         }
-        return Ok(());
+        return Ok(entries);
     }
 
     // `--address=/domain/#` (the whole address argument is literally "#",
@@ -2198,13 +2203,13 @@ fn parse_server_or_address(
         let dummy_addr = MySockAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0));
         let flags = ServFlags::ALL_ZEROS | ServFlags::LITERAL_ADDRESS;
         if domains.is_empty() {
-            daemon.servers.push(new_server(flags, String::new(), dummy_addr.clone(), dummy_addr));
+            entries.push(new_server(flags, String::new(), dummy_addr.clone(), dummy_addr));
         } else {
             for domain in domains {
-                daemon.servers.push(new_server(flags, domain, dummy_addr.clone(), dummy_addr.clone()));
+                entries.push(new_server(flags, domain, dummy_addr.clone(), dummy_addr.clone()));
             }
         }
-        return Ok(());
+        return Ok(entries);
     }
 
     // Split address[#port]
@@ -2243,14 +2248,14 @@ fn parse_server_or_address(
     let dummy_addr = MySockAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0));
 
     if domains.is_empty() {
-        daemon.servers.push(new_server(flags, String::new(), sock, dummy_addr));
+        entries.push(new_server(flags, String::new(), sock, dummy_addr));
     } else {
         for domain in domains {
-            daemon.servers.push(new_server(flags, domain, sock.clone(), dummy_addr.clone()));
+            entries.push(new_server(flags, domain, sock.clone(), dummy_addr.clone()));
         }
     }
 
-    Ok(())
+    Ok(entries)
 }
 
 pub(crate) fn new_server(flags: ServFlags, domain: String, addr: MySockAddr, source_addr: MySockAddr) -> Server {
@@ -6887,6 +6892,19 @@ mod tests {
         let lines = parse_config_text("server=/a.com/b.com/8.8.8.8", "test").unwrap();
         apply_config(&mut d, &lines).unwrap();
         assert_eq!(d.servers.len(), 2);
+    }
+
+    #[test]
+    fn build_server_or_address_entries_matches_the_address_directive() {
+        let lines = parse_config_text("address=/example.test/198.51.100.5", "test").unwrap();
+        let cl = &lines[0];
+        let v = cl.value.as_deref().unwrap();
+
+        let entries = build_server_or_address_entries("address", v, cl).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].domain, "example.test");
+        assert!(entries[0].flags.contains(crate::types::server::ServFlags::LITERAL_ADDRESS));
     }
 
     #[test]
