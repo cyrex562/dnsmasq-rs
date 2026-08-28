@@ -500,6 +500,33 @@ fn should_force_conf_reload(daemon: &Daemon, hit: bool) -> bool {
     hit && !daemon.option_bool(OPT_NO_POLL)
 }
 
+/// Push a fresh [`crate::forward::ForwardConfig`] into the live forward loop
+/// without the rest of `clear_cache_and_reload`'s work (cache flush,
+/// hosts/resolv-file re-read, DHCP hosts/options/ethers re-read) — used for
+/// a `--zones-dir` change (issue #177). `inotify_check` has already updated
+/// `daemon.zones_d` directly by the time this runs; the only thing left is
+/// getting that into the `LocalData` the forward loop actually answers
+/// from, which `daemon_forward_config` already builds fresh from `Daemon`
+/// (including `zones_d`, since issue #177's Task 7) every time it's called.
+///
+/// Deliberately does *not* reuse `clear_cache_and_reload` the way the
+/// resolv/conf-file cases below do: unlike those (rare, administrative
+/// changes), a `--zones-dir` is meant to be touched often — automation
+/// dropping/editing zone files — so flushing the *entire* DNS cache on
+/// every such touch, evicting every unrelated cached forwarded answer,
+/// would be a real, avoidable behavior cost for a feature specifically
+/// designed to be lightweight (see the spec's "Merge point" section,
+/// `docs/superpowers/specs/2026-08-27-zones-d-design.md`).
+async fn push_fresh_forward_config(
+    daemon_handle: &crate::dnsmasq::DaemonHandle,
+    fwd_config: &crate::forward::SharedForwardConfig,
+) {
+    let d = daemon_handle.read().await;
+    let fresh = crate::dnsmasq::daemon_forward_config(&d);
+    drop(d);
+    *fwd_config.lock().await = fresh;
+}
+
 /// Await inotify readiness and dispatch events as they arrive, forcing a
 /// full reload (`clear_cache_and_reload` — cache/hosts/resolv-servers/DHCP
 /// hosts-options-ethers) when a resolv watch fires (see
@@ -509,7 +536,9 @@ fn should_force_conf_reload(daemon: &Daemon, hit: bool) -> bool {
 /// re-triggers the same reload an explicit SIGHUP would). `AH_HOSTS`
 /// dynamic-directory updates are applied unconditionally inside
 /// `inotify_check` regardless of `--no-poll`, matching upstream, since that
-/// flag only ever gated resolv-file polling.
+/// flag only ever gated resolv-file polling. A `--zones-dir` change (issue
+/// #177) gets its own lighter-weight push — see
+/// [`push_fresh_forward_config`] — rather than the full reload.
 ///
 /// Returns immediately (without erroring) if no inotify fd was ever opened
 /// (`inotify_dnsmasq_init` never ran or failed) — mirrors
@@ -546,6 +575,9 @@ pub async fn watch_inotify_changes(
         };
         if should_reload {
             crate::dnsmasq::clear_cache_and_reload(&daemon_handle, &cache, &fwd_config, &dhcp_reload).await;
+        }
+        if hits.zones_dir {
+            push_fresh_forward_config(&daemon_handle, &fwd_config).await;
         }
     }
 }
@@ -862,6 +894,46 @@ mod tests {
     fn should_force_conf_reload_true_even_when_port_zero() {
         let daemon = Daemon { port: 0, ..Daemon::default() };
         assert!(should_force_conf_reload(&daemon, true));
+    }
+
+    // ── push_fresh_forward_config (issue #177) ──────────────────────────
+
+    /// The gap the plan's Task 6 missed: `inotify_check` updates
+    /// `daemon.zones_d` directly, but the live forward loop only ever reads
+    /// from the periodically-refreshed `SharedForwardConfig` snapshot, not
+    /// `Daemon` itself -- the same "reload staleness" trap issue #174 fixed
+    /// for resolv-file. This confirms `push_fresh_forward_config` actually
+    /// closes it: a `zones_d` record present only on `Daemon` reaches the
+    /// shared `ForwardConfig` after the call, with no `clear_cache_and_reload`
+    /// needed.
+    #[tokio::test]
+    async fn push_fresh_forward_config_includes_zones_d_records() {
+        // `init_daemon()` (bare `Arc::new(RwLock::new(Daemon::default()))`),
+        // not `init_daemon_with` -- the latter's own startup logic now
+        // includes an initial `rescan_zones_dirs` call (issue #177's
+        // startup-ordering fix), which would immediately wipe out a
+        // manually-set `zones_d` back to empty (no `dynamic_dirs`
+        // configured here) before this test ever gets to exercise
+        // `push_fresh_forward_config` itself.
+        let daemon_handle = crate::dnsmasq::init_daemon();
+        daemon_handle.write().await.zones_d.host_records.push(crate::types::dns_records::HostRecord {
+            ttl: 0,
+            flags: 0,
+            names: vec!["zoned.test".to_string()],
+            addr4: Some(std::net::Ipv4Addr::new(9, 9, 9, 9)),
+            addr6: None,
+        });
+        let fwd_config: crate::forward::SharedForwardConfig =
+            std::sync::Arc::new(tokio::sync::Mutex::new(crate::forward::ForwardConfig::default()));
+
+        push_fresh_forward_config(&daemon_handle, &fwd_config).await;
+
+        let cfg = fwd_config.lock().await;
+        assert!(
+            cfg.local.host_records.iter().any(|h| h.names == vec!["zoned.test".to_string()]),
+            "zones_d host-record must reach the live ForwardConfig, got {:?}",
+            cfg.local.host_records,
+        );
     }
 
     // ── set_dynamic_inotify ──────────────────────────────────────────────
