@@ -611,23 +611,25 @@ struct DhcpDaemonRuntime {
 /// `daemon->rr`, `daemon->mxnames`, `daemon->ptr`, `daemon->naptr`, the
 /// `host-record` list and the configured CNAMEs.
 pub fn daemon_local_data(daemon: &Daemon) -> crate::forward::LocalData {
-    let address_server_list = literal_servers(daemon);
+    let mut address_server_list = literal_servers(daemon);
+    address_server_list.extend(daemon.zones_d.address_server_list.iter().cloned());
     let address_servers = crate::domain_match::ServerArray::build(&[], &address_server_list);
     let ident = !daemon.option_bool(crate::types::constants::OPT_NO_IDENT);
     let mut txt_records = daemon.txt.clone();
     if ident {
         txt_records.extend(builtin_stat_txt_records());
     }
+    txt_records.extend(daemon.zones_d.txt_records.iter().cloned());
     crate::forward::LocalData {
         local_ttl:     daemon.local_ttl,
         edns_pktsz:    daemon.edns_pktsz,
         txt_records,
         rr_records:    daemon.rr.clone(),
-        mx_records:    daemon.mxnames.clone(),
-        ptr_records:   daemon.ptr.clone(),
-        host_records:  daemon.host_records.clone(),
-        cnames:        daemon.cnames.clone(),
-        naptr_records: daemon.naptr.clone(),
+        mx_records:    daemon.mxnames.iter().chain(daemon.zones_d.mx_records.iter()).cloned().collect(),
+        ptr_records:   daemon.ptr.iter().chain(daemon.zones_d.ptr_records.iter()).cloned().collect(),
+        host_records:  daemon.host_records.iter().chain(daemon.zones_d.host_records.iter()).cloned().collect(),
+        cnames:        daemon.cnames.iter().chain(daemon.zones_d.cnames.iter()).cloned().collect(),
+        naptr_records: daemon.naptr.iter().chain(daemon.zones_d.naptr_records.iter()).cloned().collect(),
         int_names:     daemon.int_names.clone(),
         nodots_local:  daemon.option_bool(crate::types::constants::OPT_NODOTS_LOCAL),
         synth_domains: daemon.synth_domains.clone(),
@@ -4523,6 +4525,42 @@ mod tests {
     /// parsed `Daemon` into `ForwardConfig`, or the directive behind it is a
     /// silent no-op at run time.
     ///
+    /// Issue #177: `zones.d`-derived local DNS answer data must appear
+    /// alongside directly-configured entries in the `LocalData` the forward
+    /// loop actually answers from — `daemon_local_data` is the one merge
+    /// point everything downstream relies on.
+    #[test]
+    fn daemon_local_data_merges_zones_d_records() {
+        let mut daemon = Daemon::default();
+        daemon.host_records.push(crate::types::dns_records::HostRecord {
+            ttl: 0,
+            flags: 0,
+            names: vec!["direct.test".to_string()],
+            addr4: Some(std::net::Ipv4Addr::new(1, 1, 1, 1)),
+            addr6: None,
+        });
+        daemon.zones_d.host_records.push(crate::types::dns_records::HostRecord {
+            ttl: 0,
+            flags: 0,
+            names: vec!["zoned.test".to_string()],
+            addr4: Some(std::net::Ipv4Addr::new(2, 2, 2, 2)),
+            addr6: None,
+        });
+        daemon.zones_d.txt_records.push(crate::types::dns_records::TxtRecord {
+            name: "zoned.test".to_string(),
+            txt: b"hello".to_vec(),
+            class: 1,
+            stat: 0,
+        });
+
+        let local = daemon_local_data(&daemon);
+
+        assert_eq!(local.host_records.len(), 2, "both direct and zones.d host-records must be present");
+        assert!(local.host_records.iter().any(|h| h.names == vec!["direct.test".to_string()]));
+        assert!(local.host_records.iter().any(|h| h.names == vec!["zoned.test".to_string()]));
+        assert!(local.txt_records.iter().any(|t| t.name == "zoned.test"));
+    }
+
     /// The end-to-end coverage for these lives in
     /// `tests/reply_processing_integration.rs`, but every test there skips when
     /// the environment forbids binding loopback sockets — this one does not, so
