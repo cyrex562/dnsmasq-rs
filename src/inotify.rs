@@ -349,6 +349,14 @@ pub fn set_dynamic_inotify(daemon: &mut Daemon, cache: &mut DnsCache) {
             }
         }
     }
+
+    // Zones.d has no per-file cache-uid bookkeeping the way AH_HOSTS does
+    // -- it always rebuilds the whole aggregate from every currently
+    // present file, so the initial scan is just "run the same rescan the
+    // watch loop runs on a hit," once, covering every configured
+    // `--zones-dir` in one pass rather than nested inside the per-`dd`
+    // loop above.
+    crate::zones_d::rescan_zones_dirs(daemon);
 }
 
 /// What [`inotify_check`] observed this pass, left for the caller to decide
@@ -360,6 +368,11 @@ pub struct InotifyHits {
     /// The watched `--conf-file` changed (issue #176; no upstream
     /// counterpart).
     pub conf_file: bool,
+    /// A watched `--zones-dir` changed (issue #177; no upstream
+    /// counterpart). Unlike `resolv`/`conf_file`, the actual rescan already
+    /// happened by the time this is observed -- see `inotify_check`'s doc
+    /// comment.
+    pub zones_dir: bool,
 }
 
 /// Drain and dispatch pending inotify events.
@@ -447,7 +460,19 @@ pub fn inotify_check(daemon: &mut Daemon, cache: &mut DnsCache) -> InotifyHits {
                     }
                 }
             }
+
+            if daemon
+                .dynamic_dirs
+                .iter()
+                .any(|dd| dd.wd == wd && dd.flags.contains(DynDirFlags::ZONES))
+            {
+                hits.zones_dir = true;
+            }
         }
+    }
+
+    if hits.zones_dir {
+        crate::zones_d::rescan_zones_dirs(daemon);
     }
 
     hits
@@ -1022,6 +1047,80 @@ mod tests {
         let hits = cache.lookup_all_by_name("foo.example", F_IPV4, Instant::now());
         assert!(hits.is_empty());
         assert_eq!(daemon.dynamic_dirs[0].files[0].index, UID_NONE);
+    }
+
+    // ── zones.d (issue #177) ─────────────────────────────────────────────
+
+    fn make_zones_dyndir(dname: &str) -> DynDir {
+        DynDir { files: vec![], flags: DynDirFlags::ZONES, dname: dname.to_string(), wd: -1 }
+    }
+
+    #[test]
+    fn set_dynamic_inotify_loads_existing_zone_files_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.conf"), "host-record=a.test,10.0.0.1\n").unwrap();
+
+        let (mut daemon, _guard) = init_test_daemon_with_fd();
+        daemon.dynamic_dirs.push(make_zones_dyndir(dir.path().to_str().unwrap()));
+        let mut cache = DnsCache::new(1000);
+
+        set_dynamic_inotify(&mut daemon, &mut cache);
+
+        assert_eq!(daemon.zones_d.host_records.len(), 1);
+    }
+
+    #[test]
+    fn inotify_check_picks_up_new_zone_file_without_sighup() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut daemon, _guard) = init_test_daemon_with_fd();
+        daemon.dynamic_dirs.push(make_zones_dyndir(dir.path().to_str().unwrap()));
+        let mut cache = DnsCache::new(1000);
+        set_dynamic_inotify(&mut daemon, &mut cache);
+        assert!(daemon.zones_d.host_records.is_empty());
+
+        std::fs::write(dir.path().join("new.conf"), "host-record=new.test,10.0.0.5\n").unwrap();
+
+        let hits = inotify_check(&mut daemon, &mut cache);
+
+        assert!(hits.zones_dir);
+        assert_eq!(daemon.zones_d.host_records.len(), 1);
+    }
+
+    #[test]
+    fn inotify_check_drops_records_when_a_zone_file_is_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("temp.conf");
+        std::fs::write(&path, "host-record=temp.test,10.0.0.9\n").unwrap();
+
+        let (mut daemon, _guard) = init_test_daemon_with_fd();
+        daemon.dynamic_dirs.push(make_zones_dyndir(dir.path().to_str().unwrap()));
+        let mut cache = DnsCache::new(1000);
+        set_dynamic_inotify(&mut daemon, &mut cache);
+        assert_eq!(daemon.zones_d.host_records.len(), 1);
+
+        std::fs::remove_file(&path).unwrap();
+
+        let hits = inotify_check(&mut daemon, &mut cache);
+
+        assert!(hits.zones_dir);
+        assert!(daemon.zones_d.host_records.is_empty());
+    }
+
+    #[test]
+    fn inotify_check_zones_dir_hit_does_not_set_resolv_or_conf_file_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut daemon, _guard) = init_test_daemon_with_fd();
+        daemon.dynamic_dirs.push(make_zones_dyndir(dir.path().to_str().unwrap()));
+        let mut cache = DnsCache::new(1000);
+        set_dynamic_inotify(&mut daemon, &mut cache);
+
+        std::fs::write(dir.path().join("new.conf"), "host-record=new.test,10.0.0.5\n").unwrap();
+
+        let hits = inotify_check(&mut daemon, &mut cache);
+
+        assert!(hits.zones_dir);
+        assert!(!hits.resolv);
+        assert!(!hits.conf_file);
     }
 
     #[test]
