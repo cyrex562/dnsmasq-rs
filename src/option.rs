@@ -2328,6 +2328,61 @@ pub fn apply_zone_directive(
     Ok(())
 }
 
+/// Apply one [`ConfigLine`] from a `--networks-dir` file, restricted to the
+/// fixed allowlist of DHCP-pool directives (issue #182 — see
+/// `docs/superpowers/specs/2026-08-28-networks-d-design.md`). Any other
+/// directive is rejected outright — a network file must not be able to
+/// reconfigure listening addresses, DNS behavior, or anything outside a
+/// DHCP pool's own data.
+///
+/// Dispatches to the exact same per-directive parser functions `apply_line`
+/// uses, writing into `target` instead of a live `Daemon`.
+#[cfg(feature = "dhcp")]
+pub fn apply_network_directive(
+    target: &mut crate::networks_d::NetworksDRecords,
+    cl: &ConfigLine,
+) -> Result<(), ConfigError> {
+    let key = cl.key.as_str();
+    let require_value = |opt: &str| -> Result<&str, ConfigError> {
+        cl.value.as_deref().ok_or_else(|| ConfigError::MissingValue(opt.to_string(), cl.file.clone(), cl.line))
+    };
+
+    match key {
+        "dhcp-range" => {
+            let v = require_value("dhcp-range")?;
+            target.contexts.push(parse_dhcp_range(v, cl)?);
+        }
+        "dhcp-relay" | "dhcp-split-relay" => {
+            let v = require_value(key)?;
+            match parse_dhcp_relay(v, cl, key == "dhcp-split-relay")? {
+                RelayEntry::V4(r) => target.relay4.push(r),
+                #[cfg(feature = "dhcp6")]
+                RelayEntry::V6(_) => {
+                    return Err(invalid_value_for(cl, key, v, "IPv6 relays are not supported in a networks-dir file"));
+                }
+            }
+        }
+        "dhcp-host" => {
+            let v = require_value("dhcp-host")?;
+            target.configs.push(parse_dhcp_host(v, cl)?);
+        }
+        "dhcp-option" => {
+            let v = require_value("dhcp-option")?;
+            target.dhcp_opts.push(parse_dhcp_option(v, cl, "dhcp-option", crate::types::dhcp::DhOptFlags::empty())?);
+        }
+        _ => {
+            return Err(invalid_value_for(
+                cl,
+                key,
+                cl.value.as_deref().unwrap_or(""),
+                "directive is not allowed in a networks-dir file",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 pub(crate) fn new_server(flags: ServFlags, domain: String, addr: MySockAddr, source_addr: MySockAddr) -> Server {
     Server {
         flags,
@@ -7084,6 +7139,61 @@ mod tests {
         let lines = parse_config_text("host-record=", "test").unwrap();
         let mut target = ZonesDRecords::default();
         assert!(apply_zone_directive(&mut target, &lines[0]).is_err());
+    }
+
+    #[test]
+    fn apply_network_directive_dhcp_range() {
+        use crate::networks_d::NetworksDRecords;
+        let lines = parse_config_text("dhcp-range=192.168.50.10,192.168.50.100", "test").unwrap();
+        let mut target = NetworksDRecords::default();
+        apply_network_directive(&mut target, &lines[0]).unwrap();
+        assert_eq!(target.contexts.len(), 1);
+        assert_eq!(target.contexts[0].start, std::net::Ipv4Addr::new(192, 168, 50, 10));
+        assert_eq!(target.contexts[0].end, std::net::Ipv4Addr::new(192, 168, 50, 100));
+    }
+
+    #[test]
+    fn apply_network_directive_dhcp_relay() {
+        use crate::networks_d::NetworksDRecords;
+        let lines = parse_config_text("dhcp-relay=192.168.50.1,192.168.60.1", "test").unwrap();
+        let mut target = NetworksDRecords::default();
+        apply_network_directive(&mut target, &lines[0]).unwrap();
+        assert_eq!(target.relay4.len(), 1);
+    }
+
+    #[test]
+    fn apply_network_directive_dhcp_host() {
+        use crate::networks_d::NetworksDRecords;
+        let lines = parse_config_text("dhcp-host=aa:bb:cc:dd:ee:ff,192.168.50.20", "test").unwrap();
+        let mut target = NetworksDRecords::default();
+        apply_network_directive(&mut target, &lines[0]).unwrap();
+        assert_eq!(target.configs.len(), 1);
+    }
+
+    #[test]
+    fn apply_network_directive_dhcp_option() {
+        use crate::networks_d::NetworksDRecords;
+        let lines = parse_config_text("dhcp-option=6,192.168.50.1", "test").unwrap();
+        let mut target = NetworksDRecords::default();
+        apply_network_directive(&mut target, &lines[0]).unwrap();
+        assert_eq!(target.dhcp_opts.len(), 1);
+    }
+
+    #[test]
+    fn apply_network_directive_rejects_disallowed_directive() {
+        use crate::networks_d::NetworksDRecords;
+        let lines = parse_config_text("host-record=zone.test,10.0.0.5", "test").unwrap();
+        let mut target = NetworksDRecords::default();
+        let err = apply_network_directive(&mut target, &lines[0]).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue(..)));
+    }
+
+    #[test]
+    fn apply_network_directive_propagates_parse_errors() {
+        use crate::networks_d::NetworksDRecords;
+        let lines = parse_config_text("dhcp-range=not-an-ip,also-not-an-ip", "test").unwrap();
+        let mut target = NetworksDRecords::default();
+        assert!(apply_network_directive(&mut target, &lines[0]).is_err());
     }
 
     #[test]
