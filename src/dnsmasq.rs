@@ -749,6 +749,15 @@ pub struct DhcpReloadConfig {
     pub configs:   Vec<crate::types::dhcp::DhcpConfig>,
     #[cfg(feature = "dhcp")]
     pub dhcp_opts: Vec<crate::types::dhcp::DhcpOpt>,
+    /// `--networks-dir`-sourced pools merged in alongside the
+    /// statically-configured ones (issue #182). Pool bounds/contexts were
+    /// previously startup-only (see `run_dhcp_loop`'s reload-tick comment,
+    /// issue #179) -- this is what makes them live-reloadable.
+    #[cfg(feature = "dhcp")]
+    pub contexts: Vec<crate::types::dhcp::DhcpContext>,
+    /// Same as `contexts`, for `dhcp-relay`/`dhcp-split-relay` entries.
+    #[cfg(feature = "dhcp")]
+    pub relay4: Vec<crate::types::dhcp::DhcpRelay>,
     /// Bumped by [`clear_cache_and_reload`] every time it pushes a fresh
     /// snapshot here, unconditionally — a reload *event* occurred, whether
     /// or not `configs`/`dhcp_opts` actually changed content, matching
@@ -772,9 +781,43 @@ pub type SharedDhcpReloadConfig = std::sync::Arc<tokio::sync::Mutex<DhcpReloadCo
 /// feature is off.
 #[cfg(feature = "dhcp")]
 pub fn daemon_dhcp_reload_config(daemon: &Daemon) -> DhcpReloadConfig {
+    let mut contexts = daemon.dhcp.clone();
+    let mut relay4 = daemon.relay4.clone();
+    let mut configs = daemon.dhcp_conf.clone();
+    let mut dhcp_opts = daemon.dhcp_opts.clone();
+
+    let networks_d = crate::networks_d::networks_d_records(daemon);
+    contexts.extend(networks_d.contexts);
+    relay4.extend(networks_d.relay4);
+    configs.extend(networks_d.configs);
+    dhcp_opts.extend(networks_d.dhcp_opts);
+
+    // Mirrors `daemon_dhcp_runtime`'s own relay `iface_index` fixup
+    // (`dhcp.c:669-673`'s `complete_context` equivalent): without it,
+    // `relay_upstream4`'s `relay.iface_index != 0` dispatch guard never
+    // matches and a non-split-mode relay silently never fires. Run over the
+    // *combined* list (not just `networks_d`'s contribution), for
+    // correctness independent of source.
+    let bind_ip = first_ipv4_listen_addr(&daemon.if_addrs).unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+    let bind_interface = first_bind_interface(daemon);
+    let relay_iface_index = bind_interface
+        .as_deref()
+        .map_or(0, |name| crate::network::nametoindex(name) as i32);
+    for relay in relay4.iter_mut() {
+        if relay.split_mode == 0 {
+            if let crate::types::addr::AllAddr::Addr4(local4) = relay.local_addr {
+                if local4 == bind_ip {
+                    relay.iface_index = relay_iface_index;
+                }
+            }
+        }
+    }
+
     DhcpReloadConfig {
-        configs:    daemon.dhcp_conf.clone(),
-        dhcp_opts:  daemon.dhcp_opts.clone(),
+        configs,
+        dhcp_opts,
+        contexts,
+        relay4,
         // Overwritten by `clear_cache_and_reload`'s own read-modify-write on
         // every reload; left at 0 here so a fresh startup snapshot (this
         // function's other caller, `resolve_run_config`) matches
@@ -4568,6 +4611,34 @@ mod tests {
         assert!(local.host_records.iter().any(|h| h.names == vec!["direct.test".to_string()]));
         assert!(local.host_records.iter().any(|h| h.names == vec!["zoned.test".to_string()]));
         assert!(local.txt_records.iter().any(|t| t.name == "zoned.test"));
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn daemon_dhcp_reload_config_merges_networks_d_records() {
+        use crate::types::network::{DynDir, DynDirFlags};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lab.conf"),
+            "dhcp-range=192.168.90.10,192.168.90.50\ndhcp-relay=192.168.90.1,192.168.100.1\n",
+        )
+        .unwrap();
+
+        let mut daemon = Daemon::default();
+        daemon.dynamic_dirs.push(DynDir {
+            files: vec![],
+            flags: DynDirFlags::NETWORKS,
+            dname: dir.path().to_str().unwrap().to_string(),
+            #[cfg(feature = "inotify")]
+            wd: -1,
+        });
+
+        let reload = daemon_dhcp_reload_config(&daemon);
+
+        assert_eq!(reload.contexts.len(), 1);
+        assert_eq!(reload.contexts[0].start, std::net::Ipv4Addr::new(192, 168, 90, 10));
+        assert_eq!(reload.relay4.len(), 1);
     }
 
     /// The end-to-end coverage for these lives in
