@@ -102,7 +102,7 @@ inotify integration (`inotify.rs`).
   `#[derive(Debug, Clone, Default)]`, plus `impl NetworksDRecords { pub fn extend(&mut self,
   other: NetworksDRecords) }` extending every field pairwise. Consumed by Tasks 2-5.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `src/networks_d.rs`:
 
@@ -211,14 +211,14 @@ definition and adjust `make_context` to match exactly — every field must be na
 Add `pub mod networks_d;` gated `#[cfg(feature = "dhcp")]` to `src/lib.rs` and `src/main.rs`,
 right after the existing `pub mod zones_d;` line in each file.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test --all-features extend_merges_every_field`
 Expected: FAIL to compile if `make_context`'s field list doesn't match the real `DhcpContext` —
 fix per the note above. Once it compiles, the test should pass immediately (nothing outside
 `networks_d.rs` references it yet).
 
-- [ ] **Step 3: Run tests to verify everything passes**
+- [x] **Step 3: Run tests to verify everything passes**
 
 Run: `cargo test --all-features networks_d`
 Expected: PASS.
@@ -228,7 +228,7 @@ Expected: clean — `--no-default-features` excludes `dhcp`, so `networks_d.rs`'
 (including its test module) must not be compiled at all. Confirm by checking
 `cargo test --no-default-features networks_d` reports zero tests found, not a compile error.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src/networks_d.rs src/lib.rs src/main.rs
@@ -250,7 +250,7 @@ git commit -m "networks.d: add NetworksDRecords data model (issue #182)"
   crate::networks_d::NetworksDRecords, cl: &ConfigLine) -> Result<(), ConfigError>` — used by
   Task 3's `parse_network_file`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to `src/option.rs`'s `#[cfg(test)] mod tests` block, near the existing
 `apply_zone_directive_*` tests:
@@ -312,12 +312,12 @@ fn apply_network_directive_propagates_parse_errors() {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test --all-features apply_network_directive`
 Expected: FAIL with "cannot find function `apply_network_directive`".
 
-- [ ] **Step 3: Write the dispatcher**
+- [x] **Step 3: Write the dispatcher**
 
 Add to `src/option.rs`, directly after `apply_zone_directive`'s closing brace:
 
@@ -378,7 +378,7 @@ pub fn apply_network_directive(
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --all-features apply_network_directive`
 Expected: PASS, all 6 tests.
@@ -388,7 +388,7 @@ Expected: clean (`apply_network_directive` is `#[cfg(feature = "dhcp")]`-gated, 
 absent from that build, matching `apply_zone_directive`'s unconditional presence vs. this
 function's conditional one — this asymmetry is expected, not a bug).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/option.rs
@@ -412,7 +412,7 @@ git commit -m "networks.d: add apply_network_directive allowlist dispatcher (iss
 - Produces: `daemon.dynamic_dirs` gains a `DynDir` entry with `DynDirFlags::NETWORKS` whenever
   `networks-dir=<path>` is configured.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to `src/networks_d.rs`'s test module:
 
@@ -456,12 +456,12 @@ fn parse_network_file_errors_on_unreadable_path() {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test --all-features parse_network_file`
 Expected: FAIL with "cannot find function `parse_network_file`".
 
-- [ ] **Step 3: Write `parse_network_file`**
+- [x] **Step 3: Write `parse_network_file`**
 
 Add to `src/networks_d.rs`:
 
@@ -484,7 +484,7 @@ pub fn parse_network_file(path: &std::path::Path) -> Result<NetworksDRecords, cr
 }
 ```
 
-- [ ] **Step 4: Add `DynDirFlags::NETWORKS`**
+- [x] **Step 4: Add `DynDirFlags::NETWORKS`**
 
 In `src/types/network.rs`, in the `DynDirFlags` bitflags block (next to `const ZONES = 1 <<
 6;`):
@@ -494,7 +494,7 @@ In `src/types/network.rs`, in the `DynDirFlags` bitflags block (next to `const Z
         const NETWORKS = 1 << 7;
 ```
 
-- [ ] **Step 5: Add the `networks-dir` directive**
+- [x] **Step 5: Add the `networks-dir` directive**
 
 In `src/option.rs`'s `apply_line`, add a new arm right after the existing `"zones-dir"` arm:
 
@@ -505,7 +505,7 @@ In `src/option.rs`'s `apply_line`, add a new arm right after the existing `"zone
         }
 ```
 
-- [ ] **Step 6: Run tests to verify they pass**
+- [x] **Step 6: Run tests to verify they pass**
 
 Run: `cargo test --all-features parse_network_file`
 Expected: PASS, all 4 tests.
@@ -532,7 +532,7 @@ Expected: PASS on both — `DynDirFlags::NETWORKS` and the `"networks-dir"` `app
 both ungated (matching `zones-dir`'s own unconditional acceptance), even though
 `apply_network_directive`/`parse_network_file`/`networks_d.rs` are `dhcp`-gated.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/networks_d.rs src/option.rs src/types/network.rs
@@ -555,7 +555,7 @@ git commit -m "networks.d: add parse_network_file and the networks-dir directive
   networks_d_records(_daemon: &Daemon) -> NetworksDRecords { NetworksDRecords::default() }`
   (no-op) — used by Task 5's `daemon_dhcp_reload_config`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to `src/networks_d.rs`'s test module (needs `#[cfg(feature = "inotify")]` since
 `networks_d_records`'s real body only exists under that feature):
@@ -645,12 +645,12 @@ mod records_tests {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test --all-features records_`
 Expected: FAIL with "cannot find function `networks_d_records`".
 
-- [ ] **Step 3: Write `networks_d_records`**
+- [x] **Step 3: Write `networks_d_records`**
 
 Add to `src/networks_d.rs`:
 
@@ -705,7 +705,7 @@ pub fn networks_d_records(_daemon: &crate::types::daemon::Daemon) -> NetworksDRe
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --all-features records_`
 Expected: PASS, all 6 tests.
@@ -714,7 +714,7 @@ Then: `cargo check --no-default-features --features "dhcp dhcp6 auth tftp loop d
 actually exercises the `#[cfg(not(feature = "inotify"))]` twin while keeping `dhcp` on).
 Expected: clean.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/networks_d.rs
@@ -737,7 +737,7 @@ git commit -m "networks.d: add networks_d_records directory aggregation (issue #
   `#[cfg(feature = "dhcp")]`) — consumed by Task 6's `run_dhcp_loop` reload tick and Task 7's
   `push_fresh_dhcp_reload_config`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add near `daemon_local_data_merges_zones_d_records` in `src/dnsmasq.rs`'s test module:
 
@@ -775,12 +775,12 @@ fn daemon_dhcp_reload_config_merges_networks_d_records() {
 repo's current `src/types/network.rs`, adjust to match — it's a real field-level `cfg`, not a
 placeholder.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test --all-features daemon_dhcp_reload_config_merges_networks_d_records`
 Expected: FAIL to compile — `DhcpReloadConfig` has no `contexts`/`relay4` fields yet.
 
-- [ ] **Step 3: Add the fields and the relay `iface_index` fixup**
+- [x] **Step 3: Add the fields and the relay `iface_index` fixup**
 
 In `src/dnsmasq.rs`, update `DhcpReloadConfig`:
 
@@ -860,7 +860,7 @@ pub fn daemon_dhcp_reload_config(daemon: &Daemon) -> DhcpReloadConfig {
 already correctly produces empty `contexts`/`relay4` (both absent as fields entirely when
 `dhcp` is off, same as `configs`/`dhcp_opts` already are).
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --all-features daemon_dhcp_reload_config`
 Expected: PASS.
@@ -868,7 +868,7 @@ Expected: PASS.
 Then: `cargo test --all-features` (full suite) and `cargo test --no-default-features`.
 Expected: PASS on both.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/dnsmasq.rs
@@ -888,7 +888,7 @@ git commit -m "networks.d: merge into DhcpReloadConfig via daemon_dhcp_reload_co
   existing dispatch site (`narrow_context`, `relay_reply4`/`relay_upstream4`); from here on, a
   `networks.d`-sourced pool/relay is indistinguishable from a statically-configured one.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add near `run_dhcp_loop_picks_up_a_reloaded_static_host_mapping` in `src/dhcp.rs`'s test
 module:
@@ -995,13 +995,13 @@ narrows differently (e.g. requires `netmask` to actually contain both `giaddr` a
 match is unambiguous — the point of the test is proving the *reload* reaches dispatch, not
 exercising `narrow_context`'s own matching rules (already covered by other existing tests).
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test --all-features run_dhcp_loop_picks_up_a_reloaded_dhcp_context`
 Expected: FAIL — either a timeout waiting for a reply (no context matches, so nothing answers)
 or a reply from the legacy `pool_start`/`pool_end` fallback instead of the new context.
 
-- [ ] **Step 3: Update the reload tick**
+- [x] **Step 3: Update the reload tick**
 
 In `src/dhcp.rs`, in `run_dhcp_loop`'s `_ = reload_ticker.tick() => { ... }` branch, right after
 the existing `cfg.dhcp_opts = fresh.dhcp_opts;` line, add:
@@ -1013,7 +1013,7 @@ the existing `cfg.dhcp_opts = fresh.dhcp_opts;` line, add:
                 cfg.relay4   = fresh.relay4;
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --all-features run_dhcp_loop_picks_up_a_reloaded_dhcp_context`
 Expected: PASS.
@@ -1021,7 +1021,7 @@ Expected: PASS.
 Then: `cargo test --all-features` (full suite) and `cargo test --no-default-features`.
 Expected: PASS on both.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/dhcp.rs
@@ -1045,7 +1045,7 @@ git commit -m "networks.d: wire cfg.contexts/relay4 into run_dhcp_loop reload ti
   `inotify_check` (fully synchronous, only touches `&mut Daemon`/`&mut DnsCache`) doesn't have
   access to.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to `src/inotify.rs`'s `#[cfg(test)] mod tests` block, near the existing `zones_dir`-focused
 tests:
@@ -1116,13 +1116,13 @@ async fn push_fresh_dhcp_reload_config_includes_networks_d_contexts() {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test --all-features networks_dir`
 Expected: FAIL — `hits.networks_dir` doesn't exist yet, `push_fresh_dhcp_reload_config` doesn't
 exist yet.
 
-- [ ] **Step 3: Add `InotifyHits::networks_dir`**
+- [x] **Step 3: Add `InotifyHits::networks_dir`**
 
 In `src/inotify.rs`, update the `InotifyHits` struct:
 
@@ -1141,7 +1141,7 @@ pub struct InotifyHits {
 }
 ```
 
-- [ ] **Step 4: Detect the hit in `inotify_check`**
+- [x] **Step 4: Detect the hit in `inotify_check`**
 
 In `src/inotify.rs`, inside `inotify_check`'s per-event loop, directly after the existing
 `hits.zones_dir = true;` block's closing brace (still inside the same `while offset <
@@ -1162,7 +1162,7 @@ hits.zones_dir { crate::zones_d::rescan_zones_dirs(daemon); }` block right befor
 final `hits` return) — leave that block untouched, and do not add a `networks_dir` equivalent
 next to it. The push happens in `watch_inotify_changes` (Step 6).
 
-- [ ] **Step 5: Add `push_fresh_dhcp_reload_config`**
+- [x] **Step 5: Add `push_fresh_dhcp_reload_config`**
 
 In `src/inotify.rs`, add this function directly after the existing
 `push_fresh_forward_config`:
@@ -1191,7 +1191,7 @@ have the identical signature `fn(&Daemon) -> DhcpReloadConfig`, so
 `push_fresh_dhcp_reload_config` itself does not need its own `dhcp`-feature split; it compiles
 and calls whichever variant is active.
 
-- [ ] **Step 6: Wire it into `watch_inotify_changes`**
+- [x] **Step 6: Wire it into `watch_inotify_changes`**
 
 In `src/inotify.rs`, in `watch_inotify_changes`'s loop body, right after the existing
 `if hits.zones_dir { push_fresh_forward_config(&daemon_handle, &fwd_config).await; }` block,
@@ -1207,7 +1207,7 @@ add:
 `watch_inotify_changes`, threaded through since issue #179 — no new plumbing needed between
 `dnsmasq.rs` and `inotify.rs`.)
 
-- [ ] **Step 7: Run tests to verify they pass**
+- [x] **Step 7: Run tests to verify they pass**
 
 Run: `cargo test --all-features` (full suite — this task touches shared code paths).
 Expected: PASS, including every pre-existing `zones_dir`/resolv/conf-file inotify test
@@ -1216,7 +1216,7 @@ unchanged.
 Then: `cargo check --no-default-features`.
 Expected: clean.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add src/inotify.rs
@@ -1233,7 +1233,7 @@ git commit -m "networks.d: wire networks-dir into inotify watch (issue #182)"
 
 **Interfaces:** None — this task only documents and verifies what Tasks 1-7 built.
 
-- [ ] **Step 1: Update `CLAUDE.md`'s module map**
+- [x] **Step 1: Update `CLAUDE.md`'s module map**
 
 In `CLAUDE.md`'s module map table, add a new row right after the `src/zones_d.rs` row:
 
@@ -1241,7 +1241,7 @@ In `CLAUDE.md`'s module map table, add a new row right after the `src/zones_d.rs
 | `src/networks_d.rs` | `--networks-dir` dynamic DHCP pool directory: watched via `src/inotify.rs`, merged into `dnsmasq::DhcpReloadConfig` at `daemon_dhcp_reload_config` (issue #182) — no upstream counterpart |
 ```
 
-- [ ] **Step 2: Add a `tasks.md` entry**
+- [x] **Step 2: Add a `tasks.md` entry**
 
 Find the most recent dated entry in `tasks.md` and add, directly after it:
 
@@ -1269,7 +1269,7 @@ Find the most recent dated entry in `tasks.md` and add, directly after it:
   `crate::types::dhcp`, itself gated on that feature.
 ```
 
-- [ ] **Step 3: Run the full verification suite**
+- [x] **Step 3: Run the full verification suite**
 
 ```bash
 cargo test --all-features 2>&1 | tail -30
@@ -1283,7 +1283,7 @@ before this plan started by roughly the number of new tests across Tasks 1-7 (1 
 --no-default-features` shows 0 errors. The clippy warning count should match the pre-existing
 baseline (check `tasks.md`'s most recent clippy-count mention) — no new warnings introduced.
 
-- [ ] **Step 4: Live smoke test**
+- [x] **Step 4: Live smoke test**
 
 ```bash
 mkdir -p /tmp/networks-d-smoke/networks.d
@@ -1321,7 +1321,7 @@ same live-reload mechanism directly over an ephemeral test-bound UDP socket, no 
 the acceptance-bar proof instead, and state clearly in the closing report that the real-binary
 smoke test wasn't run and why — do not claim it passed if it wasn't actually executed.
 
-- [ ] **Step 5: Commit the docs**
+- [x] **Step 5: Commit the docs**
 
 ```bash
 git add CLAUDE.md tasks.md
