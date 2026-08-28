@@ -60,9 +60,18 @@ pub fn init_daemon() -> DaemonHandle {
 /// `dhcp_read_ethers()` chain (`dnsmasq.c:1546-1548,1817-1819`) that SIGHUP
 /// also runs (see `dnsmasq::clear_cache_and_reload`, issue #175) — so these
 /// files take effect from the very first dispatch/query, not only after the
-/// first reload.
+/// first reload. Also does the initial `--zones-dir` scan here (issue #177)
+/// for the same reason `reload_resolv_servers` moved here: `set_dynamic_inotify`
+/// (which zones.d's watch also relies on for the *live* reload path) doesn't
+/// run until `run_main_loop_with`, by which point `resolve_run_config` has
+/// already snapshotted the `ForwardConfig`/`LocalData` the forward loop
+/// starts with — too late for zones.d's initial data to reach the very
+/// first query. Harmless to also rescan again inside `set_dynamic_inotify`
+/// shortly after (idempotent, and that call site is what the live-reload
+/// path — and this function's own unit tests — exercise).
 pub fn init_daemon_with(mut daemon: Daemon) -> DaemonHandle {
     reload_resolv_servers(&mut daemon);
+    crate::zones_d::rescan_zones_dirs(&mut daemon);
 
     #[cfg(feature = "dhcp")]
     {
@@ -5335,6 +5344,39 @@ mod tests {
             }),
             "init_daemon_with must have already read the resolv-file, got {:?}",
             d.servers.iter().map(|s| (s.flags, s.addr.clone())).collect::<Vec<_>>(),
+        );
+    }
+
+    /// Issue #177: a `--zones-dir` present at startup must be readable by
+    /// the very first query, not only from the first periodic reload tick
+    /// onward. `set_dynamic_inotify` (which also does the initial zones.d
+    /// scan) doesn't run until `run_main_loop_with`, by which point
+    /// `resolve_run_config` has already snapshotted the `ForwardConfig` the
+    /// forward loop starts with -- so `init_daemon_with` must do its own
+    /// initial scan too.
+    #[cfg(feature = "inotify")]
+    #[tokio::test]
+    async fn init_daemon_with_scans_zones_dir_at_startup() {
+        use crate::types::network::{DynDir, DynDirFlags};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.conf"), "host-record=zoned.test,10.0.0.9\n").unwrap();
+
+        let mut daemon = Daemon::default();
+        daemon.dynamic_dirs.push(DynDir {
+            files: vec![],
+            flags: DynDirFlags::ZONES,
+            dname: dir.path().to_str().unwrap().to_string(),
+            wd: -1,
+        });
+
+        let handle = init_daemon_with(daemon);
+
+        let d = handle.read().await;
+        assert!(
+            d.zones_d.host_records.iter().any(|h| h.names == vec!["zoned.test".to_string()]),
+            "init_daemon_with must have already scanned the zones-dir, got {:?}",
+            d.zones_d.host_records,
         );
     }
 
