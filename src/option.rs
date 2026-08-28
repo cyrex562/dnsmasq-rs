@@ -1751,6 +1751,12 @@ fn apply_line(daemon: &mut Daemon, cl: &ConfigLine) -> Result<(), ConfigError> {
             daemon.dynamic_dirs.push(make_dynamic_dir(v, DynDirFlags::ZONES));
         }
 
+        // ── networks-dir (issue #182; no upstream counterpart) ──────────────
+        "networks-dir" => {
+            let v = require_value("networks-dir")?;
+            daemon.dynamic_dirs.push(make_dynamic_dir(v, DynDirFlags::NETWORKS));
+        }
+
         // ── conf-dir (recursive config loading) ────────────────────────────
         "conf-dir" => {
             let v = require_value("conf-dir")?;
@@ -6996,6 +7002,16 @@ mod tests {
     }
 
     #[test]
+    fn apply_networks_dir_registers_a_dynamic_dir() {
+        let mut d = Daemon::default();
+        let lines = parse_config_text("networks-dir=/etc/dnsmasq-rs/networks.d", "test").unwrap();
+        apply_config(&mut d, &lines).unwrap();
+        assert_eq!(d.dynamic_dirs.len(), 1);
+        assert_eq!(d.dynamic_dirs[0].dname, "/etc/dnsmasq-rs/networks.d");
+        assert!(d.dynamic_dirs[0].flags.contains(DynDirFlags::NETWORKS));
+    }
+
+    #[test]
     fn apply_server_plain_ipv4() {
         let mut d = Daemon::default();
         let lines = parse_config_text("server=8.8.8.8", "test").unwrap();
@@ -7141,6 +7157,7 @@ mod tests {
         assert!(apply_zone_directive(&mut target, &lines[0]).is_err());
     }
 
+    #[cfg(feature = "dhcp")]
     #[test]
     fn apply_network_directive_dhcp_range() {
         use crate::networks_d::NetworksDRecords;
@@ -7152,6 +7169,7 @@ mod tests {
         assert_eq!(target.contexts[0].end, std::net::Ipv4Addr::new(192, 168, 50, 100));
     }
 
+    #[cfg(feature = "dhcp")]
     #[test]
     fn apply_network_directive_dhcp_relay() {
         use crate::networks_d::NetworksDRecords;
@@ -7161,6 +7179,7 @@ mod tests {
         assert_eq!(target.relay4.len(), 1);
     }
 
+    #[cfg(feature = "dhcp")]
     #[test]
     fn apply_network_directive_dhcp_host() {
         use crate::networks_d::NetworksDRecords;
@@ -7170,6 +7189,7 @@ mod tests {
         assert_eq!(target.configs.len(), 1);
     }
 
+    #[cfg(feature = "dhcp")]
     #[test]
     fn apply_network_directive_dhcp_option() {
         use crate::networks_d::NetworksDRecords;
@@ -7179,6 +7199,7 @@ mod tests {
         assert_eq!(target.dhcp_opts.len(), 1);
     }
 
+    #[cfg(feature = "dhcp")]
     #[test]
     fn apply_network_directive_rejects_disallowed_directive() {
         use crate::networks_d::NetworksDRecords;
@@ -7188,6 +7209,7 @@ mod tests {
         assert!(matches!(err, ConfigError::InvalidValue(..)));
     }
 
+    #[cfg(feature = "dhcp")]
     #[test]
     fn apply_network_directive_propagates_parse_errors() {
         use crate::networks_d::NetworksDRecords;

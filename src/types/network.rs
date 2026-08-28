@@ -94,6 +94,8 @@ bitflags::bitflags! {
         const DHCP_OPT = 1 << 5;
         /// `--zones-dir` (issue #177; no upstream `AH_*` counterpart).
         const ZONES    = 1 << 6;
+        /// `--networks-dir` (issue #182; no upstream `AH_*` counterpart).
+        const NETWORKS = 1 << 7;
     }
 }
 
