@@ -50,6 +50,55 @@ pub fn parse_network_file(path: &std::path::Path) -> Result<NetworksDRecords, cr
     Ok(records)
 }
 
+/// List every configured `--networks-dir`, parse every currently-present
+/// file, and aggregate every successfully-parsed one into a fresh
+/// `NetworksDRecords`. Called by `dnsmasq::daemon_dhcp_reload_config` on
+/// every call -- both the startup path and every reload trigger already
+/// funnel through that one function (issue #182), unlike `zones_d`'s
+/// `rescan_zones_dirs`, which needed its own separate call sites.
+#[cfg(feature = "inotify")]
+pub fn networks_d_records(daemon: &crate::types::daemon::Daemon) -> NetworksDRecords {
+    use crate::types::network::DynDirFlags;
+
+    let mut aggregate = NetworksDRecords::default();
+
+    for dd in daemon.dynamic_dirs.iter().filter(|dd| dd.flags.contains(DynDirFlags::NETWORKS)) {
+        let entries = match std::fs::read_dir(&dd.dname) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("networks-dir {} is not readable: {e}", dd.dname);
+                continue;
+            }
+        };
+
+        let mut paths: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| !crate::inotify::is_ignorable_filename(n))
+                    .unwrap_or(false)
+            })
+            .collect();
+        paths.sort();
+
+        for path in paths {
+            match parse_network_file(&path) {
+                Ok(records) => aggregate.extend(records),
+                Err(e) => tracing::error!("networks.d: skipping {}: {e}", path.display()),
+            }
+        }
+    }
+
+    aggregate
+}
+
+#[cfg(not(feature = "inotify"))]
+pub fn networks_d_records(_daemon: &crate::types::daemon::Daemon) -> NetworksDRecords {
+    NetworksDRecords::default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +193,88 @@ mod tests {
         assert_eq!(a.contexts.len(), 2);
         assert_eq!(a.contexts[0].start, Ipv4Addr::new(10, 0, 0, 10));
         assert_eq!(a.contexts[1].start, Ipv4Addr::new(10, 0, 1, 10));
+    }
+}
+
+#[cfg(all(test, feature = "inotify"))]
+mod records_tests {
+    use super::*;
+    use crate::types::daemon::Daemon;
+    use crate::types::network::{DynDir, DynDirFlags};
+
+    fn make_networks_dyndir(dname: &str) -> DynDir {
+        DynDir { files: vec![], flags: DynDirFlags::NETWORKS, dname: dname.to_string(), wd: -1 }
+    }
+
+    #[test]
+    fn records_aggregates_multiple_valid_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.conf"), "dhcp-range=192.168.80.10,192.168.80.50\n").unwrap();
+        std::fs::write(dir.path().join("b.conf"), "dhcp-range=192.168.81.10,192.168.81.50\n").unwrap();
+
+        let mut daemon = Daemon::default();
+        daemon.dynamic_dirs.push(make_networks_dyndir(dir.path().to_str().unwrap()));
+
+        let records = networks_d_records(&daemon);
+
+        assert_eq!(records.contexts.len(), 2);
+    }
+
+    #[test]
+    fn records_skips_a_bad_file_without_blocking_others() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("good.conf"), "dhcp-range=192.168.80.10,192.168.80.50\n").unwrap();
+        std::fs::write(dir.path().join("bad.conf"), "host-record=x.test,1.2.3.4\n").unwrap();
+
+        let mut daemon = Daemon::default();
+        daemon.dynamic_dirs.push(make_networks_dyndir(dir.path().to_str().unwrap()));
+
+        let records = networks_d_records(&daemon);
+
+        assert_eq!(records.contexts.len(), 1);
+    }
+
+    #[test]
+    fn records_reflect_a_deleted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gone.conf");
+        std::fs::write(&path, "dhcp-range=192.168.80.10,192.168.80.50\n").unwrap();
+
+        let mut daemon = Daemon::default();
+        daemon.dynamic_dirs.push(make_networks_dyndir(dir.path().to_str().unwrap()));
+        assert_eq!(networks_d_records(&daemon).contexts.len(), 1);
+
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(networks_d_records(&daemon).contexts.len(), 0);
+    }
+
+    #[test]
+    fn records_ignore_dotfiles_and_backup_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real.conf"), "dhcp-range=192.168.80.10,192.168.80.50\n").unwrap();
+        std::fs::write(dir.path().join(".hidden.conf"), "dhcp-range=192.168.81.10,192.168.81.50\n").unwrap();
+        std::fs::write(dir.path().join("real.conf~"), "dhcp-range=192.168.82.10,192.168.82.50\n").unwrap();
+
+        let mut daemon = Daemon::default();
+        daemon.dynamic_dirs.push(make_networks_dyndir(dir.path().to_str().unwrap()));
+
+        let records = networks_d_records(&daemon);
+
+        assert_eq!(records.contexts.len(), 1);
+        assert_eq!(records.contexts[0].start, std::net::Ipv4Addr::new(192, 168, 80, 10));
+    }
+
+    #[test]
+    fn records_with_no_networks_dirs_configured_is_empty() {
+        let daemon = Daemon::default();
+        assert!(networks_d_records(&daemon).contexts.is_empty());
+    }
+
+    #[test]
+    fn records_warns_and_continues_on_missing_directory() {
+        let mut daemon = Daemon::default();
+        daemon.dynamic_dirs.push(make_networks_dyndir("/nonexistent-networks-d-test-dir-xyz"));
+        // Must not panic.
+        assert!(networks_d_records(&daemon).contexts.is_empty());
     }
 }
