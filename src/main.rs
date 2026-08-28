@@ -78,6 +78,7 @@ pub mod loop_detect;
 pub mod helper;
 #[cfg(feature = "inotify")]
 pub mod inotify;
+pub mod zones_d;
 #[cfg(feature = "nftset")]
 pub mod nftset;
 #[cfg(feature = "ubus")]

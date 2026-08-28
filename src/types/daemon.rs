@@ -97,6 +97,11 @@ pub struct Daemon {
     pub ptr:           Vec<PtrRecord>,
     pub host_records:  Vec<HostRecord>,
     pub cnames:        Vec<Cname>,
+    /// `--zones-dir`-derived local DNS answer data (issue #177, no upstream
+    /// counterpart) — kept separate from directly-configured entries above
+    /// and merged in only at `dnsmasq::daemon_local_data`, so a zones.d
+    /// rescan never has to know how to remove entries it didn't add.
+    pub zones_d:       crate::zones_d::ZonesDRecords,
     pub auth_zones:    Vec<AuthZone>,
     pub int_names:     Vec<InterfaceName>,
     pub bogus_addr:    Vec<BogusAddr>,
@@ -443,6 +448,7 @@ impl Default for Daemon {
             ptr: vec![],
             host_records: vec![],
             cnames: vec![],
+            zones_d: crate::zones_d::ZonesDRecords::default(),
             auth_zones: vec![],
             int_names: vec![],
             bogus_addr: vec![],
