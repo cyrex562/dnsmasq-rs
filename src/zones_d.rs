@@ -55,6 +55,139 @@ pub fn parse_zone_file(path: &std::path::Path) -> Result<ZonesDRecords, crate::o
     Ok(records)
 }
 
+/// Rescan every configured `--zones-dir`, aggregate every successfully
+/// parsed file, and replace `daemon.zones_d` wholesale. Called once at
+/// startup (via `inotify::set_dynamic_inotify`) and once per hit on any
+/// watched zones-dir (via `inotify::inotify_check`) -- issue #177.
+#[cfg(feature = "inotify")]
+pub fn rescan_zones_dirs(daemon: &mut crate::types::daemon::Daemon) {
+    use crate::types::network::DynDirFlags;
+
+    let mut aggregate = ZonesDRecords::default();
+
+    for dd in daemon.dynamic_dirs.iter().filter(|dd| dd.flags.contains(DynDirFlags::ZONES)) {
+        let entries = match std::fs::read_dir(&dd.dname) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("zones-dir {} is not readable: {e}", dd.dname);
+                continue;
+            }
+        };
+
+        let mut paths: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| !crate::inotify::is_ignorable_filename(n))
+                    .unwrap_or(false)
+            })
+            .collect();
+        paths.sort();
+
+        for path in paths {
+            match parse_zone_file(&path) {
+                Ok(records) => aggregate.extend(records),
+                Err(e) => tracing::error!("zones.d: skipping {}: {e}", path.display()),
+            }
+        }
+    }
+
+    daemon.zones_d = aggregate;
+}
+
+#[cfg(not(feature = "inotify"))]
+pub fn rescan_zones_dirs(_daemon: &mut crate::types::daemon::Daemon) {}
+
+#[cfg(feature = "inotify")]
+#[cfg(test)]
+mod rescan_tests {
+    use super::*;
+    use crate::types::daemon::Daemon;
+    use crate::types::network::{DynDir, DynDirFlags};
+
+    fn make_zones_dyndir(dname: &str) -> DynDir {
+        DynDir { files: vec![], flags: DynDirFlags::ZONES, dname: dname.to_string(), wd: -1 }
+    }
+
+    #[test]
+    fn rescan_aggregates_multiple_valid_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.conf"), "host-record=a.test,10.0.0.1\n").unwrap();
+        std::fs::write(dir.path().join("b.conf"), "host-record=b.test,10.0.0.2\n").unwrap();
+
+        let mut daemon = Daemon::default();
+        daemon.dynamic_dirs.push(make_zones_dyndir(dir.path().to_str().unwrap()));
+
+        rescan_zones_dirs(&mut daemon);
+
+        assert_eq!(daemon.zones_d.host_records.len(), 2);
+    }
+
+    #[test]
+    fn rescan_skips_a_bad_file_without_blocking_others() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("good.conf"), "host-record=good.test,10.0.0.1\n").unwrap();
+        std::fs::write(dir.path().join("bad.conf"), "dhcp-range=1.2.3.4,1.2.3.10\n").unwrap();
+
+        let mut daemon = Daemon::default();
+        daemon.dynamic_dirs.push(make_zones_dyndir(dir.path().to_str().unwrap()));
+
+        rescan_zones_dirs(&mut daemon);
+
+        assert_eq!(daemon.zones_d.host_records.len(), 1);
+    }
+
+    #[test]
+    fn rescan_drops_records_for_a_deleted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gone.conf");
+        std::fs::write(&path, "host-record=gone.test,10.0.0.1\n").unwrap();
+
+        let mut daemon = Daemon::default();
+        daemon.dynamic_dirs.push(make_zones_dyndir(dir.path().to_str().unwrap()));
+        rescan_zones_dirs(&mut daemon);
+        assert_eq!(daemon.zones_d.host_records.len(), 1);
+
+        std::fs::remove_file(&path).unwrap();
+        rescan_zones_dirs(&mut daemon);
+        assert_eq!(daemon.zones_d.host_records.len(), 0);
+    }
+
+    #[test]
+    fn rescan_ignores_dotfiles_and_backup_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real.conf"), "host-record=real.test,10.0.0.1\n").unwrap();
+        std::fs::write(dir.path().join(".hidden.conf"), "host-record=hidden.test,10.0.0.2\n").unwrap();
+        std::fs::write(dir.path().join("real.conf~"), "host-record=backup.test,10.0.0.3\n").unwrap();
+
+        let mut daemon = Daemon::default();
+        daemon.dynamic_dirs.push(make_zones_dyndir(dir.path().to_str().unwrap()));
+
+        rescan_zones_dirs(&mut daemon);
+
+        assert_eq!(daemon.zones_d.host_records.len(), 1);
+        assert_eq!(daemon.zones_d.host_records[0].names[0], "real.test");
+    }
+
+    #[test]
+    fn rescan_with_no_zones_dirs_configured_produces_empty_aggregate() {
+        let mut daemon = Daemon::default();
+        rescan_zones_dirs(&mut daemon);
+        assert!(daemon.zones_d.host_records.is_empty());
+    }
+
+    #[test]
+    fn rescan_warns_and_continues_on_missing_directory() {
+        let mut daemon = Daemon::default();
+        daemon.dynamic_dirs.push(make_zones_dyndir("/nonexistent-zones-d-test-dir-xyz"));
+        // Must not panic.
+        rescan_zones_dirs(&mut daemon);
+        assert!(daemon.zones_d.host_records.is_empty());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

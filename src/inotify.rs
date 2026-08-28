@@ -111,7 +111,7 @@ pub fn to_watch_event(mask: u32, path: &str) -> Option<WatchEvent> {
 
 /// Ignore emacs backups (`foo~`), lock files (`#foo#`) and dotfiles, matching
 /// the filters in upstream `inotify_check`/`set_dynamic_inotify`.
-fn is_ignorable_filename(name: &str) -> bool {
+pub(crate) fn is_ignorable_filename(name: &str) -> bool {
     if name.is_empty() || name.starts_with('.') {
         return true;
     }
