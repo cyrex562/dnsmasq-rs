@@ -373,6 +373,12 @@ pub struct InotifyHits {
     /// happened by the time this is observed -- see `inotify_check`'s doc
     /// comment.
     pub zones_dir: bool,
+    /// A watched `--networks-dir` changed (issue #182; no upstream
+    /// counterpart). Unlike `zones_dir`, the rescan does *not* happen
+    /// inline here -- it needs `SharedDhcpReloadConfig`, which
+    /// `inotify_check` (fully synchronous) has no access to. The caller
+    /// (`watch_inotify_changes`) reacts to this flag instead.
+    pub networks_dir: bool,
 }
 
 /// Drain and dispatch pending inotify events.
@@ -468,6 +474,14 @@ pub fn inotify_check(daemon: &mut Daemon, cache: &mut DnsCache) -> InotifyHits {
             {
                 hits.zones_dir = true;
             }
+
+            if daemon
+                .dynamic_dirs
+                .iter()
+                .any(|dd| dd.wd == wd && dd.flags.contains(DynDirFlags::NETWORKS))
+            {
+                hits.networks_dir = true;
+            }
         }
     }
 
@@ -527,6 +541,22 @@ async fn push_fresh_forward_config(
     *fwd_config.lock().await = fresh;
 }
 
+/// Push a fresh [`crate::dnsmasq::DhcpReloadConfig`] into the live DHCP
+/// loop without going through `clear_cache_and_reload` — the `dhcp_reload`
+/// analog of `push_fresh_forward_config`, used for a `--networks-dir`
+/// change (issue #182). `daemon_dhcp_reload_config` (the same builder both
+/// the startup path and every full reload already use) is already
+/// `networks.d`-aware, so this needs no separate rescan step.
+async fn push_fresh_dhcp_reload_config(
+    daemon_handle: &crate::dnsmasq::DaemonHandle,
+    dhcp_reload: &crate::dnsmasq::SharedDhcpReloadConfig,
+) {
+    let d = daemon_handle.read().await;
+    let fresh = crate::dnsmasq::daemon_dhcp_reload_config(&d);
+    drop(d);
+    *dhcp_reload.lock().await = fresh;
+}
+
 /// Await inotify readiness and dispatch events as they arrive, forcing a
 /// full reload (`clear_cache_and_reload` — cache/hosts/resolv-servers/DHCP
 /// hosts-options-ethers) when a resolv watch fires (see
@@ -578,6 +608,9 @@ pub async fn watch_inotify_changes(
         }
         if hits.zones_dir {
             push_fresh_forward_config(&daemon_handle, &fwd_config).await;
+        }
+        if hits.networks_dir {
+            push_fresh_dhcp_reload_config(&daemon_handle, &dhcp_reload).await;
         }
     }
 }
@@ -1193,6 +1226,70 @@ mod tests {
         assert!(hits.zones_dir);
         assert!(!hits.resolv);
         assert!(!hits.conf_file);
+    }
+
+    // ── networks.d (issue #182) ──────────────────────────────────────────
+
+    fn make_networks_dyndir(dname: &str) -> DynDir {
+        DynDir { files: vec![], flags: DynDirFlags::NETWORKS, dname: dname.to_string(), wd: -1 }
+    }
+
+    #[test]
+    fn inotify_check_flags_a_networks_dir_hit_without_rescanning_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut daemon, _guard) = init_test_daemon_with_fd();
+        daemon.dynamic_dirs.push(make_networks_dyndir(dir.path().to_str().unwrap()));
+        let mut cache = DnsCache::new(1000);
+        set_dynamic_inotify(&mut daemon, &mut cache);
+
+        std::fs::write(dir.path().join("new.conf"), "dhcp-range=192.168.95.10,192.168.95.50\n").unwrap();
+
+        let hits = inotify_check(&mut daemon, &mut cache);
+
+        assert!(hits.networks_dir);
+        // Unlike zones_dir, inotify_check itself does NOT touch daemon.dhcp or
+        // any DHCP reload state -- there's nothing on Daemon for it to update.
+    }
+
+    #[test]
+    fn inotify_check_networks_dir_hit_does_not_set_other_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut daemon, _guard) = init_test_daemon_with_fd();
+        daemon.dynamic_dirs.push(make_networks_dyndir(dir.path().to_str().unwrap()));
+        let mut cache = DnsCache::new(1000);
+        set_dynamic_inotify(&mut daemon, &mut cache);
+
+        std::fs::write(dir.path().join("new.conf"), "dhcp-range=192.168.95.10,192.168.95.50\n").unwrap();
+
+        let hits = inotify_check(&mut daemon, &mut cache);
+
+        assert!(hits.networks_dir);
+        assert!(!hits.resolv);
+        assert!(!hits.conf_file);
+        assert!(!hits.zones_dir);
+    }
+
+    #[cfg(feature = "dhcp")]
+    #[tokio::test]
+    async fn push_fresh_dhcp_reload_config_includes_networks_d_contexts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lab.conf"), "dhcp-range=192.168.96.10,192.168.96.50\n").unwrap();
+
+        let daemon_handle = crate::dnsmasq::init_daemon();
+        daemon_handle.write().await.dynamic_dirs.push(DynDir {
+            files: vec![],
+            flags: DynDirFlags::NETWORKS,
+            dname: dir.path().to_str().unwrap().to_string(),
+            wd: -1,
+        });
+        let dhcp_reload: crate::dnsmasq::SharedDhcpReloadConfig =
+            std::sync::Arc::new(tokio::sync::Mutex::new(crate::dnsmasq::DhcpReloadConfig::default()));
+
+        push_fresh_dhcp_reload_config(&daemon_handle, &dhcp_reload).await;
+
+        let cfg = dhcp_reload.lock().await;
+        assert_eq!(cfg.contexts.len(), 1);
+        assert_eq!(cfg.contexts[0].start, std::net::Ipv4Addr::new(192, 168, 96, 10));
     }
 
     #[test]
