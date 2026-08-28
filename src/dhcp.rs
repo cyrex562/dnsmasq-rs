@@ -1584,12 +1584,18 @@ pub async fn run_dhcp_loop(
             _ = slaac_dad.poll_tick_or_recv(&lease_db, slaac_contexts), if slaac_dad.active() => {}
             _ = reload_ticker.tick() => {
                 // Only the reloadable subset is replaced (issue #179) —
-                // everything else in `cfg` (pool bounds, contexts, relay
-                // state, `leasequery_source`, ...) is either startup-only
-                // or per-packet scratch state a reload must not touch.
+                // everything else in `cfg` (`leasequery_source`, ...) is
+                // either startup-only or per-packet scratch state a reload
+                // must not touch. `contexts`/`relay4` joined the reloadable
+                // subset in issue #182, sourced from `--networks-dir`
+                // alongside the statically-configured pools/relays.
                 let fresh = reload.lock().await.clone();
                 cfg.configs = fresh.configs;
                 cfg.dhcp_opts = fresh.dhcp_opts;
+                // Issue #182: a --networks-dir pool reaches dispatch the
+                // same way configs/dhcp_opts already do.
+                cfg.contexts = fresh.contexts;
+                cfg.relay4   = fresh.relay4;
                 // Re-sync already-issued leases against the freshly-reloaded
                 // static config on the same tick (issue #180) — a lease
                 // whose dhcp-host entry's hostname just changed adopts the
@@ -4050,6 +4056,105 @@ mod tests {
             after.yiaddr,
             Ipv4Addr::new(10, 0, 0, 42),
             "the live loop must offer the reloaded static address, not the dynamic pool"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        loop_task.await.unwrap().unwrap();
+    }
+
+    /// Issue #182: a `--networks-dir` pool must reach a *running* `run_dhcp_loop`'s
+    /// dispatch, not just the config it was constructed with.
+    #[tokio::test]
+    async fn run_dhcp_loop_picks_up_a_reloaded_dhcp_context() {
+        let Some(server) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+        let Some(client) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+        let Some(receiver) = bind_udp_or_skip("127.0.0.1:0").await else { return; };
+
+        let receiver_addr = receiver.local_addr().unwrap();
+        let server = std::sync::Arc::new(server);
+        // No contexts at all initially -- default_cfg()'s existing pool_start/
+        // pool_end fallback only applies when cfg.contexts() is empty, so this
+        // proves the *new* context is what answers, not the legacy fallback.
+        let mut cfg = default_cfg();
+        cfg.pool_start = Ipv4Addr::new(10, 0, 0, 100);
+        cfg.pool_end = Ipv4Addr::new(10, 0, 0, 100);
+        let opts = DhcpLoopOptions {
+            reply_port_override: Some(receiver_addr.port()),
+            ..Default::default()
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let reload = std::sync::Arc::new(tokio::sync::Mutex::new(crate::dnsmasq::DhcpReloadConfig::default()));
+        let loop_task = tokio::spawn(run_dhcp_loop(
+            server.clone(), cfg, opts, std::sync::Arc::new(tokio::sync::Mutex::new(LeaseDb::new())),
+            shutdown_rx, Box::new(NullProbe), reload.clone(),
+        ));
+
+        let new_context = crate::types::dhcp::DhcpContext {
+            lease_time: 3600,
+            addr_epoch: 0,
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::UNSPECIFIED,
+            local: Ipv4Addr::UNSPECIFIED,
+            router: Ipv4Addr::UNSPECIFIED,
+            start: Ipv4Addr::new(10, 0, 5, 50),
+            end: Ipv4Addr::new(10, 0, 5, 50),
+            flags: crate::types::dhcp::ContextFlags::empty(),
+            netid: crate::types::dhcp::DhcpNetid { net: String::new() },
+            filter: vec![],
+            #[cfg(feature = "dhcp6")]
+            start6: std::net::Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            end6: std::net::Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            local6: std::net::Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            prefix: 0,
+            #[cfg(feature = "dhcp6")]
+            if_index: 0,
+            #[cfg(feature = "dhcp6")]
+            valid: 0,
+            #[cfg(feature = "dhcp6")]
+            preferred: 0,
+            #[cfg(feature = "dhcp6")]
+            ra_time: 0,
+            #[cfg(feature = "dhcp6")]
+            ra_short_period_start: 0,
+            #[cfg(feature = "dhcp6")]
+            saved_valid: 0,
+            #[cfg(feature = "dhcp6")]
+            address_lost_time: 0,
+        };
+        {
+            let mut guard = reload.lock().await;
+            guard.contexts = vec![new_context];
+        }
+        // `run_dhcp_loop` only checks for a fresh reload config once per second
+        // (its periodic-tick branch) -- see that branch's doc comment.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        // `address_allocate`/`allocation_contexts` iterate every configured
+        // context regardless of arrival metadata (no `ArrivalInterface` is
+        // passed by `run_dhcp_loop`'s plain `recv_from` path), so giaddr
+        // doesn't need to fall within the new context's subnet for it to be
+        // selected — it only needs to be non-zero so `loop_reply_dest`
+        // routes the reply back to this test's receiver via the port
+        // override rather than broadcasting.
+        let mut pkt = base_packet();
+        pkt.giaddr = Ipv4Addr::new(127, 0, 0, 1);
+        let wire = packet_to_wire(&pkt);
+        client.send_to(&wire, server.local_addr().unwrap()).await.unwrap();
+
+        let mut buf = [0u8; 512];
+        let (len, _) = tokio::time::timeout(Duration::from_millis(250), receiver.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for DHCP loop reply")
+            .unwrap();
+        let reply = parse_dhcp_packet(&buf[..len]).expect("loop reply should parse");
+        assert_eq!(get_message_type(&reply.options), Some(DhcpMsgType::Offer));
+        assert_eq!(
+            reply.yiaddr,
+            Ipv4Addr::new(10, 0, 5, 50),
+            "the live loop must offer from the reloaded context, not the legacy pool_start/pool_end fallback"
         );
 
         shutdown_tx.send(true).unwrap();
