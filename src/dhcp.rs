@@ -75,6 +75,12 @@ pub struct DhcpServerConfig {
     pub domain_suffix: Option<String>,
     /// Path to persist the lease database to (`--dhcp-leasefile`).
     pub lease_file: Option<String>,
+    /// The lease file opened before the privilege drop — upstream's
+    /// `daemon->lease_stream` (lease.c:208). Used when the atomic
+    /// temp-file-and-rename write cannot create files in the lease file's
+    /// directory as the unprivileged user (see
+    /// [`crate::lease::LeaseDb::write_lease_file`]).
+    pub lease_stream: Option<std::sync::Arc<std::fs::File>>,
     /// The dhcp-script hook command (`--dhcp-script`), run on lease
     /// add/old/del via [`crate::lease::LeaseDb::run_lease_scripts`].
     pub lease_change_command: Option<String>,
@@ -152,6 +158,7 @@ impl Default for DhcpServerConfig {
             boot_configs: Vec::new(),
             domain_suffix: None,
             lease_file: None,
+            lease_stream: None,
             lease_change_command: None,
             leasefile_ro: false,
             script_on_renewal: false,
@@ -1536,7 +1543,7 @@ pub async fn run_dhcp_loop(
 
                 if lease_db_guard.file_dirty {
                     let write_ok = match cfg.lease_file.as_deref() {
-                        Some(path) => match lease_db_guard.write_to_file(path) {
+                        Some(path) => match lease_db_guard.write_lease_file(path, cfg.lease_stream.as_deref()) {
                             Ok(()) => true,
                             Err(err) => {
                                 warn!("failed to write DHCP lease file {path}: {err}");
@@ -2728,6 +2735,7 @@ mod tests {
             boot_configs: vec![],
             domain_suffix: None,
             lease_file: None,
+            lease_stream: None,
             lease_change_command: None,
             leasefile_ro: false,
             script_on_renewal: false,
