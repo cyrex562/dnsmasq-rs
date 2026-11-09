@@ -1993,25 +1993,28 @@ pub struct ArrivalInterface {
     pub if_index: i32,
 }
 
-/// Server identifier (option 54) for a reply about `addr`. Port of upstream's
-/// `server_id()` (rfc2131.c:1876-1884), without the override address (not
-/// ported): the `local` address of the context serving `addr` — set from the
-/// arrival interface by [`link_contexts_for_interface`], upstream's
-/// `context->local` (dhcp.c:654) — else the first context that has one, else
-/// `fallback` (the static `server_ip`, used when no arrival interface is
-/// known). Before this, every reply used `server_ip`, which is the primary
-/// range's start address unless it carries a router, so clients sent their
-/// renewals to an address nobody owns.
+/// Server identifier (option 54) for a reply about `addr`: upstream's
+/// `server_id(context, override, fallback)` call (rfc2131.c:1876-1884) for
+/// the context serving `addr`. The context is the one whose subnet holds
+/// `addr` and that has a `local` address — set from the arrival interface by
+/// [`link_contexts_for_interface`], upstream's `context->local` (dhcp.c:654) —
+/// else the first context that has one. The priority itself is
+/// [`crate::rfc2131::server_id`] (the override is not ported, so `None`);
+/// `fallback` is the static `server_ip`, used when no arrival interface is
+/// known. Before this, every reply used `server_ip`, the primary range's start
+/// address unless it carried a router, so clients sent their renewals to an
+/// address nobody owns.
 pub fn reply_server_id(contexts: &[DhcpContext], addr: Option<Ipv4Addr>, fallback: Ipv4Addr) -> Ipv4Addr {
     let has_local = |c: &&DhcpContext| c.local != Ipv4Addr::UNSPECIFIED;
-    addr.and_then(|a| {
-        contexts
-            .iter()
-            .filter(has_local)
-            .find(|c| c.netmask != Ipv4Addr::UNSPECIFIED && is_same_net(a, c.start, c.netmask))
-    })
-    .or_else(|| contexts.iter().find(has_local))
-    .map_or(fallback, |c| c.local)
+    let context = addr
+        .and_then(|a| {
+            contexts
+                .iter()
+                .filter(has_local)
+                .find(|c| c.netmask != Ipv4Addr::UNSPECIFIED && is_same_net(a, c.start, c.netmask))
+        })
+        .or_else(|| contexts.iter().find(has_local));
+    crate::rfc2131::server_id(context.map(|c| c.local), None, fallback)
 }
 
 /// Link every context that shares a subnet with the arriving interface,
