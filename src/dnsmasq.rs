@@ -1614,6 +1614,31 @@ fn adopt_tftp_listeners(
     Ok(out)
 }
 
+/// Create and bind the DHCPv4 socket. Port of the socket-option half of
+/// upstream's `make_fd()` (dhcp.c:66-86): under `bind-interfaces`
+/// (`OPT_NOWILD`) or `bind-dynamic` (`OPT_CLEVERBIND`) "there might be more
+/// than one dnsmasq instance binding port 67. That's OK if they serve
+/// different networks", so `SO_REUSEPORT` (an `ENOPROTOOPT` kernel is
+/// tolerated, as upstream does) and `SO_REUSEADDR` are set *before*
+/// `bind()`. Without them a second instance, or any other DHCP server on the
+/// host, makes this bind fail with `EADDRINUSE`.
+#[cfg(feature = "dhcp")]
+pub(crate) fn bind_dhcp4_socket(addr: SocketAddr, reuse: bool) -> std::io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let sock = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    if reuse {
+        #[cfg(unix)]
+        if let Err(e) = sock.set_reuse_port(true) {
+            if e.raw_os_error() != Some(libc::ENOPROTOOPT) {
+                return Err(e);
+            }
+        }
+        sock.set_reuse_address(true)?;
+    }
+    sock.bind(&addr.into())?;
+    Ok(sock.into())
+}
+
 /// Bind every socket the daemon serves from, before forking and before the
 /// privilege drop.
 pub fn bind_listeners(daemon: &Daemon) -> Result<Listeners, DnsmasqError> {
@@ -1626,7 +1651,9 @@ pub fn bind_listeners(daemon: &Daemon) -> Result<Listeners, DnsmasqError> {
     let dhcp = match daemon_dhcp_runtime(daemon) {
         Some(runtime) => {
             let addr = runtime.bind_addr;
-            let sock = std::net::UdpSocket::bind(addr)
+            let reuse = daemon.option_bool(crate::types::constants::OPT_NOWILD)
+                || daemon.option_bool(crate::types::constants::OPT_CLEVERBIND);
+            let sock = bind_dhcp4_socket(addr, reuse)
                 .map_err(|e| DnsmasqError::Bind(addr.to_string(), e.to_string()))?;
             sock.set_nonblocking(true)?;
             // Upstream sets SO_BROADCAST unconditionally on this socket
@@ -4313,6 +4340,45 @@ mod tests {
             dhcp_sock.broadcast().unwrap(),
             "the DHCP socket must have SO_BROADCAST set to reply to unconfigured clients"
         );
+    }
+
+    /// Regression: two `bind-interfaces` instances serving different networks
+    /// must both be able to bind the DHCP port (upstream `make_fd`, dhcp.c:66-86).
+    /// Before the fix the second `bind()` failed with EADDRINUSE.
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn bind_dhcp4_socket_shares_the_port_only_with_reuse() {
+        let first = bind_dhcp4_socket("127.0.0.1:0".parse().unwrap(), true).unwrap();
+        let addr = first.local_addr().unwrap();
+        let second = bind_dhcp4_socket(addr, true);
+        assert!(second.is_ok(), "a second reuse socket must bind {addr}: {:?}", second.err());
+
+        let plain = bind_dhcp4_socket("127.0.0.1:0".parse().unwrap(), false).unwrap();
+        let plain_addr = plain.local_addr().unwrap();
+        let err = bind_dhcp4_socket(plain_addr, false).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "without reuse the port stays exclusive");
+    }
+
+    /// The same, end to end through `bind_listeners`: a second daemon with
+    /// `bind-interfaces` binds the DHCP port a first one already holds.
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn bind_listeners_lets_two_bind_interfaces_daemons_share_the_dhcp_port() {
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let make = || {
+            let mut d = Daemon { port: 0, ..Default::default() };
+            d.dhcp.push(test_dhcp_context());
+            d.dhcp_server_port = i32::from(port);
+            d.dhcp_client_port = i32::from(port.wrapping_add(1));
+            d.set_option(crate::types::constants::OPT_NOWILD);
+            d
+        };
+        let first = bind_listeners(&make()).expect("first daemon binds");
+        assert!(first.dhcp.is_some());
+        let second = bind_listeners(&make());
+        assert!(second.is_ok(), "second bind-interfaces daemon must share port {port}: {:?}", second.err());
     }
 
     #[tokio::test]
