@@ -75,6 +75,12 @@ pub struct DhcpServerConfig {
     pub domain_suffix: Option<String>,
     /// Path to persist the lease database to (`--dhcp-leasefile`).
     pub lease_file: Option<String>,
+    /// The lease file opened before the privilege drop — upstream's
+    /// `daemon->lease_stream` (lease.c:208). Used when the atomic
+    /// temp-file-and-rename write cannot create files in the lease file's
+    /// directory as the unprivileged user (see
+    /// [`crate::lease::LeaseDb::write_lease_file`]).
+    pub lease_stream: Option<std::sync::Arc<std::fs::File>>,
     /// The dhcp-script hook command (`--dhcp-script`), run on lease
     /// add/old/del via [`crate::lease::LeaseDb::run_lease_scripts`].
     pub lease_change_command: Option<String>,
@@ -152,6 +158,7 @@ impl Default for DhcpServerConfig {
             boot_configs: Vec::new(),
             domain_suffix: None,
             lease_file: None,
+            lease_stream: None,
             lease_change_command: None,
             leasefile_ro: false,
             script_on_renewal: false,
@@ -903,7 +910,8 @@ fn dispatch_dhcp_with_meta_view(
             } else {
                 None
             };
-            let offer = handle_discover(pkt, cfg.pool_start, cfg.pool_end, None, cfg.server_ip, static_addr, scanned_addr);
+            let sid = reply_server_id(cfg.contexts(), static_addr.or(scanned_addr), cfg.server_ip);
+            let offer = handle_discover(pkt, cfg.pool_start, cfg.pool_end, None, sid, static_addr, scanned_addr);
             // `dhcp-rapid-commit` (OPT_RAPID_COMMIT): a DISCOVER carrying
             // OPTION_RAPID_COMMIT (80) gets an immediate ACK instead of an
             // OFFER (rfc2131.c:1363-1372's jump to the `rapid_commit:`
@@ -922,7 +930,7 @@ fn dispatch_dhcp_with_meta_view(
                         .is_some_and(|addr_cfg| !config.is_some_and(|c| std::ptr::eq(c, addr_cfg)));
                     crate::rfc2131::make_rapid_commit_ack(
                         r,
-                        cfg.server_ip,
+                        sid,
                         cfg.pool_start,
                         cfg.pool_end,
                         static_addr,
@@ -943,8 +951,9 @@ fn dispatch_dhcp_with_meta_view(
             let reserved_for_other = requested
                 .and_then(|addr| config_find_by_address(&cfg.configs, addr))
                 .is_some_and(|addr_cfg| !config.is_some_and(|c| std::ptr::eq(c, addr_cfg)));
+            let sid = reply_server_id(cfg.contexts(), requested, cfg.server_ip);
             handle_request(
-                pkt, cfg.pool_start, cfg.pool_end, cfg.server_ip, static_addr, reserved_for_other,
+                pkt, cfg.pool_start, cfg.pool_end, sid, static_addr, reserved_for_other,
             )
         }
         DhcpMsgType::Release => {
@@ -956,7 +965,8 @@ fn dispatch_dhcp_with_meta_view(
         }
         DhcpMsgType::Inform => {
             inc_metric(Metric::Dhcpinform);
-            handle_inform(pkt, cfg.server_ip)
+            let ciaddr = (pkt.ciaddr != Ipv4Addr::UNSPECIFIED).then_some(pkt.ciaddr);
+            handle_inform(pkt, reply_server_id(cfg.contexts(), ciaddr, cfg.server_ip))
         }
         DhcpMsgType::Decline => {
             inc_metric(Metric::Dhcpdecline);
@@ -1115,7 +1125,7 @@ fn dispatch_bootp(
         return None; // "no address configured"
     }
 
-    let mut reply = handle_bootp(pkt, yiaddr, cfg.server_ip);
+    let mut reply = handle_bootp(pkt, yiaddr, reply_server_id(contexts.as_ref(), Some(yiaddr), cfg.server_ip));
     decorate_reply(&mut reply, pkt, cfg, &bootp_tags, config);
     cap_vendor_area(&mut reply.options, 64);
 
@@ -1533,7 +1543,7 @@ pub async fn run_dhcp_loop(
 
                 if lease_db_guard.file_dirty {
                     let write_ok = match cfg.lease_file.as_deref() {
-                        Some(path) => match lease_db_guard.write_to_file(path) {
+                        Some(path) => match lease_db_guard.write_lease_file(path, cfg.lease_stream.as_deref()) {
                             Ok(()) => true,
                             Err(err) => {
                                 warn!("failed to write DHCP lease file {path}: {err}");
@@ -1981,6 +1991,30 @@ pub struct ArrivalInterface {
     /// match (slaac.c:43), which without this was always `0` for every
     /// lease `record_lease` ever committed.
     pub if_index: i32,
+}
+
+/// Server identifier (option 54) for a reply about `addr`: upstream's
+/// `server_id(context, override, fallback)` call (rfc2131.c:1876-1884) for
+/// the context serving `addr`. The context is the one whose subnet holds
+/// `addr` and that has a `local` address — set from the arrival interface by
+/// [`link_contexts_for_interface`], upstream's `context->local` (dhcp.c:654) —
+/// else the first context that has one. The priority itself is
+/// [`crate::rfc2131::server_id`] (the override is not ported, so `None`);
+/// `fallback` is the static `server_ip`, used when no arrival interface is
+/// known. Before this, every reply used `server_ip`, the primary range's start
+/// address unless it carried a router, so clients sent their renewals to an
+/// address nobody owns.
+pub fn reply_server_id(contexts: &[DhcpContext], addr: Option<Ipv4Addr>, fallback: Ipv4Addr) -> Ipv4Addr {
+    let has_local = |c: &&DhcpContext| c.local != Ipv4Addr::UNSPECIFIED;
+    let context = addr
+        .and_then(|a| {
+            contexts
+                .iter()
+                .filter(has_local)
+                .find(|c| c.netmask != Ipv4Addr::UNSPECIFIED && is_same_net(a, c.start, c.netmask))
+        })
+        .or_else(|| contexts.iter().find(has_local));
+    crate::rfc2131::server_id(context.map(|c| c.local), None, fallback)
 }
 
 /// Link every context that shares a subnet with the arriving interface,
@@ -2704,6 +2738,7 @@ mod tests {
             boot_configs: vec![],
             domain_suffix: None,
             lease_file: None,
+            lease_stream: None,
             lease_change_command: None,
             leasefile_ro: false,
             script_on_renewal: false,
@@ -4934,6 +4969,69 @@ mod tests {
         // The mutation also persists on cfg.contexts itself (matching
         // upstream's complete_context, which is not undone after the call).
         assert_eq!(cfg.contexts[0].router, iface.local);
+    }
+
+    /// Regression: option 54 is the arrival interface's address (upstream
+    /// `server_id()` → `context->local`, rfc2131.c:1876-1884), not the static
+    /// `server_ip` (here 10.0.0.1, another subnet's address).
+    #[test]
+    fn dispatch_with_arrival_uses_the_interface_address_as_server_id() {
+        let iface = ArrivalInterface {
+            local: Ipv4Addr::new(192, 168, 1, 1),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::new(192, 168, 1, 255),
+            if_index: 1,
+        };
+        let mut cfg = two_subnet_cfg();
+        let offer = dispatch_dhcp_with_arrival(
+            &base_packet(), &mut cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe, Some(&iface),
+        )
+        .expect("discover should produce an offer");
+        assert_eq!(find_option(&offer.reply.options, 54), Some(&[192, 168, 1, 1][..]), "OFFER server id");
+
+        // REQUEST in the primary range, arriving on an interface whose address
+        // (10.0.0.5) differs from the static server_ip (10.0.0.1).
+        let iface_a = ArrivalInterface {
+            local: Ipv4Addr::new(10, 0, 0, 5),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::new(10, 0, 0, 255),
+            if_index: 2,
+        };
+        let mut cfg = two_subnet_cfg();
+        let mut req = base_packet();
+        req.options = vec![
+            OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Request as u8,
+            crate::dhcp_protocol::OPTION_REQUESTED_IP, 4, 10, 0, 0, 150,
+            OPTION_END,
+        ];
+        let ack = dispatch_dhcp_with_arrival(
+            &req, &mut cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe, Some(&iface_a),
+        )
+        .expect("request should produce an ack");
+        assert_eq!(ack.reply.yiaddr, Ipv4Addr::new(10, 0, 0, 150));
+        assert_eq!(find_option(&ack.reply.options, 54), Some(&[10, 0, 0, 5][..]), "ACK server id");
+    }
+
+    #[test]
+    fn reply_server_id_prefers_the_matching_context_then_any_then_fallback() {
+        let mut a = make_ctx(Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 254), Ipv4Addr::UNSPECIFIED, ContextFlags::empty());
+        a.netmask = Ipv4Addr::new(255, 255, 255, 0);
+        a.local = Ipv4Addr::new(10, 0, 0, 1);
+        let mut b = make_ctx(Ipv4Addr::new(10, 1, 0, 2), Ipv4Addr::new(10, 1, 0, 254), Ipv4Addr::UNSPECIFIED, ContextFlags::empty());
+        b.netmask = Ipv4Addr::new(255, 255, 255, 0);
+        b.local = Ipv4Addr::new(10, 1, 0, 1);
+        let fallback = Ipv4Addr::new(9, 9, 9, 9);
+        let ctxs = [a.clone(), b.clone()];
+        assert_eq!(reply_server_id(&ctxs, Some(Ipv4Addr::new(10, 1, 0, 77)), fallback), b.local);
+        assert_eq!(reply_server_id(&ctxs, Some(Ipv4Addr::new(10, 0, 0, 77)), fallback), a.local);
+        // no address, or one outside every context: the first context with a local address
+        assert_eq!(reply_server_id(&ctxs, None, fallback), a.local);
+        assert_eq!(reply_server_id(&ctxs, Some(Ipv4Addr::new(172, 16, 0, 5)), fallback), a.local);
+        // contexts never linked to an interface (no `local`): the fallback, as before
+        let mut unlinked = a;
+        unlinked.local = Ipv4Addr::UNSPECIFIED;
+        assert_eq!(reply_server_id(&[unlinked], Some(Ipv4Addr::new(10, 0, 0, 77)), fallback), fallback);
+        assert_eq!(reply_server_id(&[], None, fallback), fallback);
     }
 
     #[test]

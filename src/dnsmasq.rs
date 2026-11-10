@@ -1082,6 +1082,7 @@ fn daemon_dhcp_runtime(daemon: &Daemon) -> Option<DhcpDaemonRuntime> {
             boot_configs: daemon.boot_config.clone(),
             domain_suffix: daemon.domain_suffix.clone(),
             lease_file: daemon.lease_file.clone(),
+            lease_stream: None,
             lease_change_command: daemon.lease_change_command.clone(),
             leasefile_ro: daemon.option_bool(crate::types::constants::OPT_LEASE_RO),
             script_on_renewal: daemon.option_bool(crate::types::constants::OPT_LEASE_RENEW),
@@ -1223,6 +1224,9 @@ pub struct Listeners {
     arrival_filter: Option<crate::network::ArrivalFilter>,
     #[cfg(feature = "dhcp")]
     dhcp: Option<std::net::UdpSocket>,
+    /// The DHCP lease file, opened while still privileged (upstream lease.c:208).
+    #[cfg(feature = "dhcp")]
+    lease_stream: Option<std::fs::File>,
     #[cfg(feature = "dhcp6")]
     dhcp6: Option<std::net::UdpSocket>,
     #[cfg(feature = "tftp")]
@@ -1614,6 +1618,52 @@ fn adopt_tftp_listeners(
     Ok(out)
 }
 
+/// Create and bind the DHCPv4 socket. Port of the socket-option half of
+/// upstream's `make_fd()` (dhcp.c:66-86): under `bind-interfaces`
+/// (`OPT_NOWILD`) or `bind-dynamic` (`OPT_CLEVERBIND`) "there might be more
+/// than one dnsmasq instance binding port 67. That's OK if they serve
+/// different networks", so `SO_REUSEPORT` (an `ENOPROTOOPT` kernel is
+/// tolerated, as upstream does) and `SO_REUSEADDR` are set *before*
+/// `bind()`. Without them a second instance, or any other DHCP server on the
+/// host, makes this bind fail with `EADDRINUSE`.
+#[cfg(feature = "dhcp")]
+pub(crate) fn bind_dhcp4_socket(addr: SocketAddr, reuse: bool) -> std::io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let sock = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    if reuse {
+        #[cfg(unix)]
+        if let Err(e) = sock.set_reuse_port(true) {
+            if e.raw_os_error() != Some(libc::ENOPROTOOPT) {
+                return Err(e);
+            }
+        }
+        sock.set_reuse_address(true)?;
+    }
+    sock.bind(&addr.into())?;
+    Ok(sock.into())
+}
+
+/// Open (creating if needed) the lease file while still privileged, as
+/// upstream does with `fopen(daemon->lease_file, "a+")` (lease.c:208), so the
+/// unprivileged DHCP loop can still rewrite it when its directory is
+/// root-owned. `None` with `--leasefile-ro`, without a lease file, or if it
+/// cannot be opened (logged; the loop then reports each failed write).
+#[cfg(feature = "dhcp")]
+fn open_lease_stream(daemon: &Daemon) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if daemon.option_bool(crate::types::constants::OPT_LEASE_RO) {
+        return None;
+    }
+    let path = daemon.lease_file.as_deref()?;
+    match std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o644).open(path) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            tracing::warn!("cannot open or create lease file {path}: {e}");
+            None
+        }
+    }
+}
+
 /// Bind every socket the daemon serves from, before forking and before the
 /// privilege drop.
 pub fn bind_listeners(daemon: &Daemon) -> Result<Listeners, DnsmasqError> {
@@ -1626,7 +1676,9 @@ pub fn bind_listeners(daemon: &Daemon) -> Result<Listeners, DnsmasqError> {
     let dhcp = match daemon_dhcp_runtime(daemon) {
         Some(runtime) => {
             let addr = runtime.bind_addr;
-            let sock = std::net::UdpSocket::bind(addr)
+            let reuse = daemon.option_bool(crate::types::constants::OPT_NOWILD)
+                || daemon.option_bool(crate::types::constants::OPT_CLEVERBIND);
+            let sock = bind_dhcp4_socket(addr, reuse)
                 .map_err(|e| DnsmasqError::Bind(addr.to_string(), e.to_string()))?;
             sock.set_nonblocking(true)?;
             // Upstream sets SO_BROADCAST unconditionally on this socket
@@ -1658,6 +1710,9 @@ pub fn bind_listeners(daemon: &Daemon) -> Result<Listeners, DnsmasqError> {
         None => None,
     };
 
+    #[cfg(feature = "dhcp")]
+    let lease_stream = if dhcp.is_some() { open_lease_stream(daemon) } else { None };
+
     // DUID generation and context construction need a write lock on the
     // running `Daemon` ([`daemon_dhcp6_runtime`]), which isn't available yet
     // at this pre-fork, still-synchronous stage — only decide *whether* to
@@ -1681,6 +1736,8 @@ pub fn bind_listeners(daemon: &Daemon) -> Result<Listeners, DnsmasqError> {
         arrival_filter,
         #[cfg(feature = "dhcp")]
         dhcp,
+        #[cfg(feature = "dhcp")]
+        lease_stream,
         #[cfg(feature = "dhcp6")]
         dhcp6,
         #[cfg(feature = "tftp")]
@@ -1898,6 +1955,8 @@ struct PreparedListeners {
     arrival_filter: Option<crate::network::ArrivalFilter>,
     #[cfg(feature = "dhcp")]
     prebound_dhcp: Option<std::net::UdpSocket>,
+    #[cfg(feature = "dhcp")]
+    prebound_lease_stream: Option<std::fs::File>,
     #[cfg(feature = "dhcp6")]
     prebound_dhcp6: Option<std::net::UdpSocket>,
     #[cfg(feature = "tftp")]
@@ -1930,6 +1989,8 @@ async fn prepare_listeners(
 
     #[cfg(feature = "dhcp")]
     let prebound_dhcp = listeners.dhcp.take();
+    #[cfg(feature = "dhcp")]
+    let prebound_lease_stream = listeners.lease_stream.take();
     #[cfg(feature = "dhcp6")]
     let prebound_dhcp6 = listeners.dhcp6.take();
     #[cfg(feature = "tftp")]
@@ -1960,6 +2021,8 @@ async fn prepare_listeners(
         arrival_filter,
         #[cfg(feature = "dhcp")]
         prebound_dhcp,
+        #[cfg(feature = "dhcp")]
+        prebound_lease_stream,
         #[cfg(feature = "dhcp6")]
         prebound_dhcp6,
         #[cfg(feature = "tftp")]
@@ -2189,6 +2252,7 @@ async fn spawn_tftp_task(
 async fn spawn_dhcp_task(
     mut dhcp_runtime: DhcpDaemonRuntime,
     prebound_dhcp: Option<std::net::UdpSocket>,
+    prebound_lease_stream: Option<std::fs::File>,
     #[cfg_attr(not(feature = "dhcp6"), allow(unused_variables))]
     slaac_contexts: Vec<crate::types::dhcp::DhcpContext>,
     dhcp_reload_config: SharedDhcpReloadConfig,
@@ -2207,6 +2271,7 @@ async fn spawn_dhcp_task(
     {
         dhcp_runtime.loop_opts.slaac_contexts = slaac_contexts;
     }
+    dhcp_runtime.server.lease_stream = prebound_lease_stream.map(Arc::new);
 
     let bind_addr = dhcp_runtime.bind_addr;
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
@@ -2445,6 +2510,8 @@ pub async fn run_main_loop_with(
         arrival_filter,
         #[cfg(feature = "dhcp")]
         prebound_dhcp,
+        #[cfg(feature = "dhcp")]
+        prebound_lease_stream,
         #[cfg(feature = "dhcp6")]
         prebound_dhcp6,
         #[cfg(feature = "tftp")]
@@ -2537,7 +2604,7 @@ pub async fn run_main_loop_with(
             let slaac_contexts = dhcp6_runtime.as_ref().map(|rt| rt.contexts.clone()).unwrap_or_default();
             #[cfg(not(feature = "dhcp6"))]
             let slaac_contexts: Vec<crate::types::dhcp::DhcpContext> = Vec::new();
-            match spawn_dhcp_task(dhcp_runtime, prebound_dhcp, slaac_contexts, dhcp_reload_config.clone()).await {
+            match spawn_dhcp_task(dhcp_runtime, prebound_dhcp, prebound_lease_stream, slaac_contexts, dhcp_reload_config.clone()).await {
                 Ok((task, tx, lease_db)) => (Some(task), Some(tx), Some(lease_db)),
                 Err(()) => {
                     fwd_task.abort();
@@ -4293,6 +4360,36 @@ mod tests {
         assert!(matches!(err, DnsmasqError::Bind(..)), "unexpected error: {err}");
     }
 
+    /// The lease file is opened (and created) by `bind_listeners`, i.e.
+    /// before the privilege drop, like upstream's lease.c:208 — and not with
+    /// --leasefile-ro.
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn bind_listeners_opens_the_lease_file_before_the_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dnsmasq.leases");
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let port = i32::from(probe.local_addr().unwrap().port());
+        drop(probe);
+        let make = |ro: bool| {
+            let mut d = Daemon { port: 0, ..Default::default() };
+            d.dhcp.push(test_dhcp_context());
+            d.dhcp_server_port = port;
+            d.dhcp_client_port = port + 1;
+            d.lease_file = Some(path.to_str().unwrap().to_string());
+            d.set_option(crate::types::constants::OPT_NOWILD);
+            if ro {
+                d.set_option(crate::types::constants::OPT_LEASE_RO);
+            }
+            d
+        };
+        let l = bind_listeners(&make(false)).unwrap();
+        assert!(l.lease_stream.is_some(), "lease file must be opened before the drop");
+        assert!(path.is_file(), "and created if missing");
+        let ro = bind_listeners(&make(true)).unwrap();
+        assert!(ro.lease_stream.is_none(), "--leasefile-ro never opens it for writing");
+    }
+
     /// Without SO_BROADCAST, a reply to a client that has no address yet
     /// (sent to 255.255.255.255, dhcp.c's `dhcp_reply`) fails at the kernel
     /// with ENETUNREACH instead of going out — confirmed against a real
@@ -4313,6 +4410,45 @@ mod tests {
             dhcp_sock.broadcast().unwrap(),
             "the DHCP socket must have SO_BROADCAST set to reply to unconfigured clients"
         );
+    }
+
+    /// Regression: two `bind-interfaces` instances serving different networks
+    /// must both be able to bind the DHCP port (upstream `make_fd`, dhcp.c:66-86).
+    /// Before the fix the second `bind()` failed with EADDRINUSE.
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn bind_dhcp4_socket_shares_the_port_only_with_reuse() {
+        let first = bind_dhcp4_socket("127.0.0.1:0".parse().unwrap(), true).unwrap();
+        let addr = first.local_addr().unwrap();
+        let second = bind_dhcp4_socket(addr, true);
+        assert!(second.is_ok(), "a second reuse socket must bind {addr}: {:?}", second.err());
+
+        let plain = bind_dhcp4_socket("127.0.0.1:0".parse().unwrap(), false).unwrap();
+        let plain_addr = plain.local_addr().unwrap();
+        let err = bind_dhcp4_socket(plain_addr, false).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "without reuse the port stays exclusive");
+    }
+
+    /// The same, end to end through `bind_listeners`: a second daemon with
+    /// `bind-interfaces` binds the DHCP port a first one already holds.
+    #[cfg(feature = "dhcp")]
+    #[test]
+    fn bind_listeners_lets_two_bind_interfaces_daemons_share_the_dhcp_port() {
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let make = || {
+            let mut d = Daemon { port: 0, ..Default::default() };
+            d.dhcp.push(test_dhcp_context());
+            d.dhcp_server_port = i32::from(port);
+            d.dhcp_client_port = i32::from(port.wrapping_add(1));
+            d.set_option(crate::types::constants::OPT_NOWILD);
+            d
+        };
+        let first = bind_listeners(&make()).expect("first daemon binds");
+        assert!(first.dhcp.is_some());
+        let second = bind_listeners(&make());
+        assert!(second.is_ok(), "second bind-interfaces daemon must share port {port}: {:?}", second.err());
     }
 
     #[tokio::test]

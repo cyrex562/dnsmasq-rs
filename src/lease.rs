@@ -686,6 +686,38 @@ impl LeaseDb {
         Ok(())
     }
 
+    /// Persist the database to `path` as the running daemon does.
+    ///
+    /// Tries the atomic [`write_to_file`](Self::write_to_file) first. That needs
+    /// to create a temp file next to `path`, which fails with `EACCES` once the
+    /// daemon has dropped to `--user` and the directory is root-owned (the usual
+    /// `/var/lib/misc`, or a systemd `StateDirectory=`). In that case, and only
+    /// then, the lease file opened before the privilege drop (`stream`) is
+    /// rewritten in place — what upstream always does with its
+    /// `daemon->lease_stream` (lease.c:208). Without a `stream` the error is
+    /// returned unchanged.
+    pub fn write_lease_file(&self, path: &str, stream: Option<&std::fs::File>) -> Result<(), LeaseError> {
+        match self.write_to_file(path) {
+            Err(LeaseError::Io(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => match stream {
+                Some(f) => self.rewrite_in_place(f),
+                None => Err(LeaseError::Io(e)),
+            },
+            other => other,
+        }
+    }
+
+    /// Truncate and rewrite an already-open lease file (upstream's in-place
+    /// `lease_update_file`).
+    pub fn rewrite_in_place(&self, mut f: &std::fs::File) -> Result<(), LeaseError> {
+        use std::io::{Seek, SeekFrom, Write};
+        let data = self.serialize();
+        f.set_len(0)?;
+        f.seek(SeekFrom::Start(0))?;
+        f.write_all(data.as_bytes())?;
+        f.sync_data()?;
+        Ok(())
+    }
+
     /// Load a lease database from a file (using [`deserialize`]).
     pub fn load_from_file(path: &str) -> Result<Self, LeaseError> {
         let data = std::fs::read_to_string(path)?;
@@ -2105,6 +2137,41 @@ mod tests {
     fn load_from_file_nonexistent() {
         let result = LeaseDb::load_from_file("/tmp/nonexistent_lease_file_dnsmasq_test.dat");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn write_lease_file_falls_back_to_the_pre_opened_stream() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("leases");
+        let path_str = path.to_str().unwrap();
+        // Opened while "privileged", like bind_listeners does before the drop.
+        let stream = std::fs::OpenOptions::new().read(true).write(true).create(true).open(&path).unwrap();
+        std::fs::write(&path, "stale contents that are longer than the new ones\n").unwrap();
+        // The directory is no longer writable, as for `nobody` in /var/lib/misc.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let db = LeaseDb::new();
+        let root = nix::unistd::geteuid().is_root();
+        if !root {
+            // root ignores directory permissions, so only check this unprivileged
+            let err = db.write_lease_file(path_str, None).unwrap_err();
+            assert!(matches!(err, LeaseError::Io(ref e) if e.kind() == std::io::ErrorKind::PermissionDenied));
+        }
+        db.write_lease_file(path_str, Some(&stream)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), db.serialize(), "rewritten in place, old tail truncated");
+        assert!(!dir.path().join(".leases.tmp").exists());
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn write_lease_file_uses_the_atomic_write_when_it_can() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("leases");
+        let db = LeaseDb::new();
+        db.write_lease_file(path.to_str().unwrap(), None).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), db.serialize());
     }
 
     #[test]
