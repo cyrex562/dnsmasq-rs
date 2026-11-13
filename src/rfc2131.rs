@@ -1464,27 +1464,37 @@ pub fn do_options(pkt: &mut DhcpPacket, cfg: &mut DoOptionsConfig<'_>) {
     }
 
     // ── Context-derived options ──────────────────────────────────────────────
+    // A default is only sent when no configured option (that applies to this
+    // client, `DHOPT_TAGOK`) sets the same code — rfc2131.c's
+    // `!option_find2(...)` checks. Otherwise both go out: the same option
+    // twice, which some clients (busybox udhcpc in debian-installer) turn into
+    // no default route.
+    let configured = |code: u8| option_find2(cfg.config_opts, code);
     if let Some(ctx) = cfg.context {
         if (!cfg.leasequery || in_list(cfg.req_options, OPTION_NETMASK))
             && !has_opt_raw(opts, OPTION_NETMASK)
+            && !configured(OPTION_NETMASK)
         {
             option_put(opts, OPTION_NETMASK, u32::from(ctx.netmask), 4);
         }
         if ctx.broadcast != Ipv4Addr::UNSPECIFIED
             && (!cfg.leasequery || in_list(cfg.req_options, OPTION_BROADCAST))
             && !has_opt_raw(opts, OPTION_BROADCAST)
+            && !configured(OPTION_BROADCAST)
         {
             option_put(opts, OPTION_BROADCAST, u32::from(ctx.broadcast), 4);
         }
         if ctx.router != Ipv4Addr::UNSPECIFIED
             && in_list(cfg.req_options, OPTION_ROUTER)
             && !has_opt_raw(opts, OPTION_ROUTER)
+            && !configured(OPTION_ROUTER)
         {
             option_put(opts, OPTION_ROUTER, u32::from(ctx.router), 4);
         }
         if cfg.dns_port == 53
             && in_list(cfg.req_options, OPTION_DNSSERVER)
             && !has_opt_raw(opts, OPTION_DNSSERVER)
+            && !configured(OPTION_DNSSERVER)
         {
             option_put(opts, OPTION_DNSSERVER, u32::from(ctx.local), 4);
         }
@@ -1497,14 +1507,20 @@ pub fn do_options(pkt: &mut DhcpPacket, cfg: &mut DoOptionsConfig<'_>) {
 
     // ── Domain name ─────────────────────────────────────────────────────────
     if let Some(domain) = cfg.domain {
-        if in_list(cfg.req_options, OPTION_DOMAINNAME) && !has_opt_raw(opts, OPTION_DOMAINNAME) {
+        if in_list(cfg.req_options, OPTION_DOMAINNAME)
+            && !has_opt_raw(opts, OPTION_DOMAINNAME)
+            && !configured(OPTION_DOMAINNAME)
+        {
             option_put_string(opts, OPTION_DOMAINNAME, domain, cfg.null_term);
         }
     }
 
     // ── Hostname / FQDN ─────────────────────────────────────────────────────
     if let Some(hostname) = cfg.hostname {
-        if in_list(cfg.req_options, OPTION_HOSTNAME) && !has_opt_raw(opts, OPTION_HOSTNAME) {
+        if in_list(cfg.req_options, OPTION_HOSTNAME)
+            && !has_opt_raw(opts, OPTION_HOSTNAME)
+            && !configured(OPTION_HOSTNAME)
+        {
             option_put_string(opts, OPTION_HOSTNAME, hostname, cfg.null_term);
         }
         if cfg.fqdn_flags != 0 {
@@ -1590,6 +1606,15 @@ pub fn has_opt(pkt: &DhcpPacket, opt: u8) -> bool {
 /// Return `true` if option code `opt` already appears in raw options slice,
 /// beginning the search at `start` (pass 4 to skip the DHCP magic cookie).
 #[cfg(feature = "dhcp")]
+/// Is option `code` configured for this client? `option_find2()` in rfc2131.c:
+/// a `dhcp-option` with that code whose tags matched (`DHOPT_TAGOK`).
+#[cfg(feature = "dhcp")]
+pub fn option_find2(config_opts: &[crate::types::dhcp::DhcpOpt], code: u8) -> bool {
+    config_opts.iter().any(|o| {
+        o.opt == i32::from(code) && o.flags.contains(crate::types::dhcp::DhOptFlags::TAGOK)
+    })
+}
+
 pub fn has_opt_raw(opts: &[u8], opt: u8) -> bool {
     use crate::dhcp_protocol::{OPTION_PAD, OPTION_END};
     // If the slice begins with the 4-byte DHCP cookie, skip it.
