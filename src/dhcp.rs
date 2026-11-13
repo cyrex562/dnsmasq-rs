@@ -3611,6 +3611,96 @@ mod tests {
         assert!(find_option(&dispatched.reply.options, crate::dhcp_protocol::OPTION_ROUTER).is_some());
     }
 
+    /// Each option once: a configured router / DNS server / domain replaces the
+    /// context default instead of being sent next to it (rfc2131.c's
+    /// `option_find2()` checks). Found with debian-installer, whose DHCP client
+    /// set no default route when the reply carried option 3 twice.
+    #[test]
+    fn configured_options_replace_context_defaults() {
+        use crate::dhcp_protocol::{OPTION_DNSSERVER, OPTION_DOMAINNAME, OPTION_ROUTER};
+        use crate::types::dhcp::{ContextFlags, DhOptFlags, DhcpContext, DhcpNetid, DhcpOpt};
+
+        fn occurrences(opts: &[u8], code: u8) -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            let mut i = if opts.starts_with(&[0x63, 0x82, 0x53, 0x63]) { 4 } else { 0 };
+            while i < opts.len() {
+                match opts[i] {
+                    OPTION_END => break,
+                    0 => i += 1,
+                    c => {
+                        let len = opts[i + 1] as usize;
+                        if c == code {
+                            out.push(opts[i + 2..i + 2 + len].to_vec());
+                        }
+                        i += 2 + len;
+                    }
+                }
+            }
+            out
+        }
+
+        let mut pkt = base_packet();
+        pkt.options = vec![
+            OPTION_MESSAGE_TYPE, 1, DhcpMsgType::Discover as u8,
+            OPTION_REQUESTED_OPTIONS, 3, OPTION_ROUTER, OPTION_DNSSERVER, OPTION_DOMAINNAME,
+            OPTION_END,
+        ];
+        let mut cfg = default_cfg();
+        cfg.contexts.push(DhcpContext {
+            lease_time: 3600,
+            addr_epoch: 0,
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::new(10, 0, 0, 255),
+            local: Ipv4Addr::new(10, 0, 0, 1),
+            router: Ipv4Addr::new(10, 0, 0, 1),
+            start: Ipv4Addr::new(10, 0, 0, 100),
+            end: Ipv4Addr::new(10, 0, 0, 200),
+            flags: ContextFlags::DHCP,
+            netid: DhcpNetid { net: String::new() },
+            filter: vec![],
+            #[cfg(feature = "dhcp6")]
+            start6: std::net::Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            end6: std::net::Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            local6: std::net::Ipv6Addr::UNSPECIFIED,
+            #[cfg(feature = "dhcp6")]
+            prefix: 0,
+            #[cfg(feature = "dhcp6")]
+            if_index: 0,
+            #[cfg(feature = "dhcp6")]
+            valid: 0,
+            #[cfg(feature = "dhcp6")]
+            preferred: 0,
+            #[cfg(feature = "dhcp6")]
+            ra_time: 0,
+            #[cfg(feature = "dhcp6")]
+            ra_short_period_start: 0,
+            #[cfg(feature = "dhcp6")]
+            saved_valid: 0,
+            #[cfg(feature = "dhcp6")]
+            address_lost_time: 0,
+        });
+        // router and DNS server configured (as cogitator writes them, the same
+        // address as the context's, and a different one), no domain option
+        for (code, val) in [(OPTION_ROUTER, [10, 0, 0, 1]), (OPTION_DNSSERVER, [10, 0, 0, 53])] {
+            cfg.dhcp_opts.push(DhcpOpt {
+                opt: code as i32,
+                flags: DhOptFlags::empty(),
+                val: Some(val.to_vec()),
+                netid: vec![],
+                encap: 0,
+                vendor_class: None,
+            });
+        }
+
+        let dispatched = dispatch_dhcp_with_meta(&pkt, &cfg, &mut LeaseDb::new(), &mut PingCache::new(), &NullProbe).expect("discover should produce an offer");
+        let opts = &dispatched.reply.options;
+        assert_eq!(occurrences(opts, OPTION_ROUTER), vec![vec![10, 0, 0, 1]]);
+        assert_eq!(occurrences(opts, OPTION_DNSSERVER), vec![vec![10, 0, 0, 53]], "the configured server, not the context's address");
+        assert!(occurrences(opts, OPTION_DOMAINNAME).len() <= 1);
+    }
+
     #[test]
     fn discover_host_set_tag_selects_tagged_option() {
         use crate::types::dhcp::{DhcpConfig, DhcpContext, DhcpNetid, DhcpOpt, HwaddrConfig, ContextFlags, ConfigFlags};
